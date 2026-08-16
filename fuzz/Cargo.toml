@@ -1,0 +1,37 @@
+[package]
+name = "ratatosk-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Собственное рабочее пространство: цели требуют nightly и не участвуют
+# в обычной сборке.
+[workspace]
+
+# §16: «cargo-fuzz на разбор кадра, CBOR-десериализацию и парсинг
+# контакт-карточек — с первого дня, в CI.»
+[dependencies]
+libfuzzer-sys = "0.4"
+ratatosk-wire = { path = "../crates/wire" }
+ratatosk-codec = { path = "../crates/codec" }
+
+[[bin]]
+name = "frame_parse"
+path = "fuzz_targets/frame_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cbor_decode"
+path = "fuzz_targets/cbor_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "contact_card"
+path = "fuzz_targets/contact_card.rs"
+test = false
+doc = false

@@ -1,0 +1,12 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+
+# Целевые платформы здесь НЕ перечислены сознательно: rustup ставит все
+# указанные targets при любой команде в каталоге, и разработчик на Linux
+# получал бы заодно windows-msvc. Нужные цели ставятся по месту:
+#
+#   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+#   rustup target add x86_64-pc-windows-msvc
+#
+# Полный список — в README. iOS отсутствует сознательно (§15).

@@ -1,0 +1,47 @@
+[package]
+name = "ratatosk-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "UniFFI-граница ядра: Android и десктоп (§13.3)"
+
+# Cargo подбирает `src/bin/*.rs` сам, и генератор биндингов, однажды сюда
+# попавший, попадёт снова. У этого крейта исполняемых целей нет ни одной
+# и быть не должно — см. пояснение к зависимостям ниже.
+autobins = false
+
+[lib]
+# cdylib — для Android (.so внутри .aar); staticlib — для сборок, где ядро
+# линкуется статически; rlib — чтобы десктоп мог звать ядро напрямую,
+# без FFI-накладных расходов (§13.3).
+crate-type = ["cdylib", "staticlib", "rlib"]
+name = "ratatosk_ffi"
+
+[dependencies]
+ratatosk-codec.workspace = true
+ratatosk-core.workspace = true
+ratatosk-crypto.workspace = true
+ratatosk-proto.workspace = true
+ratatosk-store.workspace = true
+ratatosk-transport.workspace = true
+
+# Ядро живёт на собственном потоке с рантаймом: методы через UniFFI
+# синхронные, а драйвер асинхронный, и мост между ними — здесь.
+tokio = { workspace = true }
+uniffi.workspace = true
+thiserror.workspace = true
+
+# build.rs здесь нет сознательно: `uniffi::setup_scaffolding!()` — это
+# proc-macro режим, скаффолдинг генерируется макросом. Сборочный скрипт
+# с `generate_scaffolding_for_crate` относится к UDL-режиму, и одновременно
+# они не работают.
+#
+# Генератора биндингов здесь тоже нет: он требует признака `uniffi/cli`,
+# а признаки включаются на крейт целиком, не на цель. Держи мы его тут,
+# clap и camino попали бы в граф зависимостей библиотеки, то есть в `.so`
+# для Android. Инструмент вынесен в `crates/bindgen`.
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

@@ -1,0 +1,19 @@
+[package]
+name = "ratatosk-crdt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Порядок и слияние состояния без сервера: HLC, OR-Set, окно дедупликации (§9, §11.2, §12)"
+
+# Зависимостей нет сознательно: это чистые структуры данных, и на них держатся
+# proptest-инварианты из §16 («слияние OR-Set коммутативно и идемпотентно»).
+[dependencies]
+
+# Только для тестов: сам крейт по-прежнему собирается без единой зависимости.
+[dev-dependencies]
+proptest.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

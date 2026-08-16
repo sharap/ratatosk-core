@@ -1,0 +1,6 @@
+edition = "2021"
+max_width = 100
+# Компактные литералы и вызовы: иначе rustfmt рвёт `Hlc { wall_ms, logical }`
+# на четыре строки и код, где важна раскладка байтов, читается хуже.
+use_small_heuristics = "Max"
+use_field_init_shorthand = true

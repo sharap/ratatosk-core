@@ -1,0 +1,25 @@
+[package]
+name = "ratatosk-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Протокольные конечные автоматы без ввода-вывода (§5.4, §9, §11)"
+
+# Крейт не знает ни про сокеты, ни про SQLite, ни про рантайм. Всё время
+# приходит параметром, все байты — на входе и выходе. Это и есть sans-io:
+# без него детерминированная симуляция из §16 недостижима.
+[dependencies]
+ratatosk-wire.workspace = true
+ratatosk-crdt.workspace = true
+ratatosk-crypto.workspace = true
+ratatosk-codec.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]
+ratatosk-sim.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

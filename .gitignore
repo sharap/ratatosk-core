@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+
+# Тест-векторы (crates/crypto/tests/vectors/) НЕ игнорируются: §16 требует
+# держать их в репозитории. Изменение такого файла в диффе — сигнал, что
+# кто-то поменял деривацию, а не переформатировал код.
+
+# артефакты биндингов
+/bindings/
+/clients/android/app/src/main/jniLibs/
+*.aar
+
+# локальные базы и ключи — не должны попадать в репозиторий никогда
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+/fuzz/artifacts/
+/fuzz/corpus/

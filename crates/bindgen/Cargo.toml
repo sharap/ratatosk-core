@@ -1,0 +1,25 @@
+[package]
+name = "ratatosk-bindgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Генератор биндингов UniFFI — инструмент сборки, не часть ядра"
+
+# Крейт существует ровно затем, чтобы признак `cli` не попадал в
+# `ratatosk-ffi`. Признаки в Cargo включаются на крейт целиком, а не на цель:
+# держи мы `[[bin]] uniffi-bindgen` внутри ratatosk-ffi, clap и camino
+# оказались бы в графе зависимостей библиотеки — то есть в `.so`, которая
+# едет на телефон.
+#
+# Здесь зависимости от ratatosk-ffi нет и не нужно: bindgen работает
+# в режиме `--library` и читает метаданные из уже собранного артефакта.
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

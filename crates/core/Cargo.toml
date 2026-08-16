@@ -1,0 +1,36 @@
+[package]
+name = "ratatosk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Ядро Ratatosk: sans-io Engine и драйвер (§13.3)"
+
+[dependencies]
+ratatosk-wire.workspace = true
+ratatosk-crdt.workspace = true
+ratatosk-crypto.workspace = true
+ratatosk-codec.workspace = true
+ratatosk-proto.workspace = true
+ratatosk-store.workspace = true
+
+rand_core.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Драйвер — единственная часть ядра, знающая про рантайм. Он за фичей,
+# чтобы симуляция (§16) собиралась без tokio вообще.
+tokio = { workspace = true, optional = true }
+ratatosk-transport = { workspace = true, optional = true }
+
+[dev-dependencies]
+ratatosk-sim.workspace = true
+
+[features]
+default = ["driver"]
+driver = ["dep:tokio", "dep:ratatosk-transport"]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

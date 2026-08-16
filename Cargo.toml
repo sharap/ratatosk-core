@@ -1,0 +1,148 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# fuzz — отдельное рабочее пространство: цели собираются только nightly
+# и не должны тянуться в обычный `cargo build --workspace`.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# Версии сверены с crates.io на 15 августа 2026. Две из них выбраны НЕ по
+# принципу «самая свежая», и оба исключения отмечены на месте: rusqlite зажат
+# диапазоном tor-dirmgr, а dalek и chacha20poly1305 оставлены на поколении,
+# под API которого написан код.
+[workspace.dependencies]
+# --- крейты рабочего пространства ---
+ratatosk-wire = { path = "crates/wire" }
+ratatosk-crdt = { path = "crates/crdt" }
+ratatosk-crypto = { path = "crates/crypto" }
+ratatosk-codec = { path = "crates/codec" }
+ratatosk-proto = { path = "crates/proto" }
+ratatosk-store = { path = "crates/store" }
+ratatosk-transport = { path = "crates/transport" }
+ratatosk-core = { path = "crates/core" }
+ratatosk-sim = { path = "crates/sim" }
+
+# --- криптография (§8.1) ---
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
+
+# dalek 3.0 и chacha20poly1305 0.11 вышли летом 2026 и сменили API
+# (в частности, переход на rand_core 0.9). Код в crates/crypto написан под
+# поколение dalek 2 / AEAD 0.10, и пока он не собран и не покрыт
+# тест-векторами, подъём версии превратил бы одну ошибку резолвера в стену
+# ошибок типов. Обновление — отдельной задачей после этапа 1, с прогоном
+# тест-векторов до и после.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+argon2 = { version = "0.5", features = ["std"] }
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+# snow 0.10 вынес примитивы в отдельные признаки: `default-resolver` сам по
+# себе не включает ни DH, ни шифр, ни хэш и падает на compile_error!.
+# Набор ниже — ровно паттерн из §8.2, `Noise_IK_25519_ChaChaPoly_BLAKE2s`,
+# и ничего сверх него: AES-GCM, SHA-2, P-256 и Kyber не включены сознательно.
+# Лишний примитив в бинарнике — лишний код в самой чувствительной части,
+# а выбора у сторон всё равно нет: паттерн задан спецификацией намертво.
+#
+# `risky-raw-split` включён сознательно. Он открывает
+# `dangerously_get_raw_split`, то есть сырые ключи после Noise Split. Обычно
+# это признак того, что кто-то собирается изобрести транспорт заново, — у нас
+# ровно этот случай, и он предписан спецификацией: §7 задаёт собственный
+# формат кадра с классами размера и паддингом, §8.4 — собственный
+# симметричный ретчет. Транспортный режим Noise нам не нужен, а материал
+# после split нужен: §8.3 выводит из него `root_key`, и без него ключи
+# сессии пришлось бы брать из транскрипта, который вычисляется наблюдателем.
+snow = { version = "0.10", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom",
+    "risky-raw-split",
+    "std",
+] }
+
+# --- сериализация (§6) ---
+ciborium = "0.2"
+ciborium-io = "0.2"
+data-encoding = "2.6"   # base32 без похожих символов для отпечатков и URI
+
+# --- хранилище (§12) ---
+#
+# Версия зажата НЕ нашими потребностями, а arti: tor-dirmgr держит свой
+# кэш директории в SQLite и требует `rusqlite >=0.36, <0.40`. Пакет
+# libsqlite3-sys объявляет `links = "sqlite3"`, а двух разных его версий
+# в одном бинарнике быть не может — поэтому наш rusqlite обязан попадать
+# в тот же диапазон. При подъёме arti этот диапазон надо перепроверять
+# первым делом: сборка упадёт на резолвере, а не на компиляции.
+rusqlite = { version = "0.39", features = ["bundled", "blob"] }
+
+# --- транспорты (§5) ---
+# io-std нужен стенду `ratatosk-lab`: он читает команды со stdin.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "macros",
+    "io-util",
+    "io-std",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# arti. Спецификация (§5.2) называет «версию 2.x» — такой нет и не было:
+# у крейтов arti нумерация 0.x, актуальная — 0.45 (август 2026).
+# Приложение arti нумеруется как 1.x, отсюда, видимо, и путаница.
+#
+# `rustls`, а не `native-tls`: native-tls на Linux тянет OpenSSL, и его
+# кросс-компиляция под Android — отдельная многодневная история. Признаки
+# взаимоисключающие, выбирать надо здесь и один раз.
+#
+# `onion-service-service` включает размещение своего onion-сервиса — без
+# него §5.2 не выполнить: устройство обязано быть не только клиентом.
+arti-client = { version = "0.45", default-features = false, features = [
+    "tokio",
+    "rustls",
+    "onion-service-client",
+    "onion-service-service",
+    "compression",
+] }
+tor-rtcompat = { version = "0.45", features = ["tokio", "rustls"] }
+
+async-imap = "0.11"
+async-smtp = "0.10"
+tokio-socks = "0.5"
+mdns-sd = "0.20"
+
+# --- FFI (§13.3) ---
+uniffi = "0.32"
+
+# --- служебное ---
+thiserror = "2"
+tracing = "0.1"
+
+# --- только для тестов (§16) ---
+proptest = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Мобильная сборка: размер важнее скорости прогрева.
+[profile.release-android]
+inherits = "release"
+opt-level = "z"
+
+[profile.test]
+opt-level = 1

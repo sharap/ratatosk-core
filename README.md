@@ -1,0 +1,127 @@
+# ratatosk-core
+
+Общее ядро мессенджера Ratatosk на Rust. Реализует [спецификацию v0.1](ratatosk-v0_1-spec.md);
+клиенты Android и десктоп используют его через UniFFI (§13.3).
+
+## Состояние
+
+Каркас этапа 0 по §17. Часть кода работает и покрыта тестами, часть —
+типизированные заглушки `todo!()` со ссылкой на раздел спецификации и номер
+этапа. Ни одна заглушка не молчит: она либо падает с понятным сообщением,
+либо помечена `TODO(этап N, §M)`.
+
+| Состояние | Что это значит |
+|---|---|
+| Работает и покрыто тестами | `wire`, `crdt`, `sim`, `proto::transport_policy`, `proto::fragment`, `proto::receipts`, `proto::files`, `store::schema`, `store::compaction`, `core::honest`, `core::companion` |
+| Написано, но не проверено сборкой | `crypto`, `codec`, остальное в `proto`, `store::sqlite` |
+| Заглушки со ссылкой на этап | `crypto::handshake` (snow), `transport` целиком, `core::engine::step`, `ffi` |
+
+## Первая сборка
+
+Версии в `Cargo.toml` сверены с crates.io на 15 августа 2026, но сборка
+целиком пока не прогонялась:
+
+```sh
+cargo fetch                       # первый раз потребуется сеть
+cargo build --workspace
+cargo test --workspace
+```
+
+Две версии выбраны сознательно не самыми свежими, и обе отмечены комментарием
+на месте:
+
+- **`rusqlite = "0.39"`**, хотя есть 0.40. Диапазон задан не нами:
+  `tor-dirmgr` требует `>=0.36, <0.40`, а `libsqlite3-sys` объявляет
+  `links = "sqlite3"` — двух версий в бинарнике быть не может. Подъём arti
+  и подъём rusqlite отныне одна задача, см. `ARCHITECTURE.md` §5а.
+- **dalek 2 и `chacha20poly1305` 0.10**, хотя вышли dalek 3.0 и AEAD 0.11.
+  Код в `crates/crypto` написан под старое поколение API; переводить его
+  вслепую, до первой сборки и тест-векторов, значит менять одну понятную
+  ошибку на десятки непонятных. Обновление — отдельной задачей после этапа 1.
+
+**`native-tls` и OpenSSL запрещены в `deny.toml` намеренно.** arti собирается
+с `rustls`: OpenSSL пришлось бы кросс-компилировать под Android, и это
+многодневная возня на ровном месте. Признаки взаимоисключающие, так что выбор
+делается один раз и здесь.
+
+Крейты без внешних зависимостей (`ratatosk-wire`, `ratatosk-crdt`,
+`ratatosk-sim`) собираются и тестируются офлайн:
+
+```sh
+cargo test --offline -p ratatosk-wire -p ratatosk-crdt -p ratatosk-sim
+```
+
+Про «arti версии 2.x» из §5.2: такой версии не существует — у крейтов arti
+нумерация 0.x, актуальная 0.45. Подробности в `ARCHITECTURE.md` §5, пункт 6.
+
+Целевые платформы ставятся по месту — в `rust-toolchain.toml` их нет
+сознательно, иначе rustup тянул бы windows-таргет на машину Linux-разработчика:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+rustup target add x86_64-pc-windows-msvc   # для сборки десктопа под Windows
+```
+
+iOS в списке нет и не будет: §15.
+
+## Структура
+
+```
+crates/
+  wire/       формат кадра: заголовок, классы размера, паддинг   §5.5, §7
+  crdt/       HLC, OR-Set, окно дедупликации                     §9, §11.2, §12
+  crypto/     идентичность, Noise IK, ретчет, AEAD               §3, §8
+  codec/      детерминированный CBOR, карточка, конверт          §4, §6, §9.1
+  proto/      конечные автоматы без ввода-вывода                 §5.4, §9, §10, §11
+  store/      SQLite, FTS5, compaction                           §12
+  transport/  LAN, arti/onion, chatmail — единственный I/O        §5
+  core/       Engine (sans-io), драйвер, тексты §14              §13.3, §14
+  ffi/        UniFFI для Android и десктопа                      §13.3
+  bindgen/    генератор биндингов — инструмент сборки            §13.3
+  sim/        детерминированная симуляция                        §16
+```
+
+`bindgen` вынесен из `ffi` не для порядка: генератор требует признака
+`uniffi/cli`, а признаки в Cargo включаются на крейт целиком, а не на цель.
+Останься он внутри `ffi`, clap и camino попали бы в граф зависимостей
+библиотеки — то есть в `.so`, которая едет на телефон.
+
+```sh
+cargo build -p ratatosk-ffi --release --target aarch64-linux-android
+cargo run -p ratatosk-bindgen --bin uniffi-bindgen -- generate \
+    --library target/aarch64-linux-android/release/libratatosk_ffi.so \
+    --language kotlin --out-dir clients/android/app/src/main/java
+```
+
+Зависимости идут строго вниз: `wire` и `crdt` не зависят ни от чего,
+`transport` — единственный крейт с сокетами и рантаймом. Проверяется
+компилятором, а не договорённостью.
+
+## Почему sans-io
+
+§16 требует детерминированной симуляции с виртуальным временем, а §17 —
+чтобы харнесс делался первым. Ядро поэтому не владеет сокетами и не читает
+часы: `Engine::step(now_ms, input) -> Vec<Effect>`. Реальный ввод-вывод живёт
+в `ratatosk-transport`, симуляционный — в `ratatosk-sim`, и оба подставляются
+в одно и то же ядро без правок протокольного кода.
+
+Практическое следствие: сценарий «разделение сети на неделю» прогоняется
+за миллисекунды и воспроизводится по номеру сида.
+
+## Тестирование (§16)
+
+```sh
+cargo test --workspace                    # юниты и сценарии
+cargo test -p ratatosk-sim --test scenarios   # обязательные сценарии §16
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo deny check                          # состав криптостека (§8.1)
+```
+
+Фаззинг с первого дня (§16) — `cargo fuzz run frame_parse`, цели в `fuzz/`.
+
+## Что сюда не пишется
+
+Список из §15 действует и на код: звонки, iOS, STUN/TURN, PoW, MLS/TreeKEM,
+персоны, файловый рой, отзыв ключей. Заглушек под них в дереве нет
+сознательно — пустой модуль читается как обещание.

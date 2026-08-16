@@ -1,0 +1,42 @@
+[package]
+name = "ratatosk-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Ввод-вывод транспортов: LAN, arti/onion, chatmail (§5)"
+
+# Единственный крейт в дереве, которому разрешено владеть сокетами и рантаймом.
+# Всё, что выше по стеку, остаётся sans-io — иначе §16 недостижим.
+[dependencies]
+ratatosk-proto.workspace = true
+ratatosk-wire.workspace = true
+# Маяк LAN (§5.1) ротируется и выводится из `IK`, поэтому сопоставлять его
+# обязан тот, кто слушает эфир, — то есть транспорт. Иначе ядру пришлось бы
+# выдавать вниз новые ожидаемые значения каждые 15 минут.
+ratatosk-crypto.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Транспортные зависимости выделены в фичи: симуляция и юнит-тесты собираются
+# без arti, а сборка ядра под CI не тянет полстека Tor ради проверки логики.
+arti-client = { workspace = true, optional = true }
+tor-rtcompat = { workspace = true, optional = true }
+tokio-socks = { workspace = true, optional = true }
+async-imap = { workspace = true, optional = true }
+async-smtp = { workspace = true, optional = true }
+mdns-sd = { workspace = true, optional = true }
+
+[features]
+default = ["onion", "chatmail", "lan"]
+onion = ["dep:arti-client", "dep:tor-rtcompat"]
+chatmail = ["dep:async-imap", "dep:async-smtp", "dep:tokio-socks"]
+lan = ["dep:mdns-sd"]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

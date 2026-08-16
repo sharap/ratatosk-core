@@ -1,0 +1,24 @@
+[package]
+name = "ratatosk-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Детерминированная симуляция сети с виртуальным временем (§16)"
+
+# Зависимостей нет по принципиальной причине: харнесс, зависящий от рантайма,
+# не даёт воспроизводимости по номеру сида. Всё время — виртуальное,
+# вся случайность — из посеянного Rng.
+#
+# Крейт намеренно НЕ зависит от ratatosk-core: узел подключается через трейт
+# SimNode. Иначе харнесс нельзя было бы использовать для отдельных подсистем.
+[dependencies]
+
+# Сценарии из §16 проверяются на настоящих структурах состояния, а не на
+# заглушках: иначе харнесс доказывает работоспособность только себя самого.
+[dev-dependencies]
+ratatosk-crdt.workspace = true
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

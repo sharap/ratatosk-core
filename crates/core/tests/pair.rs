@@ -10,6 +10,8 @@
 //! рукопожатие, ретчет, кодек, кадрирование и хранилище **сходятся вместе**.
 //! Если 1:1-текст не работает здесь, в симуляторе он не заработает тем более.
 
+use std::collections::VecDeque;
+
 use ratatosk_core::engine::SelfAddresses;
 use ratatosk_core::{Command, Effect, Engine, Event, Input, SeededEntropy};
 use ratatosk_crypto::Identity;
@@ -41,34 +43,43 @@ fn node(seed: u8, name: &str) -> Node {
 /// и разрывы — забота симулятора, здесь проверяется сам протокол.
 fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Event> {
     let mut events = Vec::new();
-    let mut queue: Vec<(bool, Effect)> = from_a.into_iter().map(|e| (true, e)).collect();
+    let mut queue: VecDeque<(bool, Effect)> = from_a.into_iter().map(|e| (true, e)).collect();
+    // Сроки ожидания копятся отдельно и срабатывают только тогда, когда
+    // провод затих. Порядок здесь не косметика: срок прямого канала означает
+    // «квитанции нет, попытка не удалась» (§5.4, §9.4), а на мгновенном
+    // проводе квитанция обязана приходить раньше срока. Сработай таймер
+    // посреди обмена — тест проверял бы откат на следующий транспорт вместо
+    // доставки. Оставшийся при затихшем проводе владелец у метки — это уже
+    // настоящий провал, и его тест обязан увидеть.
+    let mut timers: Vec<(bool, u64)> = Vec::new();
 
     let mut steps = 0;
-    while let Some((from_first, effect)) = queue.pop() {
-        steps += 1;
-        assert!(steps < 100, "обмен не сходится — вероятно, кольцо эффектов");
+    loop {
+        while let Some((from_first, effect)) = queue.pop_front() {
+            steps += 1;
+            assert!(steps < 100, "обмен не сходится — вероятно, кольцо эффектов");
 
-        match effect {
-            Effect::Send { via, frame, .. } => {
-                let target = if from_first { &mut *b } else { &mut *a };
-                let produced = target
-                    .step(now_ms, Input::Received { via, frame })
-                    .expect("приём кадра не должен отказывать");
-                queue.extend(produced.into_iter().map(|e| (!from_first, e)));
+            match effect {
+                Effect::Send { via, frame, .. } => {
+                    let target = if from_first { &mut *b } else { &mut *a };
+                    let produced = target
+                        .step(now_ms, Input::Received { via, frame })
+                        .expect("приём кадра не должен отказывать");
+                    queue.extend(produced.into_iter().map(|e| (!from_first, e)));
+                }
+                Effect::SetTimer { token, .. } => timers.push((from_first, token)),
+                Effect::Notify(event) => events.push(event),
+                Effect::Connect { .. }
+                | Effect::SetLanEnabled(_)
+                | Effect::WatchLanPeers(_)
+                | Effect::RestartLan => {}
             }
-            // Таймер попытки доставки (§5.4). Провод мгновенный и без потерь,
-            // поэтому «об отказе не сообщили» здесь верно по построению:
-            // срабатывание таймера означает «ушло». Без этой ветки запись
-            // навсегда оставалась бы в очереди, и тест не проверял бы
-            // жизненный цикл доставки целиком.
-            Effect::SetTimer { token, .. } => {
-                let owner = if from_first { &mut *a } else { &mut *b };
-                let produced = owner.step(now_ms, Input::Timer { token }).expect("таймер доставки");
-                queue.extend(produced.into_iter().map(|e| (from_first, e)));
-            }
-            Effect::Notify(event) => events.push(event),
-            Effect::Connect { .. } | Effect::SetLanEnabled(_) | Effect::WatchLanPeers(_) => {}
         }
+
+        let Some((owner_first, token)) = timers.pop() else { break };
+        let owner = if owner_first { &mut *a } else { &mut *b };
+        let produced = owner.step(now_ms, Input::Timer { token }).expect("таймер доставки");
+        queue.extend(produced.into_iter().map(|e| (owner_first, e)));
     }
     events
 }
@@ -127,13 +138,16 @@ fn handshake_happens_once_and_carries_the_first_message() {
     assert_eq!(alice.awaiting_session(), 0, "сессия установлена — ждать больше нечего");
     assert_eq!(alice.queued(), 0, "очередь доставки должна опустеть");
 
-    // §9.4: по прямому каналу отправитель узнаёт хотя бы «отправлено».
+    // §9.4: по прямому каналу «доставлено» объявляет получатель квитанцией,
+    // а не отправитель по таймеру. Поэтому ждём именно `Delivered`: `Sent`
+    // здесь означал бы, что статус выставил срок ожидания, то есть обещание
+    // без подтверждения — ровно то, что запрещает §14.
     assert!(
         events.iter().any(|e| matches!(
             e,
-            Event::StatusChanged { status: ratatosk_proto::DeliveryStatus::Sent, .. }
+            Event::StatusChanged { status: ratatosk_proto::DeliveryStatus::Delivered, .. }
         )),
-        "статус доставки не дошёл до UI: {events:?}"
+        "квитанция о доставке не дошла до UI: {events:?}"
     );
 
     // Второе сообщение идёт по уже установленной сессии.
@@ -174,6 +188,201 @@ fn both_directions_work_after_one_handshake() {
         senders,
         vec![alice.own_card().ik, bob.own_card().ik],
         "отправитель каждого сообщения должен сохраняться"
+    );
+}
+
+#[test]
+fn a_deadline_without_a_receipt_is_a_failure_not_a_success() {
+    // Раньше срок ожидания прямого канала объявлял «отправлено». Это выглядело
+    // безобидной неточностью индикатора, а было дырой в §5.4: попытка
+    // закрывалась успехом, и откат на следующий транспорт не начинался.
+    // Проверяем на контакте с одним только onion: откатываться некуда,
+    // поэтому исход попытки виден сразу и не смешивается с почтой.
+    let mut alice = node(1, "alice");
+
+    let ghost = Identity::from_seed([9u8; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: ghost.public().ik,
+        sk: ghost.public().sk,
+        onion: "ghostwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww.onion".to_owned(),
+        chatmail: String::new(),
+        display_name: "призрак".to_owned(),
+        version: 1,
+    };
+    let ghost_ik = card.ik;
+    alice
+        .step(
+            0,
+            Input::Command(Command::AddContact {
+                card_bytes: card.encode().unwrap(),
+                met_in_person: true,
+            }),
+        )
+        .unwrap();
+
+    let chat = Engine::<MemoryStore>::chat_id_for(&ghost_ik);
+    let effects = alice
+        .step(1_000, Input::Command(Command::SendText { chat, text: "в пустоту".into() }))
+        .expect("отправка текста");
+
+    let token = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("прямой канал обязан завести срок ожидания квитанции");
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Sent,
+                ..
+            })
+        )),
+        "запись в сокет — не доставка: обещать «отправлено» до квитанции нельзя (§14)"
+    );
+
+    // Квитанции нет — срок вышел.
+    let produced = alice.step(46_000, Input::Timer { token }).expect("таймер");
+    let statuses: Vec<_> = produced
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Notify(Event::StatusChanged { status, .. }) => Some(*status),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statuses.contains(&ratatosk_proto::DeliveryStatus::Undeliverable),
+        "молчание на единственном транспорте обязано стать ошибкой: {statuses:?}"
+    );
+    assert!(
+        !statuses.contains(&ratatosk_proto::DeliveryStatus::Sent),
+        "срок ожидания не выдаёт успеха: {statuses:?}"
+    );
+}
+
+/// Контакт, до которого можно добраться **только** по локальной сети.
+///
+/// Ни onion, ни почты: §5.4 тогда не на что откатываться, и видно ровно
+/// поведение LAN, а не смешанный результат трёх транспортов.
+fn lan_only_contact(node: &mut Node, seed: u8) -> [u8; 32] {
+    let peer = Identity::from_seed([seed; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: peer.public().ik,
+        sk: peer.public().sk,
+        onion: String::new(),
+        chatmail: String::new(),
+        display_name: "сосед".to_owned(),
+        version: 1,
+    };
+    let peer_ik = card.ik;
+    node.step(0, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    node.step(
+        0,
+        Input::Command(Command::AddContact {
+            card_bytes: card.encode().unwrap(),
+            met_in_person: true,
+        }),
+    )
+    .unwrap();
+    peer_ik
+}
+
+#[test]
+fn a_message_waits_for_discovery_instead_of_failing_instantly() {
+    // Холодный старт: LAN включён, контакт есть, но маяка его устройства
+    // мы ещё не слышали — обнаружение занимает сотни миллисекунд, а нажатие
+    // «отправить» ждать не обязано. «Мы ещё не искали» — не то же самое,
+    // что «мы искали и не нашли», и объявлять недоставленным здесь нельзя.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    let effects = alice
+        .step(1_000, Input::Command(Command::SendText { chat, text: "ты тут?".into() }))
+        .expect("отправка текста");
+
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "адреса ещё нет — отправлять некуда: {effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Undeliverable,
+                ..
+            })
+        )),
+        "обнаружение ещё не отвечало — объявлять провал рано: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "ожидание обязано быть ограниченным по времени, иначе это зависание: {effects:?}"
+    );
+
+    // Маяк услышан — сообщение едет, не досиживая свой срок.
+    let produced = alice.step(1_100, Input::SeenOnLan { peer_ik }).expect("маяк");
+    assert!(
+        produced
+            .iter()
+            .any(|e| matches!(e, Effect::Send { via: ratatosk_proto::Transport::Lan, .. })),
+        "собеседник нашёлся, а сообщение не поехало: {produced:?}"
+    );
+}
+
+#[test]
+fn the_discovery_grace_is_spent_once_per_contact() {
+    // Обратная сторона ожидания: собеседнику, которого в этой сети нет,
+    // нельзя платить паузой перед каждым сообщением. Срок выдаётся один раз
+    // за сеанс — дальше ответ «не слышно» уже получен.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    let effects = alice
+        .step(1_000, Input::Command(Command::SendText { chat, text: "первое".into() }))
+        .expect("отправка текста");
+    let token = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("первому сообщению полагается срок на обнаружение");
+
+    // Срок вышел, никто не отозвался.
+    let produced = alice.step(4_000, Input::Timer { token }).expect("таймер");
+    assert!(
+        produced.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Undeliverable,
+                ..
+            })
+        )),
+        "после срока исход обязан быть объявлен: {produced:?}"
+    );
+
+    // Второе сообщение ждать уже нечего.
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "второе".into() }))
+        .expect("отправка текста");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "второй раз ждать того же собеседника незачем: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Undeliverable,
+                ..
+            })
+        )),
+        "исход второго сообщения известен сразу: {effects:?}"
     );
 }
 

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
-use crate::{Result, Store, StoreError, StoredContact, StoredMessage};
+use crate::{Result, Store, StoreError, StoredContact, StoredMessage, StoredSession};
 
 /// Хранилище в оперативной памяти.
 #[derive(Debug, Default)]
@@ -27,6 +27,7 @@ pub struct MemoryStore {
     /// одинаков от запуска к запуску, иначе симуляция (§16) перестаёт быть
     /// воспроизводимой по сиду.
     contacts: BTreeMap<[u8; 32], StoredContact>,
+    sessions: BTreeMap<u64, StoredSession>,
     meta: BTreeMap<String, Vec<u8>>,
 }
 
@@ -85,6 +86,23 @@ impl Store for MemoryStore {
         Ok(self.contacts.values().cloned().collect())
     }
 
+    fn put_session(&mut self, session: &StoredSession) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.sessions.insert(session.session_id, session.clone());
+        Ok(())
+    }
+
+    fn sessions(&self) -> Result<Vec<StoredSession>> {
+        Ok(self.sessions.values().cloned().collect())
+    }
+
+    fn delete_session(&mut self, session_id: u64) -> Result<()> {
+        self.sessions.remove(&session_id);
+        Ok(())
+    }
+
     fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.meta.get(key).cloned())
     }
@@ -116,6 +134,20 @@ impl Store for MemoryStore {
             window.drain(..window.len() - limit);
         }
         Ok(window)
+    }
+
+    fn status(&self, msg_id: &MsgId) -> Result<Option<u8>> {
+        Ok(self.messages.values().find(|m| m.msg_id == *msg_id).and_then(|m| m.status))
+    }
+
+    fn set_status(&mut self, msg_id: &MsgId, status: u8) -> Result<()> {
+        // Ключ карты — (чат, HLC, msg_id), поэтому запись ищется перебором.
+        // Для памяти это допустимо: она существует ради симуляции, где
+        // сообщений десятки, а не миллионы.
+        if let Some(message) = self.messages.values_mut().find(|m| m.msg_id == *msg_id) {
+            message.status = Some(status);
+        }
+        Ok(())
     }
 
     fn note_seen(&mut self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
@@ -176,6 +208,7 @@ mod tests {
             hlc: Hlc::new(wall_ms, 0),
             body: vec![n],
             received_ms: wall_ms,
+            status: None,
         }
     }
 

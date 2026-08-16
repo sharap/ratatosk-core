@@ -98,6 +98,28 @@ async fn introduce(node: &mut Node, peer_card: &[u8], peer_ik: [u8; 32], peer_po
     node.directory.note(peer_ik, loopback(peer_port));
 }
 
+/// Дожидается статуса доставки, пропуская всё остальное.
+///
+/// Отдельно от [`await_text`], и порядок вызовов важен: поток событий один,
+/// читается он один раз, и всё пропущенное пропадает навсегда. Квитанция
+/// о доставке приходит **раньше** ответного сообщения, поэтому ждать её
+/// надо до него, а не после.
+async fn await_status(node: &mut Node, wanted: ratatosk_proto::DeliveryStatus) {
+    let seen = tokio::time::timeout(PATIENCE, async {
+        while let Some(event) = node.events.next().await {
+            if let Event::StatusChanged { status, .. } = event {
+                if status == wanted {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or_else(|_| panic!("статус {wanted:?} не пришёл в срок"));
+    assert!(seen, "драйвер остановился, не объявив статус {wanted:?}");
+}
+
 /// Дожидается сообщения и возвращает его текст.
 async fn await_text(node: &mut Node) -> String {
     tokio::time::timeout(PATIENCE, async {
@@ -133,17 +155,30 @@ async fn two_engines_exchange_text_over_real_tcp() {
         let chat_with_bob = Engine::<MemoryStore>::chat_id_for(&bob_ik);
         alice
             .handle
-            .send(Command::SendText { chat: chat_with_bob, text: "привет из LAN".to_owned() })
+            .send(Command::SendText {
+                chat: chat_with_bob, text: "привет из LAN".to_owned()
+            })
             .await
             .expect("драйвер жив");
 
         assert_eq!(await_text(&mut bob).await, "привет из LAN");
 
+        // §9.4: доставку подтверждает получатель, а не таймер. Ждём **здесь**,
+        // до ответного сообщения: квитанция уходит сразу после расшифровки,
+        // то есть раньше, чем Боб успеет что-то написать.
+        //
+        // Заодно это проверка срока: страховочный таймер прямого канала —
+        // пять секунд, а `PATIENCE` десять. Приди «доставлено» от таймера,
+        // а не от квитанции, статус был бы `Sent`, и тест бы не прошёл.
+        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Delivered).await;
+
         // Обратное направление той же сессии: §8.3 устанавливает её один раз,
         // и ответ не должен требовать второго рукопожатия.
         let chat_with_alice = Engine::<MemoryStore>::chat_id_for(&alice_ik);
         bob.handle
-            .send(Command::SendText { chat: chat_with_alice, text: "и тебе привет".to_owned() })
+            .send(Command::SendText {
+                chat: chat_with_alice, text: "и тебе привет".to_owned()
+            })
             .await
             .expect("драйвер жив");
 
@@ -154,6 +189,70 @@ async fn two_engines_exchange_text_over_real_tcp() {
         result = alice_driver.run() => panic!("драйвер Алисы остановился: {result:?}"),
         result = bob_driver.run() => panic!("драйвер Боба остановился: {result:?}"),
         () = exchange => {}
+    }
+}
+
+/// Заводит «молчуна»: сокет, который соединение принимает и держит, но
+/// не отвечает ни байтом. Возвращает порт.
+///
+/// Принятые соединения складываются в вектор и не закрываются: закрытие
+/// дало бы ядру отправителя ошибку записи, то есть явный отказ — а проверить
+/// надо ровно противоположное, тишину при живом сокете.
+fn silent_listener() -> u16 {
+    let listener = std::net::TcpListener::bind(loopback(0)).expect("сокет-молчун слушает");
+    let port = listener.local_addr().expect("у сокета есть адрес").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn a_peer_that_accepts_but_stays_silent_is_reported_undeliverable() {
+    // Тот самый случай, который выглядел как «ошибка не появляется»: узел
+    // ушёл, но сокет на его адресе ещё жив (или это чужой процесс на том же
+    // порту). Запись в такой сокет ядро операционной системы принимает
+    // молча, поэтому транспорт об отказе не сообщает — и если считать
+    // «отправили в сокет» успехом, откат §5.4 не запустится, а пользователь
+    // увидит галочку вместо ошибки.
+    //
+    // Отличие от теста ниже принципиальное: там соединение отвергается,
+    // здесь — устанавливается. Единственный, кто может объявить исход,
+    // это срок ожидания квитанции (§9.4).
+    let (mut alice_driver, mut alice) = spawn_node("Алиса").await;
+
+    let ghost = Identity::generate();
+    let ghost_card = ContactCard {
+        ik: ghost.public().ik,
+        sk: ghost.public().sk,
+        onion: String::new(),
+        chatmail: String::new(),
+        display_name: "молчун".to_owned(),
+        version: 1,
+    };
+    let ghost_ik = ghost_card.ik;
+    let bytes = ghost_card.encode().expect("карточка кодируется");
+    let port = silent_listener();
+
+    let probe = async {
+        introduce(&mut alice, &bytes, ghost_ik, port).await;
+
+        let chat = Engine::<MemoryStore>::chat_id_for(&ghost_ik);
+        alice
+            .handle
+            .send(Command::SendText { chat, text: "ты там?".to_owned() })
+            .await
+            .expect("драйвер жив");
+
+        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Undeliverable).await;
+    };
+
+    tokio::select! {
+        result = alice_driver.run() => panic!("драйвер остановился: {result:?}"),
+        () = probe => {}
     }
 }
 
@@ -193,22 +292,11 @@ async fn a_peer_that_never_answers_is_reported_undeliverable() {
             .await
             .expect("драйвер жив");
 
-        let verdict = tokio::time::timeout(PATIENCE, async {
-            while let Some(event) = alice.events.next().await {
-                if let Event::StatusChanged { status, .. } = event {
-                    return Some(status);
-                }
-            }
-            None
-        })
-        .await
-        .expect("статус доставки объявлен в срок");
-
-        assert_eq!(
-            verdict,
-            Some(ratatosk_proto::DeliveryStatus::Undeliverable),
-            "сообщение без единого доступного транспорта обязано быть помечено, а не потеряно"
-        );
+        // §14: сообщение без единого доступного транспорта обязано быть
+        // помечено, а не потеряно. Ждём именно `Undeliverable`, а не «первый
+        // попавшийся статус»: первым мог бы прийти `Sent` от страховочного
+        // таймера, и тест бы прошёл, ничего не проверив.
+        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Undeliverable).await;
     };
 
     tokio::select! {

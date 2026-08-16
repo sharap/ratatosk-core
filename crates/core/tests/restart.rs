@@ -10,8 +10,11 @@ use std::path::PathBuf;
 use ratatosk_codec::ContactCard;
 use ratatosk_core::io::{Command, Input};
 use ratatosk_core::{vault, Engine, OsEntropy, SelfAddresses};
-use ratatosk_crypto::Identity;
-use ratatosk_store::{SqliteStore, Store};
+use ratatosk_crdt::Hlc;
+use ratatosk_crypto::handshake::Role;
+use ratatosk_crypto::{Identity, Session};
+use ratatosk_proto::Transport;
+use ratatosk_store::{SqliteStore, Store, StoredMessage, StoredSession};
 use zeroize::Zeroizing;
 
 /// Свой временный путь вместо зависимости ради одной функции.
@@ -47,11 +50,7 @@ impl Drop for TempDb {
 fn addresses() -> SelfAddresses {
     // Пустые адреса: доставке некуда идти, и сообщение получит `Undeliverable`.
     // Для этого теста так и надо — проверяется хранение, а не отправка.
-    SelfAddresses {
-        onion: String::new(),
-        chatmail: String::new(),
-        display_name: "я".to_owned(),
-    }
+    SelfAddresses { onion: String::new(), chatmail: String::new(), display_name: "я".to_owned() }
 }
 
 fn peer_card() -> (Vec<u8>, [u8; 32]) {
@@ -96,7 +95,9 @@ fn identity_contacts_and_history_survive_a_restart() {
         engine
             .step(
                 2_000,
-                Input::Command(Command::SendText { chat, text: "до перезапуска".to_owned() }),
+                Input::Command(Command::SendText {
+                    chat, text: "до перезапуска".to_owned()
+                }),
             )
             .expect("сообщение легло в историю");
 
@@ -122,6 +123,237 @@ fn identity_contacts_and_history_survive_a_restart() {
     let history = engine.store().messages(&chat, 10, None).expect("история читается");
     assert_eq!(history.len(), 1);
     assert_eq!(String::from_utf8_lossy(&history[0].body), "до перезапуска");
+}
+
+#[test]
+fn a_read_receipt_is_not_re_sent_after_a_restart() {
+    // §9.4: квитанцию о прочтении выпускает **вызов клиента**, и ничто иное.
+    // Водяной знак жил в памяти, поэтому после перезапуска первое же открытие
+    // чата отправляло её заново — то есть квитанция становилась следствием
+    // старта приложения, а не действия человека. Собеседник видел, будто
+    // переписку перечитывают, хотя её просто открыли.
+    let db = TempDb::new("readmark");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
+    let msg_id = [7u8; 16];
+
+    {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .unwrap();
+
+        // Сессия и чужое сообщение заводятся напрямую: проверяется квитанция,
+        // а не §8.2 и не приём кадра.
+        let session = Session::derive(Role::Initiator, peer_ik, b"transcript", b"noise", 1_000);
+        engine
+            .store_mut()
+            .put_session(&StoredSession {
+                session_id: session.session_id,
+                peer_ik,
+                lan: true,
+                snapshot: session.export().to_vec(),
+                established_ms: 1_000,
+            })
+            .unwrap();
+        engine
+            .store_mut()
+            .put_message(&StoredMessage {
+                msg_id,
+                chat_id: chat,
+                sender_ik: peer_ik,
+                hlc: Hlc::new(1_500, 0),
+                body: b"chitay".to_vec(),
+                received_ms: 1_500,
+                status: None,
+            })
+            .unwrap();
+        engine.restore().unwrap();
+
+        let effects =
+            engine.step(2_000, Input::Command(Command::MarkRead { chat, up_to: msg_id })).unwrap();
+        assert!(
+            effects.iter().any(|e| matches!(e, ratatosk_core::Effect::Send { .. })),
+            "клиент позвал — квитанция обязана уйти: {effects:?}"
+        );
+
+        let again =
+            engine.step(2_100, Input::Command(Command::MarkRead { chat, up_to: msg_id })).unwrap();
+        assert!(again.is_empty(), "повторный вызов про то же место молчит: {again:?}");
+    }
+
+    // Перезапуск: знак поднимается с диска, и открытие чата само по себе
+    // ничего не отправляет.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+
+    let effects =
+        engine.step(3_000, Input::Command(Command::MarkRead { chat, up_to: msg_id })).unwrap();
+    assert!(
+        effects.is_empty(),
+        "собеседнику уже сообщили; перезапуск — не повод сообщать снова: {effects:?}"
+    );
+}
+
+#[test]
+fn a_session_survives_and_its_send_counter_never_goes_back() {
+    // Самое важное свойство всей персистентности. Откат отправляющего
+    // счётчика после того, как система убила процесс, означает второй кадр
+    // с той же парой «ключ, nonce»: для XChaCha20-Poly1305 это раскрытие
+    // обоих сообщений, а не потеря одного.
+    //
+    // На Android это не редкий случай: процесс убивают постоянно, и «первая
+    // отправка после запуска» — обычный режим, а не край.
+    let db = TempDb::new("session");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
+
+    // Сессию неоткуда взять, не проведя рукопожатие, поэтому она заводится
+    // напрямую: тест про хранение, а не про §8.2.
+    let (session_id, counter_before) = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::AddContact {
+                    card_bytes: card_bytes.clone(),
+                    met_in_person: true,
+                }),
+            )
+            .unwrap();
+
+        let session = Session::derive(Role::Initiator, peer_ik, b"transcript", b"noise", 1_000);
+        let session_id = session.session_id;
+        engine
+            .store_mut()
+            .put_session(&StoredSession {
+                session_id,
+                peer_ik,
+                lan: true,
+                snapshot: session.export().to_vec(),
+                established_ms: 1_000,
+            })
+            .unwrap();
+        (session_id, 0u64)
+    };
+
+    // Перезапуск: сессия поднимается, и отправка продолжает ту же цепочку.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    assert_eq!(engine.restore().unwrap(), 1, "контакт поднят");
+    assert_eq!(engine.session_count(), 1, "сессия поднята");
+
+    // LAN включён и контакт «виден» — иначе §5.4 отправлять не станет.
+    engine.step(2_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine.step(2_000, Input::SeenOnLan { peer_ik }).unwrap();
+    engine
+        .step(2_100, Input::Command(Command::SendText { chat, text: "после смерти".to_owned() }))
+        .unwrap();
+
+    let snapshot = engine
+        .store()
+        .sessions()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.session_id == session_id)
+        .expect("сессия на месте");
+    let after = Session::restore(&snapshot.snapshot).expect("снимок читается");
+    assert!(
+        after.send.counter() > counter_before,
+        "отправка обязана продвинуть цепочку и записать её"
+    );
+}
+
+#[test]
+fn losing_a_lan_link_removes_the_session_from_disk_too() {
+    // §5.4: сессия, начатая в LAN, при разрыве закрывается, а не переводится
+    // на другой транспорт. Пережившая перезапуск, она указывала бы
+    // на собеседника, с которым связь давно оборвана.
+    let db = TempDb::new("lanloss");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    engine
+        .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+        .unwrap();
+
+    let session = Session::derive(Role::Initiator, peer_ik, b"transcript", b"noise", 1_000);
+    let session_id = session.session_id;
+    engine
+        .store_mut()
+        .put_session(&StoredSession {
+            session_id,
+            peer_ik,
+            lan: true,
+            snapshot: session.export().to_vec(),
+            established_ms: 1_000,
+        })
+        .unwrap();
+    engine.restore().unwrap();
+    assert_eq!(engine.session_count(), 1);
+
+    engine.step(2_000, Input::ConnectionLost { peer_ik, via: Transport::Lan }).unwrap();
+
+    assert_eq!(engine.session_count(), 0, "сессия закрыта в памяти");
+    assert!(engine.store().sessions().unwrap().is_empty(), "и на диске тоже");
+}
+
+#[test]
+fn a_network_change_forgets_what_it_knew_about_the_local_network() {
+    // §5.1: адреса локальной сети принадлежат конкретной сети. Сохранив
+    // видимость после перехода на другой Wi-Fi, §5.4 продолжал бы выбирать
+    // LAN и платить таймаутом за каждое сообщение.
+    let db = TempDb::new("netchange");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    engine
+        .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+        .unwrap();
+    engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine.step(1_000, Input::SeenOnLan { peer_ik }).unwrap();
+    assert!(engine.contacts()[&peer_ik].availability.seen_on_lan);
+
+    let effects = engine.step(2_000, Input::Command(Command::NetworkChanged)).unwrap();
+
+    assert!(
+        !engine.contacts()[&peer_ik].availability.seen_on_lan,
+        "видимость в прежней сети недействительна"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, ratatosk_core::Effect::RestartLan)),
+        "транспорт обязан подняться заново"
+    );
+}
+
+#[test]
+fn a_network_change_with_lan_off_does_not_turn_it_on() {
+    // Смена сети — не решение пользователя. §5.1 держит LAN выключенным,
+    // пока его не включили сознательно.
+    let db = TempDb::new("netchange-off");
+    let db_key = Zeroizing::new([5u8; 32]);
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+
+    let effects = engine.step(1_000, Input::Command(Command::NetworkChanged)).unwrap();
+    assert!(effects.is_empty(), "выключенный LAN переоткрывать нечего");
 }
 
 #[test]

@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::compaction::{self, Task};
 use crate::schema;
 use crate::sql_types;
-use crate::{Result, Store, StoreError, StoredContact, StoredMessage};
+use crate::{Result, Store, StoreError, StoredContact, StoredMessage, StoredSession};
 
 /// Хранилище на SQLite.
 pub struct SqliteStore {
@@ -139,13 +139,15 @@ impl Store for SqliteStore {
         // и не кладёт. Файлы и групповые блоки (§10, §11) придут вместе
         // с расширением `StoredMessage`, а не отдельным полем здесь.
         //
-        // `transport` и `status` не заполняются сознательно: у записи на диске
-        // живой попытки доставки нет, а выдуманный статус §14 прямо запрещает.
+        // `transport` не заполняется сознательно: у записи на диске живой
+        // попытки доставки нет, а выдуманное значение §14 прямо запрещает.
+        // `status` пишется как есть, включая `NULL` — «неизвестно» и «ждёт
+        // отправки» это разные вещи.
         tx.execute(
             "INSERT OR REPLACE INTO messages (
                  msg_id, chat_id, sender_ik, hlc_wall, hlc_logical,
-                 payload_type, body_enc, received_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+                 payload_type, body_enc, received_ms, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
             rusqlite::params![
                 &message.msg_id[..],
                 &message.chat_id[..],
@@ -156,6 +158,7 @@ impl Store for SqliteStore {
                 sql_types::to_sql(u64::from(message.hlc.logical)),
                 body_enc,
                 sql_types::to_sql(message.received_ms),
+                message.status.map(i64::from),
             ],
         )?;
         tx.commit()?;
@@ -172,7 +175,7 @@ impl Store for SqliteStore {
         // `messages_order`. Выбирается хвост окна: чат листается назад, поэтому
         // сортировка в запросе убывающая, а разворот делается после.
         let mut statement = self.conn.prepare(
-            "SELECT msg_id, sender_ik, hlc_wall, hlc_logical, body_enc, received_ms
+            "SELECT msg_id, sender_ik, hlc_wall, hlc_logical, body_enc, received_ms, status
                FROM messages
               WHERE chat_id = ?1
                 AND tombstone_ms IS NULL
@@ -196,16 +199,16 @@ impl Store for SqliteStore {
                     sql_types::from_sql(row.get(3)?),
                     row.get::<_, Vec<u8>>(4)?,
                     sql_types::from_sql(row.get(5)?),
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             },
         )?;
 
         let mut window = Vec::new();
         for row in rows {
-            let (msg_id, sender_ik, wall_ms, logical, body_enc, received_ms) = row?;
-            let msg_id: MsgId = msg_id
-                .try_into()
-                .map_err(|_| StoreError::Backend("msg_id не 16 байт".into()))?;
+            let (msg_id, sender_ik, wall_ms, logical, body_enc, received_ms, status) = row?;
+            let msg_id: MsgId =
+                msg_id.try_into().map_err(|_| StoreError::Backend("msg_id не 16 байт".into()))?;
             let sender_ik: [u8; 32] = sender_ik
                 .try_into()
                 .map_err(|_| StoreError::Backend("sender_ik не 32 байта".into()))?;
@@ -222,6 +225,8 @@ impl Store for SqliteStore {
                 hlc,
                 body,
                 received_ms,
+                // Код вне диапазона `u8` означает порчу: писали мы сами.
+                status: status.and_then(|code| u8::try_from(code).ok()),
             });
         }
 
@@ -231,6 +236,31 @@ impl Store for SqliteStore {
         Ok(window)
     }
 
+    fn status(&self, msg_id: &MsgId) -> Result<Option<u8>> {
+        let found = self
+            .conn
+            .query_row("SELECT status FROM messages WHERE msg_id = ?1", [&msg_id[..]], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        // Код вне диапазона `u8` означает порчу: писали мы сами.
+        Ok(found.flatten().and_then(|code| u8::try_from(code).ok()))
+    }
+
+    fn set_status(&mut self, msg_id: &MsgId, status: u8) -> Result<()> {
+        // Условия в SQL нет: допустимость перехода решена уровнем выше
+        // (`receipts::advance`), а дублировать это правило здесь значит
+        // однажды дать ему разойтись.
+        self.conn.execute(
+            "UPDATE messages SET status = ?2 WHERE msg_id = ?1",
+            rusqlite::params![&msg_id[..], i64::from(status)],
+        )?;
+        Ok(())
+    }
     fn note_seen(&mut self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO dedup (msg_id, seen_ms) VALUES (?1, ?2)",
@@ -282,8 +312,17 @@ impl Store for SqliteStore {
 
         let mut found = Vec::new();
         for row in rows {
-            let (ik, sk, onion, chatmail, display_name, card_version, card_bytes, verified, created_ms) =
-                row?;
+            let (
+                ik,
+                sk,
+                onion,
+                chatmail,
+                display_name,
+                card_version,
+                card_bytes,
+                verified,
+                created_ms,
+            ) = row?;
             found.push(StoredContact {
                 ik: ik.try_into().map_err(|_| StoreError::Backend("ik не 32 байта".into()))?,
                 sk: sk.try_into().map_err(|_| StoreError::Backend("sk не 32 байта".into()))?,
@@ -299,10 +338,75 @@ impl Store for SqliteStore {
         Ok(found)
     }
 
+    fn put_session(&mut self, session: &StoredSession) -> Result<()> {
+        // Снимок запечатывается и привязывается к своей строке: переставленный
+        // между сессиями, он подсунул бы чужую цепочку под свой `session_id`.
+        let state_enc =
+            self.seal("sessions.state_enc", &session.session_id.to_be_bytes(), &session.snapshot)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sessions (
+                 session_id, peer_ik, binding, state_enc, established_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                // `session_id` выведен из хэша транскрипта и в половине случаев
+                // больше `i64::MAX`; сохраняется побитово, сравнивается только
+                // на равенство — см. `crate::sql_types`.
+                sql_types::id_to_sql(session.session_id),
+                &session.peer_ik[..],
+                i64::from(!session.lan),
+                state_enc,
+                sql_types::to_sql(session.established_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn sessions(&self) -> Result<Vec<StoredSession>> {
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, peer_ik, binding, state_enc, established_ms FROM sessions",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                sql_types::id_from_sql(row.get(0)?),
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)? == 0,
+                row.get::<_, Vec<u8>>(3)?,
+                sql_types::from_sql(row.get(4)?),
+            ))
+        })?;
+
+        let mut found = Vec::new();
+        for row in rows {
+            let (session_id, peer_ik, lan, state_enc, established_ms) = row?;
+            let snapshot =
+                self.open_sealed("sessions.state_enc", &session_id.to_be_bytes(), &state_enc)?;
+            found.push(StoredSession {
+                session_id,
+                peer_ik: peer_ik
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("peer_ik не 32 байта".into()))?,
+                lan,
+                snapshot,
+                established_ms,
+            });
+        }
+        Ok(found)
+    }
+
+    fn delete_session(&mut self, session_id: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            [sql_types::id_to_sql(session_id)],
+        )?;
+        Ok(())
+    }
+
     fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let found = self
             .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get::<_, Vec<u8>>(0))
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),

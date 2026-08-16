@@ -24,6 +24,7 @@ use ratatosk_crypto::handshake::{
 };
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
 use ratatosk_proto::fragment::Reassembler;
+use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{Attempt, Decision, PeerAvailability, SessionBinding};
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{Store, StoredMessage};
@@ -59,6 +60,20 @@ const HANDSHAKE_CLASS: SizeClass = SizeClass::S;
 /// поэтому у прямых каналов таймаут есть всегда, а это значение — потолок
 /// из §5.4 на случай, если политика промолчит.
 const ONION_FALLBACK_TIMEOUT_MS: u64 = 45_000;
+
+/// Сколько ждать, пока обнаружение (§5.1) ответит, есть ли собеседник в сети.
+///
+/// Нужно ровно на холодном старте и после смены сети: `seen_on_lan` не
+/// переживает перезапуск намеренно — адрес в локальной сети живёт столько же,
+/// сколько подключение, и поднимать его с диска значило бы врать. Но mDNS
+/// отвечает не мгновенно, и без этой паузы первое же сообщение после запуска
+/// объявлялось недоставленным раньше, чем собеседник вообще успевал найтись.
+///
+/// Три секунды: mDNS в локальной сети отвечает за сотни миллисекунд даже на
+/// телефоне, а человек, нажавший «отправить», столько подождёт. Ожидание
+/// выдаётся один раз на контакт за сеанс, поэтому собеседник, которого в этой
+/// сети нет, стоит трёх секунд один раз, а не при каждой отправке.
+const LAN_DISCOVERY_GRACE_MS: u64 = 3_000;
 
 /// Отказ ядра.
 #[derive(Debug, thiserror::Error)]
@@ -117,12 +132,23 @@ pub struct Contact {
 enum DeliveryState {
     /// Сессии ещё нет: рукопожатие в пути, сообщение ждёт его завершения.
     AwaitingSession,
-    /// Ушло прямым каналом. Ждём либо отказа, либо истечения таймаута.
+    /// Ушло прямым каналом. Ждём квитанции, отказа или истечения срока.
     ///
-    /// Квитанций у нас нет (§9.4 разрешает их только прямым каналом, и они
-    /// ещё не реализованы), поэтому «дошло» определяется от противного:
-    /// если за отведённое время об отказе не сообщили, считаем отправленным.
+    /// Прямой канал подтверждает доставку квитанцией за миллисекунды (§9.4),
+    /// поэтому истёкший срок означает здесь **не** «отправлено», а «не вышло»:
+    /// попытка переходит к следующему транспорту по §5.4. Запись уходит
+    /// из очереди либо по подтверждению, либо когда транспорты кончились.
     InFlight { via: Transport, timer: u64 },
+    /// LAN включён, но собеседника в эфире ещё не слышали — ждём обнаружение.
+    ///
+    /// Это **не** ступень §5.4: транспорт здесь не тратится. «Мы ещё не
+    /// искали» и «мы искали и не нашли» — разные вещи, и путать их дорого.
+    /// Сразу после запуска не слышали никого: `seen_on_lan` не поднимается
+    /// с диска (адрес в локальной сети живёт ровно столько, сколько сеанс),
+    /// а mDNS отвечает через сотни миллисекунд. Первое сообщение после
+    /// перезапуска попадало ровно в эту щель и объявлялось недоставленным
+    /// за долю секунды до того, как собеседник находился.
+    AwaitingDiscovery { timer: u64 },
 }
 
 /// Незавершённое исходящее рукопожатие вместе с его попыткой доставки.
@@ -138,6 +164,11 @@ struct OutgoingHandshake {
     frame: Vec<u8>,
     attempt: Attempt,
     peer_ik: [u8; 32],
+    /// Метка таймера текущей попытки, если транспорт прямой.
+    ///
+    /// Без неё молча проглоченное рукопожатие не переходит на следующий
+    /// транспорт: об отказе никто не сообщает, а ждать больше нечего.
+    timer: Option<u64>,
 }
 
 /// Сообщение в очереди доставки.
@@ -179,6 +210,15 @@ pub struct Engine<S: Store> {
     lan_enabled: bool,
     /// Кого заметили в LAN раньше, чем добавили в контакты.
     seen_on_lan: BTreeSet<[u8; 32]>,
+    /// Кому уже давали срок на обнаружение в этом сеансе.
+    ///
+    /// Ожидание выдаётся **один раз на контакт**, а не на каждое сообщение:
+    /// собеседнику, которого в этой сети нет, иначе платили бы задержкой
+    /// перед каждой отправкой. Сбрасывается при смене сети и при включении
+    /// LAN — то есть тогда, когда прежний ответ «не слышно» устарел.
+    awaited_discovery: BTreeSet<[u8; 32]>,
+    /// До какого места в каждом чате уже отправлена квитанция о прочтении.
+    read_upto: BTreeMap<ChatId, Hlc>,
 }
 
 impl<S: Store> Engine<S> {
@@ -207,6 +247,8 @@ impl<S: Store> Engine<S> {
             next_timer_token: 1,
             lan_enabled: false,
             seen_on_lan: BTreeSet::new(),
+            awaited_discovery: BTreeSet::new(),
+            read_upto: BTreeMap::new(),
         }
     }
 
@@ -288,9 +330,12 @@ impl<S: Store> Engine<S> {
                     // и разбираться потом, почему.
                     None => {
                         self.seen_on_lan.insert(peer_ik);
+                        return Ok(Vec::new());
                     }
                 }
-                Ok(Vec::new())
+                // Собеседник нашёлся — всё, что ждало этого ответа, едет
+                // немедленно, не досиживая свой срок.
+                self.resume_discovery(peer_ik)
             }
             Input::Connected { .. } => Ok(Vec::new()),
             Input::ConnectionLost { peer_ik, via } => {
@@ -301,13 +346,17 @@ impl<S: Store> Engine<S> {
                 if via == Transport::Lan {
                     if let Some(id) = self.sessions.for_peer(&peer_ik, via) {
                         self.sessions.remove(id);
+                        // И с диска: восстановленная после перезапуска сессия
+                        // указывала бы на собеседника, с которым связь уже
+                        // разорвана, а §5.4 требует установить новую.
+                        self.store.delete_session(id)?;
                     }
                 }
                 self.on_delivery_failed(peer_ik, via)
             }
             // TODO(этап 1): перерукопожатие (§8.5) и расписание уборки (§12)
             // тоже придут таймерами — пока их ставит только доставка.
-            Input::Timer { token } => Ok(self.on_delivery_timer(token)),
+            Input::Timer { token } => self.on_timer(token),
         }
     }
 
@@ -340,17 +389,21 @@ impl<S: Store> Engine<S> {
                 for contact in self.contacts.values_mut() {
                     contact.availability.lan_enabled = on;
                 }
+                // Прежние «не слышно» устарели: эфир только что открылся,
+                // и каждому контакту снова полагается срок на обнаружение.
+                self.awaited_discovery.clear();
                 let mut effects = vec![Effect::SetLanEnabled(on)];
                 if on {
                     effects.push(self.watch_lan_peers());
                 }
                 Ok(effects)
             }
+            Command::NetworkChanged => Ok(self.on_network_changed()),
             Command::SendFile { .. } => todo!("этап 4: передача файлов (§10)"),
             Command::CreateGroup { .. }
             | Command::InviteToGroup { .. }
             | Command::EvictFromGroup { .. } => todo!("этап 5: группы (§11)"),
-            Command::MarkRead { .. } => todo!("этап 1: квитанции прямым каналом (§9.4)"),
+            Command::MarkRead { chat, up_to } => self.on_mark_read(now_ms, chat, up_to),
         }
     }
 
@@ -386,11 +439,54 @@ impl<S: Store> Engine<S> {
                 // подключении, и поднимать его с диска значило бы врать.
                 seen_on_lan: false,
             };
+            let chat = Self::chat_id_for(&peer_ik);
             self.contacts
                 .insert(peer_ik, Contact { card, verified: contact.verified, availability });
-            self.by_chat.insert(Self::chat_id_for(&peer_ik), peer_ik);
+            self.by_chat.insert(chat, peer_ik);
+
+            // Водяной знак прочтения (§9.4). Без него первое же открытие чата
+            // после перезапуска выпускало бы квитанцию о том, что собеседнику
+            // уже сообщили, — то есть квитанция становилась следствием старта
+            // приложения, а не действия человека.
+            if let Some(edge) = self.load_read_upto(chat)? {
+                self.read_upto.insert(chat, edge);
+            }
+        }
+
+        // Сессии поднимаются после контактов: внешний ключ в схеме связывает
+        // их с `contacts`, и порядок здесь тот же, что и на записи.
+        for stored in self.store.sessions()? {
+            let session = Session::restore(&stored.snapshot)?;
+            let binding = if stored.lan { SessionBinding::Lan } else { SessionBinding::Tor };
+            self.sessions.insert(session, binding);
         }
         Ok(restored)
+    }
+
+    /// Складывает состояние сессии на диск (§8.3, §12).
+    ///
+    /// **Вызывается до того, как кадр уйдёт в сеть.** Порядок здесь — не
+    /// аккуратность, а корректность: счётчик отправки, откатившийся после
+    /// того как система убила процесс, означает второй кадр с той же парой
+    /// «ключ, nonce». Для XChaCha20-Poly1305 это не потеря сообщения,
+    /// а раскрытие обоих.
+    ///
+    /// На приёме порядок обратный и это безопасно: если процесс умрёт между
+    /// расшифровкой и записью, кадр после перезапуска расшифруется тем же
+    /// ключом ещё раз, а дубль съест дедупликация (§9.2).
+    fn persist_session(&mut self, session_id: u64) -> Result<(), EngineError> {
+        let Some(bound) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+        let stored = ratatosk_store::StoredSession {
+            session_id,
+            peer_ik: bound.session.peer_ik,
+            lan: bound.binding == SessionBinding::Lan,
+            snapshot: bound.session.export().to_vec(),
+            established_ms: bound.session.established_ms,
+        };
+        self.store.put_session(&stored)?;
+        Ok(())
     }
 
     /// Складывает контакт на диск (§4, §12).
@@ -461,6 +557,189 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Сеть сменилась: всё, что известно о локальной, устарело (§5.1).
+    ///
+    /// Видимость сбрасывается **до** переоткрытия транспорта, и порядок
+    /// важен: пока `seen_on_lan` держится, §5.4 продолжает выбирать LAN
+    /// и отправлять по адресам прежней сети. Сообщения при этом не теряются
+    /// — они честно упрутся в отказ и уйдут дальше по §5.4, — но каждое
+    /// заплатит таймаутом за то, что и так уже известно.
+    ///
+    /// Сессии не трогаем. Ключевой материал к сети не привязан: если оба
+    /// устройства оказались в новой сети вместе, переписка продолжится без
+    /// нового рукопожатия. Сессию, чьё соединение оборвалось, закроет
+    /// `Input::ConnectionLost` своим чередом (§5.4).
+    fn on_network_changed(&mut self) -> Vec<Effect> {
+        for contact in self.contacts.values_mut() {
+            contact.availability.seen_on_lan = false;
+        }
+        self.seen_on_lan.clear();
+        // Сеть другая — значит и ответ «здесь его не слышно» относился
+        // к прежней. Срок на обнаружение выдаётся заново.
+        self.awaited_discovery.clear();
+
+        if !self.lan_enabled {
+            // Выключенный LAN переоткрывать нечего, и объявляться незачем.
+            return Vec::new();
+        }
+        vec![Effect::RestartLan, self.watch_lan_peers()]
+    }
+
+    /// Клиент сообщил, что пользователь прочитал чат до этого места (§9.4).
+    ///
+    /// **Единственный источник квитанции о прочтении.** Ни приём сообщения,
+    /// ни открытие чата, ни запуск приложения её не порождают: ядро не знает
+    /// и не может знать, что человек прочитал. Знает клиент — и говорит
+    /// об этом вызовом. Из этого следует и то, что клиент, который квитанций
+    /// о прочтении не хочет (или у которого они выключены настройкой), просто
+    /// не зовёт эту команду; отдельного выключателя в ядре для этого не надо.
+    ///
+    /// Водяной знак — до какого места уже отправляли — **лежит на диске**.
+    /// Раньше он жил в памяти, и это была ошибка ровно того же рода: после
+    /// перезапуска первое же открытие чата выпускало квитанцию заново, то есть
+    /// квитанция получалась следствием запуска приложения, а не действия
+    /// человека. Одному собеседнику это выглядит как «он перечитывает нашу
+    /// переписку» на пустом месте.
+    fn on_mark_read(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        up_to: MsgId,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
+
+        let window = self.store.messages(&chat, MAX_RECEIPT_IDS, None)?;
+        // Граница задаётся сообщением, а не временем: клиент знает, до какого
+        // места дочитал пользователь, но не знает меток HLC.
+        let Some(edge) = window.iter().find(|m| m.msg_id == up_to).map(|m| m.hlc) else {
+            // Сообщение вне окна или уже вычищено уборкой (§12) — не ошибка.
+            return Ok(Vec::new());
+        };
+
+        let watermark = self.read_upto.get(&chat).copied();
+        let ids: Vec<MsgId> = window
+            .iter()
+            // Квитанция о прочтении — про **чужие** сообщения: своим она
+            // ничего не сообщает.
+            .filter(|m| m.sender_ik == peer_ik)
+            .filter(|m| m.hlc <= edge && watermark.is_none_or(|seen| m.hlc > seen))
+            .map(|m| m.msg_id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Транспорт выбирается не политикой §5.4, а наличием прямой сессии:
+        // квитанция не начинает рукопожатие и не уходит почтой.
+        let Some(via) = [Transport::Lan, Transport::Onion]
+            .into_iter()
+            .find(|t| self.sessions.for_peer(&peer_ik, *t).is_some())
+        else {
+            return Ok(Vec::new());
+        };
+
+        // Знак двигается вместе с отправкой, а не до неё: не ушло — значит
+        // и отмечать нечего, иначе следующий вызов промолчит о сообщениях,
+        // про которые собеседник так и не узнал.
+        let effects = self.send_receipt(now_ms, peer_ik, via, Receipt::Read, &ids)?;
+        if !effects.is_empty() {
+            self.read_upto.insert(chat, edge);
+            self.persist_read_upto(chat, edge)?;
+        }
+        Ok(effects)
+    }
+
+    /// Кладёт водяной знак прочтения на диск (§9.4).
+    fn persist_read_upto(&mut self, chat: ChatId, edge: Hlc) -> Result<(), EngineError> {
+        let mut value = [0u8; 12];
+        value[..8].copy_from_slice(&edge.wall_ms.to_be_bytes());
+        value[8..].copy_from_slice(&edge.logical.to_be_bytes());
+        self.store.put_meta(&ratatosk_store::read_upto_key(&chat), &value)?;
+        Ok(())
+    }
+
+    /// Читает водяной знак прочтения с диска.
+    ///
+    /// Испорченное значение трактуется как его отсутствие: цена ошибки —
+    /// одна лишняя квитанция, а отказ открыть базу из-за двенадцати байт
+    /// служебной метки был бы несоразмерен.
+    fn load_read_upto(&self, chat: ChatId) -> Result<Option<Hlc>, EngineError> {
+        let Some(raw) = self.store.meta(&ratatosk_store::read_upto_key(&chat))? else {
+            return Ok(None);
+        };
+        let Ok(bytes): Result<[u8; 12], _> = raw.as_slice().try_into() else {
+            return Ok(None);
+        };
+        let wall_ms = u64::from_be_bytes(bytes[..8].try_into().expect("восемь байт"));
+        let logical = u32::from_be_bytes(bytes[8..].try_into().expect("четыре байта"));
+        Ok(Some(Hlc::new(wall_ms, logical)))
+    }
+
+    /// Отправляет квитанцию собеседнику (§9.4).
+    ///
+    /// Не через очередь доставки, и это важно. Квитанция — сведение о чужом
+    /// сообщении, а не своё сообщение: у неё нет ни истории, ни статуса,
+    /// и повторять её другим транспортом бессмысленно. Не дошла — собеседник
+    /// увидит «отправлено» вместо «доставлено», что честно.
+    ///
+    /// Квитанция на квитанцию не отправляется по построению: сюда приходят
+    /// только из ветки текста.
+    fn send_receipt(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        via: Transport,
+        receipt: Receipt,
+        msg_ids: &[MsgId],
+    ) -> Result<Vec<Effect>, EngineError> {
+        // §9.4: по почте квитанции не ходят — каждая была бы отдельным
+        // письмом, то есть удвоением трафика и метаданных у сервера.
+        if !ratatosk_proto::receipts::may_send_receipt(via) || msg_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(session_id) = self.sessions.for_peer(&peer_ik, via) else {
+            // Сессии нет — рукопожатие ради квитанции не начинаем: это
+            // превратило бы сведение о доставке в повод для трафика.
+            return Ok(Vec::new());
+        };
+
+        let hlc = self.clock.now(now_ms)?;
+        let envelope = Envelope::new(
+            self.entropy.msg_id(),
+            hlc,
+            PayloadType::Receipt,
+            receipt.payload(msg_ids),
+        );
+        let frame = self.seal_for(session_id, &envelope.encode()?)?;
+        Ok(vec![Effect::Send { peer_ik, via, frame }])
+    }
+
+    /// Выставляет статус доставки и сообщает о нём UI (§9.4).
+    ///
+    /// Одна точка на все переходы, и это не удобство: статус обязан только
+    /// расти, а правило «только растёт», размазанное по пяти местам, рано
+    /// или поздно разойдётся. Хранилище возвращает статус, **который
+    /// получился**, — его и показываем, а не тот, что просили.
+    ///
+    /// Неизвестный `msg_id` — не ошибка: квитанция может прийти на сообщение,
+    /// уже вычищенное уборкой (§12), и ронять из-за этого сессию незачем.
+    fn note_status(
+        &mut self,
+        msg_id: MsgId,
+        target: DeliveryStatus,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let current = self.store.status(&msg_id)?.and_then(DeliveryStatus::from_code);
+        // Допустимость перехода решает §9.4, а не хранилище и не это место:
+        // правило неочевидное (`Undeliverable` перекрывает только `Pending`),
+        // и записанное дважды оно однажды разойдётся.
+        let Some(status) = ratatosk_proto::receipts::advance(current, target) else {
+            // Ничего не изменилось — события об этом быть не должно.
+            return Ok(Vec::new());
+        };
+        self.store.set_status(&msg_id, status.code())?;
+        Ok(vec![Effect::Notify(Event::StatusChanged { msg_id, status })])
+    }
+
     /// Список контактов, чьи маяки транспорт должен искать в эфире (§5.1).
     fn watch_lan_peers(&self) -> Effect {
         Effect::WatchLanPeers(self.contacts.keys().copied().collect())
@@ -488,6 +767,9 @@ impl<S: Store> Engine<S> {
             hlc,
             body: text.as_bytes().to_vec(),
             received_ms: now_ms,
+            // Своё сообщение начинает с «ждёт отправки» и растёт оттуда.
+            // У принятого статуса нет вовсе — там нечему расти.
+            status: Some(DeliveryStatus::Pending.code()),
         })?;
 
         self.enqueue(Delivery {
@@ -521,16 +803,20 @@ impl<S: Store> Engine<S> {
         let contact = self.contacts.get(&delivery.peer_ik).ok_or(EngineError::UnknownPeer)?;
         let availability = contact.availability;
 
+        // Обнаружение ещё не отвечало — подождём его, прежде чем расходовать
+        // транспорты. Иначе §5.4 получает на вход «в LAN не видно» там, где
+        // правильный ответ — «пока не знаем».
+        if let Some(effect) = self.park_for_discovery(delivery) {
+            return Ok(vec![effect]);
+        }
+
         let transport = match delivery.attempt.next(availability) {
             Some(Decision::Use(t)) => t,
             Some(Decision::Undeliverable) | None => {
                 // Транспорты кончились. Сообщение не исчезает молча —
                 // пользователь обязан увидеть, что оно не ушло (§14).
                 delivery.attempt.succeed();
-                return Ok(vec![Effect::Notify(Event::StatusChanged {
-                    msg_id: delivery.msg_id,
-                    status: DeliveryStatus::Undeliverable,
-                })]);
+                return self.note_status(delivery.msg_id, DeliveryStatus::Undeliverable);
             }
         };
 
@@ -546,8 +832,11 @@ impl<S: Store> Engine<S> {
         let mut effects = vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame }];
 
         if transport.is_direct() {
-            // Прямой канал может отказать, и об этом сообщат. Таймер —
-            // страховка на случай, когда не сообщают вовсе.
+            // Срок ожидания квитанции (§9.4), а не страховка от молчания
+            // транспорта. Успешная запись в сокет ничего не доказывает:
+            // полуоткрытое соединение принимает байты молча. Не пришла
+            // квитанция за отведённое время — попытка не удалась, и §5.4
+            // ведёт дальше.
             let timer = self.allocate_timer();
             let after_ms = delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
             delivery.state = DeliveryState::InFlight { via: transport, timer };
@@ -556,10 +845,7 @@ impl<S: Store> Engine<S> {
             // §9.4: по почте статус дальше «отправлено» не растёт, ждать
             // нечего, и запись из очереди уходит.
             delivery.attempt.succeed();
-            effects.push(Effect::Notify(Event::StatusChanged {
-                msg_id: delivery.msg_id,
-                status: DeliveryStatus::Sent,
-            }));
+            effects.extend(self.note_status(delivery.msg_id, DeliveryStatus::Sent)?);
         }
         Ok(effects)
     }
@@ -606,12 +892,14 @@ impl<S: Store> Engine<S> {
         }
 
         let mut effects = vec![Effect::Send { peer_ik, via: transport, frame: frame.clone() }];
+        let mut timer = None;
         if transport.is_direct() {
-            let timer = self.allocate_timer();
+            let token = self.allocate_timer();
             let after_ms = attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
-            effects.push(Effect::SetTimer { after_ms, token: timer });
+            effects.push(Effect::SetTimer { after_ms, token });
+            timer = Some(token);
         }
-        self.pending.push(OutgoingHandshake { state, frame, attempt, peer_ik });
+        self.pending.push(OutgoingHandshake { state, frame, attempt, peer_ik, timer });
         Ok(effects)
     }
 
@@ -644,6 +932,17 @@ impl<S: Store> Engine<S> {
                         via: next,
                         frame: handshake.frame.clone(),
                     });
+                    // Новой попытке — новый срок. Без него молчание второго
+                    // транспорта не приводит к третьему, и откат §5.4
+                    // обрывается на середине.
+                    handshake.timer = None;
+                    if next.is_direct() {
+                        let token = self.allocate_timer();
+                        let after_ms =
+                            handshake.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
+                        effects.push(Effect::SetTimer { after_ms, token });
+                        handshake.timer = Some(token);
+                    }
                 }
                 Some(Decision::Undeliverable) | None => exhausted = true,
             }
@@ -697,7 +996,13 @@ impl<S: Store> Engine<S> {
         nonce[..8].copy_from_slice(&counter.to_be_bytes());
 
         let header = Header::new(FrameType::Data, session_id, counter, nonce);
-        Ok(aead::seal(&key, &header, class, envelope)?)
+        let frame = aead::seal(&key, &header, class, envelope)?;
+
+        // Запись до возврата кадра, а не после его отправки: см. пояснение
+        // к `persist_session`. Между продвижением цепочки и записью не должно
+        // быть ничего, что может не вернуться.
+        self.persist_session(session_id)?;
+        Ok(frame)
     }
 
     // --- приём --------------------------------------------------------------
@@ -774,7 +1079,9 @@ impl<S: Store> Engine<S> {
             effects.extend(self.add_contact(now_ms, &payload, false)?);
         }
 
+        let session_id = session.session_id;
         self.sessions.insert(session, SessionBinding::of(via));
+        self.persist_session(session_id)?;
 
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
         effects.push(Effect::Send { peer_ik, via, frame });
@@ -805,8 +1112,12 @@ impl<S: Store> Engine<S> {
         };
 
         let peer_ik = session.peer_ik;
+        let session_id = session.session_id;
         self.pending.retain(|p| p.peer_ik != peer_ik);
         self.sessions.insert(session, SessionBinding::of(via));
+        // До досылки очереди: `flush_outbox` двигает отправляющую цепочку,
+        // и запись должна лечь раньше первого кадра.
+        self.persist_session(session_id)?;
         self.flush_outbox(peer_ik)
     }
 
@@ -850,11 +1161,58 @@ impl<S: Store> Engine<S> {
             effects.push(Effect::SetTimer { after_ms, token: timer });
         } else {
             delivery.attempt.succeed();
-            effects.push(Effect::Notify(Event::StatusChanged {
-                msg_id: delivery.msg_id,
-                status: DeliveryStatus::Sent,
-            }));
+            effects.extend(self.note_status(delivery.msg_id, DeliveryStatus::Sent)?);
         }
+        Ok(effects)
+    }
+
+    /// Откладывает попытку до ответа обнаружения — или не откладывает.
+    ///
+    /// Возвращает `Some(таймер)`, если ждать есть чего. Условий три, и все
+    /// обязательны: LAN включён (иначе ждать нечего), собеседника в эфире
+    /// ещё не слышали, и срок ему в этом сеансе ещё не выдавался. Последнее
+    /// важнее, чем кажется: без него каждое сообщение собеседнику из другой
+    /// сети начиналось бы с трёхсекундной паузы.
+    fn park_for_discovery(&mut self, delivery: &mut Delivery) -> Option<Effect> {
+        if !self.lan_enabled || !delivery.attempt.tried().is_empty() {
+            return None;
+        }
+        let contact = self.contacts.get(&delivery.peer_ik)?;
+        if contact.availability.seen_on_lan {
+            return None;
+        }
+        if !self.awaited_discovery.insert(delivery.peer_ik) {
+            return None;
+        }
+
+        let timer = self.allocate_timer();
+        delivery.state = DeliveryState::AwaitingDiscovery { timer };
+        Some(Effect::SetTimer { after_ms: LAN_DISCOVERY_GRACE_MS, token: timer })
+    }
+
+    /// Обнаружение ответило (или кончился срок) — двигаем отложенное.
+    ///
+    /// Вызывается и по маяку, и по таймеру: разница только в том, окажется ли
+    /// LAN доступен на следующем шаге. Решает это [`Attempt`], а не эта
+    /// функция, — здесь только снимается пауза.
+    fn resume_discovery(&mut self, peer_ik: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
+        let mut effects = Vec::new();
+        let mut queue = std::mem::take(&mut self.outbox);
+
+        for delivery in &mut queue {
+            if delivery.peer_ik != peer_ik
+                || !matches!(delivery.state, DeliveryState::AwaitingDiscovery { .. })
+            {
+                continue;
+            }
+            // Состояние снимается до `advance`: иначе `park_for_discovery`
+            // увидел бы нетронутую попытку и отложил её второй раз.
+            delivery.state = DeliveryState::AwaitingSession;
+            effects.extend(self.advance(delivery)?);
+        }
+
+        queue.retain(|d| !d.attempt.is_finished());
+        self.outbox = queue;
         Ok(effects)
     }
 
@@ -864,6 +1222,16 @@ impl<S: Store> Engine<S> {
         peer_ik: [u8; 32],
         via: Transport,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Собеседник не ответил по локальной сети — значит его там больше
+        // нет. Оставить признак видимости значит выбирать LAN и для следующего
+        // сообщения, платя таймаутом за уже известное. Вернёт его mDNS,
+        // когда устройство снова объявится (§5.1).
+        if via == Transport::Lan {
+            if let Some(contact) = self.contacts.get_mut(&peer_ik) {
+                contact.availability.seen_on_lan = false;
+            }
+        }
+
         // Рукопожатие переносится первым: без сессии данные всё равно
         // упрутся в ожидание, и порядок эффектов станет непонятным.
         let (mut effects, handshake_exhausted) = self.retry_handshake(peer_ik, via)?;
@@ -880,6 +1248,11 @@ impl<S: Store> Engine<S> {
                 // исход, иначе сообщение зависает в очереди навсегда — ровно
                 // то молчание, которое §14 запрещает.
                 DeliveryState::AwaitingSession => handshake_exhausted,
+                // Это сообщение ещё не выходило в сеть и потому здесь ничего
+                // не теряло: у него свой срок, и снимет паузу он, а не чужой
+                // отказ. Тронуть его тут значило бы сжечь LAN за компанию —
+                // как раз тогда, когда собеседник вот-вот найдётся.
+                DeliveryState::AwaitingDiscovery { .. } => false,
             };
             if !failed_here {
                 continue;
@@ -892,21 +1265,55 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
-    /// Сработал таймер попытки: об отказе не сообщили, считаем отправленным.
-    fn on_delivery_timer(&mut self, token: u64) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        self.outbox.retain(|delivery| {
-            if matches!(delivery.state, DeliveryState::InFlight { timer, .. } if timer == token) {
-                effects.push(Effect::Notify(Event::StatusChanged {
-                    msg_id: delivery.msg_id,
-                    status: DeliveryStatus::Sent,
-                }));
-                false
-            } else {
-                true
-            }
+    /// Сработал таймер попытки: подтверждения нет — попытка не удалась.
+    ///
+    /// **Раньше здесь выставлялось «отправлено», и это была ошибка.** Прямой
+    /// канал подтверждает доставку квитанцией за миллисекунды (§9.4); если
+    /// за отведённое время её нет, значит кадр не дошёл. Объявлять при этом
+    /// успех — не просто неточность в индикаторе: попытка закрывалась, и
+    /// откат на следующий транспорт по §5.4 **не запускался вовсе**. Молча
+    /// исчезнувший собеседник получался неотличим от ответившего, и запись
+    /// в сокет это не ловит — ядро принимает её в буфер и для мёртвого узла.
+    ///
+    /// Поэтому таймер идёт тем же путём, что и явный отказ: это одно и то же
+    /// событие для §5.4 — «здесь не вышло, пробуем дальше».
+    ///
+    /// Запоздавшая квитанция ничего не ломает: `receipts::advance` разрешает
+    /// перейти от объявленного провала к подтверждённой доставке, а лишнюю
+    /// копию у получателя съест дедупликация (§9.2).
+    fn on_timer(&mut self, token: u64) -> Result<Vec<Effect>, EngineError> {
+        // Срок обнаружения — не отказ транспорта, а конец паузы: §5.4 ещё
+        // не начинался. Поэтому он разбирается отдельно и раньше.
+        let awaiting_discovery = self.outbox.iter().find_map(|d| match d.state {
+            DeliveryState::AwaitingDiscovery { timer } if timer == token => Some(d.peer_ik),
+            _ => None,
         });
-        effects
+        if let Some(peer_ik) = awaiting_discovery {
+            return self.resume_discovery(peer_ik);
+        }
+
+        // Один и тот же счётчик меток обслуживает и рукопожатия, и доставку,
+        // поэтому владельца ищем в обоих местах.
+        let waiting = self
+            .pending
+            .iter()
+            .find(|p| p.timer == Some(token))
+            .and_then(|p| p.attempt.tried().last().map(|via| (p.peer_ik, *via)))
+            .or_else(|| {
+                self.outbox.iter().find_map(|d| match d.state {
+                    DeliveryState::InFlight { via, timer } if timer == token => {
+                        Some((d.peer_ik, via))
+                    }
+                    _ => None,
+                })
+            });
+
+        // Метка без владельца — обычное дело: доставка могла завершиться
+        // квитанцией раньше срока, и таймер просто опоздал.
+        let Some((peer_ik, via)) = waiting else {
+            return Ok(Vec::new());
+        };
+        self.on_delivery_failed(peer_ik, via)
     }
 
     fn on_data(
@@ -941,6 +1348,7 @@ impl<S: Store> Engine<S> {
 
         let bound = self.sessions.get_mut(session_id).expect("сессия только что была");
         bound.session.recv.commit(counter, now_ms)?;
+        self.persist_session(session_id)?;
 
         let envelope = Envelope::decode(&plaintext)?.into_parts().1;
 
@@ -965,7 +1373,7 @@ impl<S: Store> Engine<S> {
     fn deliver(
         &mut self,
         now_ms: u64,
-        _via: Transport,
+        via: Transport,
         peer_ik: [u8; 32],
         envelope: Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -982,8 +1390,24 @@ impl<S: Store> Engine<S> {
                     hlc: envelope.hlc,
                     body: text.as_bytes().to_vec(),
                     received_ms: now_ms,
+                    // У принятого сообщения статуса нет: статус — это судьба
+                    // отправки, а оно уже здесь.
+                    status: None,
                 })?;
-                Ok(vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })])
+
+                let mut effects =
+                    vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })];
+                // §9.4: квитанция о доставке — сразу и только прямым каналом.
+                // «Доставлено» означает ровно то, что кадр принят и расшифрован,
+                // и узнать это может только получатель.
+                effects.extend(self.send_receipt(
+                    now_ms,
+                    peer_ik,
+                    via,
+                    Receipt::Delivered,
+                    &[envelope.msg_id],
+                )?);
+                Ok(effects)
             }
             // Неизвестный тип не повод терять сообщение целиком, но и
             // показать его нечем: молча пропускаем (§9.1).
@@ -991,7 +1415,31 @@ impl<S: Store> Engine<S> {
             PayloadType::FileOffer | PayloadType::FileChunk | PayloadType::Preview => {
                 todo!("этап 4: файлы (§10)")
             }
-            PayloadType::Receipt => todo!("этап 1: квитанции (§9.4)"),
+            PayloadType::Receipt => {
+                let (receipt, msg_ids) = Receipt::from_payload(&envelope.payload)?;
+                let candidate = match receipt {
+                    Receipt::Delivered => DeliveryStatus::Delivered,
+                    Receipt::Read => DeliveryStatus::Read,
+                };
+                // §9.4: квитанция, пришедшая не прямым каналом, не применяется.
+                // Своя проверка, а не доверие отправителю: транспорт знаем мы,
+                // и подделать его он не может.
+                if !ratatosk_proto::receipts::may_send_receipt(via) {
+                    self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+
+                let mut effects = Vec::new();
+                for msg_id in &msg_ids {
+                    effects.extend(self.note_status(*msg_id, candidate)?);
+                }
+
+                // Доставка подтверждена — запись из очереди уходит, и её
+                // таймер остаётся без владельца. Оставить её значит дождаться
+                // срока и объявить провал у сообщения, которое уже прочитано.
+                self.outbox.retain(|d| !msg_ids.contains(&d.msg_id));
+                Ok(effects)
+            }
             PayloadType::GroupMembership | PayloadType::SenderKey => {
                 todo!("этап 5: группы (§11)")
             }

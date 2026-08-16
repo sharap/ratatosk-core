@@ -113,7 +113,10 @@ impl Node {
                     self.events.push(event);
                 }
                 Effect::SetTimer { after_ms, token } => ctx.set_timer(after_ms, token),
-                Effect::Connect { .. } | Effect::SetLanEnabled(_) | Effect::WatchLanPeers(_) => {}
+                Effect::Connect { .. }
+                | Effect::SetLanEnabled(_)
+                | Effect::WatchLanPeers(_)
+                | Effect::RestartLan => {}
             }
         }
     }

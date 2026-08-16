@@ -27,7 +27,7 @@
 //! ответа». Поэтому [`Initiator::start`] возвращает не сессию,
 //! а [`PendingHandshake`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use snow::Builder;
 use zeroize::Zeroizing;
@@ -36,7 +36,7 @@ use crate::error::{CryptoError, Result};
 use crate::identity::Identity;
 use crate::kdf::{self, Key32};
 use crate::labels;
-use crate::ratchet::{RecvChain, SendChain};
+use crate::ratchet::{RecvChain, SendChain, MAX_SKIPPED_PER_SESSION};
 
 /// Имя паттерна Noise (§8.2).
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -128,6 +128,126 @@ impl Session {
             recv: RecvChain::new(recv),
             established_ms: now_ms,
         }
+    }
+
+    /// Снимок состояния для записи на диск (§12).
+    ///
+    /// Формат свой, а не CBOR: это внутреннее состояние одного устройства,
+    /// оно никогда не уходит в сеть, и канонизация (§6) ему не нужна. Зато
+    /// нужна ровно одна вещь — чтобы разбор не принял мусор молча.
+    ///
+    /// ```text
+    /// version(1) ‖ session_id(8) ‖ peer_ik(32) ‖ established_ms(8)
+    ///   ‖ send_chain(32) ‖ send_counter(8)
+    ///   ‖ recv_chain(32) ‖ recv_next(8) ‖ skipped_count(4)
+    ///   ‖ { counter(8) ‖ key(32) ‖ created_ms(8) } * skipped_count
+    /// ```
+    ///
+    /// Результат содержит ключевой материал в открытом виде и обязан быть
+    /// запечатан перед записью — этим занимается `ratatosk-store`.
+    #[must_use]
+    pub fn export(&self) -> Zeroizing<Vec<u8>> {
+        let (send_key, send_counter) = self.send.snapshot();
+        let (recv_key, recv_next, skipped) = self.recv.snapshot();
+
+        let mut out = Zeroizing::new(Vec::with_capacity(SNAPSHOT_HEAD + skipped.len() * 48));
+        out.push(SNAPSHOT_VERSION);
+        out.extend_from_slice(&self.session_id.to_be_bytes());
+        out.extend_from_slice(&self.peer_ik);
+        out.extend_from_slice(&self.established_ms.to_be_bytes());
+        out.extend_from_slice(&send_key[..]);
+        out.extend_from_slice(&send_counter.to_be_bytes());
+        out.extend_from_slice(&recv_key[..]);
+        out.extend_from_slice(&recv_next.to_be_bytes());
+        // Число пропущенных ограничено §8.4 (2000 на сессию), так что
+        // в u32 оно помещается с огромным запасом.
+        out.extend_from_slice(&(skipped.len() as u32).to_be_bytes());
+        for (counter, (key, created_ms)) in skipped {
+            out.extend_from_slice(&counter.to_be_bytes());
+            out.extend_from_slice(&key[..]);
+            out.extend_from_slice(&created_ms.to_be_bytes());
+        }
+        out
+    }
+
+    /// Восстанавливает сессию из снимка.
+    ///
+    /// Отказ означает порчу файла или снимок от несовместимой версии. Тихо
+    /// подставить пустую сессию нельзя: отправляющая цепочка начала бы
+    /// с нуля, и **тот же ключ с тем же nonce ушёл бы в сеть второй раз**.
+    pub fn restore(bytes: &[u8]) -> Result<Session> {
+        let mut cursor = Cursor::new(bytes);
+        if cursor.byte()? != SNAPSHOT_VERSION {
+            return Err(CryptoError::BadKeyMaterial);
+        }
+        let session_id = u64::from_be_bytes(cursor.take()?);
+        let peer_ik: [u8; 32] = cursor.take()?;
+        let established_ms = u64::from_be_bytes(cursor.take()?);
+
+        let send_key = Zeroizing::new(cursor.take::<32>()?);
+        let send_counter = u64::from_be_bytes(cursor.take()?);
+        let recv_key = Zeroizing::new(cursor.take::<32>()?);
+        let recv_next = u64::from_be_bytes(cursor.take()?);
+
+        let count = u32::from_be_bytes(cursor.take()?) as usize;
+        // Заявленное число проверяется пределом §8.4 до всякого выделения
+        // памяти: иначе испорченный файл просит гигабайт и получает его.
+        if count > MAX_SKIPPED_PER_SESSION {
+            return Err(CryptoError::BadKeyMaterial);
+        }
+        let mut skipped = BTreeMap::new();
+        for _ in 0..count {
+            let counter = u64::from_be_bytes(cursor.take()?);
+            let key = Zeroizing::new(cursor.take::<32>()?);
+            let created_ms = u64::from_be_bytes(cursor.take()?);
+            skipped.insert(counter, (key, created_ms));
+        }
+        if !cursor.is_empty() {
+            // Хвост означает, что разбор разошёлся с записью: молча
+            // проглотить его — значит однажды восстановить не ту сессию.
+            return Err(CryptoError::BadKeyMaterial);
+        }
+
+        Ok(Session {
+            session_id,
+            peer_ik,
+            send: SendChain::restore(send_key, send_counter),
+            recv: RecvChain::restore(recv_key, recv_next, skipped),
+            established_ms,
+        })
+    }
+}
+
+/// Версия формата снимка. Меняется при любой правке раскладки.
+const SNAPSHOT_VERSION: u8 = 1;
+/// Длина неизменной части снимка.
+const SNAPSHOT_HEAD: usize = 1 + 8 + 32 + 8 + 32 + 8 + 32 + 8 + 4;
+
+/// Чтение снимка без паник на обрезанном входе.
+struct Cursor<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Cursor<'a> {
+        Cursor { rest: bytes }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+        if self.rest.len() < N {
+            return Err(CryptoError::BadKeyMaterial);
+        }
+        let (head, tail) = self.rest.split_at(N);
+        self.rest = tail;
+        Ok(head.try_into().expect("срез длины N"))
     }
 }
 
@@ -572,6 +692,84 @@ mod tests {
 
         let (n, key) = initiator.send.next();
         assert_eq!(*responder.recv.peek(n).unwrap(), *key);
+    }
+
+    #[test]
+    fn a_snapshot_does_not_roll_the_send_counter_back() {
+        // Самое важное свойство снимка. Откат отправляющего счётчика означает
+        // повтор пары «ключ, nonce» — то есть полное разрушение шифрования
+        // кадра, а не просто дубль сообщения.
+        let mut before = session(Role::Initiator, 7);
+        for _ in 0..5 {
+            before.send.next();
+        }
+        let expected = before.send.counter();
+
+        let after = Session::restore(&before.export()).expect("снимок читается");
+        assert_eq!(after.send.counter(), expected, "счётчик отправки обязан пережить перезапуск");
+
+        // И следующий ключ — тот, который был бы без перезапуска.
+        let mut continued = before;
+        let mut restored = after;
+        assert_eq!(continued.send.next(), restored.send.next());
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_skipped_key_cache() {
+        // §8.4: пропущенные ключи — не оптимизация, а условие работоспособности
+        // при доставке с перестановками. Потерять их при перезапуске значит
+        // потерять все сообщения, которые уже в пути.
+        let mut sender = session(Role::Initiator, 0);
+        let keys: Vec<_> = (0..5).map(|_| sender.send.next()).collect();
+
+        let mut receiver = session(Role::Responder, 0);
+        receiver.recv.commit(keys[4].0, 0).expect("прыжок вперёд");
+        assert_eq!(receiver.recv.skipped_len(), 4);
+
+        let restored = Session::restore(&receiver.export()).expect("снимок читается");
+        assert_eq!(restored.recv.skipped_len(), 4);
+        for (n, key) in keys.iter().take(4) {
+            assert_eq!(*restored.recv.peek(*n).unwrap(), **key, "позиция {n}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_completely() {
+        let original = session(Role::Responder, 12_345);
+        let restored = Session::restore(&original.export()).expect("снимок читается");
+        assert_eq!(restored.session_id, original.session_id);
+        assert_eq!(restored.peer_ik, original.peer_ik);
+        assert_eq!(restored.established_ms, original.established_ms);
+        assert_eq!(restored.recv.next_counter(), original.recv.next_counter());
+    }
+
+    #[test]
+    fn a_damaged_snapshot_is_refused_without_panic() {
+        // Подставить вместо испорченного снимка пустую сессию нельзя: цепочка
+        // начнёт с нуля, и тот же ключ уйдёт в сеть второй раз. Поэтому здесь
+        // только отказ — на любом входе.
+        let snapshot = session(Role::Initiator, 1).export();
+
+        for cut in 0..snapshot.len() {
+            assert!(Session::restore(&snapshot[..cut]).is_err(), "обрез {cut}");
+        }
+
+        let mut with_tail = snapshot.to_vec();
+        with_tail.push(0);
+        assert!(Session::restore(&with_tail).is_err(), "хвост после снимка");
+
+        let mut wrong_version = snapshot.to_vec();
+        wrong_version[0] = SNAPSHOT_VERSION.wrapping_add(1);
+        assert!(Session::restore(&wrong_version).is_err(), "чужая версия формата");
+    }
+
+    #[test]
+    fn an_absurd_skipped_count_is_refused_before_allocating() {
+        // Испорченный файл не должен просить гигабайт памяти и получать его.
+        let mut snapshot = session(Role::Initiator, 1).export().to_vec();
+        let at = SNAPSHOT_HEAD - 4;
+        snapshot[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(Session::restore(&snapshot).is_err());
     }
 
     #[test]

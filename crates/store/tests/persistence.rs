@@ -46,6 +46,7 @@ fn message(n: u8, wall: u64) -> StoredMessage {
         hlc: Hlc::new(wall, 0),
         body: format!("сообщение {n}").into_bytes(),
         received_ms: wall,
+        status: None,
     }
 }
 

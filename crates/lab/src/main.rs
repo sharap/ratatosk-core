@@ -146,7 +146,7 @@ async fn run<S: Store + 'static>(
     println!("если mDNS в вашей сети не работает, допишите через пробел адрес");
     println!("этой машины: /add <карточка> 192.168.1.5:{port}");
     println!();
-    println!("команды: /add <карточка> [ip:порт]   /who   /quit");
+    println!("команды: /add <карточка> [ip:порт]   /who   /net   /quit");
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
 
@@ -186,6 +186,14 @@ async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDi
                 }
                 if line == "/who" {
                     show_contacts(&handle, &directory).await;
+                    continue;
+                }
+                if line == "/net" {
+                    // То же, что клиент вызовет из ConnectivityManager.
+                    // Руками — чтобы проверить переоткрытие, не переключая
+                    // Wi-Fi на самом деле.
+                    handle.send(Command::NetworkChanged).await.ok();
+                    println!("< сеть объявлена сменившейся: адреса забыты, объявление заново");
                     continue;
                 }
                 // Одна команда вместо двух: `/add` и `/addr` отличались одной

@@ -302,6 +302,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Effect::SetLanEnabled(on) => Some(TransportCommand::SetLanEnabled(on)),
             Effect::WatchLanPeers(peers) => Some(TransportCommand::WatchLanPeers(peers)),
+            Effect::RestartLan => Some(TransportCommand::RestartLan),
             Effect::SetTimer { after_ms, token } => {
                 self.timers.entry(now_ms.saturating_add(after_ms)).or_default().push(token);
                 None

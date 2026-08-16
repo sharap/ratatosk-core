@@ -211,6 +211,24 @@ fn lan_can_be_switched_on_and_off() {
 }
 
 #[test]
+fn a_network_change_is_survivable() {
+    // На Android это происходит постоянно: Wi-Fi ↔ мобильный, переход между
+    // точками, пробуждение. Ядро обязано пережить сообщение об этом в любом
+    // состоянии — и при включённом LAN, и при выключенном.
+    let db = TempDb::new("network");
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+        .expect("клиент открылся");
+
+    client.network_changed().expect("при выключенном LAN — тоже команда");
+    client.set_lan_enabled(true).expect("включение принято");
+    client.network_changed().expect("и при включённом");
+    client.network_changed().expect("лишний вызов стоит одного переобъявления");
+
+    assert!(!client.fingerprint().is_empty(), "ядро живо");
+    assert!(client.contacts().is_ok(), "и отвечает на запросы");
+}
+
+#[test]
 fn honest_texts_come_from_the_core() {
     // §14 существует, чтобы обещания продукта не расходились со свойствами
     // протокола. Строка, скопированная в Kotlin, разойдётся при первой правке.

@@ -160,6 +160,12 @@ pub struct FfiMessage {
     /// Показывать её как время получения можно, а сортировать по ней —
     /// нет: порядок задаёт HLC целиком, и он уже применён к списку.
     pub wall_ms: u64,
+    /// Судьба отправки (§9.4).
+    ///
+    /// `None` у **принятых** сообщений, и это не пропуск: статус — это судьба
+    /// отправки, а принятое уже здесь. Рисовать у чужого сообщения галочку
+    /// значит показать пользователю то, чего протокол не утверждает.
+    pub status: Option<FfiDeliveryStatus>,
 }
 
 /// Подписка UI на события ядра.
@@ -230,16 +236,14 @@ impl RatatoskClient {
         std::thread::Builder::new()
             .name("ratatosk-core".to_owned())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(RatatoskError::internal(error)));
-                        return;
-                    }
-                };
+                let runtime =
+                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(RatatoskError::internal(error)));
+                            return;
+                        }
+                    };
                 runtime.block_on(async move {
                     let started = start(PathBuf::from(db_path), pin, display_name).await;
                     let (mut driver, opened, events) = match started {
@@ -297,10 +301,8 @@ impl RatatoskClient {
     /// доверенный по построению и отпечаток сверять не нужно; по ссылке —
     /// нужно, и до сверки контакт помечается непроверенным.
     pub fn add_contact(&self, uri: String, met_in_person: bool) -> Result<(), RatatoskError> {
-        let card_bytes = ContactCard::from_uri(&uri)
-            .map_err(RatatoskError::internal)?
-            .bytes()
-            .to_vec();
+        let card_bytes =
+            ContactCard::from_uri(&uri).map_err(RatatoskError::internal)?.bytes().to_vec();
         self.command(Command::AddContact { card_bytes, met_in_person })
     }
 
@@ -319,6 +321,48 @@ impl RatatoskClient {
     /// Перед включением клиент обязан показать [`lan_warning`].
     pub fn set_lan_enabled(&self, enabled: bool) -> Result<(), RatatoskError> {
         self.command(Command::SetLanEnabled(enabled))
+    }
+
+    /// Сообщает, что пользователь дочитал чат до этого сообщения (§9.4).
+    ///
+    /// Отсюда уходит квитанция о прочтении — но только прямым каналом
+    /// и только про сообщения собеседника. По почте квитанций нет вовсе:
+    /// каждая была бы отдельным письмом.
+    ///
+    /// **Это единственный источник квитанции о прочтении.** Ни приём
+    /// сообщения, ни открытие чата, ни запуск приложения её не порождают:
+    /// ядро не знает и не может знать, что человек прочитал, — знает клиент.
+    /// Когда именно звать, решает тоже клиент: открытие чата, докрутка до
+    /// конца, задержка на экране. Ядро своей политики сюда не добавляет.
+    ///
+    /// Отсюда же и выключатель: клиенту, который квитанций о прочтении
+    /// не хочет, достаточно не звать эту команду. Отдельной настройки
+    /// в ядре нет и не нужно.
+    ///
+    /// Повторный вызов про то же место ничего не отправляет — и это
+    /// переживает перезапуск: собеседнику сообщают один раз.
+    pub fn mark_read(&self, chat_id: Vec<u8>, up_to: Vec<u8>) -> Result<(), RatatoskError> {
+        let up_to: [u8; 16] = up_to
+            .as_slice()
+            .try_into()
+            .map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))?;
+        self.command(Command::MarkRead { chat: to_chat(&chat_id)?, up_to })
+    }
+
+    /// Сообщает, что сеть сменилась.
+    ///
+    /// Заметить это может только система: на Android — `ConnectivityManager`,
+    /// на десктопе — событие смены интерфейса. Ядро не имеет ни сокетов,
+    /// ни часов и отличить смену сети от молчания собеседника не может.
+    ///
+    /// Без этого вызова после перехода с Wi-Fi на мобильный (и обратно, и
+    /// между точками доступа) локальная сеть остаётся в прежнем состоянии:
+    /// адреса указывают в старую сеть, объявление в эфир не звучит, и каждая
+    /// отправка платит таймаутом за то, что уже известно.
+    ///
+    /// Вызывать можно свободно: лишний вызов стоит одного переобъявления.
+    pub fn network_changed(&self) -> Result<(), RatatoskError> {
+        self.command(Command::NetworkChanged)
     }
 
     /// Список контактов.
@@ -358,6 +402,7 @@ impl RatatoskClient {
                 body: String::from_utf8_lossy(&m.body).into_owned(),
                 mine: m.sender_ik == self.opened.own_ik,
                 wall_ms: m.hlc.wall_ms,
+                status: m.status.and_then(DeliveryStatus::from_code).map(status_of),
             })
             .collect())
     }
@@ -369,6 +414,20 @@ impl RatatoskClient {
             .handle
             .send_blocking(command)
             .map_err(|_| RatatoskError::internal("ядро остановлено"))
+    }
+}
+
+/// Перевод лестницы статусов §9.4 в то, что видит UI.
+///
+/// Варианты перечислены поимённо: новый статус обязан сломать сборку здесь,
+/// а не молча стать чем-то похожим.
+const fn status_of(status: DeliveryStatus) -> FfiDeliveryStatus {
+    match status {
+        DeliveryStatus::Undeliverable => FfiDeliveryStatus::Undeliverable,
+        DeliveryStatus::Pending => FfiDeliveryStatus::Pending,
+        DeliveryStatus::Sent => FfiDeliveryStatus::Sent,
+        DeliveryStatus::Delivered => FfiDeliveryStatus::Delivered,
+        DeliveryStatus::Read => FfiDeliveryStatus::Read,
     }
 }
 
@@ -386,14 +445,14 @@ async fn start(
     pin: Option<String>,
     display_name: String,
 ) -> Result<(Driver<SqliteStore, LanRunner>, Opened, EventStream), RatatoskError> {
-    let (mut store, db_key) = vault::open_encrypted(&db_path, pin.as_deref()).map_err(engine_err)?;
+    let (mut store, db_key) =
+        vault::open_encrypted(&db_path, pin.as_deref()).map_err(engine_err)?;
     let identity = vault::load_or_create(&mut store, &db_key).map_err(engine_err)?;
 
     // Onion и chatmail пока пусты: их адреса появятся вместе с транспортами
     // этапов 2 и 3. §5.4 с пустыми адресами честно скажет «отправлять некуда»,
     // а не сделает вид, что письмо ушло.
-    let addresses =
-        SelfAddresses { onion: String::new(), chatmail: String::new(), display_name };
+    let addresses = SelfAddresses { onion: String::new(), chatmail: String::new(), display_name };
 
     let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses);
     engine.restore().map_err(engine_err)?;
@@ -447,16 +506,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::MessageReceived { chat, msg_id } => {
             FfiEvent::MessageReceived { chat_id: chat.to_vec(), msg_id: msg_id.to_vec() }
         }
-        Event::StatusChanged { msg_id, status } => FfiEvent::StatusChanged {
-            msg_id: msg_id.to_vec(),
-            status: match status {
-                DeliveryStatus::Undeliverable => FfiDeliveryStatus::Undeliverable,
-                DeliveryStatus::Pending => FfiDeliveryStatus::Pending,
-                DeliveryStatus::Sent => FfiDeliveryStatus::Sent,
-                DeliveryStatus::Delivered => FfiDeliveryStatus::Delivered,
-                DeliveryStatus::Read => FfiDeliveryStatus::Read,
-            },
-        },
+        Event::StatusChanged { msg_id, status } => {
+            FfiEvent::StatusChanged { msg_id: msg_id.to_vec(), status: status_of(status) }
+        }
         Event::ContactAdded { fingerprint, verified, .. } => {
             FfiEvent::ContactAdded { fingerprint, verified }
         }

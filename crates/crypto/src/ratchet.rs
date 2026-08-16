@@ -54,6 +54,21 @@ impl SendChain {
         self.counter
     }
 
+    /// Состояние для записи на диск (§12).
+    ///
+    /// `pub(crate)`, а не `pub`: наружу ключевой материал уходит только
+    /// запечатанным, через [`crate::handshake::Session::export`]. Публичный
+    /// доступ к ключу цепочки означал бы, что положить его в лог можно,
+    /// не заметив.
+    pub(crate) fn snapshot(&self) -> (&Key32, u64) {
+        (&self.chain_key, self.counter)
+    }
+
+    /// Восстанавливает цепочку из записанного состояния.
+    pub(crate) fn restore(chain_key: Key32, counter: u64) -> SendChain {
+        SendChain { chain_key, counter }
+    }
+
     /// Выдаёт ключ следующего сообщения и продвигает цепочку.
     ///
     /// Состояние цепочки после вызова не позволяет получить выданный ключ
@@ -95,6 +110,24 @@ impl RecvChain {
     #[must_use]
     pub fn skipped_len(&self) -> usize {
         self.skipped.len()
+    }
+
+    /// Состояние для записи на диск (§12).
+    ///
+    /// Кэш пропущенных ключей входит в снимок целиком, и иначе нельзя:
+    /// выбросить его при перезапуске значит потерять все сообщения, которые
+    /// уже в пути и придут не по порядку (§8.4).
+    pub(crate) fn snapshot(&self) -> (&Key32, u64, &BTreeMap<u64, (Key32, u64)>) {
+        (&self.chain_key, self.next_counter, &self.skipped)
+    }
+
+    /// Восстанавливает цепочку из записанного состояния.
+    pub(crate) fn restore(
+        chain_key: Key32,
+        next_counter: u64,
+        skipped: BTreeMap<u64, (Key32, u64)>,
+    ) -> RecvChain {
+        RecvChain { chain_key, next_counter, skipped }
     }
 
     /// Ключ **ровно для позиции `counter`**, без продвижения цепочки (§7.3, шаг 3).

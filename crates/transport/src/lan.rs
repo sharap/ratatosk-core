@@ -190,11 +190,8 @@ impl LanRunner {
     /// не раскрывает ничего; зато его номер нужен, чтобы объявление вообще
     /// было чем наполнить.
     pub async fn start(config: LanConfig, my_ik: [u8; 32]) -> Result<LanRunner, TransportError> {
-        let listener = TcpListener::bind(SocketAddr::new(
-            IpAddr::from([0, 0, 0, 0]),
-            config.port,
-        ))
-        .await?;
+        let listener =
+            TcpListener::bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), config.port)).await?;
         let port = listener.local_addr()?.port();
 
         let (events_tx, events_rx) = mpsc::channel(64);
@@ -229,10 +226,7 @@ impl LanRunner {
     /// Справочник адресов — его можно оставить себе, отдав раннер драйверу.
     #[must_use]
     pub fn directory(&self) -> LanDirectory {
-        LanDirectory {
-            addresses: Arc::clone(&self.directory),
-            events: self.events_tx.clone(),
-        }
+        LanDirectory { addresses: Arc::clone(&self.directory), events: self.events_tx.clone() }
     }
 
     /// Записывает адрес контакта, минуя mDNS.
@@ -274,6 +268,59 @@ impl LanRunner {
         Ok(())
     }
 
+    /// Поднимает LAN заново после смены сети (§5.1).
+    ///
+    /// **Слушающий сокет переоткрывать не нужно, и это стоит объяснить.**
+    /// Он привязан к `0.0.0.0`, то есть ко всем интерфейсам сразу, и смену
+    /// сети переживает сам — адреса меняются под ним, а сокет остаётся.
+    /// Переоткрытие сменило бы порт на ровном месте и оставило бы старую
+    /// задачу приёма висеть на прежнем сокете.
+    ///
+    /// Заново заводится то, что действительно устарело: соединения,
+    /// известные адреса и объявление в эфире.
+    async fn restart(&mut self) -> Result<(), TransportError> {
+        // Об оборванных соединениях ядро узнаёт сразу, а не по таймауту
+        // первой отправки: §5.4 иначе заплатит ожиданием за то, что уже
+        // известно. Сами сокеты об обрыве ещё не знают — узнают на первой
+        // записи, и это как раз те секунды, которых хочется избежать.
+        let peers: Vec<[u8; 32]> = self.links.keys().copied().collect();
+        self.links.clear();
+        for peer_ik in peers {
+            let _ = self
+                .events_tx
+                .send(TransportEvent::Disconnected { peer_ik, via: Transport::Lan })
+                .await;
+        }
+
+        // Адреса прежней сети хуже, чем их отсутствие: по ним отправка
+        // упирается в таймаут вместо честного «адрес неизвестен». Кэш эфира
+        // тоже: услышанное в прежней сети там больше не звучит.
+        if let Ok(mut dir) = self.directory.lock() {
+            dir.clear();
+        }
+        if let Ok(mut heard) = self.heard.lock() {
+            heard.clear();
+        }
+
+        // Объявление перевыпускается — но только если LAN включён. Смена
+        // сети не решает за пользователя (§5.1).
+        #[cfg(feature = "lan")]
+        if self.enabled && self.discovery_wanted {
+            // Прежнее снимается первым: `Drop` шлёт прощальный пакет и
+            // останавливает обзор, и делать это надо до нового объявления,
+            // а не после.
+            self.discovery = None;
+            self.discovery = Some(discovery::Discovery::start(
+                self.my_ik,
+                self.port,
+                Arc::clone(&self.watched),
+                Arc::clone(&self.heard),
+                self.directory(),
+            )?);
+        }
+        Ok(())
+    }
+
     async fn ensure_link(
         &mut self,
         peer_ik: [u8; 32],
@@ -297,10 +344,8 @@ impl LanRunner {
         spawn_write_loop(stream, rx, peer_ik, self.events_tx.clone());
         self.links.insert(peer_ik, tx.clone());
 
-        let _ = self
-            .events_tx
-            .send(TransportEvent::Connected { peer_ik, via: Transport::Lan })
-            .await;
+        let _ =
+            self.events_tx.send(TransportEvent::Connected { peer_ik, via: Transport::Lan }).await;
         Ok(tx)
     }
 
@@ -330,11 +375,34 @@ impl LanRunner {
         }
     }
 
+    /// Забывает адрес, по которому не удалось соединиться.
+    ///
+    /// Адрес в справочнике — это не свойство контакта, а последнее, что мы
+    /// о нём слышали. Не дозвонившись, держать его дальше нельзя: устройство
+    /// могло уйти из сети или перезапуститься с другим портом, и тогда каждая
+    /// следующая попытка упирается в ту же дыру, платя за неё таймаутом.
+    /// Забыть — значит вернуться к честному «адрес неизвестен»; живой сосед
+    /// объявится следующим анонсом mDNS через секунды.
+    ///
+    /// Кэш эфира чистится заодно: иначе [`LanRunner::rematch_heard`] вернул бы
+    /// тот же мёртвый адрес при первом же обновлении списка контактов.
+    fn forget_address(&self, peer_ik: [u8; 32]) {
+        let stale = match self.directory.lock() {
+            Ok(mut directory) => directory.remove(&peer_ik),
+            Err(_) => None,
+        };
+        let Some(stale) = stale else { return };
+        if let Ok(mut heard) = self.heard.lock() {
+            heard.retain(|(_, addr)| *addr != stale);
+        }
+    }
+
     /// Сообщает ядру о неудаче, а не только возвращает ошибку.
     ///
     /// Без события §5.4 узнал бы об отказе лишь по таймауту, то есть через
     /// пять секунд там, где ответ уже есть.
     async fn report_failure(&self, peer_ik: [u8; 32]) {
+        self.forget_address(peer_ik);
         let _ = self
             .events_tx
             .send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Lan })
@@ -384,6 +452,7 @@ impl Runner for LanRunner {
                 Ok(())
             }
             TransportCommand::SetLanEnabled(on) => self.set_enabled(on),
+            TransportCommand::RestartLan => self.restart().await,
             TransportCommand::WatchLanPeers(peers) => {
                 // Сначала пересматриваем уже услышанное, потом запоминаем
                 // список. Порядок неважен для результата, но так очевидно,
@@ -510,14 +579,31 @@ mod discovery {
         tasks: Vec<tokio::task::JoinHandle<()>>,
     }
 
+    /// Сколько ждать, пока демон действительно выпустит прощальный пакет.
+    ///
+    /// Ноль здесь означал бы отсутствие прощания вовсе, а не «быстро».
+    const GOODBYE_WAIT: Duration = Duration::from_millis(500);
+
     impl Drop for Discovery {
         fn drop(&mut self) {
             for task in self.tasks.drain(..) {
                 task.abort();
             }
+
             // Прощальный пакет: контакты должны узнать об уходе сразу, а не
-            // по истечении TTL записи.
-            let _ = self.daemon.unregister(&self.fullname);
+            // по истечении TTL записи — иначе они держат наш прежний адрес
+            // и порт до семидесяти пяти минут и всё это время звонят в пустоту.
+            //
+            // **Дождаться обязательно.** `unregister` только ставит задачу
+            // демону и возвращает канал; `shutdown` следом останавливал поток
+            // раньше, чем пакет уходил в сеть. Прощание было написано, но
+            // не отправлялось ни разу — а по коду выглядело сделанным.
+            match self.daemon.unregister(&self.fullname) {
+                Ok(done) => {
+                    let _ = done.recv_timeout(GOODBYE_WAIT);
+                }
+                Err(error) => tracing::debug!(?error, "не удалось снять объявление LAN"),
+            }
             let _ = self.daemon.shutdown();
         }
     }
@@ -532,18 +618,14 @@ mod discovery {
         ) -> Result<Discovery, TransportError> {
             let daemon = ServiceDaemon::new().map_err(mdns_error)?;
 
-            // Имя экземпляра не должно нести идентичность: оно видно
-            // постороннему так же, как всё остальное в эфире. Берём его
-            // из маяка текущего слота — оно ротируется вместе с ним.
-            let instance = instance_name(&my_ik);
+            let instance = instance_name();
             let info = service_info(&instance, &my_ik, port)?;
             let fullname = info.get_fullname().to_owned();
             daemon.register(info).map_err(mdns_error)?;
 
             let browse = daemon.browse(SERVICE_DOMAIN).map_err(mdns_error)?;
             let browse_task = tokio::spawn(browse_loop(browse, watched, heard, directory));
-            let rotate_task =
-                tokio::spawn(rotate_loop(daemon.clone(), instance, my_ik, port));
+            let rotate_task = tokio::spawn(rotate_loop(daemon.clone(), instance, my_ik, port));
 
             Ok(Discovery { daemon, fullname, tasks: vec![browse_task, rotate_task] })
         }
@@ -553,9 +635,34 @@ mod discovery {
         TransportError::Discovery(format!("{error:?}"))
     }
 
-    fn instance_name(my_ik: &[u8; 32]) -> String {
-        let slot = beacon::slot(unix_seconds());
-        HEXLOWER.encode(&beacon::record(my_ik, slot, nonce_for_slot(my_ik, slot))[..8])
+    /// Имя экземпляра mDNS — случайное и новое у каждого запуска.
+    ///
+    /// **Раньше оно выводилось из маяка текущего слота, и это была ошибка,
+    /// которая ломала обнаружение после перезапуска.** Маяк детерминирован:
+    /// он выводится из `IK` и номера пятнадцатиминутного слота. Значит
+    /// приложение, перезапущенное внутри того же слота, объявлялось под
+    /// **тем же самым** именем экземпляра и с тем же именем хоста — но со
+    /// свежим эфемерным TCP-портом. Для собеседника это выглядело не как
+    /// «сосед вернулся», а как «запись, которая у меня уже есть»: в его
+    /// кэше mDNS лежал прежний порт, соединение уходило в пустоту, §5.4
+    /// объявлял LAN недоступным, и связь не восстанавливалась до смены
+    /// слота — до пятнадцати минут. Симметрично с обеих сторон, поэтому
+    /// «устройства перестали видеть друг друга».
+    ///
+    /// Имя экземпляра — это идентификатор **объявления**, а не устройства,
+    /// и всё, что в объявлении, у каждого запуска своё: порт, адрес, сокет.
+    /// Поэтому и имя обязано быть своим.
+    ///
+    /// Приватности это не стоит ничего, наоборот: случайные восемь байт
+    /// не выводятся из `IK` вовсе, тогда как прежнее имя было буквально
+    /// первой половиной маяка, продублированной в открытом виде. Узнавание
+    /// своих делает маяк в TXT (§5.1), и только он.
+    fn instance_name() -> String {
+        use rand_core::RngCore;
+
+        let mut bytes = [0u8; 8];
+        rand_core::OsRng.fill_bytes(&mut bytes);
+        HEXLOWER.encode(&bytes)
     }
 
     /// Nonce маяка выводится из `IK` и слота, а не случаен.
@@ -580,9 +687,16 @@ mod discovery {
         let record = beacon::record(my_ik, slot, nonce_for_slot(my_ik, slot));
         let txt = HEXLOWER.encode(&record);
         let host = format!("{instance}.local.");
-        ServiceInfo::new(SERVICE_DOMAIN, instance, &host, "", port, &[(BEACON_TXT_KEY, txt.as_str())][..])
-            .map(ServiceInfo::enable_addr_auto)
-            .map_err(mdns_error)
+        ServiceInfo::new(
+            SERVICE_DOMAIN,
+            instance,
+            &host,
+            "",
+            port,
+            &[(BEACON_TXT_KEY, txt.as_str())][..],
+        )
+        .map(ServiceInfo::enable_addr_auto)
+        .map_err(mdns_error)
     }
 
     /// Кладёт объявление в кэш эфира, вытесняя самое старое.
@@ -629,8 +743,7 @@ mod discovery {
             remember(&heard, record, addr);
 
             // Список копируется, чтобы не держать блокировку через `.await`.
-            let peers: Vec<[u8; 32]> =
-                watched.lock().map(|w| w.clone()).unwrap_or_default();
+            let peers: Vec<[u8; 32]> = watched.lock().map(|w| w.clone()).unwrap_or_default();
             let slot = beacon::slot(unix_seconds());
 
             peers
@@ -646,14 +759,18 @@ mod discovery {
     ///
     /// Без этого маяк застыл бы на значении момента запуска, и наблюдатель
     /// получил бы ровно то, чего ротация избегает, — постоянный идентификатор.
+    ///
+    /// Меняется только TXT-запись; имя экземпляра остаётся прежним, и так
+    /// и надо. В mDNS смена имени — это не обновление, а **новый** сервис:
+    /// прежний остался бы в чужих кэшах призраком до истечения TTL, то есть
+    /// до семидесяти пяти минут. Обновление записи под тем же именем доходит
+    /// до соседей сразу, а идентифицирует нас для контактов маяк, а не имя.
     async fn rotate_loop(daemon: ServiceDaemon, instance: String, my_ik: [u8; 32], port: u16) {
         loop {
             let now = unix_seconds();
             let next = (beacon::slot(now) + 1) * beacon::SLOT_SECONDS;
             tokio::time::sleep(Duration::from_secs(next.saturating_sub(now).max(1))).await;
 
-            // Имя экземпляра тоже ротируется, поэтому объявление выпускается
-            // заново целиком.
             match service_info(&instance, &my_ik, port) {
                 Ok(info) => {
                     if let Err(error) = daemon.register(info) {
@@ -662,6 +779,23 @@ mod discovery {
                 }
                 Err(error) => tracing::debug!(?error, "не удалось собрать объявление LAN"),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn every_launch_announces_under_its_own_name() {
+            // Прежняя реализация выводила имя из маяка, то есть из `IK`
+            // и номера слота. Перезапуск внутри тех же пятнадцати минут давал
+            // **то же самое** имя при новом порте — и соседи продолжали звонить
+            // по старому адресу, пока слот не сменится. Этот тест ловит именно
+            // ту детерминированность.
+            assert_ne!(
+                super::instance_name(),
+                super::instance_name(),
+                "имя объявления обязано быть своим у каждого запуска"
+            );
         }
     }
 }
@@ -693,11 +827,7 @@ mod tests {
         runner.note_address([2u8; 32], SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9));
         let verdict = runner
             .execute(TransportCommand::Send {
-                peer: crate::runner::PeerAddress {
-                    ik: [2u8; 32],
-                    onion: None,
-                    chatmail: None,
-                },
+                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
             })
@@ -715,11 +845,7 @@ mod tests {
 
         let verdict = runner
             .execute(TransportCommand::Send {
-                peer: crate::runner::PeerAddress {
-                    ik: [2u8; 32],
-                    onion: None,
-                    chatmail: None,
-                },
+                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
             })
@@ -729,5 +855,35 @@ mod tests {
             runner.next_event().await,
             Some(TransportEvent::ConnectFailed { via: Transport::Lan, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn an_address_that_did_not_answer_is_forgotten() {
+        // Адрес в справочнике — последнее, что мы слышали, а не свойство
+        // контакта. Устройство могло перезапуститься и занять другой порт;
+        // сохранив прежний, транспорт упирался бы в него при каждой отправке,
+        // платя таймаутом, — и живой сосед оставался бы недостижимым.
+        let config = LanConfig { enabled: true, port: 0, discovery: false };
+        let mut runner = LanRunner::start(config, [1u8; 32]).await.unwrap();
+
+        // Порт 9 (discard) на loopback никем не слушается — соединение
+        // отвергается сразу, без ожидания.
+        let dead = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9);
+        runner.note_address([2u8; 32], dead);
+        assert_eq!(runner.address_of(&[2u8; 32]), Some(dead));
+
+        let _ = runner
+            .execute(TransportCommand::Send {
+                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
+                via: Transport::Lan,
+                frame: vec![0u8; SizeClass::S.frame_len()],
+            })
+            .await;
+
+        assert_eq!(
+            runner.address_of(&[2u8; 32]),
+            None,
+            "мёртвый адрес обязан уйти из справочника, а не пережить собеседника"
+        );
     }
 }

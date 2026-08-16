@@ -42,19 +42,28 @@ CREATE TABLE contacts (
 -- транскрипта и в половине случаев больше i64::MAX, то есть лежит здесь
 -- отрицательным числом. Сравнивать этот столбец можно только на равенство;
 -- ORDER BY и BETWEEN по нему бессмысленны.
+-- Состояние ретчета хранится **одним** запечатанным снимком, а не полями.
+-- Причина в том, что счётчик отправки и ключ цепочки обязаны меняться
+-- атомарно: разойдясь на одну запись, они дают повтор пары «ключ, nonce»,
+-- то есть разрушают шифрование кадра целиком. Одна строка — одна транзакция,
+-- и разойтись им негде. Формат снимка — `Session::export` в `ratatosk-crypto`.
 CREATE TABLE sessions (
     session_id      INTEGER PRIMARY KEY NOT NULL,
     peer_ik         BLOB NOT NULL REFERENCES contacts(ik) ON DELETE CASCADE,
     binding         INTEGER NOT NULL,            -- 0 = LAN, 1 = Tor (§5.4)
-    send_chain_enc  BLOB NOT NULL,
-    recv_chain_enc  BLOB NOT NULL,
-    send_counter    INTEGER NOT NULL,
-    recv_counter    INTEGER NOT NULL,
+    state_enc       BLOB NOT NULL,               -- снимок ретчета целиком
     established_ms  INTEGER NOT NULL             -- вход в правило §8.5
 ) STRICT;
 CREATE INDEX sessions_by_peer ON sessions(peer_ik);
 
 -- Кэш пропущенных ключей (§8.4): 2000 на сессию, 200 000 на устройство, TTL 30 суток.
+--
+-- Пока **не заполняется**: пропущенные ключи входят в снимок сессии выше.
+-- Для локальной сети этого достаточно — перестановки там редки, и снимок
+-- невелик. Отдельная таблица понадобится с приходом почты (этап 3): там
+-- перестановки — штатный режим, кэш дорастает до предела §8.4, и переписывать
+-- его целиком на каждое сообщение станет заметно дорого.
+
 CREATE TABLE skipped_keys (
     session_id      INTEGER NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     counter         INTEGER NOT NULL,
@@ -234,7 +243,7 @@ mod tests {
     fn encrypted_columns_are_marked() {
         // Правило именования: столбец с шифротекстом обязан кончаться на _enc.
         // Тест грубый, но он ловит забытый столбец на ревью, а не в проде.
-        for sensitive in ["send_chain", "recv_chain", "key", "body", "file_key", "chain", "data"] {
+        for sensitive in ["state", "key", "body", "file_key", "chain", "data"] {
             let marked = format!("{sensitive}_enc");
             assert!(MIGRATION_0001.contains(&marked), "нет зашифрованного столбца {marked}");
         }

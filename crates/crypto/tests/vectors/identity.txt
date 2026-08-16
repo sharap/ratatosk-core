@@ -1,0 +1,12 @@
+# Тест-векторы Ratatosk v0.1 — идентичность (§3)
+#
+# СГЕНЕРИРОВАНО tools/gen_vectors.py НЕЗАВИСИМОЙ РЕАЛИЗАЦИЕЙ.
+# Править руками нельзя. Изменение строки в диффе = изменение протокола.
+#
+# Формат: поля разделены ' | ', строки с '#' — комментарии.
+# seed_hex | ik_секрет_hex | sk_секрет_hex | ik_публичный_hex | sk_публичный_hex | отпечаток
+
+# §3: seed → IK, SK, отпечаток
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f | c3549f1a6d884f231b1d6879076824ddaad993d79ad14c137c734ce15dd84e65 | 60cba6993f88a0f225a339c86bc0ebe58f4075380f24f8102d5461c6819b1386 | 42e3ee9a435fcc59d34924f4f9ed04a2f5044a463127f7a6403c17e6fbc36c41 | 3d58006e57c24ec74df1c413da371ee1725b8e66241cb8cbb62b4b497189298a | MNTN-92NH-2D9A-2N3X-DP4H-ADG6
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | c37009c41fb4a7fc480c10961379e1ca8f50eff906851051ab4da0e6614047d9 | 027122caab9e4429d5c71a7d0d352aaad98949acc161d44f8e70fc7da15f4d8c | 37f081daf56e32c9ef61c32cc0c1925dd96b3e99227c43b3aa5a0d8a8f5e7879 | c94bbdb6843b77b4e861d61bc69c8dc5fd51a6eff4067c77eb8518986e89dc0e | PKWP-7EZ1-YEEK-VWWF-F44H-ST50
+ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff | 970b72f0b6efb0438a374fd29132b2783ae31489c8d02c793a6211df4d10498d | b69cad1850e9eeb2789d47cac79c819e273a5e95587847bc1bc897e7efc02ba1 | f82d8a04d4c8b73114ad98a994ad4ed0a23e3db0de21036428ce73e606ca7a0b | 3e1509afda086337d4285c1d2f66ae0815f2be26472353726c660a77c04173f0 | X9WS-2XKD-74YE-0KR5-FWY7-AMH8

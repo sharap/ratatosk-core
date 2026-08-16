@@ -19,6 +19,8 @@ ratatosk-crypto.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 data-encoding.workspace = true
+# Имя экземпляра mDNS — случайное и своё у каждого запуска (§5.1).
+rand_core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

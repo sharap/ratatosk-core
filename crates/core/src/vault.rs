@@ -49,9 +49,8 @@ pub fn open_encrypted(
 
     let db_key = match pin {
         Some(pin) => {
-            let salt = read_or_create(&mut probe, META_DB_SALT, || {
-                storage_key::generate_salt().to_vec()
-            })?;
+            let salt =
+                read_or_create(&mut probe, META_DB_SALT, || storage_key::generate_salt().to_vec())?;
             let salt: [u8; storage_key::SALT_LEN] = salt
                 .as_slice()
                 .try_into()
@@ -75,10 +74,7 @@ pub fn open_encrypted(
 }
 
 /// Открывает базу готовым ключом — тем, что пришёл из хранилища ключей ОС.
-pub fn open_with_key(
-    path: &Path,
-    db_key: Zeroizing<[u8; 32]>,
-) -> Result<SqliteStore, EngineError> {
+pub fn open_with_key(path: &Path, db_key: Zeroizing<[u8; 32]>) -> Result<SqliteStore, EngineError> {
     let mut store = SqliteStore::open(path, db_key)?;
     store.migrate()?;
     Ok(store)
@@ -101,16 +97,11 @@ fn read_or_create<S: Store>(
 ///
 /// Второй запуск с тем же `db_key` обязан вернуть **ту же** личность: на
 /// этом держится всё остальное, потому что контакты знают устройство по `IK`.
-pub fn load_or_create<S: Store>(
-    store: &mut S,
-    db_key: &[u8; 32],
-) -> Result<Identity, EngineError> {
+pub fn load_or_create<S: Store>(store: &mut S, db_key: &[u8; 32]) -> Result<Identity, EngineError> {
     if let Some(sealed) = store.meta(META_IDENTITY_SEED)? {
         let seed = storage_key::open_field(db_key, SEED_AAD, &sealed)?;
-        let seed: [u8; SEED_LEN] = seed
-            .as_slice()
-            .try_into()
-            .map_err(|_| ratatosk_crypto::CryptoError::BadKeyMaterial)?;
+        let seed: [u8; SEED_LEN] =
+            seed.as_slice().try_into().map_err(|_| ratatosk_crypto::CryptoError::BadKeyMaterial)?;
         return Ok(Identity::from_seed(seed));
     }
 

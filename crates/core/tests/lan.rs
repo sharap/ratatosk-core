@@ -130,9 +130,9 @@ async fn await_text(node: &mut Node) -> String {
             let messages = node.handle.messages(chat, 50).await.expect("драйвер жив");
             let found = messages
                 .iter()
-                .find(|m| m.msg_id == msg_id)
+                .find(|v| v.message.msg_id == msg_id)
                 .expect("событие ссылается на сообщение, которого нет в хранилище");
-            return String::from_utf8(found.body.clone()).expect("текст в UTF-8");
+            return String::from_utf8(found.message.body.clone()).expect("текст в UTF-8");
         }
         panic!("драйвер остановился, не доставив сообщение");
     })
@@ -211,7 +211,7 @@ fn silent_listener() -> u16 {
 }
 
 #[tokio::test]
-async fn a_peer_that_accepts_but_stays_silent_is_reported_undeliverable() {
+async fn a_peer_that_accepts_but_stays_silent_leaves_the_message_waiting() {
     // Тот самый случай, который выглядел как «ошибка не появляется»: узел
     // ушёл, но сокет на его адресе ещё жив (или это чужой процесс на том же
     // порту). Запись в такой сокет ядро операционной системы принимает
@@ -247,7 +247,7 @@ async fn a_peer_that_accepts_but_stays_silent_is_reported_undeliverable() {
             .await
             .expect("драйвер жив");
 
-        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Undeliverable).await;
+        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Waiting).await;
     };
 
     tokio::select! {
@@ -257,7 +257,7 @@ async fn a_peer_that_accepts_but_stays_silent_is_reported_undeliverable() {
 }
 
 #[tokio::test]
-async fn a_peer_that_never_answers_is_reported_undeliverable() {
+async fn a_peer_that_never_answers_leaves_the_message_waiting() {
     // Собеседник, которого нет: §14 требует показать пользователю, что
     // сообщение не ушло, а не потерять его молча. Адрес указывает в порт,
     // который никто не слушает.
@@ -292,11 +292,13 @@ async fn a_peer_that_never_answers_is_reported_undeliverable() {
             .await
             .expect("драйвер жив");
 
-        // §14: сообщение без единого доступного транспорта обязано быть
-        // помечено, а не потеряно. Ждём именно `Undeliverable`, а не «первый
-        // попавшийся статус»: первым мог бы прийти `Sent` от страховочного
-        // таймера, и тест бы прошёл, ничего не проверив.
-        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Undeliverable).await;
+        // §14: сообщение, которое не ушло, обязано быть помечено, а не
+        // потеряно. Метка — `Waiting`: собеседника нет в сети, но локальная
+        // сеть включена, и он может появиться; сообщение ждёт этого на диске.
+        // Ждём именно этот статус, а не «первый попавшийся»: первым мог бы
+        // прийти `Sent` от страховочного таймера, и тест бы прошёл, ничего
+        // не проверив.
+        await_status(&mut alice, ratatosk_proto::DeliveryStatus::Waiting).await;
     };
 
     tokio::select! {

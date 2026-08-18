@@ -103,8 +103,23 @@ pub enum DeliveryStatus {
     /// быть видно пользователю. Молчаливое исчезновение — ровно та
     /// нечестность, которую запрещает §14.
     Undeliverable,
-    /// Ждёт отправки.
+    /// Ждёт отправки: попытка идёт прямо сейчас.
     Pending,
+    /// Собеседника нет в сети. Отправится само, когда он появится.
+    ///
+    /// Не «ошибка» и не «отправлено» — третье. Пока работает только локальная
+    /// сеть (§5.1), а onion и почты ещё нет, «собеседник офлайн» — самый частый
+    /// исход отправки, и показывать его восклицательным знаком значит пугать
+    /// человека тем, что вообще-то в порядке вещей.
+    ///
+    /// **Это обещание, и потому оно чего-то стоит.** Статус утверждает, что
+    /// ядро само вернётся к сообщению, когда собеседник объявится, — значит
+    /// очередь обязана переживать перезапуск, иначе на экране остаётся обещание
+    /// без исполнителя, то есть ровно та нечестность, которую запрещает §14.
+    ///
+    /// Когда заработает почта (§5.3), этот статус станет редким: письмо уедет
+    /// и офлайновому собеседнику, а сообщение сразу получит [`Self::Sent`].
+    Waiting,
     /// Отправлено. Дальше этого статуса почтовая доставка не уходит.
     Sent,
     /// Доставлено. Возможно только для прямого канала.
@@ -125,6 +140,7 @@ impl DeliveryStatus {
         match self {
             DeliveryStatus::Undeliverable => 0,
             DeliveryStatus::Pending => 10,
+            DeliveryStatus::Waiting => 15,
             DeliveryStatus::Sent => 20,
             DeliveryStatus::Delivered => 30,
             DeliveryStatus::Read => 40,
@@ -137,6 +153,7 @@ impl DeliveryStatus {
         match code {
             0 => Some(DeliveryStatus::Undeliverable),
             10 => Some(DeliveryStatus::Pending),
+            15 => Some(DeliveryStatus::Waiting),
             20 => Some(DeliveryStatus::Sent),
             30 => Some(DeliveryStatus::Delivered),
             40 => Some(DeliveryStatus::Read),
@@ -179,8 +196,11 @@ pub const fn max_status(transport: Transport) -> DeliveryStatus {
 ///
 /// Поэтому:
 ///
-/// * `Undeliverable` перекрывает **только** `Pending` — подтверждённый успех
-///   он не отменяет: сообщение могло дойти копией по другому транспорту (§9.2);
+/// * `Undeliverable` перекрывает то, что **успехом ещё не стало** — `Pending`
+///   и `Waiting`. Подтверждённый успех он не отменяет: сообщение могло дойти
+///   копией по другому транспорту (§9.2). Перекрывать `Waiting` необходимо:
+///   очередь ожидания не бесконечна, и когда сообщение из неё вытеснено или
+///   контакт удалён, обещание «отправим позже» приходится снять;
 /// * всё остальное — только вверх.
 #[must_use]
 pub fn advance(current: Option<DeliveryStatus>, target: DeliveryStatus) -> Option<DeliveryStatus> {
@@ -192,7 +212,7 @@ pub fn advance(current: Option<DeliveryStatus>, target: DeliveryStatus) -> Optio
     }
     match target {
         DeliveryStatus::Undeliverable => {
-            (current == DeliveryStatus::Pending).then_some(target)
+            matches!(current, DeliveryStatus::Pending | DeliveryStatus::Waiting).then_some(target)
         }
         _ => (target > current).then_some(target),
     }
@@ -277,9 +297,7 @@ mod tests {
     fn a_failure_never_cancels_a_confirmed_success() {
         // Копия могла дойти другим транспортом (§9.2), и её подтверждение
         // сильнее нашего вывода об исчерпании транспортов.
-        for reached in
-            [DeliveryStatus::Sent, DeliveryStatus::Delivered, DeliveryStatus::Read]
-        {
+        for reached in [DeliveryStatus::Sent, DeliveryStatus::Delivered, DeliveryStatus::Read] {
             assert_eq!(advance(Some(reached), DeliveryStatus::Undeliverable), None, "{reached:?}");
         }
     }
@@ -306,21 +324,50 @@ mod tests {
 
     #[test]
     fn status_codes_round_trip_and_keep_their_order() {
-        for status in [
+        let ladder = [
             DeliveryStatus::Undeliverable,
             DeliveryStatus::Pending,
+            DeliveryStatus::Waiting,
             DeliveryStatus::Sent,
             DeliveryStatus::Delivered,
             DeliveryStatus::Read,
-        ] {
+        ];
+        for status in ladder {
             assert_eq!(DeliveryStatus::from_code(status.code()), Some(status));
         }
         // Порядок кодов обязан совпадать с порядком статусов: иначе сравнение
-        // «статус только растёт» в базе и в памяти разойдётся.
-        assert!(DeliveryStatus::Undeliverable.code() < DeliveryStatus::Pending.code());
-        assert!(DeliveryStatus::Sent.code() < DeliveryStatus::Delivered.code());
-        assert!(DeliveryStatus::Delivered.code() < DeliveryStatus::Read.code());
+        // «статус только растёт» в базе и в памяти разойдётся. Проверяется
+        // весь список подряд, а не отдельные пары: новый статус, вставленный
+        // не на своё место, обязан ронять тест, а не ждать, пока кто-то
+        // допишет к нему сравнение.
+        for pair in ladder.windows(2) {
+            assert!(pair[0].code() < pair[1].code(), "{:?} обогнал {:?}", pair[0], pair[1]);
+            assert!(pair[0] < pair[1], "порядок вариантов расходится с порядком кодов");
+        }
         assert_eq!(DeliveryStatus::from_code(7), None);
+    }
+
+    #[test]
+    fn waiting_is_not_a_dead_end() {
+        // «Собеседник офлайн» — не исход, а пауза: из него обязаны быть выходы
+        // и вверх (появился и получил), и в отказ (ждать больше нечего).
+        assert_eq!(
+            advance(Some(DeliveryStatus::Pending), DeliveryStatus::Waiting),
+            Some(DeliveryStatus::Waiting)
+        );
+        assert_eq!(
+            advance(Some(DeliveryStatus::Waiting), DeliveryStatus::Delivered),
+            Some(DeliveryStatus::Delivered)
+        );
+        assert_eq!(
+            advance(Some(DeliveryStatus::Waiting), DeliveryStatus::Undeliverable),
+            Some(DeliveryStatus::Undeliverable),
+            "очередь ожидания не бесконечна — обещание надо уметь снять"
+        );
+        // А назад — нет: сообщение, уже подтверждённое собеседником, не может
+        // снова стать ожидающим.
+        assert_eq!(advance(Some(DeliveryStatus::Delivered), DeliveryStatus::Waiting), None);
+        assert_eq!(advance(Some(DeliveryStatus::Sent), DeliveryStatus::Waiting), None);
     }
 
     #[test]

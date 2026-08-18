@@ -244,12 +244,20 @@ async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDi
                     // всё равно приходится перечитывать.
                     Event::MessageReceived { chat, msg_id } => {
                         if let Some(messages) = handle.messages(*chat, 20).await {
-                            if let Some(m) = messages.iter().find(|m| &m.msg_id == msg_id) {
-                                println!("< {}", String::from_utf8_lossy(&m.body));
+                            if let Some(view) =
+                                messages.iter().find(|v| &v.message.msg_id == msg_id)
+                            {
+                                println!("< {}", String::from_utf8_lossy(&view.message.body));
                             }
                         }
                     }
                     Event::StatusChanged { .. }
+                    | Event::MessagesDeleted { .. }
+                    | Event::MessageEdited { .. }
+                    | Event::ReactionChanged { .. }
+                    | Event::ContactChanged { .. }
+                    | Event::ContactRemoved { .. }
+                    | Event::AvatarChanged { .. }
                     | Event::GroupMembershipChanged { .. }
                     | Event::FileProgress { .. }
                     | Event::HonestNotice { .. } => {}
@@ -405,15 +413,44 @@ fn report(event: &Event) {
         Event::MessageReceived { .. } => {}
         Event::StatusChanged { msg_id, status } => {
             println!("< {} → {status:?}", short(msg_id));
-            if matches!(status, DeliveryStatus::Undeliverable) {
+            match status {
                 // §14: сообщение осталось в истории и не ушло. Пользователю
                 // нужно не «статус», а что с этим делать.
-                println!("    ни один транспорт не подошёл — посмотрите /who");
+                DeliveryStatus::Undeliverable => {
+                    println!("    ни один транспорт не подошёл — посмотрите /who");
+                }
+                DeliveryStatus::Waiting => {
+                    println!("    собеседника нет в сети; уйдёт само, когда появится");
+                }
+                _ => {}
             }
         }
         Event::ContactAdded { fingerprint, verified, .. } => {
             let mark = if *verified { "сверен" } else { "НЕ сверен (§4.2)" };
             println!("< контакт добавлен, отпечаток {fingerprint}, {mark} — можно писать");
+        }
+        Event::MessagesDeleted { msg_ids, .. } => {
+            println!("< удалено сообщений: {}", msg_ids.len());
+        }
+        Event::MessageEdited { msg_id, .. } => {
+            // Прежнего текста нет ни у кого, поэтому сказать о правке стенд
+            // обязан: молчаливая подмена слов — ровно то, что §14 запрещает.
+            println!("< {} изменено — перечитайте чат", short(msg_id));
+        }
+        Event::ReactionChanged { msg_id, author_ik, .. } => {
+            // Саму реакцию событие не несёт: она читается вместе с сообщением.
+            println!("< реакция от {} на {}", short(author_ik), short(msg_id));
+        }
+        Event::ContactChanged { peer_ik } => {
+            println!("< контакт {} изменился — посмотрите /who", short(peer_ik));
+        }
+        Event::ContactRemoved { peer_ik } => {
+            println!("< контакт {} удалён", short(peer_ik));
+        }
+        Event::AvatarChanged { peer_ik } => {
+            // Стенд картинок не рисует — но показать, что кадр дошёл, обязан:
+            // иначе «аватарка не появилась» неотличимо от «не отправилась».
+            println!("< у {} сменилась аватарка", short(peer_ik));
         }
         Event::GroupMembershipChanged { chat } => {
             println!("< состав группы {} изменился", short(chat));

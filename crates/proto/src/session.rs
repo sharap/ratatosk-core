@@ -94,12 +94,49 @@ impl SessionRegistry {
         }
     }
 
-    /// Регистрирует установленную сессию.
-    pub fn insert(&mut self, session: Session, binding: SessionBinding) {
+    /// Регистрирует установленную сессию, **вытесняя прежнюю** с тем же
+    /// контактом в том же семействе транспортов.
+    ///
+    /// Возвращает идентификаторы вытесненных: вызывающий обязан убрать их
+    /// и с диска, иначе они вернутся после перезапуска.
+    ///
+    /// Вытеснение — не уборка мусора, а исправление настоящей поломки.
+    /// Разговор 1:1 в одном семействе транспортов — это ровно одна сессия;
+    /// накапливая их, реестр отдаёт по `for_peer` самую свежую **у себя**,
+    /// а собеседник — самую свежую **у него**, и после любого расхождения
+    /// (перерукопожатие, потеря сессии одной стороной) выборы перестают
+    /// совпадать. Кадры при этом уходят в сессию, которой у другой стороны
+    /// нет: она их молча отбрасывает (§7.3), квитанции не приходит, и
+    /// отправитель до конца дней объявляет «не доставлено» — при живой связи
+    /// и «онлайн» в интерфейсе.
+    ///
+    /// Второй, менее заметный итог накопления: ключевой материал старых
+    /// сессий продолжал лежать в памяти и на диске без всякой пользы.
+    pub fn insert(&mut self, session: Session, binding: SessionBinding) -> Vec<u64> {
         let id = session.session_id;
         let peer = session.peer_ik;
+
+        let superseded: Vec<u64> = self
+            .by_peer
+            .get(&peer)
+            .map(|ids| {
+                ids.iter()
+                    .filter(|old| **old != id)
+                    .filter(|old| self.by_id.get(old).is_some_and(|bound| bound.binding == binding))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for old in &superseded {
+            self.remove(*old);
+        }
+
         self.by_id.insert(id, BoundSession { session, binding });
-        self.by_peer.entry(peer).or_default().push(id);
+        let ids = self.by_peer.entry(peer).or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        superseded
     }
 
     /// Сессия по идентификатору.
@@ -167,6 +204,45 @@ mod tests {
 
     fn session(peer: u8, transcript: &[u8]) -> Session {
         Session::derive(Role::Initiator, [peer; 32], transcript, b"out", 0)
+    }
+
+    #[test]
+    fn a_new_session_supersedes_the_old_one_with_the_same_peer() {
+        // Разговор 1:1 в одном семействе транспортов — ровно одна сессия.
+        // Накапливая их, реестр отдавал бы по `for_peer` самую свежую у себя,
+        // а собеседник — самую свежую у него, и после любого расхождения
+        // выборы перестали бы совпадать: кадры уходят в сессию, которой
+        // у другой стороны нет.
+        let mut r = SessionRegistry::new();
+        let first = session(1, "первое рукопожатие".as_bytes());
+        let second = session(1, "второе рукопожатие".as_bytes());
+        let (old_id, new_id) = (first.session_id, second.session_id);
+        assert_ne!(old_id, new_id);
+
+        assert!(r.insert(first, SessionBinding::Lan).is_empty(), "вытеснять пока нечего");
+        let superseded = r.insert(second, SessionBinding::Lan);
+
+        assert_eq!(superseded, vec![old_id], "прежнюю надо не только забыть, но и назвать");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.route(old_id), Route::Unknown);
+        assert_eq!(r.for_peer(&[1u8; 32], Transport::Lan), Some(new_id));
+    }
+
+    #[test]
+    fn sessions_of_different_families_coexist() {
+        // Вытесняется только своё семейство: §5.4 держит LAN и Tor раздельно,
+        // и сессия в локальной сети не имеет отношения к сессии поверх onion.
+        let mut r = SessionRegistry::new();
+        let lan = session(1, b"lan");
+        let tor = session(1, b"tor");
+        let (lan_id, tor_id) = (lan.session_id, tor.session_id);
+
+        r.insert(lan, SessionBinding::Lan);
+        assert!(r.insert(tor, SessionBinding::Tor).is_empty(), "чужое семейство не трогаем");
+
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.for_peer(&[1u8; 32], Transport::Lan), Some(lan_id));
+        assert_eq!(r.for_peer(&[1u8; 32], Transport::Onion), Some(tor_id));
     }
 
     #[test]

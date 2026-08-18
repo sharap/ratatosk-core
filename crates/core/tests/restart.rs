@@ -169,6 +169,9 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
                 body: b"chitay".to_vec(),
                 received_ms: 1_500,
                 status: None,
+                edited_ms: None,
+                forwarded: false,
+                reply_to: None,
             })
             .unwrap();
         engine.restore().unwrap();
@@ -274,13 +277,19 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
 }
 
 #[test]
-fn losing_a_lan_link_removes_the_session_from_disk_too() {
-    // §5.4: сессия, начатая в LAN, при разрыве закрывается, а не переводится
-    // на другой транспорт. Пережившая перезапуск, она указывала бы
-    // на собеседника, с которым связь давно оборвана.
+fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
+    // Раньше здесь проверялось обратное: разрыв LAN закрывал сессию. Читалось
+    // это как §5.4, но §5.4 запрещает **переносить** сессию в чужое семейство
+    // транспортов, а не переживать разрыв сокета. Ошибка стоила дорого: сессия
+    // умирала у одной стороны и оставалась у другой, та отправляла кадры
+    // в никуда и видела «не доставлено» при живой связи. Лечилось только
+    // удалением контакта.
+    //
+    // Закрывает сессию теперь одно: кадр ушёл, а квитанции в срок нет.
     let db = TempDb::new("lanloss");
     let db_key = Zeroizing::new([5u8; 32]);
     let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
 
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
@@ -304,9 +313,27 @@ fn losing_a_lan_link_removes_the_session_from_disk_too() {
     engine.restore().unwrap();
     assert_eq!(engine.session_count(), 1);
 
+    // Разрыв соединения — событие сокета. Сессия остаётся.
     engine.step(2_000, Input::ConnectionLost { peer_ik, via: Transport::Lan }).unwrap();
+    assert_eq!(engine.session_count(), 1, "разрыв сокета не закрывает сессию");
+    assert_eq!(engine.store().sessions().unwrap().len(), 1, "и с диска не убирает");
 
-    assert_eq!(engine.session_count(), 0, "сессия закрыта в памяти");
+    // А вот молчание в ответ на ушедший кадр — закрывает.
+    engine.step(3_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine.step(3_000, Input::SeenOnLan { peer_ik }).unwrap();
+    let effects = engine
+        .step(3_100, Input::Command(Command::SendText { chat, text: "есть кто?".to_owned() }))
+        .unwrap();
+    let token = effects
+        .iter()
+        .find_map(|e| match e {
+            ratatosk_core::Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("прямой канал заводит срок ожидания квитанции");
+
+    engine.step(9_000, Input::Timer { token }).unwrap();
+    assert_eq!(engine.session_count(), 0, "несогласованная сессия закрыта в памяти");
     assert!(engine.store().sessions().unwrap().is_empty(), "и на диске тоже");
 }
 
@@ -403,4 +430,105 @@ fn a_message_sent_with_nowhere_to_go_is_still_kept() {
 
     let store = db.open(&db_key);
     assert_eq!(store.messages(&chat, 10, None).unwrap().len(), 1);
+}
+
+#[test]
+fn a_waiting_message_still_waits_after_a_restart() {
+    // Статус «отправим, когда появится» — обещание, и оно чего-то стоит только
+    // если переживает перезапуск. В памяти оно не переживало бы убитый процесс,
+    // а на Android процесс убивают постоянно: человек видел бы «ждём»
+    // у сообщения, к которому никто уже не вернётся. Ровно та нечестность,
+    // которую запрещает §14.
+    let db = TempDb::new("waiting");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
+
+    let msg_id = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .unwrap();
+        // LAN включён, но собеседника никто не видел: отправлять некуда.
+        engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+
+        let effects = engine
+            .step(2_000, Input::Command(Command::SendText { chat, text: "подожду".to_owned() }))
+            .unwrap();
+        let token = effects
+            .iter()
+            .find_map(|e| match e {
+                ratatosk_core::Effect::SetTimer { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("срок обнаружения");
+        engine.step(6_000, Input::Timer { token }).unwrap();
+
+        let stored = engine.store().messages(&chat, 10, None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].status.and_then(ratatosk_proto::DeliveryStatus::from_code),
+            Some(ratatosk_proto::DeliveryStatus::Waiting),
+            "сообщение ждёт, а не потеряно"
+        );
+        assert_eq!(engine.store().outbox().unwrap().len(), 1, "очередь легла на диск");
+        stored[0].msg_id
+    };
+
+    // Перезапуск: очередь поднимается, и первое же включение LAN приводит её
+    // в движение — сообщение уходит, как только собеседник находится.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+    assert_eq!(engine.store().outbox().unwrap().len(), 1, "очередь на месте");
+
+    engine.step(10_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    let effects = engine.step(11_000, Input::SeenOnLan { peer_ik }).unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, ratatosk_core::Effect::Send { .. })),
+        "обещание, пережившее перезапуск, обязано исполниться: {effects:?}"
+    );
+
+    // И статус сообщения при этом тот же — ждало, не пропало.
+    let stored = engine.store().messages(&chat, 10, None).unwrap();
+    assert_eq!(stored[0].msg_id, msg_id);
+}
+
+#[test]
+fn a_waiting_message_for_a_deleted_contact_stops_waiting() {
+    // Обещание надо уметь снимать: контакта больше нет, ехать некому,
+    // и «ждём, когда появится» превратилось бы в ожидание без конца.
+    let db = TempDb::new("waiting-gone");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    engine
+        .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+        .unwrap();
+    engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+
+    let effects = engine
+        .step(2_000, Input::Command(Command::SendText { chat, text: "подожду".to_owned() }))
+        .unwrap();
+    let token = effects
+        .iter()
+        .find_map(|e| match e {
+            ratatosk_core::Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("срок обнаружения");
+    engine.step(6_000, Input::Timer { token }).unwrap();
+    assert_eq!(engine.store().outbox().unwrap().len(), 1);
+
+    engine
+        .step(7_000, Input::Command(Command::DeleteContact { peer_ik, purge_history: false }))
+        .unwrap();
+    assert!(engine.store().outbox().unwrap().is_empty(), "ждать больше нечего и некого");
 }

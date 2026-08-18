@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ratatosk_codec::ContactCard;
-use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
+use ratatosk_core::driver::{Driver, DriverHandle, EventStream, MessageView};
 use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::SqliteStore;
@@ -78,8 +78,24 @@ pub enum FfiDeliveryStatus {
     /// и не уйдёт, показанное как ожидающее, — обещание, которого протокол
     /// не даёт, то есть ровно то, что §14 запрещает.
     Undeliverable,
-    /// Ждёт отправки.
+    /// Ждёт отправки: попытка идёт прямо сейчас.
     Pending,
+    /// Собеседника нет в сети. Отправится само, когда он появится.
+    ///
+    /// **Не ошибка.** Пока работает только локальная сеть (§5.1), а onion
+    /// и почты ещё нет, «собеседник офлайн» — самый частый исход отправки,
+    /// и рисовать его восклицательным знаком значит пугать человека тем,
+    /// что вообще-то в порядке вещей. Показывать стоит спокойно: часы,
+    /// «ждёт сети», бледная отметка.
+    ///
+    /// Обещание за этим статусом настоящее: очередь лежит на диске и
+    /// переживает перезапуск. Ядро вернётся к сообщению, когда включится
+    /// локальная сеть, сменится сеть или собеседник объявится в эфире.
+    ///
+    /// Чего он **не** обещает: что это случится, пока приложение не работает.
+    /// Отправляет ядро, а не система; убитый процесс ничего не отправляет,
+    /// пока его не запустят. Текст для человека — [`waiting_notice`].
+    Waiting,
     /// Отправлено.
     Sent,
     /// Доставлено. Только прямой канал.
@@ -107,11 +123,63 @@ pub enum FfiEvent {
     },
     /// Добавлен контакт.
     ContactAdded {
+        /// Чей — им адресуются команды.
+        peer_ik: Vec<u8>,
         /// Отпечаток для показа (§3).
         fingerprint: String,
         /// Сверен ли отпечаток. Пока нет — UI обязан пометить контакт
         /// непроверенным (§4.2).
         verified: bool,
+    },
+    /// Сообщения исчезли: удалены у себя или отозваны собеседником.
+    MessagesDeleted {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Какие сообщения.
+        msg_ids: Vec<Vec<u8>>,
+    },
+    /// Сообщение изменилось: автор его поправил.
+    ///
+    /// Прежнего текста нет ни у кого. Клиент перечитывает сообщение и обязан
+    /// показать отметку [`FfiMessage::edited_at_ms`]: подмена текста без
+    /// отметки — молчаливая подмена, а §14 это запрещает.
+    MessageEdited {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Какое сообщение.
+        msg_id: Vec<u8>,
+    },
+    /// Реакция появилась, сменилась или исчезла.
+    ///
+    /// Сама реакция событием не едет: она читается вместе с сообщением
+    /// ([`FfiMessage::reactions`]), и второй источник того же сведения
+    /// однажды разошёлся бы с первым.
+    ReactionChanged {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// На каком сообщении.
+        msg_id: Vec<u8>,
+        /// Чья реакция. Своя — собственный `IK`.
+        author_ik: Vec<u8>,
+    },
+    /// Контакт изменился: сверка, локальное имя.
+    ContactChanged {
+        /// Чей.
+        peer_ik: Vec<u8>,
+    },
+    /// Контакт удалён.
+    ContactRemoved {
+        /// Чей.
+        peer_ik: Vec<u8>,
+    },
+    /// У контакта появилась, сменилась или исчезла аватарка.
+    ///
+    /// Байты событием не едут: они большие, а событие может ждать в очереди.
+    /// Клиент забирает их через [`RatatoskClient::avatar_of`], когда дойдёт
+    /// до отрисовки, и обновляет свой кэш по этому событию.
+    AvatarChanged {
+        /// Чья.
+        peer_ik: Vec<u8>,
     },
     /// Изменился состав группы.
     GroupMembershipChanged {
@@ -137,10 +205,23 @@ pub struct FfiContact {
     /// Имя из карточки. **Не доверенное** (§4.1): его задаёт собеседник,
     /// и UI обязан показывать его как подпись, а не как удостоверение.
     pub display_name: String,
+    /// Как контакт подписал у себя пользователь, если подписал.
+    ///
+    /// Показывать надо его, когда оно есть: это единственное имя, которому
+    /// в списке контактов можно верить, потому что его написал сам человек.
+    /// По проводу оно не едет никогда, и собеседник о нём не знает.
+    pub local_name: Option<String>,
     /// Сверен ли отпечаток голосом (§4.2).
     pub verified: bool,
     /// Виден ли контакт в локальной сети прямо сейчас (§5.1).
     pub seen_on_lan: bool,
+    /// Есть ли аватарка, которую **можно показать**.
+    ///
+    /// Учитывает §4.2: у несверенного контакта картинка может лежать
+    /// в хранилище, но здесь всё равно `false`. Само изображение —
+    /// [`RatatoskClient::avatar_of`]; здесь только признак, чтобы список
+    /// чатов не тянул по тридцать килобайт на строку.
+    pub has_avatar: bool,
 }
 
 /// Сообщение в том виде, в каком его показывает UI.
@@ -166,6 +247,44 @@ pub struct FfiMessage {
     /// отправки, а принятое уже здесь. Рисовать у чужого сообщения галочку
     /// значит показать пользователю то, чего протокол не утверждает.
     pub status: Option<FfiDeliveryStatus>,
+    /// Когда сообщение правили. `None` — не правили.
+    ///
+    /// Показывать отметку **обязательно**: прежнего текста нет ни у кого,
+    /// и без отметки подмена слов в истории выглядела бы так, будто их такими
+    /// и написали. §14 это запрещает.
+    pub edited_at_ms: Option<u64>,
+    /// Переслано из другого разговора.
+    ///
+    /// Пометку показывать обязательно, а имени автора здесь нет намеренно:
+    /// при пересылке подпись не сохраняется, и «переслано от N» было бы
+    /// утверждением, которое никто не может проверить.
+    pub forwarded: bool,
+    /// Реакции на сообщение — по одной от человека.
+    pub reactions: Vec<FfiReaction>,
+    /// Сообщение, на которое это отвечает. `None` — ответом не является.
+    ///
+    /// Едет **ссылка**, а не отрывок цитаты: цитату клиент берёт из своей
+    /// копии — [`RatatoskClient::message`], если её нет в загруженном окне.
+    /// Подделать её поэтому нельзя.
+    ///
+    /// Ссылка **мягкая**: сообщения с таким `msg_id` может не быть — удалено,
+    /// не дошло, вычищено уборкой. Тогда клиент обязан сказать «сообщение
+    /// недоступно», а не придумывать текст и не прятать сам ответ.
+    pub reply_to: Option<Vec<u8>>,
+}
+
+/// Реакция на сообщение в том виде, в каком её показывает UI.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiReaction {
+    /// Эмодзи.
+    pub emoji: String,
+    /// Чья — им адресуется команда снятия.
+    pub author_ik: Vec<u8>,
+    /// Своя ли.
+    ///
+    /// Считается здесь, а не в клиенте: сравнение с собственным `IK` —
+    /// протокольное знание, и §13.3 не разрешает ему подниматься выше.
+    pub mine: bool,
 }
 
 /// Подписка UI на события ядра.
@@ -311,9 +430,121 @@ impl RatatoskClient {
         self.command(Command::MarkVerified { peer_ik: to_ik(&peer_ik)? })
     }
 
+    /// Отзывает сверку отпечатка (§4.2).
+    ///
+    /// Контакт снова считается непроверенным: UI обязан пометить его так же,
+    /// как контакт, добавленный по ссылке. Аватарка с этого момента ему
+    /// не отправляется и его не показывается — оба конца правила читают
+    /// один и тот же признак.
+    ///
+    /// **Собеседник об этом не узнает.** Отзыв — решение пользователя о том,
+    /// кому он доверяет, а не сообщение о человеке. Перед вызовом клиент
+    /// обязан показать [`revocation_notice`].
+    pub fn revoke_verification(&self, peer_ik: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::RevokeVerification { peer_ik: to_ik(&peer_ik)? })
+    }
+
+    /// Подписывает контакт своим именем — или снимает подпись (`None`).
+    ///
+    /// Имя **локальное**: по проводу не едет никогда и собеседнику неизвестно.
+    /// Имя из карточки задаёт он сам, и §4.1 прямо называет его не доверенным;
+    /// это — своя пометка. Отправить её значило бы и сообщить человеку, как
+    /// его записали, и завести поле, которое он может подделать.
+    ///
+    /// Пустая строка равносильна `None`: человек, стёрший имя в поле ввода,
+    /// имел в виду именно это. Предел длины — [`max_local_name_chars`].
+    pub fn set_local_name(
+        &self,
+        peer_ik: Vec<u8>,
+        name: Option<String>,
+    ) -> Result<(), RatatoskError> {
+        let peer_ik = to_ik(&peer_ik)?;
+        // Как и с аватаркой: проверка здесь, чтобы отказ пришёл сейчас,
+        // а не потерялся в очереди команд. Правило одно, вызывается дважды.
+        if let Some(name) = &name {
+            let trimmed = name.trim();
+            if trimmed.chars().count() > ratatosk_core::MAX_LOCAL_NAME_CHARS {
+                return Err(RatatoskError::internal("локальное имя слишком длинное"));
+            }
+        }
+        self.command(Command::SetLocalName { peer_ik, name })
+    }
+
+    /// Удаляет контакт.
+    ///
+    /// Личность уходит всегда: карточка, отметка о сверке (§4.2), аватарка,
+    /// сессия вместе с ключевым материалом (§8.3) и всё, что стояло в очереди
+    /// этому человеку. `purge_history` решает судьбу переписки — ядро не
+    /// выбрасывает её само и не оставляет само.
+    ///
+    /// **Это не блокировка, и обещать её нельзя.** Собеседник может написать
+    /// снова: его рукопожатие (§8.2) заведёт контакт заново — уже
+    /// непроверенным, но заведёт. Перед вызовом клиент обязан показать
+    /// [`deletion_notice`].
+    pub fn delete_contact(
+        &self,
+        peer_ik: Vec<u8>,
+        purge_history: bool,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::DeleteContact { peer_ik: to_ik(&peer_ik)?, purge_history })
+    }
+
     /// Отправляет текст.
     pub fn send_text(&self, chat_id: Vec<u8>, text: String) -> Result<(), RatatoskError> {
         self.command(Command::SendText { chat: to_chat(&chat_id)?, text })
+    }
+
+    /// Ставит или снимает свою аватарку.
+    ///
+    /// `None` — снять. Байты — готовое изображение: PNG, JPEG или WebP,
+    /// не больше [`max_avatar_bytes`]. Масштабирует и перекодирует **клиент**:
+    /// декодер изображений — большая поверхность атаки, и в процессе,
+    /// который держит ключи, ему делать нечего. Ядро проверяет ровно две
+    /// вещи — длину и сигнатуру формата.
+    ///
+    /// Аватарка уходит **только сверенным контактам** (§4.2) и только прямым
+    /// каналом: почта её не повезёт. Несверенные не получат ничего и не
+    /// узнают, что она есть.
+    ///
+    /// Отдать её тому, чей отпечаток не сверен, значило бы отдать своё лицо
+    /// тому, кто, может быть, не тот, за кого себя выдаёт, — а §4.2 ровно
+    /// про эту возможность.
+    pub fn set_avatar(&self, bytes: Option<Vec<u8>>) -> Result<(), RatatoskError> {
+        let bytes = bytes.unwrap_or_default();
+        // Проверка **здесь**, а не только в ядре, и это не нарушение §13.3:
+        // решения на границе не принимается, зовётся та же самая функция,
+        // что и внутри. Разница в моменте. Команды уходят в ядро без ответа,
+        // поэтому отказ, случившийся там, вернулся бы клиенту никогда — а он
+        // нужен сейчас, пока у пользователя ещё открыт выбор файла и слова
+        // «слишком большая» ему что-то говорят.
+        ratatosk_proto::avatar::check(&bytes)
+            .map_err(|e| RatatoskError::Internal { reason: e.to_string() })?;
+        self.command(Command::SetAvatar(bytes))
+    }
+
+    /// Своя аватарка, если она поставлена.
+    pub fn my_avatar(&self) -> Result<Option<Vec<u8>>, RatatoskError> {
+        self.opened
+            .handle
+            .avatar_blocking(None)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
+    /// Аватарка контакта.
+    ///
+    /// `None` означает «показывать нечего»: её нет **или контакт не сверен**.
+    /// Различать эти два случая клиенту не нужно, а §4.2 в обоих требует
+    /// одного и того же — заглушку.
+    ///
+    /// Правило показа живёт в ядре, а не здесь: §13.3 не разрешает
+    /// протокольной логике подниматься выше этой границы. Клиент, который
+    /// решил бы показать лицо несверенного, не смог бы — байтов не отдадут.
+    pub fn avatar_of(&self, peer_ik: Vec<u8>) -> Result<Option<Vec<u8>>, RatatoskError> {
+        let peer_ik = to_ik(&peer_ik)?;
+        self.opened
+            .handle
+            .avatar_blocking(Some(peer_ik))
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
     }
 
     /// Включает или выключает LAN (§5.1).
@@ -321,6 +552,166 @@ impl RatatoskClient {
     /// Перед включением клиент обязан показать [`lan_warning`].
     pub fn set_lan_enabled(&self, enabled: bool) -> Result<(), RatatoskError> {
         self.command(Command::SetLanEnabled(enabled))
+    }
+
+    /// Удаляет сообщения **у себя**.
+    ///
+    /// Тихо и без трафика: собеседник не узнает. Работает и над своими,
+    /// и над чужими сообщениями — это своя история.
+    ///
+    /// Тело стирается сразу; в базе остаётся только идентификатор, чтобы
+    /// копия, пришедшая позже другим транспортом, не воскресила удалённое.
+    /// Через девяносто суток уходит и он (§12).
+    pub fn delete_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::DeleteMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Удаляет у себя и **просит** собеседника удалить у себя.
+    ///
+    /// Именно просит. Мы не знаем и не можем узнать, работает ли у него наш
+    /// клиент или его переделка, не снят ли уже скриншот, не открыт ли чат
+    /// на втором устройстве. Перед вызовом клиент **обязан** показать
+    /// [`retraction_notice`], и формулировка «удалить у обоих» на кнопке
+    /// была бы обещанием, которого протокол не даёт (§14).
+    ///
+    /// Просьба уходит только про **свои** сообщения; чужие из списка просто
+    /// удаляются у себя. Отзыв едет обычной очередью доставки (§5.4), а не
+    /// отдельным быстрым каналом: собеседник, который был офлайн, получит
+    /// его позже — иначе всё это не имело бы смысла.
+    pub fn retract_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::RetractMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Отвечает на сообщение — с цитатой, которую нельзя подделать.
+    ///
+    /// По проводу едет **ссылка** (`msg_id`), а не отрывок текста: цитату
+    /// каждая сторона рисует из своей копии. Поэтому в цитате не может
+    /// оказаться слов, которых собеседник не говорил, — и поэтому же, если
+    /// исходного сообщения у него нет, показать цитату будет нечем.
+    ///
+    /// Отвечать можно на любое сообщение этого чата, и на своё тоже.
+    ///
+    /// **Что проверяется здесь, а что в ядре.** Пустой текст отвергается
+    /// сразу — это чистая проверка аргумента, и человеку она нужна сейчас,
+    /// пока у него открыто поле ввода. А вот «такого сообщения в этом чате
+    /// нет» знает только ядро, и ответ на этот отказ вернуться не может:
+    /// команды уходят без результата. Наружу это выглядит как ответ, который
+    /// не появился в чате, — редкий случай (клиент отвечает на то, что сам же
+    /// и показал), но обещать здесь ошибку было бы неправдой.
+    ///
+    /// Как показать цитату: `reply_to` у ответа — идентификатор; сообщение
+    /// по нему берётся из уже загруженного окна, а если его там нет —
+    /// [`RatatoskClient::message`]. Чтобы **пролистать** к нему, нужен
+    /// [`RatatoskClient::messages_before`].
+    pub fn reply(
+        &self,
+        chat_id: Vec<u8>,
+        reply_to: Vec<u8>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        let reply_to = to_msg_id(&reply_to)?;
+        ratatosk_proto::reply::check(&text)
+            .map_err(|e| RatatoskError::Internal { reason: e.to_string() })?;
+        self.command(Command::SendReply { chat, reply_to, text })
+    }
+
+    /// Заменяет текст своего сообщения и **просит** собеседника сделать то же.
+    ///
+    /// Устройство то же, что у [`RatatoskClient::retract_messages`], и та же
+    /// оговорка: это просьба. Перед вызовом клиент обязан показать
+    /// [`edit_notice`] — прежний текст собеседник мог уже прочитать, и
+    /// «изменить у обоих» на кнопке было бы обещанием, которого протокол
+    /// не даёт (§14).
+    ///
+    /// Прежний текст не сохраняется ни у кого, но отметка о правке
+    /// ([`FfiMessage::edited_at_ms`]) появляется у обоих, и показывать её
+    /// обязательно.
+    ///
+    /// Отказ приходит сразу, до очереди: править можно только своё, только
+    /// непустым текстом и только в течение [`max_edit_age_ms`].
+    pub fn edit_message(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        let msg_id = to_msg_id(&msg_id)?;
+        // Та же функция, что и в ядре, вызванная раньше: команды уходят без
+        // ответа, и отказ, случившийся там, вернулся бы клиенту никогда — а он
+        // нужен сейчас, пока у человека открыто поле ввода.
+        ratatosk_proto::edit::check(&text)
+            .map_err(|e| RatatoskError::Internal { reason: e.to_string() })?;
+        self.command(Command::EditMessage { chat, msg_id, text })
+    }
+
+    /// Пересылает сообщения в другой чат.
+    ///
+    /// Каждое уезжает своим новым сообщением с пометкой «переслано»
+    /// и **без имени автора**. Перед вызовом клиент обязан показать
+    /// [`forward_notice`]: пользователь, знакомый с другими мессенджерами,
+    /// уверен, что пересылает сообщение вместе с автором, а подтвердить
+    /// авторство пересланного текста невозможно.
+    ///
+    /// Источник может быть любым чатом. Сообщений за раз — не больше
+    /// [`max_forward_ids`]; лишние молча не отправляются, потому что каждое
+    /// пересланное — отдельный кадр.
+    pub fn forward_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::ForwardMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Ставит или снимает свою реакцию на сообщение.
+    ///
+    /// `None` или пустая строка — снять. Реакция от человека одна: новая
+    /// заменяет прежнюю. Реагировать можно и на своё сообщение.
+    ///
+    /// Пределы — [`max_reaction_bytes`] и «это должно быть эмодзи». Второе
+    /// проверяется эвристикой, а не таблицами Unicode, и настоящее
+    /// ограничение здесь — длина: она и мешает превратить реакцию в способ
+    /// прислать текст, который не выглядит сообщением.
+    pub fn set_reaction(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+        emoji: Option<String>,
+    ) -> Result<(), RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        let msg_id = to_msg_id(&msg_id)?;
+        let emoji = emoji.unwrap_or_default();
+        ratatosk_proto::reaction::check(&emoji)
+            .map_err(|e| RatatoskError::Internal { reason: e.to_string() })?;
+        self.command(Command::SetReaction { chat, msg_id, emoji })
+    }
+
+    /// Очищает чат целиком — **у себя**.
+    ///
+    /// Отзыва здесь нет: просьба удалить всю переписку — это решение
+    /// за собеседника о его истории. Убрать разговор у себя и стереть его
+    /// у другого — разные намерения; второе выражается явным отзывом.
+    pub fn clear_chat(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::ClearChat { chat: to_chat(&chat_id)? })
     }
 
     /// Сообщает, что пользователь дочитал чат до этого сообщения (§9.4).
@@ -342,10 +733,7 @@ impl RatatoskClient {
     /// Повторный вызов про то же место ничего не отправляет — и это
     /// переживает перезапуск: собеседнику сообщают один раз.
     pub fn mark_read(&self, chat_id: Vec<u8>, up_to: Vec<u8>) -> Result<(), RatatoskError> {
-        let up_to: [u8; 16] = up_to
-            .as_slice()
-            .try_into()
-            .map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))?;
+        let up_to = to_msg_id(&up_to)?;
         self.command(Command::MarkRead { chat: to_chat(&chat_id)?, up_to })
     }
 
@@ -379,8 +767,10 @@ impl RatatoskClient {
                 peer_ik: c.peer_ik.to_vec(),
                 fingerprint: c.fingerprint,
                 display_name: c.display_name,
+                local_name: c.local_name,
                 verified: c.verified,
                 seen_on_lan: c.availability.seen_on_lan,
+                has_avatar: c.has_avatar,
             })
             .collect())
     }
@@ -393,22 +783,87 @@ impl RatatoskClient {
             .handle
             .messages_blocking(chat, limit as usize)
             .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
-        Ok(found
-            .into_iter()
-            .map(|m| FfiMessage {
-                msg_id: m.msg_id.to_vec(),
-                // Тела сегодня всегда текстовые (§9.1, `PayloadType::Text`);
-                // порча кодировки не повод потерять сообщение целиком.
-                body: String::from_utf8_lossy(&m.body).into_owned(),
-                mine: m.sender_ik == self.opened.own_ik,
-                wall_ms: m.hlc.wall_ms,
-                status: m.status.and_then(DeliveryStatus::from_code).map(status_of),
-            })
-            .collect())
+        Ok(found.into_iter().map(|view| self.view(view)).collect())
+    }
+
+    /// Окно сообщений **перед** названным — листание назад.
+    ///
+    /// Якорь — `msg_id` того сообщения, которое сейчас первое в списке:
+    /// клиент его уже знает, а метку HLC (§9.1) наружу отдавать незачем —
+    /// порядок задаёт она, и строить на ней логику выше границы §13.3 нельзя.
+    ///
+    /// Так же выглядит и «прокрутить до цитаты»: клиент листает назад, пока
+    /// в окне не появится нужный `msg_id`. Пустой список означает либо начало
+    /// переписки, либо что якоря больше нет (его удалили) — во втором случае
+    /// листать не от чего, и отдавать вместо этого последние сообщения было бы
+    /// обманом: человек увидел бы конец переписки там, где листал её начало.
+    pub fn messages_before(
+        &self,
+        chat_id: Vec<u8>,
+        before: Vec<u8>,
+        limit: u32,
+    ) -> Result<Vec<FfiMessage>, RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        let before = to_msg_id(&before)?;
+        let found = self
+            .opened
+            .handle
+            .messages_before_blocking(chat, before, limit as usize)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found.into_iter().map(|view| self.view(view)).collect())
+    }
+
+    /// Одно сообщение по идентификатору.
+    ///
+    /// Нужно ради цитат: ответ несёт ссылку, а не текст, и цитируемое
+    /// сообщение может лежать далеко за пределами загруженного окна.
+    ///
+    /// `None` означает «показать нечего»: сообщение удалено, не дошло или
+    /// вычищено уборкой (§12). Клиент обязан сказать это прямо — «сообщение
+    /// недоступно», — а не показать пустую рамку.
+    pub fn message(&self, msg_id: Vec<u8>) -> Result<Option<FfiMessage>, RatatoskError> {
+        let msg_id = to_msg_id(&msg_id)?;
+        let found = self
+            .opened
+            .handle
+            .message_blocking(msg_id)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found.map(|view| self.view(view)))
     }
 }
 
 impl RatatoskClient {
+    /// Перевод сообщения ядра в то, что видит UI.
+    ///
+    /// Одно место на все три чтения истории: `messages`, `messages_before`
+    /// и `message`. Разведённые по трём веткам, они однажды разошлись бы
+    /// в том, чем считается «своё» — а это протокольное сравнение, и §13.3
+    /// не разрешает ему подниматься в клиент.
+    fn view(&self, view: MessageView) -> FfiMessage {
+        let m = view.message;
+        FfiMessage {
+            msg_id: m.msg_id.to_vec(),
+            // Тела сегодня всегда текстовые (§9.1: `Text`, `Forward`, `Reply`);
+            // порча кодировки не повод потерять сообщение целиком.
+            body: String::from_utf8_lossy(&m.body).into_owned(),
+            mine: m.sender_ik == self.opened.own_ik,
+            wall_ms: m.hlc.wall_ms,
+            status: m.status.and_then(DeliveryStatus::from_code).map(status_of),
+            edited_at_ms: m.edited_ms,
+            forwarded: m.forwarded,
+            reply_to: m.reply_to.map(|id| id.to_vec()),
+            reactions: view
+                .reactions
+                .into_iter()
+                .map(|r| FfiReaction {
+                    emoji: r.emoji,
+                    mine: r.author_ik == self.opened.own_ik,
+                    author_ik: r.author_ik.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
     fn command(&self, command: Command) -> Result<(), RatatoskError> {
         self.opened
             .handle
@@ -425,6 +880,7 @@ const fn status_of(status: DeliveryStatus) -> FfiDeliveryStatus {
     match status {
         DeliveryStatus::Undeliverable => FfiDeliveryStatus::Undeliverable,
         DeliveryStatus::Pending => FfiDeliveryStatus::Pending,
+        DeliveryStatus::Waiting => FfiDeliveryStatus::Waiting,
         DeliveryStatus::Sent => FfiDeliveryStatus::Sent,
         DeliveryStatus::Delivered => FfiDeliveryStatus::Delivered,
         DeliveryStatus::Read => FfiDeliveryStatus::Read,
@@ -435,8 +891,26 @@ fn to_ik(bytes: &[u8]) -> Result<[u8; 32], RatatoskError> {
     bytes.try_into().map_err(|_| RatatoskError::internal("ключ контакта не 32 байта"))
 }
 
+fn to_msg_id(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
+    bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))
+}
+
 fn to_chat(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
     bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор чата не 16 байт"))
+}
+
+/// Разбирает список идентификаторов сообщений.
+///
+/// Отказ на первом же негодном, а не пропуск: список пришёл от клиента,
+/// и «удалили не то, что просили» — худший исход, чем «не удалили ничего».
+fn to_msg_ids(ids: &[Vec<u8>]) -> Result<Vec<[u8; 16]>, RatatoskError> {
+    ids.iter()
+        .map(|id| {
+            id.as_slice()
+                .try_into()
+                .map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))
+        })
+        .collect()
 }
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
@@ -509,9 +983,24 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::StatusChanged { msg_id, status } => {
             FfiEvent::StatusChanged { msg_id: msg_id.to_vec(), status: status_of(status) }
         }
-        Event::ContactAdded { fingerprint, verified, .. } => {
-            FfiEvent::ContactAdded { fingerprint, verified }
+        Event::ContactAdded { peer_ik, fingerprint, verified } => {
+            FfiEvent::ContactAdded { peer_ik: peer_ik.to_vec(), fingerprint, verified }
         }
+        Event::MessagesDeleted { chat, msg_ids } => FfiEvent::MessagesDeleted {
+            chat_id: chat.to_vec(),
+            msg_ids: msg_ids.iter().map(|id| id.to_vec()).collect(),
+        },
+        Event::MessageEdited { chat, msg_id } => {
+            FfiEvent::MessageEdited { chat_id: chat.to_vec(), msg_id: msg_id.to_vec() }
+        }
+        Event::ReactionChanged { chat, msg_id, author_ik } => FfiEvent::ReactionChanged {
+            chat_id: chat.to_vec(),
+            msg_id: msg_id.to_vec(),
+            author_ik: author_ik.to_vec(),
+        },
+        Event::ContactChanged { peer_ik } => FfiEvent::ContactChanged { peer_ik: peer_ik.to_vec() },
+        Event::ContactRemoved { peer_ik } => FfiEvent::ContactRemoved { peer_ik: peer_ik.to_vec() },
+        Event::AvatarChanged { peer_ik } => FfiEvent::AvatarChanged { peer_ik: peer_ik.to_vec() },
         Event::GroupMembershipChanged { chat } => {
             FfiEvent::GroupMembershipChanged { chat_id: chat.to_vec() }
         }
@@ -540,6 +1029,55 @@ pub fn honest_notices() -> Vec<String> {
     ratatosk_core::honest::NOTICES.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// Наибольший размер аватарки в байтах.
+///
+/// Функция на границе, а не число в клиенте: масштабирует изображение клиент,
+/// и предел, записанный у него отдельно, однажды разойдётся с ядром — тогда
+/// пользователь получит отказ уже после того, как выбрал фотографию.
+#[uniffi::export]
+#[must_use]
+pub fn max_avatar_bytes() -> u32 {
+    // `try_from`, а не `as`: предел заведомо мал, но молчаливое усечение
+    // в этом месте однажды дало бы клиенту разрешение на кадр, который ядро
+    // не примет.
+    u32::try_from(ratatosk_proto::MAX_AVATAR_BYTES).unwrap_or(u32::MAX)
+}
+
+/// Наибольшая длина локального имени контакта, в символах.
+#[uniffi::export]
+#[must_use]
+pub fn max_local_name_chars() -> u32 {
+    u32::try_from(ratatosk_core::MAX_LOCAL_NAME_CHARS).unwrap_or(u32::MAX)
+}
+
+/// Что сказать про сообщение, ждущее появления собеседника.
+#[uniffi::export]
+#[must_use]
+pub fn waiting_notice() -> String {
+    ratatosk_core::honest::WAITING_NOTICE.to_string()
+}
+
+/// Что сказать перед отзывом сообщения (§14).
+#[uniffi::export]
+#[must_use]
+pub fn retraction_notice() -> String {
+    ratatosk_core::honest::RETRACTION_NOTICE.to_string()
+}
+
+/// Что сказать перед удалением контакта (§14).
+#[uniffi::export]
+#[must_use]
+pub fn deletion_notice() -> String {
+    ratatosk_core::honest::DELETION_NOTICE.to_string()
+}
+
+/// Что сказать перед отзывом сверки (§4.2).
+#[uniffi::export]
+#[must_use]
+pub fn revocation_notice() -> String {
+    ratatosk_core::honest::REVOCATION_NOTICE.to_string()
+}
+
 /// Предупреждение при включении LAN (§5.1).
 #[uniffi::export]
 #[must_use]
@@ -552,6 +1090,57 @@ pub fn lan_warning() -> String {
 #[must_use]
 pub fn no_pin_warning() -> String {
     ratatosk_core::honest::NO_PIN_WARNING.to_string()
+}
+
+/// Сколько времени сообщение можно править, в миллисекундах.
+///
+/// Функция на границе, а не число в клиенте: кнопку «изменить» рисует он,
+/// и предел, записанный у него отдельно, однажды разойдётся с ядром — тогда
+/// человек увидит кнопку, которая отказывает.
+#[uniffi::export]
+#[must_use]
+pub fn max_edit_age_ms() -> u64 {
+    ratatosk_proto::MAX_EDIT_AGE_MS
+}
+
+/// Наибольшая длина реакции в байтах.
+#[uniffi::export]
+#[must_use]
+pub fn max_reaction_bytes() -> u32 {
+    u32::try_from(ratatosk_proto::MAX_REACTION_BYTES).unwrap_or(u32::MAX)
+}
+
+/// Сколько сообщений можно переслать одной командой.
+#[uniffi::export]
+#[must_use]
+pub fn max_forward_ids() -> u32 {
+    u32::try_from(ratatosk_proto::MAX_FORWARD_IDS).unwrap_or(u32::MAX)
+}
+
+/// Что сказать перед правкой сообщения (§14).
+#[uniffi::export]
+#[must_use]
+pub fn edit_notice() -> String {
+    ratatosk_core::honest::EDIT_NOTICE.to_string()
+}
+
+/// Что показать вместо цитаты, которой нет.
+///
+/// Ответ несёт ссылку, а не текст: цитата берётся из своей копии сообщения,
+/// и если её нет — удалили, не дошло, вычистила уборка — показывать нечего.
+/// Строка отсюда, а не из клиента: придуманная цитата и пустая рамка — два
+/// способа соврать об одном и том же.
+#[uniffi::export]
+#[must_use]
+pub fn quote_unavailable_notice() -> String {
+    ratatosk_core::honest::QUOTE_UNAVAILABLE.to_string()
+}
+
+/// Что сказать при пересылке (§14).
+#[uniffi::export]
+#[must_use]
+pub fn forward_notice() -> String {
+    ratatosk_core::honest::FORWARD_NOTICE.to_string()
 }
 
 /// Формулировка последствий исключения из группы (§11.4).

@@ -13,8 +13,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_proto::transport_policy::PeerAvailability;
-use ratatosk_store::{StoredMessage, Store};
+use ratatosk_store::{Store, StoredMessage, StoredReaction};
 use ratatosk_transport::{Runner, TransportCommand, TransportEvent};
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,21 +27,76 @@ use ratatosk_transport::runner::PeerAddress;
 /// начнёт ждать.
 const CHANNEL_DEPTH: usize = 64;
 
-/// Запрос на чтение состояния.
+/// Что клиент прислал драйверу: команду или запрос.
 ///
-/// Отдельно от [`Command`] намеренно: команда меняет состояние и её исполнение
-/// наблюдается событиями, а запрос ничего не меняет и обязан вернуть ответ.
-/// Смешать их значило бы завести команду, у которой есть результат, — и первый
-/// же клиент начал бы строить на нём логику, которой по §13.3 быть не должно.
+/// **Одна очередь на оба, и это исправление настоящей ошибки.** Раньше
+/// команды и запросы шли разными каналами, а `select!` выбирает готовую ветку
+/// произвольно — поэтому чтение, отправленное **после** записи, могло быть
+/// обслужено **до** неё. Клиент ставил аватарку и тут же перечитывал её,
+/// получая прежнюю; то же самое ждало любого, кто отправит сообщение и сразу
+/// перечитает чат. Объяснить такое пользователю нельзя, а воспроизвести —
+/// через раз, что хуже всего.
+///
+/// Одна очередь даёт то, чего клиент и ожидает: **что позвал раньше, то
+/// и выполнится раньше** (в пределах одной ручки — `tokio::mpsc` хранит
+/// порядок для каждого отправителя).
+///
+/// Разделение [`Command`] и [`Query`] **типами** при этом остаётся, и оно
+/// важнее общей очереди: команда меняет состояние и наблюдается событиями,
+/// а запрос ничего не меняет и обязан вернуть ответ. Смешать их значило бы
+/// завести команду, у которой есть результат, — и первый же клиент начал бы
+/// строить на нём логику, которой по §13.3 быть не должно.
+enum Request {
+    /// Изменить состояние.
+    Command(Command),
+    /// Прочитать состояние.
+    Query(Query),
+}
+
+/// Сообщение вместе с тем, что к нему прилипло.
+///
+/// Реакции читаются здесь, а не отдельным запросом на каждое сообщение:
+/// клиент рисует их в том же списке, а сотня запросов на экран чата — сотня
+/// проходов через границу §13.3 ради строки в тридцать байт.
+#[derive(Debug, Clone)]
+pub struct MessageView {
+    /// Само сообщение.
+    pub message: StoredMessage,
+    /// Реакции — только те, что есть: снятые хранилище не отдаёт.
+    pub reactions: Vec<StoredReaction>,
+}
+
+/// Запрос на чтение состояния.
 enum Query {
     /// Окно сообщений чата в порядке HLC (§9.1).
-    Messages {
+    Messages { chat: ChatId, limit: usize, reply: oneshot::Sender<Vec<MessageView>> },
+    /// Окно **перед** названным сообщением — листание назад.
+    ///
+    /// Якорем служит `msg_id`, а не метка HLC, и это не удобство: метка —
+    /// протокольная величина (§9.1), и выдав её наружу, мы отдали бы клиенту
+    /// возможность строить на ней порядок. Свой якорь он и так знает — это
+    /// сообщение, которое он видит первым в списке.
+    MessagesBefore {
         chat: ChatId,
+        before: MsgId,
         limit: usize,
-        reply: oneshot::Sender<Vec<StoredMessage>>,
+        reply: oneshot::Sender<Vec<MessageView>>,
     },
+    /// Одно сообщение по идентификатору.
+    ///
+    /// Нужно ради цитат: ответ несёт ссылку, а не текст (`proto::reply`),
+    /// и цитируемое сообщение может лежать далеко за пределами загруженного
+    /// окна. `None` — его нет: удалено, не дошло или вычищено уборкой (§12).
+    Message { msg_id: MsgId, reply: oneshot::Sender<Option<MessageView>> },
     /// Что известно о контактах прямо сейчас.
     Contacts { reply: oneshot::Sender<Vec<ContactStatus>> },
+    /// Байты аватарки: свои (`None`) или контакта (`Some`).
+    ///
+    /// Отдельным запросом, а не полем в [`ContactStatus`]: до тридцати двух
+    /// килобайт на контакт, и тащить их в каждый показ списка чатов незачем.
+    /// Клиент берёт байты, когда дошёл до отрисовки, и обновляет по событию
+    /// [`Event::AvatarChanged`].
+    Avatar { owner: Option<[u8; 32]>, reply: oneshot::Sender<Option<Vec<u8>>> },
 }
 
 /// Что клиент знает о контакте.
@@ -59,10 +115,18 @@ pub struct ContactStatus {
     pub fingerprint: String,
     /// Имя из карточки. Получателем не доверяется (§4.1).
     pub display_name: String,
+    /// Как контакт подписан у пользователя. По проводу не едет никогда.
+    pub local_name: Option<String>,
     /// Сверен ли отпечаток голосом (§4.2).
     pub verified: bool,
     /// Чем до него можно достучаться (§5.4).
     pub availability: PeerAvailability,
+    /// Есть ли у него аватарка, которую **можно показать**.
+    ///
+    /// Учитывает §4.2: у несверенного контакта аватарка может лежать
+    /// в хранилище, но здесь всё равно будет `false` — показывать её нельзя,
+    /// а обещать клиенту картинку, которой он не получит, незачем.
+    pub has_avatar: bool,
 }
 
 /// Что разбудило цикл. Существует только затем, чтобы решение принималось
@@ -87,8 +151,7 @@ enum Wake {
 /// бы ни до кого.
 #[derive(Clone)]
 pub struct DriverHandle {
-    commands: mpsc::Sender<Command>,
-    queries: mpsc::Sender<Query>,
+    requests: mpsc::Sender<Request>,
 }
 
 /// Поток событий для UI. Существует в единственном экземпляре.
@@ -108,13 +171,16 @@ impl DriverHandle {
     ///
     /// Ошибка означает, что драйвер остановлен.
     pub async fn send(&self, command: Command) -> Result<(), Command> {
-        self.commands.send(command).await.map_err(|e| e.0)
+        self.requests.send(Request::Command(command)).await.map_err(|e| match e.0 {
+            Request::Command(command) => command,
+            Request::Query(_) => unreachable!("послали команду — вернулась не она"),
+        })
     }
 
     /// Читает последние сообщения чата. `None` — драйвер остановлен.
-    pub async fn messages(&self, chat: ChatId, limit: usize) -> Option<Vec<StoredMessage>> {
+    pub async fn messages(&self, chat: ChatId, limit: usize) -> Option<Vec<MessageView>> {
         let (reply, answer) = oneshot::channel();
-        self.queries.send(Query::Messages { chat, limit, reply }).await.ok()?;
+        self.requests.send(Request::Query(Query::Messages { chat, limit, reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -122,7 +188,7 @@ impl DriverHandle {
     /// остановлен.
     pub async fn contacts(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
-        self.queries.send(Query::Contacts { reply }).await.ok()?;
+        self.requests.send(Request::Query(Query::Contacts { reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -137,20 +203,57 @@ impl DriverHandle {
 
     /// Отправляет команду, блокируя вызывающий поток.
     pub fn send_blocking(&self, command: Command) -> Result<(), Command> {
-        self.commands.blocking_send(command).map_err(|e| e.0)
+        self.requests.blocking_send(Request::Command(command)).map_err(|e| match e.0 {
+            Request::Command(command) => command,
+            Request::Query(_) => unreachable!("послали команду — вернулась не она"),
+        })
     }
 
     /// Читает сообщения, блокируя вызывающий поток.
-    pub fn messages_blocking(&self, chat: ChatId, limit: usize) -> Option<Vec<StoredMessage>> {
+    pub fn messages_blocking(&self, chat: ChatId, limit: usize) -> Option<Vec<MessageView>> {
         let (reply, answer) = oneshot::channel();
-        self.queries.blocking_send(Query::Messages { chat, limit, reply }).ok()?;
+        self.requests.blocking_send(Request::Query(Query::Messages { chat, limit, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает окно перед названным сообщением — листание назад.
+    pub fn messages_before_blocking(
+        &self,
+        chat: ChatId,
+        before: MsgId,
+        limit: usize,
+    ) -> Option<Vec<MessageView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .blocking_send(Request::Query(Query::MessagesBefore { chat, before, limit, reply }))
+            .ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает одно сообщение по идентификатору.
+    ///
+    /// Внешний `None` означает «драйвер остановлен», внутренний — «такого
+    /// сообщения нет».
+    pub fn message_blocking(&self, msg_id: MsgId) -> Option<Option<MessageView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Message { msg_id, reply })).ok()?;
         answer.blocking_recv().ok()
     }
 
     /// Читает контакты, блокируя вызывающий поток.
     pub fn contacts_blocking(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
-        self.queries.blocking_send(Query::Contacts { reply }).ok()?;
+        self.requests.blocking_send(Request::Query(Query::Contacts { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает аватарку, блокируя вызывающий поток.
+    ///
+    /// `owner` — `None` для своей. Внешний `None` означает «драйвер
+    /// остановлен», внутренний — «аватарки нет или показывать её нельзя».
+    pub fn avatar_blocking(&self, owner: Option<[u8; 32]>) -> Option<Option<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Avatar { owner, reply })).ok()?;
         answer.blocking_recv().ok()
     }
 }
@@ -159,8 +262,7 @@ impl DriverHandle {
 pub struct Driver<S: Store, R: Runner> {
     engine: Engine<S>,
     runner: R,
-    commands: mpsc::Receiver<Command>,
-    queries: mpsc::Receiver<Query>,
+    requests: mpsc::Receiver<Request>,
     notices: mpsc::Sender<Event>,
     /// Срок → метки таймеров, которые в этот срок сработают.
     ///
@@ -172,18 +274,16 @@ pub struct Driver<S: Store, R: Runner> {
 impl<S: Store, R: Runner> Driver<S, R> {
     /// Связывает ядро с раннером и выдаёт ручку и поток событий для UI.
     pub fn new(engine: Engine<S>, runner: R) -> (Driver<S, R>, DriverHandle, EventStream) {
-        let (commands_tx, commands_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let (queries_tx, queries_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let (requests_tx, requests_rx) = mpsc::channel(CHANNEL_DEPTH);
         let (notices_tx, notices_rx) = mpsc::channel(CHANNEL_DEPTH);
         let driver = Driver {
             engine,
             runner,
-            commands: commands_rx,
-            queries: queries_rx,
+            requests: requests_rx,
             notices: notices_tx,
             timers: BTreeMap::new(),
         };
-        let handle = DriverHandle { commands: commands_tx, queries: queries_tx };
+        let handle = DriverHandle { requests: requests_tx };
         (driver, handle, EventStream { notices: notices_rx })
     }
 
@@ -201,27 +301,29 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // делают: пока идёт разбор, остальные фьючерсы ещё живы и держат
             // заимствования полей, так что `&mut self` внутри ветки не взять.
             //
-            // Все три ожидания — `recv` по каналу, то есть отменяемы без
-            // потери сообщения. Иначе `select!` терял бы вход при каждом
+            // Оба ожидания — `recv` по каналу, то есть отменяемы без потери
+            // сообщения. Иначе `select!` терял бы вход при каждом
             // срабатывании таймера.
+            //
+            // Команды и запросы идут одной очередью, поэтому порядок между
+            // ними сохраняется: чтение, отправленное после записи, не может
+            // обогнать её. Событиям транспорта такой гарантии не нужно и не
+            // может быть — они приходят снаружи.
             let wake = tokio::select! {
                 event = self.runner.next_event() => match event {
                     Some(event) => Wake::Input(translate(event)),
                     None => Wake::Stop,
                 },
-                command = self.commands.recv() => match command {
-                    Some(command) => Wake::Input(Input::Command(command)),
-                    None => Wake::Stop,
-                },
-                query = self.queries.recv() => match query {
-                    Some(query) => Wake::Query(query),
+                request = self.requests.recv() => match request {
+                    Some(Request::Command(command)) => Wake::Input(Input::Command(command)),
+                    Some(Request::Query(query)) => Wake::Query(query),
                     None => Wake::Stop,
                 },
                 () = sleep_until(deadline) => Wake::Timers,
             };
 
             match wake {
-                Wake::Input(input) => self.feed(input).await?,
+                Wake::Input(input) => self.tolerate(input).await?,
                 Wake::Query(query) => self.answer(query),
                 Wake::Timers => self.fire_due_timers().await?,
                 Wake::Stop => return Ok(()),
@@ -233,9 +335,38 @@ impl<S: Store, R: Runner> Driver<S, R> {
     fn answer(&self, query: Query) {
         match query {
             Query::Messages { chat, limit, reply } => {
-                let found = self.engine.store().messages(&chat, limit, None).unwrap_or_default();
                 // Отправитель мог уйти, не дождавшись: это не ошибка.
+                let _ = reply.send(self.window(&chat, limit, None));
+            }
+            Query::MessagesBefore { chat, before, limit, reply } => {
+                // Якоря может уже не быть — например, его удалили. Тогда
+                // листать не от чего, и честный ответ пустой: отдав вместо
+                // него последние сообщения, мы показали бы человеку конец
+                // переписки там, где он листал её начало.
+                let anchor = self.engine.store().message(&before).ok().flatten();
+                let found = match anchor {
+                    Some(message) => self.window(&chat, limit, Some(message.hlc)),
+                    None => Vec::new(),
+                };
                 let _ = reply.send(found);
+            }
+            Query::Message { msg_id, reply } => {
+                let store = self.engine.store();
+                let found = store.message(&msg_id).ok().flatten().map(|message| {
+                    let reactions = store.reactions(&message.msg_id).unwrap_or_default();
+                    MessageView { message, reactions }
+                });
+                let _ = reply.send(found);
+            }
+            Query::Avatar { owner, reply } => {
+                let found = match owner {
+                    Some(peer_ik) => self.engine.avatar_of(&peer_ik),
+                    None => self.engine.own_avatar(),
+                };
+                // Ошибка хранилища здесь неотличима от «нет аватарки», и это
+                // единственное честное поведение: показать нечего в обоих
+                // случаях, а ронять список чатов из-за картинки нельзя.
+                let _ = reply.send(found.unwrap_or_default());
             }
             Query::Contacts { reply } => {
                 let found = self
@@ -254,13 +385,38 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         .map(|id| id.fingerprint())
                         .unwrap_or_default(),
                         display_name: contact.card.display_name.clone(),
+                        local_name: contact.local_name.clone(),
                         verified: contact.verified,
                         availability: contact.availability,
+                        // §4.2: у несверенного показывать нечего, даже если
+                        // байты лежат. Правило одно и то же здесь и в
+                        // `Engine::avatar_of` — разойдясь, они дали бы кружок
+                        // с заглушкой вместо картинки, которая «вот-вот».
+                        has_avatar: contact.has_avatar && contact.verified,
                     })
                     .collect();
                 let _ = reply.send(found);
             }
         }
+    }
+
+    /// Окно сообщений вместе с реакциями.
+    ///
+    /// Одно место на все три чтения истории: разведённые по веткам, они однажды
+    /// разошлись бы в том, отдаются ли реакции.
+    fn window(&self, chat: &ChatId, limit: usize, before: Option<Hlc>) -> Vec<MessageView> {
+        let store = self.engine.store();
+        store
+            .messages(chat, limit, before)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| {
+                // Отказ на реакциях не должен стоить чата: сообщение без
+                // реакций читается, реакции без сообщения — нет.
+                let reactions = store.reactions(&message.msg_id).unwrap_or_default();
+                MessageView { message, reactions }
+            })
+            .collect()
     }
 
     /// Подаёт вход ядру и исполняет всё, что оно вернуло.
@@ -270,6 +426,31 @@ impl<S: Store, R: Runner> Driver<S, R> {
             self.apply(now_ms, effect).await;
         }
         Ok(())
+    }
+
+    /// Подаёт вход и **переживает** его отказ.
+    ///
+    /// Раньше любой отказ `step` останавливал драйвер, и это была ошибка,
+    /// которую видно только на живом клиенте. Отвергнутый вход — это, как
+    /// правило, чужая или клиентская ошибка, а не поломка ядра: команда
+    /// с устаревшим `chat_id`, картинка не того формата, кадр от собеседника
+    /// со сломанной сборкой. Останавливаться на них значит дать любому
+    /// контакту выключить мессенджер одним негодным сообщением, а клиенту —
+    /// одной опечаткой в идентификаторе.
+    ///
+    /// Отказ хранилища остаётся смертельным, и это не исключение из правила,
+    /// а его продолжение: без диска ядро не может ни принять сообщение, ни
+    /// сохранить сессию, и продолжать работу означало бы делать вид, что всё
+    /// в порядке, теряя всё, что придёт дальше (§14).
+    async fn tolerate(&mut self, input: Input) -> Result<(), EngineError> {
+        match self.feed(input).await {
+            Ok(()) => Ok(()),
+            Err(error @ EngineError::Store(_)) => Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "вход отвергнут ядром");
+                Ok(())
+            }
+        }
     }
 
     /// Отдаёт ядру все таймеры, чей срок наступил.
@@ -285,18 +466,16 @@ impl<S: Store, R: Runner> Driver<S, R> {
             fired.into_values().flatten().collect()
         };
         for token in due {
-            self.feed(Input::Timer { token }).await?;
+            self.tolerate(Input::Timer { token }).await?;
         }
         Ok(())
     }
 
     async fn apply(&mut self, now_ms: u64, effect: Effect) {
         let command = match effect {
-            Effect::Send { peer_ik, via, frame } => Some(TransportCommand::Send {
-                peer: self.address_of(peer_ik),
-                via,
-                frame,
-            }),
+            Effect::Send { peer_ik, via, frame } => {
+                Some(TransportCommand::Send { peer: self.address_of(peer_ik), via, frame })
+            }
             Effect::Connect { peer_ik, via } => {
                 Some(TransportCommand::Connect { peer: self.address_of(peer_ik), via })
             }

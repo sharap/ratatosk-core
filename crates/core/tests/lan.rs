@@ -40,6 +40,11 @@ type Wired = (Driver<MemoryStore, LanRunner>, Node);
 /// Узел собирается, но не запускается: цикл драйвера гоняется вызывающим
 /// через `select!`, а не `spawn`. Так тест не требует от ядра `Send` —
 /// а состояние рукопожатия из `snow` его и не обещает.
+/// Байты вложений в памяти: этот тест про сеть, а не про диск.
+fn blobs() -> Box<ratatosk_store::MemoryBlobs> {
+    Box::new(ratatosk_store::MemoryBlobs::new())
+}
+
 async fn spawn_node(name: &str) -> Wired {
     let mut store = MemoryStore::new();
     store.migrate().expect("миграция хранилища в памяти");
@@ -51,7 +56,7 @@ async fn spawn_node(name: &str) -> Wired {
         chatmail: String::new(),
         display_name: name.to_owned(),
     };
-    let engine = Engine::new(Identity::generate(), store, Box::new(OsEntropy), addresses);
+    let engine = Engine::new(Identity::generate(), store, blobs(), Box::new(OsEntropy), addresses);
     let card = engine.own_card().encode().expect("своя карточка кодируется");
     let ik = engine.own_card().ik;
 

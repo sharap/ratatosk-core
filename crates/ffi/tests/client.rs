@@ -248,6 +248,42 @@ fn honest_texts_come_from_the_core() {
     assert!(ratatosk_ffi::max_edit_age_ms() > 0);
     assert!(ratatosk_ffi::max_reaction_bytes() > 0);
     assert!(ratatosk_ffi::max_forward_ids() > 0);
+    // Файлы: пределы и размер куска приходят отсюда же. Клиент считает по ним
+    // ход передачи и решает, что вообще можно отправить.
+    assert!(ratatosk_ffi::chunk_bytes() > 0);
+    assert!(ratatosk_ffi::max_file_bytes() > u64::from(ratatosk_ffi::chunk_bytes()));
+    assert!(ratatosk_ffi::max_files_per_message() > 1);
+    assert!(ratatosk_ffi::max_preview_bytes() > 0);
+    assert!(!ratatosk_ffi::file_source_gone_notice().is_empty());
+}
+
+#[test]
+fn the_auto_accept_threshold_is_a_setting_and_survives_a_restart() {
+    // Порог — настройка человека, а не константа сборки: «спрашивать всегда»
+    // законно, и назавтра телефон не должен снова принимать всё подряд.
+    let db = TempDb::new("auto-accept");
+
+    {
+        let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+            .expect("клиент открылся");
+        assert_eq!(
+            client.auto_accept_bytes().unwrap(),
+            Some(ratatosk_ffi::default_auto_accept_bytes()),
+            "по умолчанию мелочь приезжает сама"
+        );
+
+        client.set_auto_accept_bytes(None).expect("«спрашивать всегда» принято");
+        let asked = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            client.auto_accept_bytes().map(|v| v.is_none()).unwrap_or(false)
+        });
+        assert!(asked);
+    }
+    settle();
+
+    let again = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+        .expect("второй запуск");
+    assert_eq!(again.auto_accept_bytes().unwrap(), None, "настройка пережила перезапуск");
 }
 
 #[test]

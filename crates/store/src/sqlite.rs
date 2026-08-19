@@ -16,8 +16,8 @@ use crate::compaction::{self, Task};
 use crate::schema;
 use crate::sql_types;
 use crate::{
-    Result, Store, StoreError, StoredAvatar, StoredContact, StoredMessage, StoredOutbox,
-    StoredReaction, StoredSession,
+    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredFile, StoredMessage,
+    StoredOutbox, StoredReaction, StoredSession,
 };
 
 /// Хранилище на SQLite.
@@ -103,6 +103,82 @@ impl SqliteStore {
             Some(cutoff) => Ok(self.conn.execute(sql, [sql_types::to_sql(cutoff)])?),
             None => Ok(0),
         }
+    }
+
+    /// Читает строки файлов из подготовленного запроса.
+    ///
+    /// Одно место на три чтения (`file`, `files_of`, `unfinished_files`):
+    /// разведённые по веткам, они разошлись бы в том, что делать с испорченным
+    /// полем, — а это решение про честность, а не про SQL.
+    fn read_files(
+        &self,
+        statement: &mut rusqlite::Statement<'_>,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<StoredFile>> {
+        let rows = statement.query_map(params, |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                sql_types::from_sql(row.get(3)?),
+                sql_types::from_sql(row.get(4)?),
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)? != 0,
+                row.get::<_, i64>(10)? != 0,
+            ))
+        })?;
+
+        let mut found = Vec::new();
+        for row in rows {
+            let (
+                file_id,
+                msg_id,
+                name_enc,
+                size_bytes,
+                chunk_total,
+                key_enc,
+                preview_enc,
+                incoming,
+                source_path,
+                accepted,
+                complete,
+            ) = row?;
+            let file_id: FileId =
+                file_id.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?;
+            // Имя и ключ обязательны: без ключа файл не собрать, а без имени
+            // нечего показать. Испорченное здесь — это неверный PIN или порча
+            // файла, и отвечать надо отказом, а не файлом без имени.
+            let name =
+                String::from_utf8(self.open_sealed("files.name_enc", &file_id, &name_enc)?)
+                    .map_err(|_| StoreError::Backend("имя файла не UTF-8".into()))?;
+            let key: [u8; 32] = self
+                .open_sealed("files.file_key_enc", &file_id, &key_enc)?
+                .try_into()
+                .map_err(|_| StoreError::Backend("ключ файла не 32 байта".into()))?;
+            let preview = match preview_enc {
+                Some(sealed) => Some(self.open_sealed("files.preview_enc", &file_id, &sealed)?),
+                None => None,
+            };
+            found.push(StoredFile {
+                file_id,
+                msg_id: msg_id
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("msg_id не 16 байт".into()))?,
+                name,
+                size_bytes,
+                chunk_total,
+                key,
+                preview,
+                incoming,
+                source_path,
+                accepted,
+                complete,
+            });
+        }
+        Ok(found)
     }
 
     fn schema_version(&self) -> Result<u32> {
@@ -645,6 +721,173 @@ impl Store for SqliteStore {
 
     fn delete_outbox(&mut self, msg_id: &MsgId) -> Result<()> {
         self.conn.execute("DELETE FROM outbox WHERE msg_id = ?1", [&msg_id[..]])?;
+        Ok(())
+    }
+
+    fn put_file(&mut self, file: &StoredFile) -> Result<()> {
+        // Имя, ключ и превью — содержимое (§12). Имя не меньше остального:
+        // «результаты анализов.pdf» в открытом столбце рассказывает о переписке
+        // ровно то, от чего шифруется тело сообщения.
+        let name_enc = self.seal("files.name_enc", &file.file_id, file.name.as_bytes())?;
+        let key_enc = self.seal("files.file_key_enc", &file.file_id, &file.key)?;
+        let preview_enc = match &file.preview {
+            Some(bytes) => Some(self.seal("files.preview_enc", &file.file_id, bytes)?),
+            None => None,
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO files (
+                 file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
+                 preview_enc, incoming, source_path, accepted, complete
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                &file.file_id[..],
+                &file.msg_id[..],
+                name_enc,
+                sql_types::to_sql(file.size_bytes),
+                sql_types::to_sql(file.chunk_total),
+                key_enc,
+                preview_enc,
+                i64::from(file.incoming),
+                file.source_path.as_deref(),
+                i64::from(file.accepted),
+                i64::from(file.complete),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn file(&self, file_id: &FileId) -> Result<Option<StoredFile>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
+                    preview_enc, incoming, source_path, accepted, complete
+               FROM files WHERE file_id = ?1",
+        )?;
+        let mut found = self.read_files(&mut statement, rusqlite::params![&file_id[..]])?;
+        Ok(found.pop())
+    }
+
+    fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
+                    preview_enc, incoming, source_path, accepted, complete
+               FROM files WHERE msg_id = ?1 ORDER BY file_id",
+        )?;
+        self.read_files(&mut statement, rusqlite::params![&msg_id[..]])
+    }
+
+    fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute("UPDATE files SET accepted = 1 WHERE file_id = ?1", [&file_id[..]])?;
+        Ok(affected > 0)
+    }
+
+    fn complete_file(&mut self, file_id: &FileId) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute("UPDATE files SET complete = 1 WHERE file_id = ?1", [&file_id[..]])?;
+        Ok(affected > 0)
+    }
+
+    fn note_chunk(&mut self, file_id: &FileId, index: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO file_chunks (file_id, chunk_index) VALUES (?1, ?2)",
+            rusqlite::params![&file_id[..], sql_types::to_sql(index)],
+        )?;
+        Ok(())
+    }
+
+    fn has_chunk(&self, file_id: &FileId, index: u64) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM file_chunks WHERE file_id = ?1 AND chunk_index = ?2",
+                rusqlite::params![&file_id[..], sql_types::to_sql(index)],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        Ok(found.is_some())
+    }
+
+    fn received_chunks(&self, file_id: &FileId) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM file_chunks WHERE file_id = ?1",
+            [&file_id[..]],
+            |row| row.get(0),
+        )?;
+        Ok(sql_types::from_sql(count))
+    }
+
+    fn next_missing_chunk(&self, file_id: &FileId, chunk_total: u64) -> Result<Option<u64>> {
+        // Индексы читаются по порядку и обходятся в Rust, а не считаются в SQL.
+        // Арифметики в запросах здесь нет намеренно (см. `compact`), а для
+        // двух тысяч строк разницы всё равно никакой.
+        let mut statement = self.conn.prepare(
+            "SELECT chunk_index FROM file_chunks WHERE file_id = ?1 ORDER BY chunk_index",
+        )?;
+        let rows = statement
+            .query_map([&file_id[..]], |row| Ok(sql_types::from_sql(row.get::<_, i64>(0)?)))?;
+
+        let mut expected = 0u64;
+        for row in rows {
+            let index: u64 = row?;
+            if index != expected {
+                return Ok(Some(expected));
+            }
+            expected += 1;
+        }
+        Ok((expected < chunk_total).then_some(expected))
+    }
+
+    fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
+                    preview_enc, incoming, source_path, accepted, complete
+               FROM files WHERE complete = 0 ORDER BY file_id",
+        )?;
+        self.read_files(&mut statement, rusqlite::params![])
+    }
+
+    fn file_ids_of_chat(&self, chat_id: &[u8; 16]) -> Result<Vec<FileId>> {
+        let mut statement = self.conn.prepare(
+            "SELECT files.file_id FROM files
+               JOIN messages ON messages.msg_id = files.msg_id
+              WHERE messages.chat_id = ?1
+              ORDER BY files.file_id",
+        )?;
+        let rows = statement.query_map([&chat_id[..]], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            let Ok(file_id) = FileId::try_from(bytes.as_slice()) else { continue };
+            found.push(file_id);
+        }
+        Ok(found)
+    }
+
+    fn all_file_ids(&self) -> Result<Vec<FileId>> {
+        let mut statement = self.conn.prepare("SELECT file_id FROM files ORDER BY file_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            // Длина не та — строка испорчена. Пропускаем: сверка от этого
+            // недосчитается одного файла, то есть в худшем случае оставит
+            // на диске лишнее. Обратная ошибка — стереть нужное.
+            let Ok(file_id) = FileId::try_from(bytes.as_slice()) else { continue };
+            found.push(file_id);
+        }
+        Ok(found)
+    }
+
+    fn delete_file(&mut self, file_id: &FileId) -> Result<()> {
+        // Чанки уйдут каскадом; байты с диска убирает вызывающий — они лежат
+        // в `Blobs`, а не здесь.
+        self.conn.execute("DELETE FROM files WHERE file_id = ?1", [&file_id[..]])?;
         Ok(())
     }
 

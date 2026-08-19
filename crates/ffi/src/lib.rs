@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use ratatosk_codec::ContactCard;
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream, MessageView};
-use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
+use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, OutgoingFile, SelfAddresses};
 use ratatosk_proto::DeliveryStatus;
-use ratatosk_store::SqliteStore;
+use ratatosk_store::{FsBlobs, SqliteStore};
 use ratatosk_transport::{LanConfig, LanRunner};
 
 uniffi::setup_scaffolding!();
@@ -186,6 +186,19 @@ pub enum FfiEvent {
         /// Чат.
         chat_id: Vec<u8>,
     },
+    /// Ход передачи файла (§10.2).
+    ///
+    /// Приходит на каждый принятый чанк и на завершение. `total` равен нулю
+    /// только в одном случае — файл отклонён и убран; тогда клиенту надо
+    /// перечитать сообщение, вложения у него больше нет.
+    FileProgress {
+        /// Какой файл.
+        file_id: Vec<u8>,
+        /// Принято чанков.
+        received: u64,
+        /// Всего чанков.
+        total: u64,
+    },
     /// Текст из §14, который клиент обязан показать дословно.
     HonestNotice {
         /// Текст.
@@ -261,6 +274,8 @@ pub struct FfiMessage {
     pub forwarded: bool,
     /// Реакции на сообщение — по одной от человека.
     pub reactions: Vec<FfiReaction>,
+    /// Вложения. К одному сообщению их может быть несколько (§10).
+    pub files: Vec<FfiFile>,
     /// Сообщение, на которое это отвечает. `None` — ответом не является.
     ///
     /// Едет **ссылка**, а не отрывок цитаты: цитату клиент берёт из своей
@@ -271,6 +286,117 @@ pub struct FfiMessage {
     /// не дошло, вычищено уборкой. Тогда клиент обязан сказать «сообщение
     /// недоступно», а не придумывать текст и не прятать сам ответ.
     pub reply_to: Option<Vec<u8>>,
+}
+
+/// Открытое на чтение вложение (§10.2).
+///
+/// Живёт отдельно от клиента и не занимает ядро: читать можно из фонового
+/// потока сколько угодно долго, и переписка при этом идёт своим ходом.
+/// Ключ файла остаётся внутри — наружу выходят только расшифрованные байты.
+///
+/// Это **снимок**: число кусков и ключ берутся в момент открытия. Файл,
+/// который дозагружается прямо сейчас, читается ровно настолько, насколько
+/// успел приехать; чтобы увидеть остальное, надо открыть заново.
+#[derive(uniffi::Object)]
+pub struct FfiFileReader {
+    reader: ratatosk_core::FileReader,
+}
+
+#[uniffi::export]
+impl FfiFileReader {
+    /// Сколько всего кусков.
+    pub fn chunk_total(&self) -> u64 {
+        self.reader.chunk_total()
+    }
+
+    /// Размер файла целиком.
+    pub fn size_bytes(&self) -> u64 {
+        self.reader.size_bytes()
+    }
+
+    /// Своё ли это вложение — то, которое отправляли мы.
+    ///
+    /// У своего вложения байты берутся из исходника по пути, а не из
+    /// принятого: отправитель ничего у себя не запечатывал. Отсюда разница
+    /// в поведении, о которой стоит знать: свой файл перестаёт открываться,
+    /// если человек удалил или перенёс исходник, — ядро его не копировало.
+    pub fn own(&self) -> bool {
+        self.reader.own()
+    }
+
+    /// Расшифрованный кусок. `None` — показать нечего.
+    ///
+    /// Куски идут подряд, от нуля до `chunk_total() - 1`; размер каждого,
+    /// кроме последнего, — [`chunk_bytes`].
+    ///
+    /// Вызывать **не из UI-потока**: расшифровка мебибайта — это работа.
+    /// Ядру она больше не мешает, а вот отрисовке помешает.
+    pub fn chunk(&self, index: u64) -> Result<Option<Vec<u8>>, RatatoskError> {
+        self.reader.chunk(index).map_err(|error| RatatoskError::internal(error.to_string()))
+    }
+}
+
+/// Что убрала уборка осиротевших вложений (§12).
+///
+/// Три числа, а не одно: целые вложения без записи в базе — след удалённой
+/// переписки, обрывки — след процесса, убитого системой между записью чанка
+/// и отметкой о нём. Человеку показывают обычно только `bytes`, но остальные
+/// два стоит писать в журнал: по ним видно, что именно течёт.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSwept {
+    /// Сколько вложений убрано целиком.
+    pub files: u64,
+    /// Сколько отдельных чанков убрано.
+    pub chunks: u64,
+    /// Сколько байт освободилось.
+    pub bytes: u64,
+}
+
+/// Вложение в том виде, в каком его показывает UI.
+///
+/// Байтов здесь нет: файл может весить гигабайты, а список чата рисуется
+/// целиком. Содержимое берётся у [`RatatoskClient::open_file`] по куску,
+/// превью — [`RatatoskClient::preview_of`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFile {
+    /// Идентификатор — им адресуются команды и чтение содержимого.
+    pub file_id: Vec<u8>,
+    /// Имя для показа. Задал его собеседник, поэтому **путём его считать
+    /// нельзя**: ядро проверяет, что в нём нет разделителей, но сохранять
+    /// файл под этим именем клиент обязан через системный выбор места.
+    pub name: String,
+    /// Размер открытого содержимого.
+    pub size_bytes: u64,
+    /// Входящий файл. У исходящего показывать «принять» нечего.
+    pub incoming: bool,
+    /// Принят к загрузке — автоматически по порогу или человеком.
+    pub accepted: bool,
+    /// Собран целиком.
+    pub complete: bool,
+    /// Сколько чанков уже принято — и сколько всего. Это и есть ход передачи;
+    /// в байтах он получается умножением на [`chunk_bytes`].
+    pub received_chunks: u64,
+    /// Сколько чанков всего.
+    pub chunk_total: u64,
+    /// Есть ли превью, которое можно показать (§10.3).
+    pub has_preview: bool,
+}
+
+/// Файл, который клиент просит отправить.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiOutgoingFile {
+    /// Путь на диске. Файл **не копируется** — ядро читает его лениво,
+    /// по чанку за раз, пока идёт передача. Значит, до её конца файл должен
+    /// оставаться на месте; на Android это означает «сперва скопируйте
+    /// из `content://` в своё хранилище, потом отправляйте».
+    pub path: String,
+    /// Превью изображения до [`max_preview_bytes`] (§10.3).
+    ///
+    /// Готовит клиент, как и аватарку: декодер изображений — большая
+    /// поверхность атаки, и в процессе, который держит ключи, ему делать
+    /// нечего. Без превью человек на той стороне решает «принимать или нет»
+    /// по имени файла, то есть вслепую.
+    pub preview: Option<Vec<u8>>,
 }
 
 /// Реакция на сообщение в том виде, в каком её показывает UI.
@@ -596,6 +722,142 @@ impl RatatoskClient {
         })
     }
 
+    /// Отправляет файлы одним сообщением — с подписью или без (§10).
+    ///
+    /// Файл **не копируется**: ядро читает его с диска по пути, пока идёт
+    /// передача. Значит, до её конца файл должен оставаться на месте — на
+    /// Android это означает «сперва скопируйте из `content://` в своё
+    /// хранилище, потом отправляйте». Исчезнувший исходник останавливает
+    /// передачу, и клиент получит [`honest_notices`]-текст
+    /// [`file_source_gone_notice`].
+    ///
+    /// Отказ приходит сразу: файлов больше [`max_files_per_message`], файл
+    /// больше [`max_file_bytes`], негодное имя или слишком большое превью.
+    ///
+    /// Чанки идут **только прямым каналом** (§10.2): почтой тысячи кадров
+    /// не поедут. Пока собеседника нет в сети, сообщение с вложением стоит
+    /// в очереди как любое другое, а байты начнут ездить, когда он появится.
+    pub fn send_files(
+        &self,
+        chat_id: Vec<u8>,
+        files: Vec<FfiOutgoingFile>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        if files.is_empty() || files.len() > ratatosk_proto::files::MAX_FILES_PER_MESSAGE {
+            return Err(RatatoskError::internal("не тот набор файлов"));
+        }
+        for file in &files {
+            if let Some(preview) = &file.preview {
+                if !ratatosk_proto::files::preview_fits(preview.len()) {
+                    return Err(RatatoskError::internal("превью слишком большое"));
+                }
+            }
+        }
+        let files = files
+            .into_iter()
+            .map(|f| OutgoingFile { path: PathBuf::from(f.path), preview: f.preview })
+            .collect();
+        self.command(Command::SendFiles { chat, files, text })
+    }
+
+    /// Принимает входящий файл к загрузке.
+    ///
+    /// Нужно только тем файлам, которые не прошли по порогу автоприёма
+    /// ([`RatatoskClient::set_auto_accept_bytes`]). Согласие переживает
+    /// перезапуск: спрашивать дважды об одном файле незачем.
+    pub fn accept_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::AcceptFile { file_id: to_msg_id(&file_id)? })
+    }
+
+    /// Отказывается от входящего файла.
+    ///
+    /// Сведения о файле и всё, что успело приехать, удаляются. Собеседнику
+    /// не уходит ничего: отказ — решение о своей памяти, а не сообщение о себе.
+    /// Он увидит только, что чанки перестали запрашивать.
+    pub fn decline_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::DeclineFile { file_id: to_msg_id(&file_id)? })
+    }
+
+    /// Задаёт порог автоматического приёма файлов, в байтах.
+    ///
+    /// `None` — принимать только вручную; это законный выбор, а не отключённая
+    /// функция. Настройка переживает перезапуск. По умолчанию —
+    /// [`default_auto_accept_bytes`].
+    pub fn set_auto_accept_bytes(&self, limit: Option<u64>) -> Result<(), RatatoskError> {
+        self.command(Command::SetAutoAcceptBytes(limit))
+    }
+
+    /// Текущий порог автоматического приёма файлов.
+    pub fn auto_accept_bytes(&self) -> Result<Option<u64>, RatatoskError> {
+        self.opened
+            .handle
+            .auto_accept_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
+    /// Стирает с диска вложения, которых нет в базе (§12).
+    ///
+    /// Байты вложений лежат не в базе, а в каталоге рядом с ней, и разойтись
+    /// они способны: удаление переписки уносит записи, а каталоги с чанками
+    /// остаются. Эта сверка их подбирает — и ту, что накопилась раньше, тоже.
+    ///
+    /// Направление одно: **с диска убирается лишнее**. Незаконченный приём
+    /// не трогается — запись о нём в базе есть, и продолжится он с той же
+    /// дырки (§10.2).
+    ///
+    /// Дорогая: обходит каталог вложений целиком, поэтому место ей —
+    /// кнопка «освободить место», а не запуск приложения. Вызывать не
+    /// из UI-потока.
+    pub fn sweep_orphan_files(&self) -> Result<FfiSwept, RatatoskError> {
+        let swept = self
+            .opened
+            .handle
+            .sweep_orphan_files_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(FfiSwept { files: swept.files, chunks: swept.chunks, bytes: swept.bytes })
+    }
+
+    /// Открывает вложение на чтение (§10.2).
+    ///
+    /// **Один вызов на файл, а не на кусок.** Дальше куски берутся
+    /// у [`FfiFileReader`], и ядро в этом не участвует: читать можно
+    /// в фоновом потоке, пока переписка идёт своим ходом.
+    ///
+    /// Так было не всегда. Раньше каждый кусок ходил через ядро, и открытие
+    /// вложения на полгигабайта занимало его на всё время чтения с диска
+    /// и расшифровки — сообщения в это время не уходили. Расшифровка
+    /// не стала быстрее; она перестала стоять в общей очереди.
+    ///
+    /// Собирает файл всё равно **клиент**: куда его положить — в галерею,
+    /// в загрузки, в другое приложение — знает только он, и только он умеет
+    /// писать туда системными средствами.
+    ///
+    /// `None` — такого вложения нет: не приезжало, отклонено или удалено.
+    pub fn open_file(&self, file_id: Vec<u8>) -> Result<Option<Arc<FfiFileReader>>, RatatoskError> {
+        let file_id = to_msg_id(&file_id)?;
+        let found = self
+            .opened
+            .handle
+            .open_file_blocking(file_id)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found.map(|reader| Arc::new(FfiFileReader { reader })))
+    }
+
+    /// Превью вложения, если оно есть (§10.3).
+    ///
+    /// Отдельным вызовом, как и аватарка: до 32 КиБ на файл, и тащить их
+    /// в каждый показ списка чата незачем.
+    pub fn preview_of(&self, file_id: Vec<u8>) -> Result<Option<Vec<u8>>, RatatoskError> {
+        let file_id = to_msg_id(&file_id)?;
+        let found = self
+            .opened
+            .handle
+            .file_preview_blocking(file_id)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found)
+    }
+
     /// Отвечает на сообщение — с цитатой, которую нельзя подделать.
     ///
     /// По проводу едет **ссылка** (`msg_id`), а не отрывок текста: цитату
@@ -861,6 +1123,23 @@ impl RatatoskClient {
                     author_ik: r.author_ik.to_vec(),
                 })
                 .collect(),
+            files: view
+                .files
+                .into_iter()
+                .map(|view| FfiFile {
+                    // Ход передачи считает ядро: клиенту незачем знать,
+                    // что чанки бывают неполными и приходят не по порядку.
+                    received_chunks: view.received_chunks,
+                    file_id: view.file.file_id.to_vec(),
+                    name: view.file.name,
+                    size_bytes: view.file.size_bytes,
+                    incoming: view.file.incoming,
+                    accepted: view.file.accepted,
+                    complete: view.file.complete,
+                    chunk_total: view.file.chunk_total,
+                    has_preview: view.file.preview.is_some(),
+                })
+                .collect(),
         }
     }
 
@@ -923,12 +1202,18 @@ async fn start(
         vault::open_encrypted(&db_path, pin.as_deref()).map_err(engine_err)?;
     let identity = vault::load_or_create(&mut store, &db_key).map_err(engine_err)?;
 
+    // Байты вложений — рядом с базой, но не в ней (§10, §12). Каталог
+    // соседний, чтобы жить и удаляться вместе с ней: база без чанков — это
+    // сообщения с вложениями, которых нет, а чанки без базы — мусор,
+    // который никто не подберёт.
+    let blobs = FsBlobs::new(db_path.with_extension("files"));
+
     // Onion и chatmail пока пусты: их адреса появятся вместе с транспортами
     // этапов 2 и 3. §5.4 с пустыми адресами честно скажет «отправлять некуда»,
     // а не сделает вид, что письмо ушло.
     let addresses = SelfAddresses { onion: String::new(), chatmail: String::new(), display_name };
 
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses);
+    let mut engine = Engine::new(identity, store, Box::new(blobs), Box::new(OsEntropy), addresses);
     engine.restore().map_err(engine_err)?;
 
     let card = engine.own_card();
@@ -1004,10 +1289,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::GroupMembershipChanged { chat } => {
             FfiEvent::GroupMembershipChanged { chat_id: chat.to_vec() }
         }
-        // §10 ещё не проходит через `step`, поэтому события и не будет.
-        // Показывать вместо него пустое уведомление хуже, чем не показывать
-        // ничего: клиент нарисовал бы пустую строку из §14.
-        Event::FileProgress { .. } => return None,
+        Event::FileProgress { file_id, received, total } => {
+            FfiEvent::FileProgress { file_id: file_id.to_vec(), received, total }
+        }
         Event::HonestNotice { text } => FfiEvent::HonestNotice { text: text.to_owned() },
     })
 }
@@ -1115,6 +1399,48 @@ pub fn max_reaction_bytes() -> u32 {
 #[must_use]
 pub fn max_forward_ids() -> u32 {
     u32::try_from(ratatosk_proto::MAX_FORWARD_IDS).unwrap_or(u32::MAX)
+}
+
+/// Размер куска файла в байтах — то, чем ходит [`FfiFileReader::chunk`].
+#[uniffi::export]
+#[must_use]
+pub fn chunk_bytes() -> u32 {
+    u32::try_from(ratatosk_proto::files::CHUNK_BYTES).unwrap_or(u32::MAX)
+}
+
+/// Наибольший размер файла в байтах.
+#[uniffi::export]
+#[must_use]
+pub fn max_file_bytes() -> u64 {
+    ratatosk_proto::files::MAX_FILE_BYTES
+}
+
+/// Сколько файлов можно приложить к одному сообщению.
+#[uniffi::export]
+#[must_use]
+pub fn max_files_per_message() -> u32 {
+    u32::try_from(ratatosk_proto::files::MAX_FILES_PER_MESSAGE).unwrap_or(u32::MAX)
+}
+
+/// Наибольший размер превью в байтах (§10.3).
+#[uniffi::export]
+#[must_use]
+pub fn max_preview_bytes() -> u32 {
+    u32::try_from(ratatosk_proto::files::PREVIEW_LIMIT_BYTES).unwrap_or(u32::MAX)
+}
+
+/// Порог автоматического приёма файлов по умолчанию.
+#[uniffi::export]
+#[must_use]
+pub fn default_auto_accept_bytes() -> u64 {
+    ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES
+}
+
+/// Что сказать, когда исходный файл исчез (§14).
+#[uniffi::export]
+#[must_use]
+pub fn file_source_gone_notice() -> String {
+    ratatosk_core::honest::FILE_SOURCE_GONE.to_string()
 }
 
 /// Что сказать перед правкой сообщения (§14).

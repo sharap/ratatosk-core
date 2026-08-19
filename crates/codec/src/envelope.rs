@@ -103,6 +103,14 @@ pub enum PayloadType {
     /// цитату каждая сторона рисует из своей копии, и потому подделать её
     /// нельзя.
     Reply,
+    /// Просьба продолжить передачу файла с указанного чанка (§10.2).
+    ///
+    /// **Дополнение к спецификации:** v0.1 называет возобновление по индексу
+    /// чанка, но не описывает, чем о нём просят. Правила —
+    /// в `ratatosk_proto::files`. Она же служит подтверждением: «всё до этого
+    /// номера у меня есть». Двух разных кадров для «начни» и «продолжай» нет
+    /// намеренно — это одно утверждение о состоянии получателя.
+    FileRequest,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -129,6 +137,7 @@ impl PayloadType {
             PayloadType::Reaction => 12,
             PayloadType::Forward => 13,
             PayloadType::Reply => 14,
+            PayloadType::FileRequest => 15,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -151,6 +160,7 @@ impl PayloadType {
             12 => PayloadType::Reaction,
             13 => PayloadType::Forward,
             14 => PayloadType::Reply,
+            15 => PayloadType::FileRequest,
             other => PayloadType::Unknown(other),
         }
     }

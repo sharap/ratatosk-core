@@ -30,7 +30,7 @@ use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
 use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
 use ratatosk_crypto::Identity;
 use ratatosk_proto::DeliveryStatus;
-use ratatosk_store::{MemoryStore, Store};
+use ratatosk_store::{FsBlobs, MemoryStore, Store};
 use ratatosk_transport::{LanConfig, LanDirectory, LanRunner};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -118,7 +118,13 @@ async fn run<S: Store + 'static>(
         display_name: args.name.clone(),
     };
 
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses);
+    // Вложения стенда лежат рядом с базой; без `--data` — во временном
+    // каталоге, как и всё остальное состояние такого запуска.
+    let blobs = FsBlobs::new(args.data.as_ref().map_or_else(
+        || std::env::temp_dir().join("ratatosk-lab-files"),
+        |p| p.with_extension("files"),
+    ));
+    let mut engine = Engine::new(identity, store, Box::new(blobs), Box::new(OsEntropy), addresses);
     let known = engine.restore()?;
 
     let card = BASE64URL_NOPAD.encode(&engine.own_card().encode()?);
@@ -146,7 +152,7 @@ async fn run<S: Store + 'static>(
     println!("если mDNS в вашей сети не работает, допишите через пробел адрес");
     println!("этой машины: /add <карточка> 192.168.1.5:{port}");
     println!();
-    println!("команды: /add <карточка> [ip:порт]   /who   /net   /quit");
+    println!("команды: /add <карточка> [ip:порт]   /who   /net   /sweep   /quit");
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
 
@@ -186,6 +192,21 @@ async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDi
                 }
                 if line == "/who" {
                     show_contacts(&handle, &directory).await;
+                    continue;
+                }
+                if line == "/sweep" {
+                    // Байты вложений лежат рядом с базой, а не в ней, и
+                    // разойтись они способны. Проверяется руками так: принять
+                    // файл, удалить контакт с историей, позвать `/sweep` —
+                    // до правки он находил гигабайты, теперь обязан находить
+                    // ноль.
+                    match handle.sweep_orphan_files().await {
+                        Some(swept) => println!(
+                            "< убрано: вложений {}, обрывков {}, освободилось {} байт",
+                            swept.files, swept.chunks, swept.bytes
+                        ),
+                        None => return,
+                    }
                     continue;
                 }
                 if line == "/net" {

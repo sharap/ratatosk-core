@@ -14,6 +14,7 @@
 //! | [`kdf`] | §8.1, обёртка над `BLAKE3::derive_key` |
 //! | [`identity`] | §3 идентичность, отпечаток, §5.1 маяк LAN |
 //! | [`aead`] | §7.2 запечатывание кадра |
+//! | [`file`] | §10.1 ключи и запечатывание чанков файла |
 //! | [`handshake`] | §8.2 Noise IK, §8.3 сессия, §8.5 перерукопожатие |
 //! | [`ratchet`] | §8.4 симметричный ретчет, §11.1 sender keys |
 //! | [`storage_key`] | §8.6 `db_key` из PIN |
@@ -28,6 +29,7 @@
 
 pub mod aead;
 pub mod error;
+pub mod file;
 pub mod handshake;
 pub mod identity;
 pub mod kdf;
@@ -36,6 +38,7 @@ pub mod ratchet;
 pub mod storage_key;
 
 pub use error::{CryptoError, Result};
+pub use file::{FileId, FileKey};
 pub use handshake::{
     Accepted, Admission, HandshakeOutcome, HandshakeReplayGuard, Initiator, PendingHandshake,
     RekeyPolicy, Responder, Role, Session,

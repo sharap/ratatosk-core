@@ -55,9 +55,74 @@ pub const BEACON_TXT_KEY: &str = "b";
 /// на следующий транспорт.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Сколько кадров помещается в очередь на запись, прежде чем отправка начнёт
-/// ждать. Кадр класса L — мебибайт, поэтому очередь короткая намеренно.
-const WRITE_QUEUE: usize = 16;
+/// Сколько мелких кадров помещается в срочную полосу.
+///
+/// Кадры классов S и M — от четырёх килобайт; тридцать две штуки это меньше
+/// двух мебибайт в худшем случае и обычно десятки килобайт. Ждать на такой
+/// очереди можно: она наполняется ровно тогда, когда сеть действительно
+/// не успевает, и тогда ожидание — честный ответ, а не затор.
+const URGENT_QUEUE: usize = 32;
+
+/// Сколько чанков файла ждёт записи, прежде чем кадр будет отброшен.
+///
+/// Кадр класса L — мебибайт, поэтому очередь короткая намеренно: восемь
+/// штук это восемь мебибайт памяти на одно соединение. Больше и не нужно —
+/// окно передачи (§10.2) держит в полёте единицы чанков на файл, так что
+/// заполнить эту очередь может только сеть, которая встала совсем.
+const BULK_QUEUE: usize = 8;
+
+/// Две полосы записи в одно соединение.
+///
+/// Разделение появилось не от любви к приоритетам, а от простого наблюдения:
+/// кадр класса L — мебибайт, кадр с текстом — четыре килобайта, и в общей
+/// очереди текст ждёт, пока в сокет уползут мегабайты чужой передачи. На
+/// быстром LAN это миллисекунды, на onion — минуты, и человек видит, что
+/// «файл заблокировал переписку».
+///
+/// Поэтому полос две, и пишущая задача всегда сначала опустошает срочную.
+/// Передача файла от этого не замедляется заметно: она и так упирается
+/// в пропускную способность, а мелкие кадры отнимают у неё доли процента.
+#[derive(Clone)]
+struct Link {
+    urgent: mpsc::Sender<Vec<u8>>,
+    bulk: mpsc::Sender<Vec<u8>>,
+}
+
+impl Link {
+    /// Закрыта ли хоть одна полоса.
+    ///
+    /// Обе половины живут и умирают вместе — их держит одна пишущая задача,
+    /// и её уход закрывает обе. Проверка по любой из них равносильна, но
+    /// писать «любая» честнее, чем полагаться на это молча.
+    fn is_closed(&self) -> bool {
+        self.urgent.is_closed() || self.bulk.is_closed()
+    }
+
+    /// Кладёт кадр в свою полосу.
+    ///
+    /// Класс L едет через [`mpsc::Sender::try_send`] — то есть отправка чанка
+    /// **никогда** не ждёт. Ждать здесь нельзя: `Driver::apply` дожидается
+    /// каждой команды по очереди, и одно ожидание на забитой очереди чанков
+    /// останавливает весь цикл ядра — вместе с сообщениями, квитанциями
+    /// и таймерами. Именно так «зависший файл» и превращался в зависший
+    /// мессенджер.
+    ///
+    /// Цена отказа известна и ограничена: потерянный чанк получатель
+    /// перепросит по сроку молчания (§10.2), как перепросил бы потерянный
+    /// сетью. Мелкие кадры, наоборот, ждут: терять квитанцию или сообщение
+    /// ради полумиллисекунды нечестно.
+    async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
+        let bulky = SizeClass::from_frame_len(frame.len()).is_ok_and(|class| class == SizeClass::L);
+        if bulky {
+            self.bulk.try_send(frame).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => TransportError::Busy,
+                mpsc::error::TrySendError::Closed(_) => TransportError::Unavailable,
+            })
+        } else {
+            self.urgent.send(frame).await.map_err(|_| TransportError::Unavailable)
+        }
+    }
+}
 
 /// Настройки LAN-транспорта.
 #[derive(Debug, Clone)]
@@ -167,7 +232,7 @@ pub struct LanRunner {
     events_tx: mpsc::Sender<TransportEvent>,
     events_rx: mpsc::Receiver<TransportEvent>,
     /// Куда писать каждому контакту.
-    links: BTreeMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    links: BTreeMap<[u8; 32], Link>,
     directory: Directory,
     watched: Watched,
     heard: Heard,
@@ -321,10 +386,7 @@ impl LanRunner {
         Ok(())
     }
 
-    async fn ensure_link(
-        &mut self,
-        peer_ik: [u8; 32],
-    ) -> Result<mpsc::Sender<Vec<u8>>, TransportError> {
+    async fn ensure_link(&mut self, peer_ik: [u8; 32]) -> Result<Link, TransportError> {
         if let Some(link) = self.links.get(&peer_ik) {
             if !link.is_closed() {
                 return Ok(link.clone());
@@ -340,13 +402,15 @@ impl LanRunner {
         // добавила бы задержку, ничего не экономя.
         stream.set_nodelay(true)?;
 
-        let (tx, rx) = mpsc::channel(WRITE_QUEUE);
-        spawn_write_loop(stream, rx, peer_ik, self.events_tx.clone());
-        self.links.insert(peer_ik, tx.clone());
+        let (urgent_tx, urgent_rx) = mpsc::channel(URGENT_QUEUE);
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
+        spawn_write_loop(stream, urgent_rx, bulk_rx, peer_ik, self.events_tx.clone());
+        let link = Link { urgent: urgent_tx, bulk: bulk_tx };
+        self.links.insert(peer_ik, link.clone());
 
         let _ =
             self.events_tx.send(TransportEvent::Connected { peer_ik, via: Transport::Lan }).await;
-        Ok(tx)
+        Ok(link)
     }
 
     /// Сверяет уже услышанные объявления с обновлённым списком контактов.
@@ -421,14 +485,19 @@ impl Runner for LanRunner {
                     return Err(TransportError::Unavailable);
                 }
                 match self.ensure_link(peer.ik).await {
-                    Ok(link) => {
-                        if link.send(frame).await.is_err() {
+                    Ok(link) => match link.send(frame).await {
+                        Ok(()) => Ok(()),
+                        // Забитая очередь чанков — не обрыв: соединение живо,
+                        // просто пишет медленнее, чем в него кладут. Рвать его
+                        // здесь значило бы лечить затор разрывом, а заодно
+                        // ронять переписку из-за одной передачи файла.
+                        Err(TransportError::Busy) => Err(TransportError::Busy),
+                        Err(error) => {
                             self.links.remove(&peer.ik);
                             self.report_failure(peer.ik).await;
-                            return Err(TransportError::Unavailable);
+                            Err(error)
                         }
-                        Ok(())
-                    }
+                    },
                     Err(error) => {
                         self.report_failure(peer.ik).await;
                         Err(error)
@@ -521,14 +590,35 @@ fn spawn_read_loop(mut stream: TcpStream, events: mpsc::Sender<TransportEvent>) 
     });
 }
 
+/// Пишущая задача: сначала срочная полоса, потом чанки.
+///
+/// `biased` в [`tokio::select!`] здесь — это и есть весь приоритет: пока
+/// в срочной полосе есть хоть один кадр, к чанкам очередь не доходит.
+/// Голодания у чанков не возникает, потому что мелкие кадры кончаются:
+/// их порождают сообщения и квитанции, а не бесконечный поток.
 fn spawn_write_loop(
     mut stream: TcpStream,
-    mut frames: mpsc::Receiver<Vec<u8>>,
+    mut urgent: mpsc::Receiver<Vec<u8>>,
+    mut bulk: mpsc::Receiver<Vec<u8>>,
     peer_ik: [u8; 32],
     events: mpsc::Sender<TransportEvent>,
 ) {
     tokio::spawn(async move {
-        while let Some(frame) = frames.recv().await {
+        loop {
+            // Обе полосы закрываются вместе — их отправители лежат в одной
+            // записи `Link`, — поэтому `None` с любой из них означает, что
+            // соединение больше никому не нужно.
+            let frame = tokio::select! {
+                biased;
+                frame = urgent.recv() => match frame {
+                    Some(frame) => frame,
+                    None => return,
+                },
+                frame = bulk.recv() => match frame {
+                    Some(frame) => frame,
+                    None => return,
+                },
+            };
             let Ok(class) = SizeClass::from_frame_len(frame.len()) else {
                 // Кадр не того размера сюда попасть не может: его собирает
                 // `crypto::aead::seal`. Если попал — это ошибка выше, и
@@ -885,5 +975,83 @@ mod tests {
             None,
             "мёртвый адрес обязан уйти из справочника, а не пережить собеседника"
         );
+    }
+
+    /// Соединение с задачей записи и с концом, куда можно читать.
+    async fn linked() -> (Link, TcpStream, mpsc::Receiver<TransportEvent>) {
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 0))
+            .await
+            .expect("слушающий сокет");
+        let addr = listener.local_addr().expect("адрес");
+        let (outgoing, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let outgoing = outgoing.expect("соединение");
+        let (incoming, _) = accepted.expect("принято");
+
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (urgent_tx, urgent_rx) = mpsc::channel(URGENT_QUEUE);
+        let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
+        spawn_write_loop(outgoing, urgent_rx, bulk_rx, [7u8; 32], events_tx);
+        (Link { urgent: urgent_tx, bulk: bulk_tx }, incoming, events_rx)
+    }
+
+    #[tokio::test]
+    async fn a_full_chunk_queue_refuses_instead_of_waiting() {
+        // Суть всей правки: отправка чанка не ждёт никогда. `Driver::apply`
+        // дожидается каждой команды по очереди, и одно ожидание на забитой
+        // очереди останавливает весь цикл ядра — вместе с сообщениями,
+        // квитанциями и таймерами. Так «зависший файл» и превращался
+        // в зависший мессенджер.
+        let (urgent_tx, _urgent_rx) = mpsc::channel(URGENT_QUEUE);
+        let (bulk_tx, _bulk_rx) = mpsc::channel(BULK_QUEUE);
+        let link = Link { urgent: urgent_tx, bulk: bulk_tx };
+
+        let chunk = || vec![0u8; SizeClass::L.frame_len()];
+        for _ in 0..BULK_QUEUE {
+            link.send(chunk()).await.expect("пока есть место — кадр принимается");
+        }
+        assert!(
+            matches!(link.send(chunk()).await, Err(TransportError::Busy)),
+            "переполнение обязано отличаться от обрыва: рвать живое соединение из-за затора нельзя"
+        );
+
+        // А мелкий кадр в это же время проходит: полосы независимы.
+        link.send(vec![0u8; SizeClass::S.frame_len()])
+            .await
+            .expect("переписка не зависит от того, сколько чанков ждёт записи");
+    }
+
+    #[tokio::test]
+    async fn a_message_overtakes_the_chunks_already_queued() {
+        // Ради этого полосы и разделены: без приоритета текст ждал бы,
+        // пока в сокет уползут мегабайты чужой передачи.
+        let (link, mut incoming, _events) = linked().await;
+
+        // Забиваем полосу чанков до отказа — тогда задача записи заведомо
+        // стоит на первом из них, а остальные ждут в очереди.
+        let mut queued = 0usize;
+        while link.send(vec![0u8; SizeClass::L.frame_len()]).await.is_ok() {
+            queued += 1;
+        }
+        assert!(queued >= 2, "очередь чанков обязана вмещать хотя бы пару кадров");
+
+        link.send(vec![0u8; SizeClass::S.frame_len()]).await.expect("мелкий кадр принят");
+
+        let mut order = Vec::new();
+        for _ in 0..=queued {
+            let mut tag = [0u8; 1];
+            incoming.read_exact(&mut tag).await.expect("тег класса");
+            let class = class_of_tag(tag[0]).expect("известный класс");
+            let mut frame = vec![0u8; class.frame_len()];
+            incoming.read_exact(&mut frame).await.expect("кадр целиком");
+            order.push(class);
+        }
+
+        let small = order.iter().position(|c| *c == SizeClass::S).expect("мелкий кадр дошёл");
+        // Точное место назвать нельзя: сколько чанков успеет уйти в буферы
+        // сокета, решает система, а не мы. Проверяется то, ради чего полосы
+        // и разделены, — мелкий кадр не ждёт всей очереди: после него чанков
+        // остаётся больше половины.
+        let after = order.len() - small - 1;
+        assert!(after * 2 >= queued, "мелкий кадр пропустили вперёд не по-настоящему: {order:?}");
     }
 }

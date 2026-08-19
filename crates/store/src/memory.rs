@@ -8,14 +8,14 @@
 //! Зато она даёт трейту [`Store`] вторую реализацию — а трейт с одной
 //! реализацией никогда не бывает честной абстракцией.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
 use crate::{
-    Result, Store, StoreError, StoredAvatar, StoredContact, StoredMessage, StoredOutbox,
-    StoredReaction, StoredSession,
+    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredFile, StoredMessage,
+    StoredOutbox, StoredReaction, StoredSession,
 };
 
 /// Хранилище в оперативной памяти.
@@ -39,6 +39,10 @@ pub struct MemoryStore {
     /// заменяет прежнюю.
     reactions: BTreeMap<(MsgId, [u8; 32]), StoredReaction>,
     outbox: BTreeMap<MsgId, StoredOutbox>,
+    files: BTreeMap<FileId, StoredFile>,
+    /// Какие чанки приняты. `BTreeSet` по паре, чтобы «первый недостающий»
+    /// считался обходом по порядку, как и в файловой базе.
+    chunks: std::collections::BTreeSet<(FileId, u64)>,
     meta: BTreeMap<String, Vec<u8>>,
 }
 
@@ -65,6 +69,19 @@ impl MemoryStore {
     #[must_use]
     pub fn seen_len(&self) -> usize {
         self.seen.len()
+    }
+
+    /// Идентификаторы сообщений чата.
+    ///
+    /// Ключ карты — тройка, а не `msg_id`, поэтому «сообщения этого чата»
+    /// каждый раз приходится собирать обходом. Место сборки одно, чтобы
+    /// удаление чата и поиск его вложений не разошлись.
+    fn message_ids_of_chat(&self, chat_id: &[u8; 16]) -> BTreeSet<MsgId> {
+        self.messages
+            .iter()
+            .filter(|((chat, _, _), _)| chat == chat_id)
+            .map(|(_, message)| message.msg_id)
+            .collect()
     }
 }
 
@@ -114,16 +131,25 @@ impl Store for MemoryStore {
     }
 
     fn delete_chat(&mut self, chat_id: &[u8; 16]) -> Result<()> {
-        let removed: Vec<MsgId> = self
-            .messages
-            .iter()
-            .filter(|((chat, _, _), _)| chat == chat_id)
-            .map(|(_, m)| m.msg_id)
-            .collect();
+        let removed = self.message_ids_of_chat(chat_id);
         self.messages.retain(|(chat, _, _), _| chat != chat_id);
         for msg_id in removed {
             self.tombstones.remove(&msg_id);
             self.reactions.retain(|(id, _), _| *id != msg_id);
+            // Файлы — тем же каскадом, что и в SQLite. Записи, пережившие
+            // свои сообщения, разошлись бы с продуктом ровно в том месте,
+            // которое ищет уборка: она считает лишним на диске то, чего нет
+            // в базе, и лишняя запись прятала бы от неё настоящий мусор.
+            let orphaned: Vec<FileId> = self
+                .files
+                .values()
+                .filter(|file| file.msg_id == msg_id)
+                .map(|file| file.file_id)
+                .collect();
+            for file_id in orphaned {
+                self.files.remove(&file_id);
+                self.chunks.retain(|(id, _)| *id != file_id);
+            }
         }
         Ok(())
     }
@@ -317,6 +343,85 @@ impl Store for MemoryStore {
 
     fn delete_outbox(&mut self, msg_id: &MsgId) -> Result<()> {
         self.outbox.remove(msg_id);
+        Ok(())
+    }
+
+    fn put_file(&mut self, file: &StoredFile) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.files.insert(file.file_id, file.clone());
+        Ok(())
+    }
+
+    fn file(&self, file_id: &FileId) -> Result<Option<StoredFile>> {
+        Ok(self.files.get(file_id).cloned())
+    }
+
+    fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
+        Ok(self.files.values().filter(|f| f.msg_id == *msg_id).cloned().collect())
+    }
+
+    fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
+        let Some(file) = self.files.get_mut(file_id) else { return Ok(false) };
+        file.accepted = true;
+        Ok(true)
+    }
+
+    fn complete_file(&mut self, file_id: &FileId) -> Result<bool> {
+        let Some(file) = self.files.get_mut(file_id) else { return Ok(false) };
+        file.complete = true;
+        Ok(true)
+    }
+
+    fn note_chunk(&mut self, file_id: &FileId, index: u64) -> Result<()> {
+        self.chunks.insert((*file_id, index));
+        Ok(())
+    }
+
+    fn has_chunk(&self, file_id: &FileId, index: u64) -> Result<bool> {
+        Ok(self.chunks.contains(&(*file_id, index)))
+    }
+
+    fn received_chunks(&self, file_id: &FileId) -> Result<u64> {
+        Ok(self.chunks.range((*file_id, 0)..=(*file_id, u64::MAX)).count() as u64)
+    }
+
+    fn next_missing_chunk(&self, file_id: &FileId, chunk_total: u64) -> Result<Option<u64>> {
+        let mut expected = 0u64;
+        for (_, index) in self.chunks.range((*file_id, 0)..=(*file_id, u64::MAX)) {
+            if *index != expected {
+                return Ok(Some(expected));
+            }
+            expected += 1;
+        }
+        Ok((expected < chunk_total).then_some(expected))
+    }
+
+    fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
+        Ok(self.files.values().filter(|f| !f.complete).cloned().collect())
+    }
+
+    fn file_ids_of_chat(&self, chat_id: &[u8; 16]) -> Result<Vec<FileId>> {
+        let of_chat = self.message_ids_of_chat(chat_id);
+        Ok(self
+            .files
+            .values()
+            .filter(|file| of_chat.contains(&file.msg_id))
+            .map(|file| file.file_id)
+            .collect())
+    }
+
+    fn all_file_ids(&self) -> Result<Vec<FileId>> {
+        Ok(self.files.keys().copied().collect())
+    }
+
+    fn delete_file(&mut self, file_id: &FileId) -> Result<()> {
+        self.files.remove(file_id);
+        // Каскада внешних ключей здесь нет — он делается руками, иначе
+        // симуляция разошлась бы с продуктом там, где это заметно: учёт
+        // чанков пережил бы файл.
+        self.chunks.retain(|(id, _)| id != file_id);
         Ok(())
     }
 
@@ -534,6 +639,40 @@ mod tests {
         // И уходит вместе с сообщением.
         s.tombstone_message(&[1u8; 16], 300).unwrap();
         assert!(s.reaction(&[1u8; 16], &author).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_resume_point_is_the_first_gap() {
+        // То же правило, что в файловой базе: продолжать надо с дырки,
+        // а не с числа принятых. Разойдясь здесь, симуляция (§16) перестала бы
+        // говорить о продукте — а именно её мы гоняем на перестановках.
+        let mut s = store();
+        s.put_message(&message(1, 100)).unwrap();
+        s.put_file(&StoredFile {
+            file_id: [2u8; 16],
+            msg_id: [1u8; 16],
+            name: "a.bin".into(),
+            size_bytes: 10,
+            chunk_total: 3,
+            key: [0u8; 32],
+            preview: None,
+            incoming: true,
+            source_path: None,
+            accepted: false,
+            complete: false,
+        })
+        .unwrap();
+
+        assert_eq!(s.next_missing_chunk(&[2u8; 16], 3).unwrap(), Some(0));
+        s.note_chunk(&[2u8; 16], 0).unwrap();
+        s.note_chunk(&[2u8; 16], 2).unwrap();
+        assert_eq!(s.received_chunks(&[2u8; 16]).unwrap(), 2);
+        assert_eq!(s.next_missing_chunk(&[2u8; 16], 3).unwrap(), Some(1));
+        s.note_chunk(&[2u8; 16], 1).unwrap();
+        assert_eq!(s.next_missing_chunk(&[2u8; 16], 3).unwrap(), None);
+
+        s.delete_file(&[2u8; 16]).unwrap();
+        assert_eq!(s.received_chunks(&[2u8; 16]).unwrap(), 0);
     }
 
     #[test]

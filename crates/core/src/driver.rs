@@ -15,12 +15,13 @@ use std::time::Duration;
 
 use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_proto::transport_policy::PeerAvailability;
-use ratatosk_store::{Store, StoredMessage, StoredReaction};
+use ratatosk_store::{FileId, Store, StoredFile, StoredMessage, StoredReaction};
 use ratatosk_transport::{Runner, TransportCommand, TransportEvent};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::{Engine, EngineError};
-use crate::io::{ChatId, Command, Effect, Event, Input};
+use crate::io::{ChatId, Command, Effect, Event, Input, Swept};
+use crate::reader::FileReader;
 use ratatosk_transport::runner::PeerAddress;
 
 /// Сколько команд и уведомлений помещается в очередь, прежде чем отправитель
@@ -51,6 +52,21 @@ enum Request {
     Command(Command),
     /// Прочитать состояние.
     Query(Query),
+    /// Обслуживание: меняет состояние **и** отвечает.
+    ///
+    /// Третий вид появился не для симметрии. Команда ничего не возвращает,
+    /// а запрос ничего не меняет — и на этом обещании держится [`Driver::answer`],
+    /// который берёт `&self`. Уборке нужно и то, и другое: она стирает файлы
+    /// и обязана сказать сколько. Сложить её в команду значило бы отправить
+    /// ответ окольным путём через поток событий; сложить в запрос — молча
+    /// отменить правило, по которому чтение безопасно.
+    Chore(Chore),
+}
+
+/// Обслуживание хранилища — по кнопке, а не по расписанию.
+enum Chore {
+    /// Стереть с диска вложения, которых нет в базе (§12).
+    SweepOrphanFiles { reply: oneshot::Sender<Swept> },
 }
 
 /// Сообщение вместе с тем, что к нему прилипло.
@@ -64,6 +80,21 @@ pub struct MessageView {
     pub message: StoredMessage,
     /// Реакции — только те, что есть: снятые хранилище не отдаёт.
     pub reactions: Vec<StoredReaction>,
+    /// Вложения. К одному сообщению их может быть несколько (§10).
+    pub files: Vec<FileView>,
+}
+
+/// Вложение вместе с тем, сколько его уже приехало.
+///
+/// Счётчик считается здесь, а не отдельным запросом на каждый файл: иначе
+/// экран чата с десятком вложений стоил бы десяти проходов через границу
+/// §13.3 ради одного числа.
+#[derive(Debug, Clone)]
+pub struct FileView {
+    /// Что за файл.
+    pub file: StoredFile,
+    /// Сколько чанков уже принято. У исходящего и у собранного — все.
+    pub received_chunks: u64,
 }
 
 /// Запрос на чтение состояния.
@@ -82,6 +113,17 @@ enum Query {
         limit: usize,
         reply: oneshot::Sender<Vec<MessageView>>,
     },
+    /// Открыть вложение на чтение (§10.2).
+    ///
+    /// Один заход на файл, а не на кусок. Дальше клиент читает через
+    /// [`FileReader`] из своего потока, и очередь драйвера в этом
+    /// не участвует — иначе открытие вложения на полгигабайта останавливало
+    /// бы отправку сообщений на всё время расшифровки.
+    OpenFile { file_id: FileId, reply: oneshot::Sender<Option<FileReader>> },
+    /// Порог автоматического приёма файлов.
+    AutoAccept { reply: oneshot::Sender<Option<u64>> },
+    /// Превью вложения (§10.3).
+    FilePreview { file_id: FileId, reply: oneshot::Sender<Option<Vec<u8>>> },
     /// Одно сообщение по идентификатору.
     ///
     /// Нужно ради цитат: ответ несёт ссылку, а не текст (`proto::reply`),
@@ -134,6 +176,7 @@ pub struct ContactStatus {
 enum Wake {
     Input(Input),
     Query(Query),
+    Chore(Chore),
     Timers,
     Stop,
 }
@@ -173,7 +216,9 @@ impl DriverHandle {
     pub async fn send(&self, command: Command) -> Result<(), Command> {
         self.requests.send(Request::Command(command)).await.map_err(|e| match e.0 {
             Request::Command(command) => command,
-            Request::Query(_) => unreachable!("послали команду — вернулась не она"),
+            Request::Query(_) | Request::Chore(_) => {
+                unreachable!("послали команду — вернулась не она")
+            }
         })
     }
 
@@ -192,6 +237,15 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Стирает с диска вложения, которых нет в базе (§12).
+    ///
+    /// `None` — драйвер остановлен.
+    pub async fn sweep_orphan_files(&self) -> Option<Swept> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Chore(Chore::SweepOrphanFiles { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
     // --- синхронные обёртки для UniFFI --------------------------------------
     //
     // Методы через UniFFI-границу синхронные, а драйвер живёт на своём потоке
@@ -205,7 +259,9 @@ impl DriverHandle {
     pub fn send_blocking(&self, command: Command) -> Result<(), Command> {
         self.requests.blocking_send(Request::Command(command)).map_err(|e| match e.0 {
             Request::Command(command) => command,
-            Request::Query(_) => unreachable!("послали команду — вернулась не она"),
+            Request::Query(_) | Request::Chore(_) => {
+                unreachable!("послали команду — вернулась не она")
+            }
         })
     }
 
@@ -237,6 +293,42 @@ impl DriverHandle {
     pub fn message_blocking(&self, msg_id: MsgId) -> Option<Option<MessageView>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::Message { msg_id, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Открывает вложение на чтение — один заход на файл, а не на кусок.
+    ///
+    /// Внешний `None` — драйвер остановлен, внутренний — такого файла нет.
+    /// Полученным [`FileReader`] можно пользоваться из любого потока и
+    /// сколько угодно долго: ядро в чтении не участвует.
+    pub fn open_file_blocking(&self, file_id: FileId) -> Option<Option<FileReader>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::OpenFile { file_id, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает превью вложения.
+    pub fn file_preview_blocking(&self, file_id: FileId) -> Option<Option<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::FilePreview { file_id, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Стирает с диска вложения, которых нет в базе (§12).
+    ///
+    /// `None` — драйвер остановлен. Дорогая операция: обходит каталог
+    /// вложений целиком, поэтому зовётся по кнопке «освободить место»,
+    /// а не при каждом запуске.
+    pub fn sweep_orphan_files_blocking(&self) -> Option<Swept> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Chore(Chore::SweepOrphanFiles { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает порог автоматического приёма файлов.
+    pub fn auto_accept_blocking(&self) -> Option<Option<u64>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::AutoAccept { reply })).ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -317,6 +409,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 request = self.requests.recv() => match request {
                     Some(Request::Command(command)) => Wake::Input(Input::Command(command)),
                     Some(Request::Query(query)) => Wake::Query(query),
+                    Some(Request::Chore(chore)) => Wake::Chore(chore),
                     None => Wake::Stop,
                 },
                 () = sleep_until(deadline) => Wake::Timers,
@@ -325,8 +418,30 @@ impl<S: Store, R: Runner> Driver<S, R> {
             match wake {
                 Wake::Input(input) => self.tolerate(input).await?,
                 Wake::Query(query) => self.answer(query),
+                Wake::Chore(chore) => self.do_chore(chore),
                 Wake::Timers => self.fire_due_timers().await?,
                 Wake::Stop => return Ok(()),
+            }
+        }
+    }
+
+    /// Выполняет обслуживание и отвечает, что вышло.
+    ///
+    /// Идёт той же очередью, что команды и запросы, — то есть **между**
+    /// шагами ядра, а не посреди одного. Для уборки это не деталь: чанк
+    /// ложится на диск и отмечается в базе внутри одного шага, и уборка,
+    /// вклинившаяся между этими двумя операциями, сочла бы живой чанк мусором.
+    fn do_chore(&mut self, chore: Chore) {
+        match chore {
+            Chore::SweepOrphanFiles { reply } => {
+                // Отказ диска здесь — не повод ронять мессенджер: убранное
+                // до отказа убрано, остальное подберёт следующий запуск.
+                // Человек увидит нули и повторит.
+                let swept = self.engine.sweep_orphan_files().unwrap_or_else(|error| {
+                    tracing::warn!(?error, "уборка осиротевших вложений не доделана");
+                    Swept::default()
+                });
+                let _ = reply.send(swept);
             }
         }
     }
@@ -354,8 +469,23 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let store = self.engine.store();
                 let found = store.message(&msg_id).ok().flatten().map(|message| {
                     let reactions = store.reactions(&message.msg_id).unwrap_or_default();
-                    MessageView { message, reactions }
+                    let files = Self::file_views(store, &message.msg_id);
+                    MessageView { message, reactions, files }
                 });
+                let _ = reply.send(found);
+            }
+            Query::OpenFile { file_id, reply } => {
+                // Отказ хранилища здесь неотличим от «такого файла нет», и это
+                // единственное честное поведение: показать нечего в обоих
+                // случаях, а ронять чат из-за вложения нельзя.
+                let _ = reply.send(self.engine.open_file(&file_id).unwrap_or_default());
+            }
+            Query::AutoAccept { reply } => {
+                let _ = reply.send(self.engine.auto_accept_bytes());
+            }
+            Query::FilePreview { file_id, reply } => {
+                let found =
+                    self.engine.store().file(&file_id).ok().flatten().and_then(|f| f.preview);
                 let _ = reply.send(found);
             }
             Query::Avatar { owner, reply } => {
@@ -412,9 +542,30 @@ impl<S: Store, R: Runner> Driver<S, R> {
             .into_iter()
             .map(|message| {
                 // Отказ на реакциях не должен стоить чата: сообщение без
-                // реакций читается, реакции без сообщения — нет.
+                // реакций читается, реакции без сообщения — нет. То же и
+                // с вложениями.
                 let reactions = store.reactions(&message.msg_id).unwrap_or_default();
-                MessageView { message, reactions }
+                let files = Self::file_views(store, &message.msg_id);
+                MessageView { message, reactions, files }
+            })
+            .collect()
+    }
+
+    /// Вложения сообщения вместе с ходом их передачи.
+    fn file_views(store: &S, msg_id: &MsgId) -> Vec<FileView> {
+        store
+            .files_of(msg_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|file| {
+                // Своё и собранное считаются полными без запроса: у первого
+                // чанков «принято» не бывает вовсе, у второго они все на месте.
+                let received_chunks = if !file.incoming || file.complete {
+                    file.chunk_total
+                } else {
+                    store.received_chunks(&file.file_id).unwrap_or(0)
+                };
+                FileView { file, received_chunks }
             })
             .collect()
     }

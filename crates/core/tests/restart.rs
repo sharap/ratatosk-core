@@ -47,6 +47,11 @@ impl Drop for TempDb {
     }
 }
 
+/// Байты вложений в памяти: перезапуск проверяется по базе, а не по диску.
+fn blobs() -> Box<ratatosk_store::MemoryBlobs> {
+    Box::new(ratatosk_store::MemoryBlobs::new())
+}
+
 fn addresses() -> SelfAddresses {
     // Пустые адреса: доставке некуда идти, и сообщение получит `Undeliverable`.
     // Для этого теста так и надо — проверяется хранение, а не отправка.
@@ -78,7 +83,7 @@ fn identity_contacts_and_history_survive_a_restart() {
         let identity = vault::load_or_create(&mut store, &db_key).expect("личность заведена");
         let fingerprint = identity.fingerprint();
 
-        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
         assert_eq!(engine.restore().expect("подъём с чистой базы"), 0);
 
         engine
@@ -113,7 +118,7 @@ fn identity_contacts_and_history_survive_a_restart() {
         "отпечаток обязан совпасть: по нему контакты знают устройство (§3)"
     );
 
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     assert_eq!(engine.restore().expect("контакты подняты"), 1);
 
     let contact = engine.contacts().get(&peer_ik).expect("тот же контакт");
@@ -141,7 +146,7 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
     {
         let mut store = db.open(&db_key);
         let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
         engine
             .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
             .unwrap();
@@ -192,7 +197,7 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
     // ничего не отправляет.
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine.restore().unwrap();
 
     let effects =
@@ -222,7 +227,7 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
     let (session_id, counter_before) = {
         let mut store = db.open(&db_key);
         let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
         engine
             .step(
                 1_000,
@@ -251,7 +256,7 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
     // Перезапуск: сессия поднимается, и отправка продолжает ту же цепочку.
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     assert_eq!(engine.restore().unwrap(), 1, "контакт поднят");
     assert_eq!(engine.session_count(), 1, "сессия поднята");
 
@@ -293,7 +298,7 @@ fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
 
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine
         .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
         .unwrap();
@@ -348,7 +353,7 @@ fn a_network_change_forgets_what_it_knew_about_the_local_network() {
 
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine
         .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
         .unwrap();
@@ -377,7 +382,7 @@ fn a_network_change_with_lan_off_does_not_turn_it_on() {
 
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
 
     let effects = engine.step(1_000, Input::Command(Command::NetworkChanged)).unwrap();
     assert!(effects.is_empty(), "выключенный LAN переоткрывать нечего");
@@ -409,7 +414,7 @@ fn a_message_sent_with_nowhere_to_go_is_still_kept() {
     {
         let mut store = db.open(&db_key);
         let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
         engine
             .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: false }))
             .unwrap();
@@ -447,7 +452,7 @@ fn a_waiting_message_still_waits_after_a_restart() {
     let msg_id = {
         let mut store = db.open(&db_key);
         let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-        let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
         engine
             .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
             .unwrap();
@@ -481,7 +486,7 @@ fn a_waiting_message_still_waits_after_a_restart() {
     // в движение — сообщение уходит, как только собеседник находится.
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine.restore().unwrap();
     assert_eq!(engine.store().outbox().unwrap().len(), 1, "очередь на месте");
 
@@ -508,7 +513,7 @@ fn a_waiting_message_for_a_deleted_contact_stops_waiting() {
 
     let mut store = db.open(&db_key);
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
-    let mut engine = Engine::new(identity, store, Box::new(OsEntropy), addresses());
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine
         .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
         .unwrap();

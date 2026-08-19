@@ -78,6 +78,7 @@ impl Node {
         let engine = Engine::new(
             identity,
             store,
+            Box::new(ratatosk_store::MemoryBlobs::new()),
             Box::new(SeededEntropy::new(seed ^ u64::from(index))),
             SelfAddresses {
                 onion: if mail_only {

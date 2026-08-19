@@ -11,29 +11,43 @@
 //! Если 1:1-текст не работает здесь, в симуляторе он не заработает тем более.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use ratatosk_core::engine::SelfAddresses;
 use ratatosk_core::{Command, Effect, Engine, Event, Input, SeededEntropy};
 use ratatosk_crypto::Identity;
-use ratatosk_store::{MemoryStore, Store};
+use ratatosk_store::{MemoryBlobs, MemoryStore, Store};
 
 type Node = Engine<MemoryStore>;
+/// Хранилище байтов, к которому есть доступ и у ядра, и у теста.
+type Blobs = Arc<Mutex<MemoryBlobs>>;
 
 fn node(seed: u8, name: &str) -> Node {
+    node_with_blobs(seed, name).0
+}
+
+/// Узел вместе со ссылкой на его хранилище байтов.
+///
+/// Нужно там, где проверяются файлы: тесту приходится и положить исходный
+/// файл «на диск» отправителю, и заглянуть в принятое у получателя.
+fn node_with_blobs(seed: u8, name: &str) -> (Node, Blobs) {
     let identity = Identity::from_seed([seed; 32]);
     let mut store = MemoryStore::new();
     store.migrate().expect("миграция in-memory хранилища");
 
-    Engine::new(
+    let blobs: Blobs = Arc::new(Mutex::new(MemoryBlobs::new()));
+    let engine = Engine::new(
         identity,
         store,
+        Box::new(Arc::clone(&blobs)),
         Box::new(SeededEntropy::new(u64::from(seed))),
         SelfAddresses {
             onion: format!("{name}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"),
             chatmail: format!("{name}@nine.example"),
             display_name: name.to_owned(),
         },
-    )
+    );
+    (engine, blobs)
 }
 
 /// Провод между двумя ядрами.
@@ -1232,6 +1246,17 @@ fn edit_marks(node: &Node, peer: &Node) -> Vec<Option<u64>> {
     node.store().messages(&chat, 100, None).unwrap().into_iter().map(|m| m.edited_ms).collect()
 }
 
+/// Все метки таймеров, которые узел просил поставить.
+fn timers(effects: &[Effect]) -> Vec<u64> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Все кадры, которые узел просил отправить.
 fn frames(effects: Vec<Effect>) -> Vec<(ratatosk_proto::Transport, Vec<u8>)> {
     effects
@@ -1735,4 +1760,512 @@ fn a_reply_without_words_is_refused() {
         }),
     );
     assert!(nowhere.is_err());
+}
+
+// --- файлы (§10) ---------------------------------------------------------
+
+use ratatosk_core::OutgoingFile;
+use ratatosk_proto::files;
+// Под псевдонимом: имя `Blobs` в этом файле уже занято псевдонимом типа
+// разделяемого хранилища, а трейт нужен ради `put_chunk` — тесты уборки
+// кладут на «диск» то, чего ядро туда не клало.
+use ratatosk_store::Blobs as BlobBytes;
+
+/// Содержимое, которое узнаётся: каждый байт зависит от своего места.
+fn payload_of(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Собирает файл из расшифрованных кусков — так же, как это делает клиент.
+fn assembled(node: &Node, file_id: &[u8; 16]) -> Vec<u8> {
+    let reader = node.open_file(file_id).unwrap().expect("файл известен");
+    let mut whole = Vec::with_capacity(reader.size_bytes() as usize);
+    for index in 0..reader.chunk_total() {
+        let chunk = reader.chunk(index).unwrap().expect("кусок на месте");
+        whole.extend_from_slice(&chunk);
+    }
+    whole
+}
+
+fn only_file(node: &Node, peer: &Node) -> [u8; 16] {
+    let msg_id = *ids_in(node, peer).last().expect("сообщение с вложением");
+    node.store().files_of(&msg_id).unwrap()[0].file_id
+}
+
+#[test]
+fn a_file_travels_in_chunks_and_arrives_whole() {
+    // Передача целиком: предложение, согласие по порогу, окно чанков,
+    // подтверждения, сборка. Файл нарочно длиннее окна — иначе окно
+    // не проверяется вовсе.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let content = payload_of(files::CHUNK_BYTES * 5 + 17);
+    alice_blobs.lock().unwrap().seed("/tmp/otchet.pdf", content.clone());
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile {
+                    path: "/tmp/otchet.pdf".into(),
+                    preview: Some(vec![0x89, b'P', b'N', b'G']),
+                }],
+                text: "вот отчёт".into(),
+            }),
+        )
+        .expect("отправка файла принята");
+
+    // Порог автоприёма по умолчанию мал, поэтому Боб файл руками не принимает:
+    // ставим ему порог заведомо больше файла.
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    assert_eq!(inbox(&bob, &alice), vec!["вот отчёт".to_string()], "подпись — обычное сообщение");
+    let file_id = only_file(&bob, &alice);
+    let received = bob.store().file(&file_id).unwrap().unwrap();
+    assert_eq!(received.name, "otchet.pdf");
+    assert_eq!(received.size_bytes, content.len() as u64);
+    assert!(received.complete, "файл обязан собраться до конца");
+    assert_eq!(received.preview.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+    assert_eq!(assembled(&bob, &file_id), content, "и совпасть с исходным до байта");
+}
+
+#[test]
+fn a_file_over_the_threshold_waits_for_the_button() {
+    // Чужой клиент не должен уметь занять память телефона, не спросив.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let content = payload_of(files::CHUNK_BYTES + 1);
+    alice_blobs.lock().unwrap().seed("/tmp/video.mp4", content.clone());
+
+    // «Спрашивать всегда» — законная настройка, а не отключённая функция.
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(None))).unwrap();
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/video.mp4".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let file_id = only_file(&bob, &alice);
+    let waiting = bob.store().file(&file_id).unwrap().unwrap();
+    assert!(!waiting.accepted, "большой файл ждёт человека");
+    assert!(!waiting.complete);
+    assert_eq!(
+        bob.store().received_chunks(&file_id).unwrap(),
+        0,
+        "пока не приняли — ни одного байта на диск"
+    );
+
+    // Человек нажал «принять» — и файл поехал.
+    let effects = bob.step(2_000, Input::Command(Command::AcceptFile { file_id })).unwrap();
+    pump(&mut bob, &mut alice, 2_000, effects);
+
+    assert!(bob.store().file(&file_id).unwrap().unwrap().complete);
+    assert_eq!(assembled(&bob, &file_id), content);
+}
+
+#[test]
+fn a_declined_file_leaves_nothing_behind() {
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    alice_blobs.lock().unwrap().seed("/tmp/nenuzhno.bin", payload_of(files::CHUNK_BYTES / 2));
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(None))).unwrap();
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/nenuzhno.bin".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let file_id = only_file(&bob, &alice);
+    bob.step(2_000, Input::Command(Command::DeclineFile { file_id })).unwrap();
+
+    assert!(bob.store().file(&file_id).unwrap().is_none(), "запись ушла");
+    assert_eq!(bob_blobs.lock().unwrap().chunk_count(), 0, "и байты тоже");
+    // Сообщение с подписью при этом остаётся: отказ — про вложение, а не про
+    // слова собеседника.
+    assert_eq!(ids_in(&bob, &alice).len(), 1);
+}
+
+#[test]
+fn several_files_ride_on_one_message() {
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let first = payload_of(1_000);
+    let second = payload_of(2_000);
+    {
+        let mut seeded = alice_blobs.lock().unwrap();
+        seeded.seed("/tmp/a.jpg", first.clone());
+        seeded.seed("/tmp/b.jpg", second.clone());
+    }
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![
+                    OutgoingFile { path: "/tmp/a.jpg".into(), preview: None },
+                    OutgoingFile { path: "/tmp/b.jpg".into(), preview: None },
+                ],
+                text: "с прогулки".into(),
+            }),
+        )
+        .expect("несколько вложений — обычный случай");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let msg_id = *ids_in(&bob, &alice).last().unwrap();
+    let files = bob.store().files_of(&msg_id).unwrap();
+    assert_eq!(files.len(), 2, "оба вложения на месте");
+    for file in files {
+        assert!(file.complete);
+        let content = assembled(&bob, &file.file_id);
+        assert!(content == first || content == second);
+    }
+}
+
+#[test]
+fn a_broken_transfer_resumes_where_it_stopped() {
+    // §10.2: возобновление по индексу чанка. Связь рвётся посреди передачи;
+    // возобновляет её **получатель** — у него есть всё, чтобы спросить заново,
+    // а у отправителя своего состояния передачи нет вовсе.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+    // Сессию ставим заранее: иначе первые кадры будут рукопожатием, и тест
+    // проверял бы §8.2 вместо §10.
+    let hello = send_text(&mut alice, &bob, 800, "сейчас пришлю");
+    pump(&mut alice, &mut bob, 800, hello);
+
+    let content = payload_of(files::CHUNK_BYTES * 3 + 7);
+    alice_blobs.lock().unwrap().seed("/tmp/dolgij.bin", content.clone());
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    // Предложение доносим до Боба и забираем то, что он ответил: квитанцию
+    // и просьбу о первом чанке.
+    let offer = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/dolgij.bin".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+    let mut answer = Vec::new();
+    for (via, frame) in frames(offer) {
+        answer.extend(frames(bob.step(1_000, Input::Received { via, frame }).unwrap()));
+    }
+    assert!(!answer.is_empty(), "получатель обязан попросить первый чанк");
+
+    // Ответ доезжает, чанки идут — но до Боба добирается только первый.
+    let mut chunks = Vec::new();
+    for (via, frame) in answer {
+        chunks.extend(frames(alice.step(1_100, Input::Received { via, frame }).unwrap()));
+    }
+    assert!(chunks.len() > 1, "окно шлёт несколько чанков вперёд: {}", chunks.len());
+    let first = chunks.remove(0);
+    let after_chunk = bob.step(1_200, Input::Received { via: first.0, frame: first.1 }).unwrap();
+    assert_eq!(bob.store().received_chunks(&only_file(&bob, &alice)).unwrap(), 1);
+
+    // Дальше тишина — и её сторожит срок.
+    let token = timers(&after_chunk).first().copied().expect("после чанка ставится срок молчания");
+    let retry = bob.step(20_000, Input::Timer { token }).expect("срок молчания вышел");
+    assert!(!frames(retry.clone()).is_empty(), "по сроку уходит новая просьба");
+
+    // Провод снова цел: остаток доезжает сам.
+    let events = pump(&mut bob, &mut alice, 20_000, retry);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::FileProgress { .. })),
+        "ход передачи обязан быть виден: {events:?}"
+    );
+
+    let file_id = only_file(&bob, &alice);
+    assert!(bob.store().file(&file_id).unwrap().unwrap().complete, "файл дособрался");
+    assert_eq!(assembled(&bob, &file_id), content, "и совпал с исходным до байта");
+}
+
+#[test]
+fn a_file_that_vanished_stops_the_transfer_out_loud() {
+    // Ядро не копирует файл при отправке — читает его с диска. Значит,
+    // исчезнувший исходник останавливает передачу, и молчать об этом нельзя.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+    let hello = send_text(&mut alice, &bob, 800, "сейчас пришлю");
+    pump(&mut alice, &mut bob, 800, hello);
+
+    alice_blobs.lock().unwrap().seed("/tmp/propal.bin", payload_of(files::CHUNK_BYTES + 5));
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let offer = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/propal.bin".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+    let mut answer = Vec::new();
+    for (via, frame) in frames(offer) {
+        answer.extend(frames(bob.step(1_000, Input::Received { via, frame }).unwrap()));
+    }
+
+    // Файл исчез между предложением и первым чанком.
+    alice_blobs.lock().unwrap().forget("/tmp/propal.bin");
+
+    let mut said = Vec::new();
+    for (via, frame) in answer {
+        said.extend(alice.step(1_100, Input::Received { via, frame }).unwrap());
+    }
+    assert!(
+        said.iter().any(|e| matches!(e, Effect::Notify(Event::HonestNotice { .. }))),
+        "человек обязан узнать, что передача встала: {said:?}"
+    );
+    assert!(
+        !said.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "и ни одного чанка не уходит: читать нечего"
+    );
+}
+
+/// Принимает файл целиком и возвращает его идентификатор.
+///
+/// Ровно то же, что делают тесты передачи, — вынесено, чтобы тесты уборки
+/// говорили про уборку, а не про §10.2 в третий раз.
+fn receive_a_file(
+    alice: &mut Node,
+    alice_blobs: &Blobs,
+    bob: &mut Node,
+    path: &str,
+    bytes: usize,
+) -> [u8; 16] {
+    let content = payload_of(bytes);
+    alice_blobs.lock().unwrap().seed(path, content);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: path.into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .expect("отправка принята");
+    pump(alice, bob, 1_000, effects);
+
+    let file_id = only_file(bob, alice);
+    assert!(bob.store().file(&file_id).unwrap().unwrap().complete, "файл обязан собраться");
+    file_id
+}
+
+#[test]
+fn deleting_a_contact_with_the_history_frees_the_disk_too() {
+    // Байты вложений лежат не в базе, а рядом с ней, и каскад внешних ключей
+    // до них не достаёт. Пока эти строки не появились, удаление контакта
+    // с перепиской на гигабайт освобождало ноль байт: записи исчезали,
+    // каталоги с чанками оставались навсегда.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let file_id = receive_a_file(&mut alice, &alice_blobs, &mut bob, "/tmp/arhiv.zip", 5_000);
+    assert!(bob_blobs.lock().unwrap().chunk_count() > 0, "чанки лежат на диске");
+
+    let alice_ik = alice.own_card().ik;
+    bob.step(
+        2_000,
+        Input::Command(Command::DeleteContact { peer_ik: alice_ik, purge_history: true }),
+    )
+    .expect("удаление принято");
+
+    assert!(bob.store().file(&file_id).unwrap().is_none(), "запись о файле ушла с перепиской");
+    assert_eq!(
+        bob_blobs.lock().unwrap().chunk_count(),
+        0,
+        "и байты тоже: иначе место не освободится никогда"
+    );
+}
+
+#[test]
+fn the_sweep_takes_the_orphans_and_leaves_the_living() {
+    // Уборка сверяет диск с базой и стирает лишнее. Проверяется вместе
+    // с обратным: живое вложение и незаконченный приём она трогать не вправе.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let file_id = receive_a_file(&mut alice, &alice_blobs, &mut bob, "/tmp/foto.jpg", 4_000);
+    let alive = bob_blobs.lock().unwrap().chunk_count();
+    assert!(alive > 0);
+
+    // Сирота — каталог, о котором в базе нет ни строчки. Так выглядит
+    // вложение, пережившее удаление переписки на прежней версии.
+    bob_blobs.lock().unwrap().put_chunk(&[0xEEu8; 16], 0, b"sirota").unwrap();
+    // Обрывок — чанк живого файла, не отмеченный принятым. Так выглядит
+    // след процесса, убитого системой между записью байтов и отметкой.
+    bob_blobs.lock().unwrap().put_chunk(&file_id, 999, b"obryvok").unwrap();
+
+    let swept = bob.sweep_orphan_files().expect("уборка прошла");
+    assert_eq!(swept.files, 1, "сирота обязан уйти целиком");
+    assert_eq!(swept.chunks, 1, "и обрывок тоже");
+    assert_eq!(swept.bytes, (b"sirota".len() + b"obryvok".len()) as u64);
+
+    assert_eq!(
+        bob_blobs.lock().unwrap().chunk_count(),
+        alive,
+        "а живое вложение обязано остаться нетронутым"
+    );
+    assert!(bob.store().file(&file_id).unwrap().unwrap().complete);
+
+    // Второй прогон ничего не находит: уборка идемпотентна, иначе на неё
+    // нельзя повесить кнопку.
+    assert_eq!(bob.sweep_orphan_files().unwrap(), ratatosk_core::Swept::default());
+}
+
+#[test]
+fn the_sweep_does_not_touch_a_transfer_in_progress() {
+    // Незаконченный приём — не мусор: запись о нём в базе есть, и продолжится
+    // он с той дырки, которой не хватает (§10.2). Уборка, принявшая его
+    // за мусор, стёрла бы половину принятого и заставила качать заново.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    let hello = send_text(&mut alice, &bob, 800, "сейчас пришлю");
+    pump(&mut alice, &mut bob, 800, hello);
+
+    alice_blobs.lock().unwrap().seed("/tmp/kino.mkv", payload_of(files::CHUNK_BYTES * 3 + 7));
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let offer = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/kino.mkv".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+
+    // Доводим передачу до середины и останавливаем.
+    let mut answer = Vec::new();
+    for (via, frame) in frames(offer) {
+        answer.extend(frames(bob.step(1_000, Input::Received { via, frame }).unwrap()));
+    }
+    let mut chunks = Vec::new();
+    for (via, frame) in answer {
+        chunks.extend(frames(alice.step(1_100, Input::Received { via, frame }).unwrap()));
+    }
+    let first = chunks.remove(0);
+    bob.step(1_200, Input::Received { via: first.0, frame: first.1 }).unwrap();
+
+    let half = bob_blobs.lock().unwrap().chunk_count();
+    assert!(half > 0, "часть файла уже на диске");
+
+    let swept = bob.sweep_orphan_files().expect("уборка прошла");
+    assert_eq!(swept, ratatosk_core::Swept::default(), "у незаконченного приёма убирать нечего");
+    assert_eq!(bob_blobs.lock().unwrap().chunk_count(), half, "принятое осталось на месте");
+}
+
+#[test]
+fn a_reader_outlives_the_core_and_reads_beside_it() {
+    // Ради этого читатель и заведён. Раньше каждый кусок был заходом в очередь
+    // драйвера, и открытие вложения на полгигабайта занимало ядро на всё время
+    // расшифровки: сообщения в это время не уходили. Проверяется двумя
+    // утверждениями. Первое: читателю ядро больше не нужно — он читает,
+    // не касаясь `Engine`. Второе: пока он открыт, ядро продолжает работать.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let content = payload_of(files::CHUNK_BYTES * 2 + 11);
+    let file_id =
+        receive_a_file(&mut alice, &alice_blobs, &mut bob, "/tmp/albom.zip", content.len());
+
+    let reader = bob.open_file(&file_id).unwrap().expect("вложение открылось");
+    assert_eq!(reader.chunk_total(), files::chunk_count(content.len() as u64));
+    assert!(!reader.own(), "принятое вложение — не своё");
+
+    // Читаем первый кусок, потом даём ядру поработать, потом дочитываем.
+    // Если бы чтение шло через ядро, так переставить их было бы нельзя вовсе.
+    let mut whole = reader.chunk(0).unwrap().expect("первый кусок");
+
+    let while_reading = send_text(&mut bob, &alice, 3_000, "смотрю альбом");
+    assert!(
+        !frames(while_reading.clone()).is_empty(),
+        "ядро обязано отправлять сообщения, пока открыто вложение"
+    );
+    pump(&mut bob, &mut alice, 3_000, while_reading);
+    assert!(
+        inbox(&alice, &bob).contains(&"смотрю альбом".to_owned()),
+        "и они обязаны доходить, а не ждать конца чтения"
+    );
+
+    for index in 1..reader.chunk_total() {
+        whole.extend_from_slice(&reader.chunk(index).unwrap().expect("кусок на месте"));
+    }
+    assert_eq!(whole, payload_of(content.len()), "и файл собрался до байта");
+
+    // За концом файла показывать нечего, и это не отказ.
+    assert!(reader.chunk(reader.chunk_total()).unwrap().is_none());
+}
+
+#[test]
+fn a_sent_attachment_opens_from_its_source() {
+    // Своё вложение через ядро не открывалось вовсе: запечатанных чанков
+    // у отправителя нет — он читает исходник с диска, ничего не копируя.
+    // Читатель обязан уметь и это, иначе человек не может открыть то,
+    // что сам же и отправил.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+
+    let content = payload_of(files::CHUNK_BYTES + 5);
+    let file_id = receive_a_file(&mut alice, &alice_blobs, &mut bob, "/tmp/moe.bin", content.len());
+
+    // У Алисы файл тот же, но запись своя: идентификатор общий, источник — путь.
+    let reader = alice.open_file(&file_id).unwrap().expect("своё вложение открылось");
+    assert!(reader.own(), "это отправленный нами файл");
+    assert_eq!(assembled(&alice, &file_id), content, "и читается до байта");
+
+    // Исходник — не копия: удалили его, и открывать стало нечего. Молчать
+    // об этом нельзя, поэтому здесь честный отказ, а не пустой кусок.
+    alice_blobs.lock().unwrap().forget("/tmp/moe.bin");
+    assert!(
+        reader.chunk(0).is_err(),
+        "исчезнувший исходник обязан отличаться от «показать нечего»"
+    );
 }

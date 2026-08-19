@@ -20,6 +20,7 @@ pub mod engine;
 pub mod entropy;
 pub mod honest;
 pub mod io;
+pub mod reader;
 pub mod vault;
 
 #[cfg(feature = "driver")]
@@ -27,4 +28,5 @@ pub mod driver;
 
 pub use engine::{Contact, Engine, EngineError, SelfAddresses, MAX_LOCAL_NAME_CHARS};
 pub use entropy::{Entropy, OsEntropy, SeededEntropy};
-pub use io::{ChatId, Command, Effect, Event, Input};
+pub use io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};
+pub use reader::FileReader;

@@ -666,3 +666,125 @@ fn a_reply_link_survives_a_restart_and_may_dangle() {
     // И через чтение по одному идентификатору — тем же самым.
     assert_eq!(store.message(&[2u8; 16]).unwrap().unwrap().reply_to, Some([1u8; 16]));
 }
+
+fn file(n: u8, msg: u8, incoming: bool) -> ratatosk_store::StoredFile {
+    ratatosk_store::StoredFile {
+        file_id: [n; 16],
+        msg_id: [msg; 16],
+        name: format!("файл {n}.pdf"),
+        size_bytes: 5_000,
+        chunk_total: 3,
+        key: [n.wrapping_add(1); 32],
+        preview: None,
+        incoming,
+        source_path: (!incoming).then(|| "/tmp/ishodnyj".to_owned()),
+        accepted: !incoming,
+        complete: false,
+    }
+}
+
+#[test]
+fn a_file_round_trips_and_its_name_is_sealed() {
+    // Имя файла говорит о переписке не меньше, чем текст: «результаты
+    // анализов.pdf» в открытом столбце — ровно то, от чего §12 защищает тело.
+    let db = TempDb::new("file");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&message(1, 100)).unwrap();
+        let mut with_preview = file(2, 1, true);
+        with_preview.preview = Some(vec![0x89, b'P', b'N', b'G']);
+        store.put_file(&with_preview).unwrap();
+        store.put_file(&file(3, 1, false)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.file(&[2u8; 16]).unwrap().expect("файл на месте");
+    assert_eq!(found.name, "файл 2.pdf");
+    assert_eq!(found.key, [3u8; 32], "без ключа файл не собрать");
+    assert_eq!(found.preview.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+    assert!(found.incoming);
+    assert!(!found.accepted, "входящий файл ждёт согласия");
+
+    // К одному сообщению их несколько — это обычный случай.
+    let attached = store.files_of(&[1u8; 16]).unwrap();
+    assert_eq!(attached.len(), 2);
+    assert_eq!(attached[1].source_path.as_deref(), Some("/tmp/ishodnyj"));
+
+    let wrong = SqliteStore::open(&db.0, key(2)).unwrap();
+    assert!(wrong.file(&[2u8; 16]).is_err(), "чужой ключ не должен открывать имя и ключ файла");
+}
+
+#[test]
+fn chunks_are_counted_and_the_first_gap_is_the_resume_point() {
+    // §10.2: возобновление по индексу чанка. Точка возобновления — первый
+    // недостающий, и считать её надо не по количеству принятых: чанки
+    // законно приходят не по порядку.
+    let db = TempDb::new("chunks");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_file(&file(2, 1, true)).unwrap();
+
+    assert_eq!(store.next_missing_chunk(&[2u8; 16], 3).unwrap(), Some(0));
+
+    store.note_chunk(&[2u8; 16], 0).unwrap();
+    store.note_chunk(&[2u8; 16], 2).unwrap();
+    assert_eq!(store.received_chunks(&[2u8; 16]).unwrap(), 2);
+    assert_eq!(
+        store.next_missing_chunk(&[2u8; 16], 3).unwrap(),
+        Some(1),
+        "принято два чанка из трёх, но продолжать надо с дырки"
+    );
+
+    store.note_chunk(&[2u8; 16], 1).unwrap();
+    store.note_chunk(&[2u8; 16], 1).unwrap();
+    assert_eq!(store.received_chunks(&[2u8; 16]).unwrap(), 3, "повтор не считается дважды");
+    assert_eq!(store.next_missing_chunk(&[2u8; 16], 3).unwrap(), None, "файл собран");
+}
+
+#[test]
+fn an_unfinished_file_survives_a_restart() {
+    // Ради этого учёт и лежит в базе: после перезапуска передача обязана
+    // продолжиться с того же места, а не начаться заново.
+    let db = TempDb::new("file-restart");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&message(1, 100)).unwrap();
+        store.put_file(&file(2, 1, true)).unwrap();
+        store.accept_file(&[2u8; 16]).unwrap();
+        store.note_chunk(&[2u8; 16], 0).unwrap();
+    }
+
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let unfinished = store.unfinished_files().unwrap();
+    assert_eq!(unfinished.len(), 1);
+    assert!(unfinished[0].accepted, "согласие переживает перезапуск: спрашивать заново незачем");
+    assert_eq!(store.next_missing_chunk(&[2u8; 16], 3).unwrap(), Some(1));
+
+    store.complete_file(&[2u8; 16]).unwrap();
+    assert!(store.unfinished_files().unwrap().is_empty());
+}
+
+#[test]
+fn deleting_a_message_takes_its_files_and_their_chunk_tally() {
+    let db = TempDb::new("file-del");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_file(&file(2, 1, true)).unwrap();
+    store.note_chunk(&[2u8; 16], 0).unwrap();
+
+    store.delete_file(&[2u8; 16]).unwrap();
+    assert!(store.file(&[2u8; 16]).unwrap().is_none());
+    assert_eq!(store.received_chunks(&[2u8; 16]).unwrap(), 0, "учёт чанков не пережил файл");
+
+    // И то же самое каскадом от чата: вложения не остаются от удалённой
+    // переписки. Байты с диска убирает вызывающий — они лежат не здесь.
+    store.put_file(&file(3, 1, true)).unwrap();
+    store.delete_chat(&[9u8; 16]).unwrap();
+    assert!(store.file(&[3u8; 16]).unwrap().is_none());
+}

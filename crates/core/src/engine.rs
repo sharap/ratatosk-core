@@ -27,11 +27,12 @@ use ratatosk_proto::fragment::Reassembler;
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{Attempt, Decision, PeerAvailability, SessionBinding};
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
-use ratatosk_store::{Store, StoredMessage};
+use ratatosk_store::{Blobs, FileId, Store, StoredFile, StoredMessage};
 use ratatosk_wire::{pad_to, unpad, FrameType, Header, SizeClass};
 
 use crate::entropy::Entropy;
-use crate::io::{ChatId, Command, Effect, Event, Input};
+use crate::io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};
+use crate::reader::FileReader;
 
 /// Номер первого сообщения рукопожатия в поле `counter` заголовка.
 ///
@@ -123,6 +124,9 @@ pub enum EngineError {
     /// Реакция не принята: слишком длинная или не эмодзи.
     #[error("реакция: {0}")]
     Reaction(#[from] ratatosk_proto::reaction::ReactionError),
+    /// Файл не принят: размер, имя, число вложений или превью.
+    #[error("файл: {0}")]
+    File(#[from] ratatosk_proto::files::FileError),
     /// Ответ не принят: без слов или на то, чего в этом чате нет.
     ///
     /// Отказ, а не тихая отправка обычным текстом: человек нажал «ответить»
@@ -138,6 +142,34 @@ pub enum EngineError {
 // исчезло бы, тогда как §14 требует показать пользователю, что оно не ушло.
 // Теперь этот случай выражается статусом `DeliveryStatus::Undeliverable`,
 // а сообщение остаётся в истории.
+
+/// Сколько ждать чанк, прежде чем спросить заново (§10.2).
+///
+/// Сторожит **получатель**: у него есть всё, чтобы спросить, — список
+/// принятых чанков и точка возобновления. Без этого срока оборванная передача
+/// не возобновится никогда: отправитель ждёт подтверждения, получатель ждёт
+/// чанков, и оба правы.
+const FILE_STALL_MS: u64 = 10_000;
+
+/// Идущая исходящая передача файла (§10.2).
+///
+/// Окно, а не «шлём всё подряд»: без него один шаг ядра выдал бы драйверу весь
+/// файл эффектами, то есть два гигабайта в памяти процесса, который на Android
+/// убивают за меньшее. Отправитель держит окно в [`CHUNK_WINDOW`] чанков
+/// впереди подтверждённого получателем.
+///
+/// [`CHUNK_WINDOW`]: ratatosk_proto::files::CHUNK_WINDOW
+#[derive(Debug, Clone, Copy)]
+struct Sending {
+    file_id: FileId,
+    peer_ik: [u8; 32],
+    /// Сколько всего чанков.
+    chunk_total: u64,
+    /// Получатель подтвердил всё **до** этого номера.
+    acked_upto: u64,
+    /// Сколько чанков уже отправлено.
+    sent_upto: u64,
+}
 
 /// Чем сообщение является помимо текста.
 ///
@@ -355,6 +387,27 @@ pub struct Engine<S: Store> {
     awaited_discovery: BTreeSet<[u8; 32]>,
     /// До какого места в каждом чате уже отправлена квитанция о прочтении.
     read_upto: BTreeMap<ChatId, Hlc>,
+    /// Байты файлов — вне SQLite (§10, §12).
+    blobs: Box<dyn Blobs>,
+    /// Порог автоматического приёма файлов. `None` — спрашивать всегда.
+    auto_accept: Option<u64>,
+    /// Идущие **исходящие** передачи.
+    ///
+    /// Только в памяти, и это не упущение: всё, что нужно для возобновления,
+    /// знает получатель (какие чанки у него есть) и хранит у себя. Отправителю
+    /// достаточно исходного файла на диске и просьбы «продолжай с такого-то» —
+    /// поэтому после перезапуска ему нечего восстанавливать, он ждёт вопроса.
+    sending: Vec<Sending>,
+    /// Взведённый срок молчания по каждому файлу: файл → метка.
+    ///
+    /// Ключ — **файл**, а не метка, и это исправление настоящей поломки.
+    /// Раньше метки копились: каждый принятый чанк заводил свою, ни одна
+    /// не снималась, и на длинном файле десяток сроков выходил вразнобой.
+    /// Каждый выход — новая просьба, каждая просьба — новые чанки, и передача
+    /// разгоняла сама себя, пока очередь кадров к собеседнику не забивалась
+    /// мебибайтами. Теперь у файла ровно один живой срок; сработавшая метка,
+    /// которой здесь больше нет, — опоздавшая, и её игнорируют.
+    file_timers: BTreeMap<FileId, u64>,
 }
 
 impl<S: Store> Engine<S> {
@@ -362,6 +415,7 @@ impl<S: Store> Engine<S> {
     pub fn new(
         identity: Identity,
         store: S,
+        blobs: Box<dyn Blobs>,
         entropy: Box<dyn Entropy>,
         addresses: SelfAddresses,
     ) -> Engine<S> {
@@ -386,6 +440,10 @@ impl<S: Store> Engine<S> {
             deferred: Vec::new(),
             awaited_discovery: BTreeSet::new(),
             read_upto: BTreeMap::new(),
+            blobs,
+            auto_accept: Some(ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES),
+            sending: Vec::new(),
+            file_timers: BTreeMap::new(),
         }
     }
 
@@ -483,6 +541,10 @@ impl<S: Store> Engine<S> {
                 if appeared {
                     // И то, что не уехало раньше: он снова в сети.
                     effects.extend(self.retry_deferred(Some(peer_ik))?);
+                    // Недокачанные файлы спрашиваются здесь же — но только
+                    // если сессия уже есть: просьба без прямого канала уйдёт
+                    // в никуда, а рукопожатие позовёт нас ещё раз.
+                    effects.extend(self.resume_files(now_ms, peer_ik)?);
                 }
                 Ok(effects)
             }
@@ -509,7 +571,7 @@ impl<S: Store> Engine<S> {
             }
             // TODO(этап 1): перерукопожатие (§8.5) и расписание уборки (§12)
             // тоже придут таймерами — пока их ставит только доставка.
-            Input::Timer { token } => self.on_timer(token),
+            Input::Timer { token } => self.on_timer(now_ms, token),
         }
     }
 
@@ -604,7 +666,19 @@ impl<S: Store> Engine<S> {
                 Ok(effects)
             }
             Command::NetworkChanged => self.on_network_changed(),
-            Command::SendFile { .. } => todo!("этап 4: передача файлов (§10)"),
+            Command::SendFiles { chat, files, text } => {
+                self.on_send_files(now_ms, chat, &files, &text)
+            }
+            Command::AcceptFile { file_id } => self.on_accept_file(now_ms, file_id),
+            Command::DeclineFile { file_id } => self.on_decline_file(file_id),
+            Command::SetAutoAcceptBytes(limit) => {
+                self.auto_accept = limit;
+                // Настройка обязана пережить перезапуск: иначе назавтра
+                // телефон снова начнёт принимать всё подряд.
+                let value = limit.map_or_else(Vec::new, |bytes| bytes.to_be_bytes().to_vec());
+                self.store.put_meta(ratatosk_store::META_AUTO_ACCEPT, &value)?;
+                Ok(Vec::new())
+            }
             Command::CreateGroup { .. }
             | Command::InviteToGroup { .. }
             | Command::EvictFromGroup { .. } => todo!("этап 5: группы (§11)"),
@@ -689,6 +763,20 @@ impl<S: Store> Engine<S> {
                 session_reset_used: false,
             });
         }
+
+        // Порог автоприёма файлов (§10). Настройка человека, и переживать
+        // перезапуск она обязана: иначе назавтра телефон снова начнёт
+        // принимать всё подряд. Пустое значение означает «спрашивать всегда»
+        // — это выбор, а не отсутствие настройки, поэтому и хранится он
+        // отдельно от «ключа нет вовсе».
+        self.auto_accept = match self.store.meta(ratatosk_store::META_AUTO_ACCEPT)? {
+            Some(raw) if raw.is_empty() => None,
+            Some(raw) => <[u8; 8]>::try_from(raw.as_slice())
+                .map(u64::from_be_bytes)
+                .ok()
+                .or(Some(ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES)),
+            None => Some(ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES),
+        };
 
         // Сессии поднимаются после контактов: внешний ключ в схеме связывает
         // их с `contacts`, и порядок здесь тот же, что и на записи.
@@ -974,6 +1062,12 @@ impl<S: Store> Engine<S> {
             self.outbox.retain(|d| d.msg_id != *msg_id);
             let _ = self.store.delete_outbox(msg_id);
 
+            // Вложения уходят вместе с сообщением — и записи, и байты.
+            // Каскад внешнего ключа тут не поможет: надгробие не удаляет
+            // строку сообщения, а гигабайт чанков на диске пережил бы «удалить»
+            // и лежал бы там, где человек уверен, что уже ничего нет.
+            self.forget_files(msg_id);
+
             // Отказ хранилища на одном сообщении не повод бросить остальные:
             // пользователь просил убрать список, а не «список или ничего».
             if self.store.tombstone_message(msg_id, now_ms).unwrap_or(false) {
@@ -984,6 +1078,32 @@ impl<S: Store> Engine<S> {
             return Vec::new();
         }
         vec![Effect::Notify(Event::MessagesDeleted { chat, msg_ids: gone })]
+    }
+
+    /// Убирает вложения сообщения: записи, байты и идущие передачи.
+    ///
+    /// Отказы проглатываются намеренно: удаление не должно останавливаться
+    /// на первом же файле, который не удалось стереть. Оставшийся чанк —
+    /// мусор на диске, а незавершённое удаление — сообщение, которое человек
+    /// считает удалённым.
+    fn forget_files(&mut self, msg_id: &MsgId) {
+        let files = self.store.files_of(msg_id).unwrap_or_default();
+        for file in files {
+            self.forget_file(&file.file_id);
+        }
+    }
+
+    /// Убирает одно вложение: идущую передачу, срок молчания, байты и запись.
+    ///
+    /// Порядок значим ровно в одном месте: байты уходят раньше записи. Иначе
+    /// запись исчезает первой, и чанки на диске остаются без всякого следа
+    /// о том, чьи они, — подобрать их сможет только сверка каталога с базой
+    /// ([`Engine::sweep_orphan_files`]).
+    fn forget_file(&mut self, file_id: &FileId) {
+        self.sending.retain(|s| s.file_id != *file_id);
+        self.file_timers.remove(file_id);
+        let _ = self.blobs.remove(file_id);
+        let _ = self.store.delete_file(file_id);
     }
 
     /// Удаляет у себя и просит собеседника удалить у себя.
@@ -1038,8 +1158,10 @@ impl<S: Store> Engine<S> {
         if self.store.tombstone_chat(&chat, now_ms)? == 0 {
             return Ok(Vec::new());
         }
-        // Ничего из очищенного не должно уехать позже.
+        // Ничего из очищенного не должно уехать позже — и ничего не должно
+        // остаться на диске.
         for msg_id in &doomed {
+            self.forget_files(msg_id);
             self.deferred.retain(|d| d.msg_id != *msg_id);
             self.outbox.retain(|d| d.msg_id != *msg_id);
             self.store.delete_outbox(msg_id)?;
@@ -1095,6 +1217,619 @@ impl<S: Store> Engine<S> {
             effects.push(Effect::Notify(Event::MessagesDeleted { chat, msg_ids: gone }));
         }
         Ok(effects)
+    }
+
+    // --- файлы (§10) --------------------------------------------------------
+
+    /// Отправляет файлы одним сообщением.
+    ///
+    /// Что происходит сразу: сообщение ложится в историю (с подписью, если она
+    /// есть), для каждого файла заводится запись и уезжает **предложение** —
+    /// имя, размер, ключ и превью. Байты не читаются вовсе: чанки пойдут
+    /// потом, и только если получатель их попросит.
+    ///
+    /// Ключ у каждого файла свой и генерируется здесь. Это не мелочь:
+    /// `ratatosk_crypto::file` шифрует чанк ключом, выведенным из
+    /// `file_key ‖ index`, с нулевым nonce — и это безопасно ровно до тех пор,
+    /// пока один и тот же `file_key` не использован дважды для разного
+    /// содержимого. Повторная отправка того же файла — это новое предложение
+    /// с новым ключом.
+    fn on_send_files(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        files: &[OutgoingFile],
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::files;
+
+        let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
+        if files.is_empty() || files.len() > files::MAX_FILES_PER_MESSAGE {
+            return Err(files::FileError::TooMany.into());
+        }
+
+        let msg_id = self.entropy.msg_id();
+        let hlc = self.clock.now(now_ms)?;
+        let own_ik = self.identity.public().ik;
+
+        // Сперва собираем предложение целиком — и только потом пишем в базу.
+        // Отказ на третьем файле не должен оставлять в истории сообщение
+        // с двумя вложениями, которых никто не просил.
+        let mut offers = Vec::with_capacity(files.len());
+        let mut records = Vec::with_capacity(files.len());
+        for file in files {
+            let size_bytes = self.blobs.size_of(&file.path)?;
+            if size_bytes > files::MAX_FILE_BYTES {
+                return Err(files::FileError::TooLarge.into());
+            }
+            let name = file
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(files::FileError::BadName)?
+                .to_owned();
+            files::check_name(&name)?;
+            if let Some(preview) = &file.preview {
+                if !files::preview_fits(preview.len()) {
+                    return Err(files::FileError::PreviewTooLarge.into());
+                }
+            }
+
+            let file_id = self.entropy.msg_id();
+            let mut key = [0u8; 32];
+            self.entropy.fill(&mut key);
+
+            offers.push(files::FileOffer {
+                file_id,
+                name: name.clone(),
+                size_bytes,
+                key,
+                preview: file.preview.clone(),
+            });
+            records.push(StoredFile {
+                file_id,
+                msg_id,
+                name,
+                size_bytes,
+                chunk_total: files::chunk_count(size_bytes),
+                key,
+                preview: file.preview.clone(),
+                incoming: false,
+                // Путь, а не байты: копировать файл ради отправки значит
+                // требовать вдвое больше места, чем у него есть.
+                source_path: Some(file.path.to_string_lossy().into_owned()),
+                // Своё отправляем, ничего не спрашивая.
+                accepted: true,
+                complete: true,
+            });
+        }
+        files::check_offers(&offers).map_err(EngineError::File)?;
+
+        self.store.put_message(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: own_ik,
+            hlc,
+            body: text.as_bytes().to_vec(),
+            received_ms: now_ms,
+            status: Some(DeliveryStatus::Pending.code()),
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+        for record in &records {
+            self.store.put_file(record)?;
+        }
+
+        let envelope =
+            Envelope::new(msg_id, hlc, PayloadType::FileOffer, files::offer_payload(text, &offers));
+        self.enqueue(Delivery {
+            msg_id,
+            peer_ik,
+            envelope: envelope.encode()?,
+            attempt: Attempt::new(),
+            state: DeliveryState::AwaitingSession,
+            queued_ms: now_ms,
+            session_reset_used: false,
+        })
+    }
+
+    /// Человек согласился принять файл.
+    fn on_accept_file(&mut self, now_ms: u64, file_id: FileId) -> Result<Vec<Effect>, EngineError> {
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        if !file.incoming || file.complete {
+            return Ok(Vec::new());
+        }
+        self.store.accept_file(&file_id)?;
+        // Первая просьба про файл — «начните сначала», то есть тот же случай,
+        // что и возобновление: у отправителя об этой передаче ещё ничего нет.
+        self.ask_for_file(now_ms, &file, true)
+    }
+
+    /// Человек отказался от файла.
+    ///
+    /// Собеседнику не уходит ничего: отказ — решение о своей памяти, а не
+    /// сообщение о себе. Он увидит, что чанки перестали запрашивать, и это
+    /// всё, что ему полагается знать.
+    fn on_decline_file(&mut self, file_id: FileId) -> Result<Vec<Effect>, EngineError> {
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        if !file.incoming {
+            return Ok(Vec::new());
+        }
+        // Сперва байты, потом запись: обратный порядок оставил бы чанки
+        // на диске без всякого следа о том, чьи они.
+        self.blobs.remove(&file_id)?;
+        self.store.delete_file(&file_id)?;
+        Ok(vec![Effect::Notify(Event::FileProgress { file_id, received: 0, total: 0 })])
+    }
+
+    /// Просит собеседника продолжить (или начать) передачу файла.
+    ///
+    /// Просьба уходит **прямым каналом и только им**: файл — это тысячи кадров,
+    /// и почтой (§5.3) они не поедут. Нет канала — нет и просьбы: собеседник
+    /// появится, сессия установится, и мы спросим снова.
+    fn ask_for_file(
+        &mut self,
+        now_ms: u64,
+        file: &StoredFile,
+        stalled: bool,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let chat = self.store.message(&file.msg_id)?.map(|m| m.chat_id);
+        let Some(peer_ik) = chat.and_then(|chat| self.by_chat.get(&chat).copied()) else {
+            return Ok(Vec::new());
+        };
+        let next = self.store.next_missing_chunk(&file.file_id, file.chunk_total)?;
+        let Some(next) = next else {
+            // Просить нечего — всё на месте. Такое бывает у пустого файла
+            // и у передачи, которая закончилась ровно перед перезапуском.
+            return self.finish_file(file);
+        };
+        let Some(via) = self.direct_channel(&peer_ik) else { return Ok(Vec::new()) };
+
+        let mut effects = self.send_file_frame(
+            now_ms,
+            peer_ik,
+            via,
+            PayloadType::FileRequest,
+            ratatosk_proto::files::request_payload(file.file_id, next, stalled),
+        )?;
+        effects.extend(self.watch_for_stall(file.file_id));
+        Ok(effects)
+    }
+
+    /// Ставит срок молчания по файлу.
+    ///
+    /// Без него оборванная передача не возобновится никогда: отправитель ждёт
+    /// подтверждения, получатель ждёт чанков, и оба правы. Срок сторожит
+    /// получатель — у него есть всё, чтобы спросить заново.
+    fn watch_for_stall(&mut self, file_id: FileId) -> Vec<Effect> {
+        let token = self.allocate_timer();
+        // Прежняя метка забывается, а не снимается: отменить уже поставленный
+        // таймер драйверу нечем, но сработавшая метка, которой здесь больше
+        // нет, ничего не делает. Живой срок у файла всегда один.
+        self.file_timers.insert(file_id, token);
+        vec![Effect::SetTimer { after_ms: FILE_STALL_MS, token }]
+    }
+
+    /// Отправляет служебный кадр файла — просьбу или чанк.
+    ///
+    /// Мимо очереди §5.4, и это не нарушение, а её признание: очередь
+    /// обслуживает **сообщения**, у которых есть статус, квитанция и место
+    /// в истории. У чанка нет ничего из этого — его подтверждает следующая
+    /// просьба, а не квитанция, и ставить тысячи чанков в очередь доставки
+    /// значит забить её тем, чему там не место.
+    fn send_file_frame(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        via: Transport,
+        payload_type: PayloadType,
+        payload: Value,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(session_id) = self.sessions.for_peer(&peer_ik, via) else {
+            return Ok(Vec::new());
+        };
+        let envelope =
+            Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
+        let frame = self.seal_for(session_id, &envelope.encode()?)?;
+        Ok(vec![Effect::Send { peer_ik, via, frame }])
+    }
+
+    /// Пришло предложение файлов.
+    ///
+    /// Сообщение с подписью ложится в историю обычным путём — с событием и
+    /// квитанцией (§9.4). Файлы к нему прикладываются записями; те, что
+    /// проходят по порогу, сразу запрашиваются, остальные ждут человека.
+    fn on_file_offer(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let (caption, offers) = ratatosk_proto::files::offer_from_payload(&envelope.payload)?;
+        let mut effects =
+            self.on_incoming_text(now_ms, via, peer_ik, envelope, &caption, TextKind::Plain)?;
+
+        let mut records = Vec::with_capacity(offers.len());
+        for offer in offers {
+            let chunk_total = ratatosk_proto::files::chunk_count(offer.size_bytes);
+            let record = StoredFile {
+                file_id: offer.file_id,
+                msg_id: envelope.msg_id,
+                name: offer.name,
+                size_bytes: offer.size_bytes,
+                chunk_total,
+                key: offer.key,
+                preview: offer.preview,
+                incoming: true,
+                source_path: None,
+                // Порог — настройка, а не правило: `None` означает «спрашивать
+                // всегда», и это законный выбор человека.
+                accepted: ratatosk_proto::files::auto_accept(offer.size_bytes, self.auto_accept),
+                // Пустой файл собран в тот же миг: чанков у него нет.
+                complete: chunk_total == 0,
+            };
+            self.store.put_file(&record)?;
+            records.push(record);
+        }
+
+        for record in records {
+            if record.complete {
+                effects.extend(self.finish_file(&record)?);
+            } else if record.accepted {
+                effects.extend(self.ask_for_file(now_ms, &record, true)?);
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Пришла просьба продолжить передачу — она же подтверждение.
+    fn on_file_request(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let (file_id, next_index, stalled) =
+            ratatosk_proto::files::request_from_payload(&envelope.payload)?;
+
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        // Отдаём только своё и только тому, кому отправляли: просьба про чужой
+        // файл — попытка вычитать переписку, которой у собеседника нет.
+        if file.incoming
+            || self.store.message(&file.msg_id)?.map(|m| m.chat_id)
+                != Some(Self::chat_id_for(&peer_ik))
+        {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+        if next_index > file.chunk_total {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+
+        let position = self.sending.iter().position(|s| s.file_id == file_id);
+        let sending = match position {
+            Some(at) => {
+                let sending = &mut self.sending[at];
+                // Получатель сам сказал, что имеет в виду, — гадать не о чем.
+                // «Ничего не дошло» отматывает отправку назад; подтверждение
+                // только двигает окно, потому что то, что уже в полёте,
+                // слать второй раз незачем.
+                if stalled {
+                    sending.sent_upto = next_index;
+                } else {
+                    sending.sent_upto = sending.sent_upto.max(next_index);
+                }
+                sending.acked_upto = next_index;
+                *sending
+            }
+            None => {
+                // Первая просьба — или первая после нашего перезапуска.
+                // Своего состояния передачи отправитель не хранит: всё, что
+                // нужно, только что приехало в просьбе.
+                let sending = Sending {
+                    file_id,
+                    peer_ik,
+                    chunk_total: file.chunk_total,
+                    acked_upto: next_index,
+                    sent_upto: next_index,
+                };
+                self.sending.push(sending);
+                sending
+            }
+        };
+
+        if sending.acked_upto >= file.chunk_total {
+            // Получатель сказал, что у него всё. Больше этой передаче ничего
+            // не нужно.
+            self.sending.retain(|s| s.file_id != file_id);
+            return Ok(Vec::new());
+        }
+        self.pump_file(now_ms, &file)
+    }
+
+    /// Досылает чанки, пока окно не закрылось.
+    fn pump_file(&mut self, now_ms: u64, file: &StoredFile) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::files;
+
+        let Some(index) = self.sending.iter().position(|s| s.file_id == file.file_id) else {
+            return Ok(Vec::new());
+        };
+        let sending = self.sending[index];
+        let Some(via) = self.direct_channel(&sending.peer_ik) else {
+            // Прямого канала нет — чанкам ехать не на чем. Получатель спросит
+            // снова, когда канал появится; своего расписания у отправителя нет.
+            return Ok(Vec::new());
+        };
+        let Some(source) = file.source_path.clone() else { return Ok(Vec::new()) };
+        let Some(session_id) = self.sessions.for_peer(&sending.peer_ik, via) else {
+            return Ok(Vec::new());
+        };
+
+        let limit = sending.chunk_total.min(sending.acked_upto.saturating_add(files::CHUNK_WINDOW));
+        let mut effects = Vec::new();
+        let mut next = sending.sent_upto;
+        while next < limit {
+            let offset = next * files::CHUNK_BYTES as u64;
+            // Отказ чтения и пустой ответ — один и тот же случай: файла там
+            // больше нет или он стал короче. Отказ **не** поднимается выше:
+            // это не поломка ядра, а исчезнувший исходник, и сказать о нём
+            // надо человеку, а не вызывающему коду.
+            let plain = self
+                .blobs
+                .read_at(std::path::Path::new(&source), offset, files::CHUNK_BYTES)
+                .unwrap_or_default();
+            if plain.is_empty() {
+                // Молчать нельзя: передача встанет, и человек будет думать,
+                // что она идёт.
+                self.sending.retain(|s| s.file_id != file.file_id);
+                effects.push(Effect::Notify(Event::HonestNotice {
+                    text: crate::honest::FILE_SOURCE_GONE,
+                }));
+                break;
+            }
+            let sealed = ratatosk_crypto::file::seal_chunk(&file.key, &file.file_id, next, &plain)?;
+            let envelope = Envelope::new(
+                self.entropy.msg_id(),
+                self.clock.now(now_ms)?,
+                PayloadType::FileChunk,
+                files::chunk_payload(file.file_id, next, &sealed),
+            );
+            let frame = self.seal_for(session_id, &envelope.encode()?)?;
+            effects.push(Effect::Send { peer_ik: sending.peer_ik, via, frame });
+            next += 1;
+        }
+        if let Some(slot) = self.sending.iter_mut().find(|s| s.file_id == file.file_id) {
+            slot.sent_upto = next;
+        }
+        Ok(effects)
+    }
+
+    /// Пришёл чанк файла.
+    ///
+    /// Квитанции (§9.4) здесь нет и не должно быть: чанк — не сообщение,
+    /// и подтверждает его следующая просьба, а не отметка в истории.
+    fn on_file_chunk(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::files;
+
+        let (file_id, index, sealed) = files::chunk_from_payload(&envelope.payload)?;
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        if !file.incoming
+            || !file.accepted
+            || self.store.message(&file.msg_id)?.map(|m| m.chat_id)
+                != Some(Self::chat_id_for(&peer_ik))
+        {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+        if index >= file.chunk_total {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+
+        // Проверка тега — здесь и сейчас, до записи на диск. Она утверждает
+        // три вещи разом: содержимое не изменено, чанк с этого места и из
+        // этого файла (§10.1, AAD).
+        if ratatosk_crypto::file::open_chunk(&file.key, &file_id, index, &sealed).is_err() {
+            self.sessions.note_anomaly(peer_ik, |c| c.bad_tag += 1);
+            return Ok(Vec::new());
+        }
+
+        // Повтор чанка законен (§9.2) и безвреден — но обрабатывать его как
+        // новый нельзя: он потянул бы за собой и подтверждение, и новый срок
+        // молчания, а значит и новые чанки в ответ. Ровно так передача
+        // начинала разгонять сама себя.
+        if self.store.has_chunk(&file_id, index)? {
+            return Ok(Vec::new());
+        }
+
+        // Байты — раньше отметки. Наоборот было бы «файл собран из куска,
+        // которого нет»: отметка переживает падение процесса, а незаписанный
+        // чанк — нет.
+        self.blobs.put_chunk(&file_id, index, &sealed)?;
+        self.store.note_chunk(&file_id, index)?;
+
+        let received = self.store.received_chunks(&file_id)?;
+        let mut effects = vec![Effect::Notify(Event::FileProgress {
+            file_id,
+            received,
+            total: file.chunk_total,
+        })];
+
+        if received >= file.chunk_total {
+            effects.extend(self.finish_file(&file)?);
+            return Ok(effects);
+        }
+        // Подтверждение — оно же просьба продолжать. Реже, чем каждый чанк:
+        // окно не должно простаивать, но и кадр на каждый чанк ни к чему.
+        // Подтверждение — «принял, шлите дальше», а не «начните заново»:
+        // у отправителя в полёте ещё несколько чанков, и пересылать их
+        // не нужно. Различие едет флагом, а не угадывается на той стороне.
+        if received % files::ACK_EVERY == 0 {
+            effects.extend(self.ask_for_file(now_ms, &file, false)?);
+        } else {
+            effects.extend(self.watch_for_stall(file_id));
+        }
+        Ok(effects)
+    }
+
+    /// Файл собран.
+    fn finish_file(&mut self, file: &StoredFile) -> Result<Vec<Effect>, EngineError> {
+        self.store.complete_file(&file.file_id)?;
+        self.file_timers.remove(&file.file_id);
+        Ok(vec![Effect::Notify(Event::FileProgress {
+            file_id: file.file_id,
+            received: file.chunk_total,
+            total: file.chunk_total,
+        })])
+    }
+
+    /// Срок молчания вышел — спрашиваем заново.
+    fn on_file_stall(&mut self, now_ms: u64, file_id: FileId) -> Result<Vec<Effect>, EngineError> {
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        if file.complete || !file.incoming || !file.accepted {
+            return Ok(Vec::new());
+        }
+        // Срок вышел — значит за всё это время не пришло ничего. Вот теперь
+        // отправителю и правда надо начать с названного номера.
+        self.ask_for_file(now_ms, &file, true)
+    }
+
+    /// Возобновляет незаконченные приёмы у этого собеседника.
+    ///
+    /// Зовётся, когда появляется прямой канал: после рукопожатия и когда
+    /// собеседник объявился в эфире. Это и есть возобновление после
+    /// перезапуска — своего состояния передачи у получателя нет, всё нужное
+    /// лежит в базе.
+    fn resume_files(&mut self, now_ms: u64, peer_ik: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
+        let chat = Self::chat_id_for(&peer_ik);
+        let unfinished: Vec<StoredFile> = self
+            .store
+            .unfinished_files()?
+            .into_iter()
+            .filter(|f| f.incoming && f.accepted)
+            .collect();
+
+        let mut effects = Vec::new();
+        for file in unfinished {
+            if self.store.message(&file.msg_id)?.map(|m| m.chat_id) != Some(chat) {
+                continue;
+            }
+            effects.extend(self.ask_for_file(now_ms, &file, true)?);
+        }
+        Ok(effects)
+    }
+
+    /// Стирает с диска вложения, которых нет в базе (§12).
+    ///
+    /// Байты вложений живут не в базе, а рядом с ней ([`ratatosk_store::Blobs`]),
+    /// и это правильно: двухгигабайтный BLOB в SQLite — переписанная страница
+    /// на каждый чанк и WAL размером с файл. Но у раздельного хранения есть
+    /// своя цена, и вот она: база и диск способны разойтись, а база о том,
+    /// что осталось на диске, не знает ничего.
+    ///
+    /// Расходятся они двумя путями, и оба настоящие. Удаление контакта вместе
+    /// с историей сносит сообщения, каскад внешних ключей уносит записи
+    /// о файлах — а каталоги с чанками остаются лежать; переписка на гигабайт
+    /// исчезала из базы, не освободив ни байта. И удаление сообщения намеренно
+    /// проглатывает отказы удаления байтов: незавершённое удаление сообщения
+    /// хуже, чем оставшийся на диске мусор, — но мусор остаётся.
+    ///
+    /// Поэтому сверка отдельной операцией, а не частью удаления: она чинит
+    /// и то, что утекло вчера на устройстве, где эта функция ещё не работала.
+    /// Направление у неё одно — **с диска убирается лишнее**, на диск ничего
+    /// не добавляется. Запись в базе без байтов на диске мусором не является:
+    /// это незаконченный приём, и продолжится он ровно с той дырки, которой
+    /// не хватает (§10.2).
+    ///
+    /// Стирается два вида лишнего: целые каталоги вложений, о которых в базе
+    /// нет ни строчки, и отдельные чанки, не отмеченные принятыми, — след
+    /// процесса, убитого системой между записью байтов и отметкой о них
+    /// (порядок этих двух шагов сознательный, см. [`ratatosk_store::Blobs`]).
+    /// Такой чанк не читается никогда: его перепросят и перезапишут.
+    ///
+    /// Дорогая: обходит каталог целиком. Звать по кнопке «освободить место»
+    /// или в редкой фоновой уборке, но не по событию.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или диска. Убранное до отказа остаётся убранным:
+    /// уборка не транзакция, и делать её транзакцией незачем — повторный
+    /// запуск просто доделает остальное.
+    pub fn sweep_orphan_files(&mut self) -> Result<Swept, EngineError> {
+        let known: BTreeSet<FileId> = self.store.all_file_ids()?.into_iter().collect();
+        let mut swept = Swept::default();
+
+        for file_id in self.blobs.stored_files()? {
+            let chunks = self.blobs.stored_chunks(&file_id)?;
+            if !known.contains(&file_id) {
+                swept.bytes += chunks.iter().map(|(_, size)| *size).sum::<u64>();
+                swept.files += 1;
+                self.blobs.remove(&file_id)?;
+                continue;
+            }
+            // Идущую передачу это не трогает: чанк отмечается в базе в том же
+            // шаге, в котором ложится на диск, а уборка идёт между шагами.
+            // Неотмеченный чанк здесь — всегда след прошлой жизни процесса.
+            for (index, size) in chunks {
+                if !self.store.has_chunk(&file_id, index)? {
+                    self.blobs.remove_chunk(&file_id, index)?;
+                    swept.chunks += 1;
+                    swept.bytes += size;
+                }
+            }
+        }
+        Ok(swept)
+    }
+
+    /// Открывает вложение на чтение — **один раз на файл, а не на кусок**.
+    ///
+    /// Ядро отвечает на один вопрос и выдаёт [`FileReader`], в котором лежит
+    /// всё нужное для расшифровки. Дальше клиент читает сам, из своего
+    /// потока, и ядро в этом не участвует.
+    ///
+    /// Раньше он участвовал в каждом куске, и это был не выбор, а недосмотр:
+    /// открытие вложения на полгигабайта означало пятьсот заходов в очередь
+    /// драйвера, каждый на время чтения с диска и расшифровки мебибайта.
+    /// Всё это время не уходили сообщения и не срабатывали таймеры. Чтение
+    /// вложения ничего в состоянии не меняет — значит, ему незачем стоять
+    /// в очереди за тем, что меняет.
+    ///
+    /// Работает и на **своё** отправленное вложение: у него нет запечатанных
+    /// чанков (отправитель читает исходник с диска, ничего не копируя),
+    /// поэтому читатель берёт его по пути и открытым текстом. До этой правки
+    /// своё вложение через ядро не открывалось вовсе.
+    ///
+    /// `None` — такого файла нет: не приезжал, отклонён или удалён.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    ///
+    /// [`FileReader`]: crate::reader::FileReader
+    pub fn open_file(&self, file_id: &FileId) -> Result<Option<FileReader>, EngineError> {
+        let Some(file) = self.store.file(file_id)? else { return Ok(None) };
+        Ok(Some(FileReader::new(
+            *file_id,
+            file.key,
+            file.chunk_total,
+            file.size_bytes,
+            file.source_path.map(std::path::PathBuf::from),
+            self.blobs.reader(),
+        )))
+    }
+
+    /// Порог автоматического приёма файлов.
+    #[must_use]
+    pub const fn auto_accept_bytes(&self) -> Option<u64> {
+        self.auto_accept
     }
 
     // --- правка, пересылка, реакции -----------------------------------------
@@ -1417,6 +2152,17 @@ impl<S: Store> Engine<S> {
         self.store.delete_contact(&peer_ik)?;
         self.store.delete_avatar(&peer_ik)?;
         if purge_history {
+            // Байты вложений — **до** `delete_chat`, и только в этом порядке.
+            // Он уносит сообщения, каскад внешних ключей уносит следом записи
+            // о файлах, и после него спросить «какие вложения были в этом
+            // чате» уже не у кого: каталоги с чанками остались бы на диске
+            // навсегда, а переписка на гигабайт исчезла бы, не освободив
+            // ни байта. Подобрать их потом умеет только
+            // [`Engine::sweep_orphan_files`], и полагаться на неё здесь
+            // значило бы оставлять мусор нарочно.
+            for file_id in self.store.file_ids_of_chat(&chat).unwrap_or_default() {
+                self.forget_file(&file_id);
+            }
             self.store.delete_chat(&chat)?;
         }
 
@@ -2142,6 +2888,7 @@ impl<S: Store> Engine<S> {
         // отправлять по ней нечего. Сверенному контакту уедет лицо, всем
         // остальным — ничего (§4.2).
         effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
+        effects.extend(self.resume_files(now_ms, peer_ik)?);
         Ok(effects)
     }
 
@@ -2181,6 +2928,9 @@ impl<S: Store> Engine<S> {
         // Сессия есть — значит связь работает. То, что не уехало раньше,
         // получает свой шанс здесь.
         effects.extend(self.retry_deferred(Some(peer_ik))?);
+        // И недокачанные файлы тоже: у получателя нет своего расписания,
+        // он спрашивает, когда появляется канал (§10.2).
+        effects.extend(self.resume_files(now_ms, peer_ik)?);
         Ok(effects)
     }
 
@@ -2455,7 +3205,7 @@ impl<S: Store> Engine<S> {
     /// Запоздавшая квитанция ничего не ломает: `receipts::advance` разрешает
     /// перейти от объявленного провала к подтверждённой доставке, а лишнюю
     /// копию у получателя съест дедупликация (§9.2).
-    fn on_timer(&mut self, token: u64) -> Result<Vec<Effect>, EngineError> {
+    fn on_timer(&mut self, now_ms: u64, token: u64) -> Result<Vec<Effect>, EngineError> {
         // Срок обнаружения — не отказ транспорта, а конец паузы: §5.4 ещё
         // не начинался. Поэтому он разбирается отдельно и раньше.
         let awaiting_discovery = self.outbox.iter().find_map(|d| match d.state {
@@ -2464,6 +3214,16 @@ impl<S: Store> Engine<S> {
         });
         if let Some(peer_ik) = awaiting_discovery {
             return self.resume_discovery(peer_ik);
+        }
+
+        // Срок молчания по файлу — не отказ транспорта и не конец паузы
+        // доставки: чанки идут мимо очереди §5.4, и путать их сроки с её
+        // сроками нельзя.
+        let stalled_file =
+            self.file_timers.iter().find(|(_, armed)| **armed == token).map(|(id, _)| *id);
+        if let Some(file_id) = stalled_file {
+            self.file_timers.remove(&file_id);
+            return self.on_file_stall(now_ms, file_id);
         }
 
         // Один и тот же счётчик меток обслуживает и рукопожатия, и доставку,
@@ -2563,6 +3323,15 @@ impl<S: Store> Engine<S> {
         // и не отвечали — и он снова считал, что не дошло. Сообщение навсегда
         // оставалось «ждёт» у отправителя и лежало прочитанным у получателя,
         // а каждое появление в сети приводило к очередной бесполезной отправке.
+        // Чанк файла в окно дедупликации не кладётся, и это не исключение
+        // из §9.2, а его прочтение. Окно защищает **показ**: одно сообщение —
+        // один раз на экране. У чанка показа нет; повтор его безвреден (те же
+        // байты лягут в то же место), а две тысячи идентификаторов на файл
+        // забили бы и окно, и таблицу `dedup` тем, что никогда не понадобится.
+        if envelope.payload_type == PayloadType::FileChunk {
+            return self.deliver(now_ms, via, peer_ik, envelope);
+        }
+
         let fresh = self.dedup.check(envelope.msg_id, now_ms).is_fresh()
             && self.store.note_seen(&envelope.msg_id, now_ms)?;
         if !fresh {
@@ -2712,9 +3481,14 @@ impl<S: Store> Engine<S> {
             // Неизвестный тип не повод терять сообщение целиком, но и
             // показать его нечем: молча пропускаем (§9.1).
             PayloadType::Unknown(_) => Ok(Vec::new()),
-            PayloadType::FileOffer | PayloadType::FileChunk | PayloadType::Preview => {
-                todo!("этап 4: файлы (§10)")
-            }
+            PayloadType::FileOffer => self.on_file_offer(now_ms, via, peer_ik, &envelope),
+            PayloadType::FileChunk => self.on_file_chunk(now_ms, peer_ik, &envelope),
+            PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
+            // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
+            // оно не ездит. Тип остаётся в перечислении, потому что он есть
+            // в спецификации, а молча принимать то, чего мы не отправляем,
+            // незачем.
+            PayloadType::Preview => Ok(Vec::new()),
             PayloadType::Receipt => {
                 let (receipt, msg_ids) = Receipt::from_payload(&envelope.payload)?;
                 let candidate = match receipt {

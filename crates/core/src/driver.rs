@@ -82,6 +82,34 @@ pub struct MessageView {
     pub reactions: Vec<StoredReaction>,
     /// Вложения. К одному сообщению их может быть несколько (§10).
     pub files: Vec<FileView>,
+    /// Присланная карточка контакта, если это сообщение — она.
+    pub shared_contact: Option<SharedContactView>,
+}
+
+/// Присланная карточка контакта вместе с тем, что о ней уже известно.
+///
+/// Отпечаток и признак «уже в контактах» считаются здесь, а не в клиенте:
+/// вывод отпечатка из `IK ‖ SK` — протокольная логика, а §13.3 держит её
+/// ниже границы. Заодно клиенту нечем ошибиться в главном — в том, что
+/// показать рядом с именем.
+#[derive(Debug, Clone)]
+pub struct SharedContactView {
+    /// Чей контакт.
+    pub peer_ik: [u8; 32],
+    /// Имя из карточки. Его выбрал сам владелец, и **доверять ему нельзя**
+    /// (§4.1) — как и любому `display_name`.
+    pub display_name: String,
+    /// Отпечаток для сверки голосом (§3, §4.2).
+    ///
+    /// Показывать обязательно: это единственное, что человек может проверить
+    /// сам, и единственное, что отличает настоящего собеседника от карточки,
+    /// которую отправитель сочинил.
+    pub fingerprint: String,
+    /// Этот человек уже есть в контактах.
+    ///
+    /// Считается наличием контакта, а не флагом в базе: флаг разошёлся бы
+    /// с правдой в первый же раз, когда контакт добавят из QR или удалят.
+    pub already_known: bool,
 }
 
 /// Вложение вместе с тем, сколько его уже приехало.
@@ -122,6 +150,18 @@ enum Query {
     OpenFile { file_id: FileId, reply: oneshot::Sender<Option<FileReader>> },
     /// Порог автоматического приёма файлов.
     AutoAccept { reply: oneshot::Sender<Option<u64>> },
+    /// Поиск по словам (§12).
+    ///
+    /// `chat` = `None` — по всей переписке. Возвращает сами сообщения, а не
+    /// идентификаторы: клиент их и показывает, а второй заход через границу
+    /// §13.3 за каждой находкой был бы ровно тем, чего [`MessageView`]
+    /// и создан избежать.
+    Search {
+        chat: Option<ChatId>,
+        query: String,
+        limit: usize,
+        reply: oneshot::Sender<Vec<MessageView>>,
+    },
     /// Превью вложения (§10.3).
     FilePreview { file_id: FileId, reply: oneshot::Sender<Option<Vec<u8>>> },
     /// Одно сообщение по идентификатору.
@@ -237,6 +277,21 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Ищет сообщения по словам (§12). `None` — драйвер остановлен.
+    pub async fn search(
+        &self,
+        chat: Option<ChatId>,
+        query: String,
+        limit: usize,
+    ) -> Option<Vec<MessageView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Query(Query::Search { chat, query, limit, reply }))
+            .await
+            .ok()?;
+        answer.await.ok()
+    }
+
     /// Стирает с диска вложения, которых нет в базе (§12).
     ///
     /// `None` — драйвер остановлен.
@@ -322,6 +377,24 @@ impl DriverHandle {
     pub fn sweep_orphan_files_blocking(&self) -> Option<Swept> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Chore(Chore::SweepOrphanFiles { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Ищет сообщения по словам (§12).
+    ///
+    /// `chat = None` — по всей переписке. Ищутся **целые слова**: индекс
+    /// хранит их хэши на ключе базы, поэтому ни префиксов, ни подстрок тут
+    /// нет и быть не может.
+    pub fn search_blocking(
+        &self,
+        chat: Option<ChatId>,
+        query: String,
+        limit: usize,
+    ) -> Option<Vec<MessageView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .blocking_send(Request::Query(Query::Search { chat, query, limit, reply }))
+            .ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -422,6 +495,20 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 Wake::Timers => self.fire_due_timers().await?,
                 Wake::Stop => return Ok(()),
             }
+
+            // Уборка (§12) — по событию, а не по таймеру: телефон
+            // значительную часть времени спит (§13.1), и таймер там
+            // не гарантирует ничего, а этот цикл всё равно просыпается
+            // на каждое сообщение. Само решение «пора или нет» принимает
+            // ядро; здесь только повод спросить.
+            //
+            // Отказ хранилища тут не роняет драйвер: не прибраться —
+            // не то же самое, что не доставить сообщение.
+            match self.engine.compact_if_due(now_ms()) {
+                Ok(0) => {}
+                Ok(removed) => tracing::debug!(removed, "уборка прошла"),
+                Err(error) => tracing::warn!(%error, "уборка не удалась"),
+            }
         }
     }
 
@@ -470,7 +557,8 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let found = store.message(&msg_id).ok().flatten().map(|message| {
                     let reactions = store.reactions(&message.msg_id).unwrap_or_default();
                     let files = Self::file_views(store, &message.msg_id);
-                    MessageView { message, reactions, files }
+                    let shared_contact = self.shared_contact_view(&message.msg_id);
+                    MessageView { message, reactions, files, shared_contact }
                 });
                 let _ = reply.send(found);
             }
@@ -482,6 +570,25 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::AutoAccept { reply } => {
                 let _ = reply.send(self.engine.auto_accept_bytes());
+            }
+            Query::Search { chat, query, limit, reply } => {
+                let store = self.engine.store();
+                let found = store
+                    .search(chat.as_ref(), &query, limit)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|msg_id| {
+                        // Находка без сообщения — рассинхрон индекса
+                        // с историей. Пропускаем молча: показать её нечем,
+                        // а ронять поиск целиком из-за одной строки незачем.
+                        let message = store.message(&msg_id).ok().flatten()?;
+                        let reactions = store.reactions(&msg_id).unwrap_or_default();
+                        let files = Self::file_views(store, &msg_id);
+                        let shared_contact = self.shared_contact_view(&msg_id);
+                        Some(MessageView { message, reactions, files, shared_contact })
+                    })
+                    .collect();
+                let _ = reply.send(found);
             }
             Query::FilePreview { file_id, reply } => {
                 let found =
@@ -546,7 +653,8 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 // с вложениями.
                 let reactions = store.reactions(&message.msg_id).unwrap_or_default();
                 let files = Self::file_views(store, &message.msg_id);
-                MessageView { message, reactions, files }
+                let shared_contact = self.shared_contact_view(&message.msg_id);
+                MessageView { message, reactions, files, shared_contact }
             })
             .collect()
     }
@@ -568,6 +676,29 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 FileView { file, received_chunks }
             })
             .collect()
+    }
+
+    /// Присланная карточка контакта, если это сообщение — она.
+    ///
+    /// Берёт `&self`, а не `&S`, в отличие от [`Driver::file_views`]: признак
+    /// «уже в контактах» знает ядро, а не хранилище, — контакты лежат в памяти
+    /// движка.
+    fn shared_contact_view(&self, msg_id: &MsgId) -> Option<SharedContactView> {
+        let share = self.engine.store().contact_share_of(msg_id).ok().flatten()?;
+        // Карточку разбираем каждый раз заново, а не храним разобранной:
+        // §6 требует читать принятые байты, и второе представление рядом
+        // однажды разошлось бы с первым.
+        let card = ratatosk_codec::ContactCard::decode(&share.card_bytes).ok()?.into_parts().1;
+        // Отпечаток не сложился — показывать нечего: такую карточку и добавить
+        // нельзя. Прятать её целиком честнее, чем рисовать имя без отпечатка.
+        let fingerprint =
+            ratatosk_crypto::PublicIdentity::from_bytes(card.ik, card.sk).ok()?.fingerprint();
+        Some(SharedContactView {
+            peer_ik: card.ik,
+            display_name: card.display_name,
+            fingerprint,
+            already_known: self.engine.contacts().contains_key(&card.ik),
+        })
     }
 
     /// Подаёт вход ядру и исполняет всё, что оно вернуло.

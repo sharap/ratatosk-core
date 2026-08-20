@@ -2269,3 +2269,205 @@ fn a_sent_attachment_opens_from_its_source() {
         "исчезнувший исходник обязан отличаться от «показать нечего»"
     );
 }
+
+#[test]
+fn the_cleanup_runs_by_itself_and_not_on_every_step() {
+    // §12: «Compaction обязателен с первого дня. Иначе клиент перестанет
+    // открываться на третий год.» Написан он был целиком, а запускался
+    // только тестами — то есть не запускался. Проверяется и то, что теперь
+    // запускается, и то, что не на каждом шаге: уборка на каждое сообщение
+    // была бы своей поломкой.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "первое");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    // Пары сообщений мало, шести часов ещё не прошло — прибираться не время.
+    assert_eq!(bob.compact_if_due(1_000).unwrap(), 0, "уборка не бежит на каждом шаге");
+
+    // А через интервал — время. Убрать может быть и нечего; проверяется, что
+    // отметка поставлена, то есть проход состоялся.
+    let interval = ratatosk_store::Schedule::default().min_interval_ms;
+    bob.compact_if_due(interval).expect("уборка прошла");
+    assert!(
+        bob.store().meta(ratatosk_store::META_LAST_COMPACTION).unwrap().is_some(),
+        "проход обязан оставить отметку — иначе интервал не с чем сравнивать"
+    );
+
+    // И сразу второй раз не бежит: интервал считается от прошлого прохода.
+    assert_eq!(bob.compact_if_due(interval).unwrap(), 0, "дважды подряд прибираться незачем");
+}
+
+#[test]
+fn search_finds_whole_words_across_the_history() {
+    // Правила поиска у обеих реализаций хранилища обязаны совпасть: в файловой
+    // базе ищет индекс по хэшам слов, здесь — обход, а отвечать они должны
+    // одинаково. Разойдись они — симуляция (§16) проверяла бы не тот поиск,
+    // который поедет на телефон.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    for (at, text) in [(1_000, "привет, как дела"), (2_000, "дела идут"), (3_000, "про другое")]
+    {
+        let effects = send_text(&mut alice, &bob, at, text);
+        pump(&mut alice, &mut bob, at, effects);
+    }
+
+    let found = |query: &str| {
+        bob.store()
+            .search(None, query, 10)
+            .unwrap()
+            .into_iter()
+            .filter_map(|id| bob.store().message(&id).unwrap())
+            .map(|m| String::from_utf8(m.body).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(found("дела"), vec!["дела идут".to_owned(), "привет, как дела".to_owned()]);
+    assert_eq!(found("ДЕЛА").len(), 2, "регистр запроса значения не имеет");
+    assert_eq!(found("дела привет"), vec!["привет, как дела".to_owned()], "нужны все слова");
+    assert!(found("прив").is_empty(), "по началу слова не ищется, и это не недоделка");
+    assert!(found("").is_empty(), "пустой запрос — пустой ответ, а не вся история");
+}
+
+// --- поделиться контактом (§4.1, дополнение) ------------------------------
+
+/// Отправляет карточку и доводит её до собеседника. Возвращает `msg_id`
+/// сообщения у получателя.
+fn share(from: &mut Node, to: &mut Node, now_ms: u64, whose: [u8; 32]) -> [u8; 16] {
+    let chat = Engine::<MemoryStore>::chat_id_for(&to.own_card().ik);
+    let effects = from
+        .step(now_ms, Input::Command(Command::ShareContact { chat, peer_ik: whose }))
+        .expect("карточка принята к отправке");
+    pump(from, to, now_ms, effects);
+
+    let mine = Engine::<MemoryStore>::chat_id_for(&from.own_card().ik);
+    let received = to.store().messages(&mine, 20, None).unwrap();
+    received
+        .iter()
+        .rev()
+        .find(|m| to.store().contact_share_of(&m.msg_id).unwrap().is_some())
+        .expect("карточка легла в историю")
+        .msg_id
+}
+
+#[test]
+fn a_shared_contact_arrives_unverified_even_from_a_verified_friend() {
+    // Главное свойство всей функции. Алиса сверила Кэрол голосом, но Бобу
+    // от этого не легче: он не слышал Кэрол и проверить карточку не может.
+    // Доверие не транзитивно (§4.2), и подпись бы не помогла — у карточки
+    // её нет и не бывает.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    introduce(&mut alice, &mut bob);
+    introduce(&mut alice, &mut carol);
+
+    let carol_ik = carol.own_card().ik;
+    assert!(alice.contacts().get(&carol_ik).unwrap().verified, "у Алисы Кэрол сверена");
+
+    let msg_id = share(&mut alice, &mut bob, 1_000, carol_ik);
+
+    // Само по себе сообщение ничего не добавило.
+    assert!(bob.contacts().get(&carol_ik).is_none(), "приход карточки не добавляет контакт");
+
+    bob.step(2_000, Input::Command(Command::AddSharedContact { msg_id })).expect("добавление");
+    let added = bob.contacts().get(&carol_ik).expect("после нажатия контакт есть");
+    assert!(!added.verified, "присланный контакт непроверен всегда — даже от сверенного друга");
+    assert_eq!(added.card.display_name, "carol", "имя берётся из карточки");
+}
+
+#[test]
+fn a_shared_card_never_touches_a_contact_we_already_have() {
+    // Иначе кто угодно пришлёт «карточку версии 99» со своим адресом
+    // и уведёт маршрут на себя. Адреса меняет только подписанное обновление
+    // от самого владельца (§4.3).
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    introduce(&mut alice, &mut bob);
+    introduce(&mut alice, &mut carol);
+    introduce(&mut bob, &mut carol);
+
+    let carol_ik = carol.own_card().ik;
+    let before = bob.contacts().get(&carol_ik).expect("Боб уже знает Кэрол").clone();
+    assert!(before.verified, "и знает сверенной");
+
+    // Алиса делится настоящей Кэрол — даже честная карточка ничего не меняет.
+    //
+    // Подсунуть Бобу «Кэрол» с чужими ключами этим тестом не получится:
+    // ядро отправляет то, что лежит в его собственном хранилище, а лгущего
+    // собеседника через `--test pair` не собрать. Та же оговорка, что
+    // у отзыва и правки.
+    let msg_id = share(&mut alice, &mut bob, 2_000, carol_ik);
+    bob.step(3_000, Input::Command(Command::AddSharedContact { msg_id })).unwrap();
+
+    let after = bob.contacts().get(&carol_ik).expect("Кэрол на месте");
+    assert!(after.verified, "сверка не сброшена");
+    assert_eq!(after.card, before.card, "карточка известного контакта не тронута");
+}
+
+#[test]
+fn sharing_your_own_card_is_the_same_operation() {
+    // «Перешли мою визитку другу» — частый случай, и отдельного механизма
+    // ему не нужно.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    let alice_ik = alice.own_card().ik;
+    let msg_id = share(&mut alice, &mut bob, 1_000, alice_ik);
+    let share_record = bob.store().contact_share_of(&msg_id).unwrap().expect("карточка на месте");
+    assert_eq!(share_record.ik, alice_ik);
+
+    // Боб уже знает Алису — нажатие ничего не меняет и не ломает.
+    bob.step(2_000, Input::Command(Command::AddSharedContact { msg_id })).unwrap();
+    assert!(bob.contacts().get(&alice_ik).unwrap().verified, "сверка Алисы не сброшена");
+}
+
+#[test]
+fn the_local_name_stays_home() {
+    // Локальное имя — заметка о своём отношении, а не свойство контакта,
+    // и «по проводу не едет никогда» (§4.1). Проверяется именно здесь:
+    // поделиться контактом — единственное место, где чужая карточка
+    // покидает устройство.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    introduce(&mut alice, &mut bob);
+    introduce(&mut alice, &mut carol);
+
+    let carol_ik = carol.own_card().ik;
+    alice
+        .step(
+            500,
+            Input::Command(Command::SetLocalName {
+                peer_ik: carol_ik,
+                name: Some("Кэрол с работы".into()),
+            }),
+        )
+        .unwrap();
+
+    let msg_id = share(&mut alice, &mut bob, 1_000, carol_ik);
+    let share_record = bob.store().contact_share_of(&msg_id).unwrap().unwrap();
+    let text = String::from_utf8_lossy(&share_record.card_bytes).into_owned();
+    assert!(!text.contains("работы"), "локальное имя уехало вместе с карточкой");
+
+    bob.step(2_000, Input::Command(Command::AddSharedContact { msg_id })).unwrap();
+    assert_eq!(
+        bob.contacts().get(&carol_ik).unwrap().card.display_name,
+        "carol",
+        "у Боба имя из карточки, а не подпись Алисы"
+    );
+}
+
+#[test]
+fn a_shared_contact_disappears_with_its_message() {
+    // Карточка — содержимое сообщения. Оставить её значит оставить в истории
+    // кнопку «добавить» у сообщения, которого больше нет.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    introduce(&mut alice, &mut bob);
+    introduce(&mut alice, &mut carol);
+
+    let msg_id = share(&mut alice, &mut bob, 1_000, carol.own_card().ik);
+    let chat = Engine::<MemoryStore>::chat_id_for(&alice.own_card().ik);
+    bob.step(2_000, Input::Command(Command::DeleteMessages { chat, msg_ids: vec![msg_id] }))
+        .unwrap();
+
+    assert!(
+        bob.store().contact_share_of(&msg_id).unwrap().is_none(),
+        "карточка обязана уйти вместе с сообщением"
+    );
+}

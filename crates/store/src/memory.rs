@@ -4,7 +4,8 @@
 //! база этому мешает дважды: она заводит настоящий диск там, где вся суть
 //! в отсутствии внешнего мира, и она медленная, когда узлов десятки.
 //!
-//! Реализация не пытается быть SQLite: у неё нет ни FTS5, ни экспорта.
+//! Реализация не пытается быть SQLite: у неё нет ни поискового индекса,
+//! ни экспорта — искать она умеет обходом.
 //! Зато она даёт трейту [`Store`] вторую реализацию — а трейт с одной
 //! реализацией никогда не бывает честной абстракцией.
 
@@ -14,8 +15,8 @@ use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
 use crate::{
-    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredFile, StoredMessage,
-    StoredOutbox, StoredReaction, StoredSession,
+    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredContactShare, StoredFile,
+    StoredMessage, StoredOutbox, StoredReaction, StoredSession,
 };
 
 /// Хранилище в оперативной памяти.
@@ -40,6 +41,8 @@ pub struct MemoryStore {
     reactions: BTreeMap<(MsgId, [u8; 32]), StoredReaction>,
     outbox: BTreeMap<MsgId, StoredOutbox>,
     files: BTreeMap<FileId, StoredFile>,
+    /// Присланные карточки контактов: одна на сообщение.
+    contact_shares: BTreeMap<MsgId, StoredContactShare>,
     /// Какие чанки приняты. `BTreeSet` по паре, чтобы «первый недостающий»
     /// считался обходом по порядку, как и в файловой базе.
     chunks: std::collections::BTreeSet<(FileId, u64)>,
@@ -150,6 +153,7 @@ impl Store for MemoryStore {
                 self.files.remove(&file_id);
                 self.chunks.retain(|(id, _)| *id != file_id);
             }
+            self.contact_shares.remove(&msg_id);
         }
         Ok(())
     }
@@ -231,6 +235,10 @@ impl Store for MemoryStore {
         // к словам, которых больше нет.
         message.edited_ms = None;
         self.reactions.retain(|(id, _), _| id != msg_id);
+        // Присланная карточка — тоже содержимое сообщения, и уходит вместе
+        // с ним: иначе в истории осталась бы кнопка «добавить контакт»
+        // у сообщения, которого больше нет.
+        self.contact_shares.remove(msg_id);
         self.tombstones.insert(*msg_id, now_ms);
         Ok(true)
     }
@@ -362,6 +370,18 @@ impl Store for MemoryStore {
         Ok(self.files.values().filter(|f| f.msg_id == *msg_id).cloned().collect())
     }
 
+    fn put_contact_share(&mut self, share: &StoredContactShare) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.contact_shares.insert(share.msg_id, share.clone());
+        Ok(())
+    }
+
+    fn contact_share_of(&self, msg_id: &MsgId) -> Result<Option<StoredContactShare>> {
+        Ok(self.contact_shares.get(msg_id).cloned())
+    }
+
     fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
         let Some(file) = self.files.get_mut(file_id) else { return Ok(false) };
         file.accepted = true;
@@ -414,6 +434,39 @@ impl Store for MemoryStore {
 
     fn all_file_ids(&self) -> Result<Vec<FileId>> {
         Ok(self.files.keys().copied().collect())
+    }
+
+    /// Ищет обходом, а не по индексу — и это не упрощение.
+    ///
+    /// Индекс в файловой базе нужен затем, чтобы не хранить открытый текст
+    /// рядом с зашифрованным. Здесь всё и так в памяти процесса, прятать
+    /// не от кого, а вот **правила** обязаны совпасть до буквы: те же слова,
+    /// то же приведение к нижнему регистру, то же «нужны все слова
+    /// запроса». Разойдись они — симуляция (§16) проверяла бы не тот поиск,
+    /// который поедет на телефон.
+    fn search(&self, chat_id: Option<&[u8; 16]>, query: &str, limit: usize) -> Result<Vec<MsgId>> {
+        let wanted = crate::tokens::words(query);
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut found: Vec<(Hlc, MsgId)> = self
+            .messages
+            .iter()
+            .filter(|((chat, _, _), _)| chat_id.is_none_or(|want| chat == want))
+            .filter(|(_, message)| !self.tombstones.contains_key(&message.msg_id))
+            .filter(|(_, message)| {
+                let Ok(text) = std::str::from_utf8(&message.body) else { return false };
+                let present = crate::tokens::words(text);
+                wanted.iter().all(|word| present.contains(word))
+            })
+            .map(|(_, message)| (message.hlc, message.msg_id))
+            .collect();
+
+        // Новые первыми — как и в файловой базе.
+        found.sort_unstable_by(|a, b| b.cmp(a));
+        found.truncate(limit);
+        Ok(found.into_iter().map(|(_, msg_id)| msg_id).collect())
     }
 
     fn delete_file(&mut self, file_id: &FileId) -> Result<()> {

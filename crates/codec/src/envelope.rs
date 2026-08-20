@@ -111,6 +111,18 @@ pub enum PayloadType {
     /// номера у меня есть». Двух разных кадров для «начни» и «продолжай» нет
     /// намеренно — это одно утверждение о состоянии получателя.
     FileRequest,
+    /// Карточка третьего человека, присланная в чат (§4.1).
+    ///
+    /// **Дополнение к спецификации:** v0.1 описывает обмен контактами только
+    /// через QR и ссылку. Правила — в `ratatosk_proto::contact_share`.
+    ///
+    /// Едет ровно та же карточка, что и в QR, и подписи под ней нет — её
+    /// не бывает и у QR: карточка **есть** заявление о ключах, а доверие
+    /// к нему берётся из канала (§4.2). Отсюда всё поведение приёма:
+    /// присланный контакт непроверен всегда, а известный контакт не
+    /// обновляет никогда — адреса меняет только подписанный
+    /// [`PayloadType::CardUpdate`].
+    ContactShare,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -138,6 +150,7 @@ impl PayloadType {
             PayloadType::Forward => 13,
             PayloadType::Reply => 14,
             PayloadType::FileRequest => 15,
+            PayloadType::ContactShare => 16,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -161,6 +174,7 @@ impl PayloadType {
             13 => PayloadType::Forward,
             14 => PayloadType::Reply,
             15 => PayloadType::FileRequest,
+            16 => PayloadType::ContactShare,
             other => PayloadType::Unknown(other),
         }
     }

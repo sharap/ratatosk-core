@@ -22,7 +22,7 @@
 //! иначе неудача не отличима от «сеть не пропускает mDNS».
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use data_encoding::BASE64URL_NOPAD;
 use ratatosk_codec::ContactCard;
@@ -40,11 +40,22 @@ struct Args {
     discovery: bool,
     data: Option<PathBuf>,
     pin: Option<String>,
+    /// Каталог с несколькими аккаунтами (§3, дополнение).
+    accounts: Option<PathBuf>,
+    /// Имя аккаунта в этом каталоге; заводится, если его там ещё нет.
+    account: Option<String>,
 }
 
 fn parse_args() -> Args {
-    let mut args =
-        Args { name: "узел".to_owned(), port: 0, discovery: true, data: None, pin: None };
+    let mut args = Args {
+        name: "узел".to_owned(),
+        port: 0,
+        discovery: true,
+        data: None,
+        pin: None,
+        accounts: None,
+        account: None,
+    };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         match flag.as_str() {
@@ -53,6 +64,8 @@ fn parse_args() -> Args {
             "--no-mdns" => args.discovery = false,
             "--data" => args.data = argv.next().map(PathBuf::from),
             "--pin" => args.pin = argv.next(),
+            "--accounts" => args.accounts = argv.next().map(PathBuf::from),
+            "--account" => args.account = argv.next(),
             other => eprintln!("неизвестный ключ: {other}"),
         }
     }
@@ -62,7 +75,20 @@ fn parse_args() -> Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("ratatosk=debug").init();
-    let args = parse_args();
+    let mut args = parse_args();
+
+    // Каталог аккаунтов сводится к пути базы: дальше всё работает как
+    // с одиночной. Стенд проверяет ядро, а не список аккаунтов, — ему
+    // достаточно уметь открыть нужный.
+    if let Some(root) = args.accounts.clone() {
+        match resolve_account(&root, args.account.as_deref()) {
+            Ok(path) => args.data = Some(path),
+            Err(error) => {
+                eprintln!("аккаунт не открыть: {error}");
+                return Ok(());
+            }
+        }
+    }
 
     match (&args.data, &args.pin) {
         // §8.6: PIN необязателен, и его отсутствие — не ошибка. Но db_key
@@ -76,6 +102,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, _) => run_ephemeral(&args).await,
     }
+}
+
+/// Находит базу аккаунта по имени, заводя его при необходимости.
+///
+/// Реестр лежит открытым, и это видно прямо здесь: имя аккаунта читается
+/// без всякого PIN. Так и задумано — список надо показать до разблокировки,
+/// — но означает это, что взявший каталог видит, сколько аккаунтов и как
+/// они названы.
+fn resolve_account(
+    root: &Path,
+    label: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut registry = ratatosk_core::Registry::open(root)?;
+    let label = label.unwrap_or("основной");
+
+    if let Some(known) = registry.listed().iter().find(|a| a.label == label) {
+        return Ok(registry.db_path(&known.id));
+    }
+    let created = registry.create(&mut OsEntropy, label, 0)?;
+    println!("аккаунт  : {label} — заведён");
+    Ok(registry.db_path(&created.id))
 }
 
 /// Хранилище в памяти: личность живёт до выхода.
@@ -127,6 +174,7 @@ async fn run<S: Store + 'static>(
     let mut engine = Engine::new(identity, store, Box::new(blobs), Box::new(OsEntropy), addresses);
     let known = engine.restore()?;
 
+    let own_ik = engine.own_card().ik;
     let card = BASE64URL_NOPAD.encode(&engine.own_card().encode()?);
     let fingerprint = engine.fingerprint();
 
@@ -152,7 +200,9 @@ async fn run<S: Store + 'static>(
     println!("если mDNS в вашей сети не работает, допишите через пробел адрес");
     println!("этой машины: /add <карточка> 192.168.1.5:{port}");
     println!();
-    println!("команды: /add <карточка> [ip:порт]   /who   /net   /sweep   /quit");
+    println!(
+        "команды: /add <карточка> [ip:порт]   /who   /net   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
+    );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
 
@@ -169,13 +219,18 @@ async fn run<S: Store + 'static>(
                 eprintln!("ядро остановилось: {error}");
             }
         }
-        () = console(handle, events, directory) => {}
+        () = console(handle, events, directory, own_ik) => {}
     }
     Ok(())
 }
 
 /// Консоль: команды со stdin и события из ядра.
-async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDirectory) {
+async fn console(
+    handle: DriverHandle,
+    mut events: EventStream,
+    directory: LanDirectory,
+    own_ik: [u8; 32],
+) {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut peer: Option<[u8; 32]> = None;
 
@@ -192,6 +247,56 @@ async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDi
                 }
                 if line == "/who" {
                     show_contacts(&handle, &directory).await;
+                    continue;
+                }
+                if line == "/share" {
+                    // Делимся с текущим собеседником **своей** карточкой:
+                    // на стенде третьего обычно нет, а проверить путь этого
+                    // достаточно — своя карточка идёт тем же кадром, что чужая.
+                    if peer.is_none() {
+                        peer = sole_contact(&handle).await;
+                    }
+                    let Some(ik) = peer else {
+                        println!("< некому: сперва /add <карточка>");
+                        continue;
+                    };
+                    let chat = Engine::<MemoryStore>::chat_id_for(&ik);
+                    handle.send(Command::ShareContact { chat, peer_ik: own_ik }).await.ok();
+                    println!("< своя карточка ушла в чат");
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/take ") {
+                    // Добавить присланную карточку по идентификатору сообщения.
+                    // Контакт появится **непроверенным** — иначе и быть
+                    // не может: доверие не транзитивно (§4.2).
+                    match data_encoding::HEXLOWER.decode(rest.trim().as_bytes()) {
+                        Ok(raw) if raw.len() == 16 => {
+                            let mut msg_id = [0u8; 16];
+                            msg_id.copy_from_slice(&raw);
+                            handle.send(Command::AddSharedContact { msg_id }).await.ok();
+                            println!("< если карточка была — контакт добавлен непроверенным");
+                        }
+                        _ => println!("< нужен полный msg_id в hex (32 знака)"),
+                    }
+                    continue;
+                }
+                if let Some(query) = line.strip_prefix("/find ") {
+                    // Ищутся целые слова: в индексе лежат их хэши на ключе
+                    // базы, а не сам текст. Проверяется здесь же — «прив»
+                    // обязано не находить «привет».
+                    match handle.search(None, query.trim().to_owned(), 20).await {
+                        Some(found) if found.is_empty() => println!("< ничего не нашлось"),
+                        Some(found) => {
+                            for view in found {
+                                println!(
+                                    "< {}: {}",
+                                    short(&view.message.msg_id),
+                                    String::from_utf8_lossy(&view.message.body)
+                                );
+                            }
+                        }
+                        None => return,
+                    }
                     continue;
                 }
                 if line == "/sweep" {
@@ -268,7 +373,30 @@ async fn console(handle: DriverHandle, mut events: EventStream, directory: LanDi
                             if let Some(view) =
                                 messages.iter().find(|v| &v.message.msg_id == msg_id)
                             {
-                                println!("< {}", String::from_utf8_lossy(&view.message.body));
+                                match &view.shared_contact {
+                                    // Отпечаток рядом обязателен: карточку
+                                    // прислал человек, а не её владелец,
+                                    // и проверить её можно только голосом
+                                    // с самим владельцем (§4.2).
+                                    Some(shared) => {
+                                        println!("< прислана карточка: {}", shared.display_name);
+                                        println!("    отпечаток: {}", shared.fingerprint);
+                                        if shared.already_known {
+                                            println!("    этот контакт уже есть — ничего не меняем");
+                                        } else {
+                                            println!(
+                                                "    добавить непроверенным: /take {}",
+                                                data_encoding::HEXLOWER.encode(msg_id)
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        println!(
+                                            "< {}",
+                                            String::from_utf8_lossy(&view.message.body)
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

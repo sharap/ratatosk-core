@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 
 use ratatosk_codec::ContactCard;
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream, MessageView};
-use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, OutgoingFile, SelfAddresses};
+use ratatosk_core::{
+    vault, Account, AccountId, Command, Engine, Event, OsEntropy, OutgoingFile, Registry,
+    SelfAddresses,
+};
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 use ratatosk_transport::{LanConfig, LanRunner};
@@ -286,6 +289,46 @@ pub struct FfiMessage {
     /// не дошло, вычищено уборкой. Тогда клиент обязан сказать «сообщение
     /// недоступно», а не придумывать текст и не прятать сам ответ.
     pub reply_to: Option<Vec<u8>>,
+    /// Присланная карточка контакта, если это сообщение — она.
+    pub shared_contact: Option<FfiSharedContact>,
+}
+
+/// Карточка контакта, присланная в чат (§4.1, дополнение).
+///
+/// **Проверить её нечем, и подпись бы не помогла.** Голая карточка не
+/// подписана — ни здесь, ни в QR-коде: она *есть* заявление «вот мои ключи»,
+/// а доверие к нему берётся из канала. Отправитель мог завести пару ключей
+/// сам и назвать её чужим именем; тот, чьей карточкой делятся, ничего
+/// не подписывал и не мог — он не знает, что ею делятся.
+///
+/// Что из этого обязан сделать клиент:
+///
+/// * показать [`FfiSharedContact::fingerprint`] рядом с именем — это
+///   единственное, что человек может проверить сам, голосом (§4.2);
+/// * сказать, **кто** прислал карточку (это видно по чату, и это единственное
+///   знание, на котором можно принимать решение);
+/// * не изображать проверенность: добавленный отсюда контакт непроверен
+///   всегда, даже если приславший у вас сверен. Доверие не транзитивно.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSharedContact {
+    /// Чей контакт.
+    pub peer_ik: Vec<u8>,
+    /// Имя из карточки. Выбрал его сам владелец — **не доверенное** (§4.1).
+    pub display_name: String,
+    /// Отпечаток для сверки голосом (§3, §4.2). Показывать обязательно.
+    pub fingerprint: String,
+    /// Этот человек уже есть в контактах.
+    ///
+    /// Тогда добавлять нечего, и кнопки быть не должно: присланная карточка
+    /// **не обновляет** известный контакт — ни адреса, ни имя. Иначе кто
+    /// угодно прислал бы «карточку версии 99» со своим адресом и увёл
+    /// маршрут на себя.
+    pub already_known: bool,
+    /// Это наша собственная карточка, вернувшаяся к нам.
+    ///
+    /// Добавлять себя в контакты нечего; показать «это вы» честнее, чем
+    /// нарисовать кнопку, которая ничего не делает.
+    pub mine: bool,
 }
 
 /// Открытое на чтение вложение (§10.2).
@@ -779,6 +822,43 @@ impl RatatoskClient {
         self.command(Command::DeclineFile { file_id: to_msg_id(&file_id)? })
     }
 
+    /// Отправляет в чат карточку контакта (§4.1, дополнение).
+    ///
+    /// Один контакт на сообщение. Своей карточкой поделиться можно — передайте
+    /// собственный `IK`; это та же операция, отдельного механизма «визитка»
+    /// нет.
+    ///
+    /// Не едет ничего лишнего: локальное имя, которым пользователь подписал
+    /// человека у себя, остаётся у него (§4.1), признак сверки — тоже, потому
+    /// что у получателя контакт будет непроверенным в любом случае.
+    ///
+    /// **Скажите это человеку до отправки.** Поделиться контактом — значит
+    /// рассказать получателю, что вы знакомы с третьим, и отдать его адреса;
+    /// согласия у третьего никто не спрашивал и спросить негде. Это цена
+    /// любой визитки, переданной из рук в руки, но в мессенджере про
+    /// приватность о ней стоит говорить вслух.
+    pub fn share_contact(&self, chat_id: Vec<u8>, peer_ik: Vec<u8>) -> Result<(), RatatoskError> {
+        let chat = to_chat(&chat_id)?;
+        let peer_ik = to_ik(&peer_ik)?;
+        self.command(Command::ShareContact { chat, peer_ik })
+    }
+
+    /// Добавляет контакт, присланный в чат.
+    ///
+    /// **Всегда непроверенным** — даже если приславший у вас сверен. Отдельный
+    /// метод, а не [`RatatoskClient::add_contact`] с готовыми байтами, именно
+    /// поэтому: у `add_contact` есть `met_in_person`, а здесь его быть
+    /// не может (§4.2).
+    ///
+    /// Ничего не делает, если контакт уже есть или если карточка — ваша
+    /// собственная. Присланная карточка **не обновляет** известный контакт:
+    /// адреса меняет только подписанное обновление от самого владельца (§4.3).
+    ///
+    /// Результат приходит событием `ContactAdded`, как и у `add_contact`.
+    pub fn add_shared_contact(&self, msg_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::AddSharedContact { msg_id: to_msg_id(&msg_id)? })
+    }
+
     /// Задаёт порог автоматического приёма файлов, в байтах.
     ///
     /// `None` — принимать только вручную; это законный выбор, а не отключённая
@@ -1048,6 +1128,41 @@ impl RatatoskClient {
         Ok(found.into_iter().map(|view| self.view(view)).collect())
     }
 
+    /// Ищет сообщения по словам (§12). Новые первыми.
+    ///
+    /// `chat_id = None` — по всей переписке.
+    ///
+    /// **Ищутся целые слова, и только они.** Ни префиксов, ни подстрок,
+    /// ни морфологии: «дом» не найдёт «дома», а «прив» не найдёт «привет».
+    /// Несколько слов в запросе означают «нужны все».
+    ///
+    /// Так вышло не от лени. База целиком не шифруется — это обычный SQLite,
+    /// шифруются отдельные поля, тела сообщений в их числе. Полнотекстовый
+    /// индекс по открытым телам положил бы рядом с зашифрованной перепиской
+    /// её незашифрованную копию, и потерянный телефон отдал бы всё. Поэтому
+    /// в индексе лежат хэши слов на ключе базы, а по хэшу нельзя искать
+    /// по началу слова — как нельзя и перебирать индекс по началу слова.
+    ///
+    /// Клиенту стоит сказать это человеку прямо в поле поиска, иначе пустой
+    /// ответ на «прив» он прочтёт как «ничего не нашлось».
+    pub fn search(
+        &self,
+        chat_id: Option<Vec<u8>>,
+        query: String,
+        limit: u32,
+    ) -> Result<Vec<FfiMessage>, RatatoskError> {
+        let chat = match chat_id {
+            Some(raw) => Some(to_chat(&raw)?),
+            None => None,
+        };
+        let found = self
+            .opened
+            .handle
+            .search_blocking(chat, query, limit as usize)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found.into_iter().map(|view| self.view(view)).collect())
+    }
+
     /// Окно сообщений **перед** названным — листание назад.
     ///
     /// Якорь — `msg_id` того сообщения, которое сейчас первое в списке:
@@ -1140,6 +1255,13 @@ impl RatatoskClient {
                     has_preview: view.file.preview.is_some(),
                 })
                 .collect(),
+            shared_contact: view.shared_contact.map(|shared| FfiSharedContact {
+                peer_ik: shared.peer_ik.to_vec(),
+                display_name: shared.display_name,
+                fingerprint: shared.fingerprint,
+                already_known: shared.already_known,
+                mine: shared.peer_ik == self.opened.own_ik,
+            }),
         }
     }
 
@@ -1233,6 +1355,279 @@ async fn start(
         own_ik: opened_parts.2,
     };
     Ok((driver, opened, events))
+}
+
+/// Аккаунт в том виде, в каком он числится в реестре (§3, дополнение).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAccount {
+    /// Идентификатор — им адресуются все операции с аккаунтом.
+    pub id: Vec<u8>,
+    /// Имя для списка. Задал человек.
+    ///
+    /// **Лежит открыто**, вне зашифрованной базы: список надо показать
+    /// до ввода PIN, а расшифровать его в этот момент нечем.
+    pub label: String,
+    /// Когда завели, мс.
+    pub created_ms: u64,
+}
+
+/// Несколько личностей на одном устройстве (§3, дополнение).
+///
+/// Аккаунт — это **отдельный файл базы со своим `db_key`**, а не запись
+/// в общей. Одна база означала бы один ключ на всё, то есть один PIN,
+/// открывающий обе переписки; человек, заведший второй аккаунт ровно затем,
+/// чтобы первый о нём не говорил, получил бы обратное.
+///
+/// # Что реестр показывает всем
+///
+/// Взявший устройство видит **число аккаунтов, их имена и время создания** —
+/// без всякого PIN. Иначе нельзя: список рисуется до разблокировки.
+/// Внутри базы остаётся всё остальное: личность, отпечаток, переписка.
+/// Сказать это человеку в UI обязательно.
+///
+/// # Скрытые аккаунты
+///
+/// [`AccountRegistry::create_hidden`] заводит аккаунт **мимо реестра**:
+/// в списке его нет, открывается он через [`AccountRegistry::find_hidden`]
+/// вводом своего PIN.
+///
+/// **Скрыт он от списка, а не от осмотра файловой системы.** Файл базы лежит
+/// в том же каталоге, и файлов там больше, чем записей в реестре, — вот
+/// и весь секрет. Слово «скрытый» читается как «его не найдут»; человек,
+/// положившийся на это прочтение, пострадает не от ошибки в коде, поэтому
+/// формулировка в UI важнее самой функции.
+///
+/// У скрытого аккаунта **обязан быть PIN**. Без него открывать нечем:
+/// поиск идёт перебором, а перебирать без ключа не с чем.
+#[derive(uniffi::Object)]
+pub struct AccountRegistry {
+    registry: Mutex<Registry>,
+    /// Кто сейчас открыт — ради одного инварианта, см. `set_foreground`.
+    ///
+    /// Слабые ссылки: закрыть аккаунт — значит отпустить его клиента,
+    /// и держать его здесь живым означало бы, что закрыть нельзя никогда.
+    opened: Mutex<Vec<(AccountId, std::sync::Weak<RatatoskClient>)>>,
+}
+
+#[uniffi::export]
+impl AccountRegistry {
+    /// Открывает реестр в каталоге, заводя каталог при необходимости.
+    ///
+    /// Отсутствие файла реестра — первый запуск, то есть пустой список.
+    /// А вот испорченный файл — отказ, и путать эти два случая нельзя:
+    /// на пустой список человек заведёт всё заново поверх целых баз.
+    #[uniffi::constructor]
+    pub fn open(root: String) -> Result<Arc<AccountRegistry>, RatatoskError> {
+        let registry = Registry::open(root).map_err(RatatoskError::internal)?;
+        Ok(Arc::new(AccountRegistry {
+            registry: Mutex::new(registry),
+            opened: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Аккаунты из реестра, в порядке создания. Скрытых здесь нет.
+    pub fn list(&self) -> Result<Vec<FfiAccount>, RatatoskError> {
+        Ok(self.locked()?.listed().iter().map(account_of).collect())
+    }
+
+    /// Заводит аккаунт и вносит его в реестр.
+    ///
+    /// Файла базы при этом не создаёт: её заводит первое
+    /// [`AccountRegistry::open_account`], и оно же знает про PIN.
+    pub fn create(&self, label: String) -> Result<FfiAccount, RatatoskError> {
+        let account = self
+            .locked()?
+            .create(&mut OsEntropy, &label, now_ms())
+            .map_err(RatatoskError::internal)?;
+        Ok(account_of(&account))
+    }
+
+    /// Заводит аккаунт **мимо реестра** — скрытый.
+    ///
+    /// Возвращает идентификатор: записать его некуда, и потеряв его,
+    /// вы потеряете доступ до тех пор, пока не переберёте файлы по PIN.
+    ///
+    /// Открывать его **обязательно с PIN**: без него перебор ничего
+    /// не найдёт, и файл станет мёртвым грузом.
+    pub fn create_hidden(&self) -> Result<Vec<u8>, RatatoskError> {
+        Ok(self.locked()?.create_hidden(&mut OsEntropy).to_vec())
+    }
+
+    /// Меняет имя аккаунта в реестре.
+    pub fn rename(&self, id: Vec<u8>, label: String) -> Result<(), RatatoskError> {
+        self.locked()?.rename(&to_account_id(&id)?, &label).map_err(RatatoskError::internal)
+    }
+
+    /// Убирает аккаунт из реестра, **не трогая его данные**.
+    ///
+    /// Это и есть «сделать скрытым»: файлы на месте, в списке его больше нет.
+    /// Обратная операция — [`AccountRegistry::adopt`].
+    pub fn hide(&self, id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.locked()?.hide(&to_account_id(&id)?).map_err(RatatoskError::internal)
+    }
+
+    /// Вносит в реестр аккаунт, которого там не было, — снимает скрытость.
+    pub fn adopt(&self, id: Vec<u8>, label: String) -> Result<FfiAccount, RatatoskError> {
+        let account = self
+            .locked()?
+            .adopt(&to_account_id(&id)?, &label, now_ms())
+            .map_err(RatatoskError::internal)?;
+        Ok(account_of(&account))
+    }
+
+    /// Стирает аккаунт целиком: запись, базу, журнал и вложения.
+    ///
+    /// **Удаление файла не значит, что байты исчезли.** На флеш-памяти запись
+    /// поверх не гарантирована ничем: контроллер пишет в другое место,
+    /// а прежнее освобождает когда сочтёт нужным. Делается то, что возможно
+    /// из приложения; «стёрто безвозвратно» обещать нельзя.
+    ///
+    /// Открытый аккаунт стереть нельзя: файл из-под живого ядра — верный
+    /// способ получить половину базы. Проверяется здесь, а не оставляется
+    /// на совесть клиента.
+    pub fn wipe(&self, id: Vec<u8>) -> Result<(), RatatoskError> {
+        let id = to_account_id(&id)?;
+        if self.live(&id)?.is_some() {
+            return Err(RatatoskError::internal("аккаунт открыт: сперва закройте его"));
+        }
+        self.locked()?.wipe(&id).map_err(RatatoskError::internal)
+    }
+
+    /// Открывает аккаунт и поднимает для него ядро.
+    ///
+    /// Каждый аккаунт получает своё ядро, свою базу и свой каталог вложений.
+    /// Открыть один аккаунт **дважды нельзя**: две сессии поверх одной базы
+    /// разъедутся в состоянии ретчета, а это не рассинхрон показа, а потеря
+    /// переписки. Повторный вызов на уже открытом аккаунте — отказ.
+    pub fn open_account(
+        &self,
+        id: Vec<u8>,
+        pin: Option<String>,
+        display_name: String,
+    ) -> Result<Arc<RatatoskClient>, RatatoskError> {
+        let id = to_account_id(&id)?;
+        if self.live(&id)?.is_some() {
+            return Err(RatatoskError::internal("аккаунт уже открыт"));
+        }
+        let path = self.locked()?.db_path(&id);
+        let path = path
+            .to_str()
+            .ok_or_else(|| RatatoskError::internal("путь к базе не в UTF-8"))?
+            .to_owned();
+
+        let client = RatatoskClient::open(path, pin, display_name)?;
+        let mut opened = self.opened.lock().map_err(|_| poisoned())?;
+        opened.retain(|(_, weak)| weak.strong_count() > 0);
+        opened.push((id, Arc::downgrade(&client)));
+        Ok(client)
+    }
+
+    /// Ищет скрытый аккаунт, который открывается этим PIN.
+    ///
+    /// Перебирает файлы, не числящиеся в реестре, и возвращает
+    /// идентификатор первого подошедшего — или `None`, если не подошёл
+    /// ни один. Открыть его дальше — [`AccountRegistry::open_account`]
+    /// с тем же PIN.
+    ///
+    /// **Долго.** Каждая попытка стоит одного вывода ключа Argon2id (§8.6) —
+    /// около полусекунды; всего их столько, сколько нечислящихся файлов.
+    /// Показать человеку ожидание обязательно, иначе он решит, что
+    /// приложение зависло. Звать не из UI-потока.
+    ///
+    /// Ничего при этом не меняется: перебор идёт по чужим файлам, и писать
+    /// в них мы не вправе.
+    pub fn find_hidden(&self, pin: String) -> Result<Option<Vec<u8>>, RatatoskError> {
+        let candidates = {
+            let registry = self.locked()?;
+            let unlisted = registry.unlisted().map_err(RatatoskError::internal)?;
+            unlisted.into_iter().map(|id| (id, registry.db_path(&id))).collect::<Vec<_>>()
+        };
+        for (id, path) in candidates {
+            if vault::accepts_pin(&path, &pin).map_err(engine_err)? {
+                return Ok(Some(id.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Объявляет в локальной сети **только** названный аккаунт (§5.1).
+    ///
+    /// Два одновременно объявленных аккаунта — это два сервиса, появляющихся
+    /// и исчезающих вместе с одного адреса. §5.1 старательно делает имя
+    /// экземпляра случайным, чтобы устройство нельзя было отследить между
+    /// запусками, — а тут аккаунты выдавали бы друг друга наблюдателю в той
+    /// же сети. Поэтому в эфире всегда один: тот, что сейчас на экране.
+    ///
+    /// Плата названа честно: остальным аккаунтам по локальной сети в фоне
+    /// не приходит ничего.
+    ///
+    /// Инвариант держится **здесь**, а не в клиенте, и это не придирка:
+    /// то, что клиент может забыть, он забудет — а забытый второй маяк
+    /// в эфире не виден никому, кроме наблюдателя.
+    ///
+    /// `id = None` снимает объявление со всех.
+    pub fn set_foreground(&self, id: Option<Vec<u8>>) -> Result<(), RatatoskError> {
+        let front = match id {
+            Some(raw) => Some(to_account_id(&raw)?),
+            None => None,
+        };
+        let mut opened = self.opened.lock().map_err(|_| poisoned())?;
+        opened.retain(|(_, weak)| weak.strong_count() > 0);
+
+        // Обход не прерывается на первом отказе, и запоминается только он.
+        // Прервавшись, мы оставили бы часть аккаунтов объявленными — то есть
+        // ровно то состояние, которого вся эта функция и избегает. Отказ
+        // здесь означает остановленное ядро, и он не повод бросить остальных
+        // в эфире.
+        let mut failure = None;
+        for (account, weak) in opened.iter() {
+            let Some(client) = weak.upgrade() else { continue };
+            if let Err(error) = client.set_lan_enabled(front == Some(*account)) {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl AccountRegistry {
+    fn locked(&self) -> Result<std::sync::MutexGuard<'_, Registry>, RatatoskError> {
+        self.registry.lock().map_err(|_| poisoned())
+    }
+
+    /// Живой клиент этого аккаунта, если он открыт.
+    fn live(&self, id: &AccountId) -> Result<Option<Arc<RatatoskClient>>, RatatoskError> {
+        let opened = self.opened.lock().map_err(|_| poisoned())?;
+        Ok(opened.iter().find(|(a, _)| a == id).and_then(|(_, weak)| weak.upgrade()))
+    }
+}
+
+fn poisoned() -> RatatoskError {
+    RatatoskError::internal("реестр аккаунтов отравлен чужой паникой")
+}
+
+fn account_of(account: &Account) -> FfiAccount {
+    FfiAccount {
+        id: account.id.to_vec(),
+        label: account.label.clone(),
+        created_ms: account.created_ms,
+    }
+}
+
+fn to_account_id(bytes: &[u8]) -> Result<AccountId, RatatoskError> {
+    bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор аккаунта не 16 байт"))
+}
+
+/// Часы для реестра.
+///
+/// Своя копия, а не общая с драйвером: тот живёт на потоке ядра, а реестр
+/// работает до того, как хоть одно ядро поднято.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Единственный читатель потока событий: раздаёт их подписчику.

@@ -38,8 +38,15 @@ pub const SENDER_CHAIN: &str = "ratatosk v0 sender-chain";
 /// §11.1: ключ группового сообщения.
 pub const SENDER_MSG: &str = "ratatosk v0 sender-msg";
 
+/// §12: токен поискового индекса из `db_key` и слова.
+///
+/// В индексе лежат не слова, а их хэши на ключе базы: полнотекстовый индекс
+/// по открытым телам свёл бы `body_enc` к декорации — файл базы отдал бы
+/// всю переписку тому, у кого нет PIN.
+pub const SEARCH_TOKEN: &str = "ratatosk v0 search-token";
+
 /// Все контексты — для теста уникальности и для тест-векторов.
-pub const ALL: [&str; 12] = [
+pub const ALL: [&str; 13] = [
     IK,
     SK,
     BEACON,
@@ -52,6 +59,7 @@ pub const ALL: [&str; 12] = [
     FILE,
     SENDER_CHAIN,
     SENDER_MSG,
+    SEARCH_TOKEN,
 ];
 
 #[cfg(test)]

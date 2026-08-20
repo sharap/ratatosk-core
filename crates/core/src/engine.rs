@@ -27,7 +27,9 @@ use ratatosk_proto::fragment::Reassembler;
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{Attempt, Decision, PeerAvailability, SessionBinding};
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
-use ratatosk_store::{Blobs, FileId, Store, StoredFile, StoredMessage};
+use ratatosk_store::{
+    Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredMessage, Task,
+};
 use ratatosk_wire::{pad_to, unpad, FrameType, Header, SizeClass};
 
 use crate::entropy::Entropy;
@@ -408,6 +410,18 @@ pub struct Engine<S: Store> {
     /// мебибайтами. Теперь у файла ровно один живой срок; сработавшая метка,
     /// которой здесь больше нет, — опоздавшая, и её игнорируют.
     file_timers: BTreeMap<FileId, u64>,
+    /// Сколько сообщений легло в историю с прошлой уборки (§12).
+    ///
+    /// В памяти, а не на диске, и это не забывчивость: счётчик — способ
+    /// не запускать уборку слишком часто, а перезапуск и так повод пройтись.
+    /// Момент прошлой уборки, наоборот, переживает перезапуск
+    /// ([`META_LAST_COMPACTION`]) — иначе шестичасовой интервал не наступал бы
+    /// никогда у того, кто перезапускает телефон чаще.
+    ///
+    /// [`META_LAST_COMPACTION`]: ratatosk_store::META_LAST_COMPACTION
+    messages_since_compaction: u64,
+    /// Правила уборки (§12).
+    schedule: Schedule,
 }
 
 impl<S: Store> Engine<S> {
@@ -444,6 +458,8 @@ impl<S: Store> Engine<S> {
             auto_accept: Some(ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES),
             sending: Vec::new(),
             file_timers: BTreeMap::new(),
+            messages_since_compaction: 0,
+            schedule: Schedule::default(),
         }
     }
 
@@ -671,6 +687,8 @@ impl<S: Store> Engine<S> {
             }
             Command::AcceptFile { file_id } => self.on_accept_file(now_ms, file_id),
             Command::DeclineFile { file_id } => self.on_decline_file(file_id),
+            Command::ShareContact { chat, peer_ik } => self.on_share_contact(now_ms, chat, peer_ik),
+            Command::AddSharedContact { msg_id } => self.on_add_shared_contact(now_ms, msg_id),
             Command::SetAutoAcceptBytes(limit) => {
                 self.auto_accept = limit;
                 // Настройка обязана пережить перезапуск: иначе назавтра
@@ -1305,7 +1323,7 @@ impl<S: Store> Engine<S> {
         }
         files::check_offers(&offers).map_err(EngineError::File)?;
 
-        self.store.put_message(&StoredMessage {
+        self.remember(&StoredMessage {
             msg_id,
             chat_id: chat,
             sender_ik: own_ik,
@@ -1332,6 +1350,150 @@ impl<S: Store> Engine<S> {
             queued_ms: now_ms,
             session_reset_used: false,
         })
+    }
+
+    /// Поделиться контактом: отправить в чат карточку известного человека.
+    ///
+    /// Своей карточкой — можно, и это та же операция: `peer_ik` совпадает
+    /// с собственным `IK`, карточка берётся своя. Отдельного механизма
+    /// «передать визитку» заводить незачем.
+    ///
+    /// Что **не** едет: локальное имя, которым пользователь подписал человека
+    /// у себя (§4.1 — «по проводу не едет никогда»: это заметка о своём
+    /// отношении, а не свойство контакта), и признак сверки — присланный
+    /// контакт непроверен всегда.
+    fn on_share_contact(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let own_ik = self.identity.public().ik;
+        let card_bytes = if peer_ik == own_ik {
+            self.own_card().encode()?
+        } else {
+            let contact = self.contacts.get(&peer_ik).ok_or(EngineError::UnknownPeer)?;
+            contact.card.encode()?
+        };
+
+        let Some(&recipient) = self.by_chat.get(&chat) else {
+            return Err(EngineError::UnknownPeer);
+        };
+        let hlc = self.clock.now(now_ms)?;
+        let msg_id = self.entropy.msg_id();
+
+        // Тело пустое: карточка лежит записью рядом, как вложение. Класть
+        // её байты в текст значило бы показать человеку CBOR, если клиент
+        // забудет про отдельное поле, — а §14 просит не показывать того,
+        // чего человек не поймёт.
+        self.remember(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: own_ik,
+            hlc,
+            body: Vec::new(),
+            received_ms: now_ms,
+            status: Some(DeliveryStatus::Pending.code()),
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+        self.store.put_contact_share(&StoredContactShare {
+            msg_id,
+            ik: peer_ik,
+            card_bytes: card_bytes.clone(),
+        })?;
+
+        let envelope = Envelope::new(
+            msg_id,
+            hlc,
+            PayloadType::ContactShare,
+            ratatosk_proto::contact_share::payload(&card_bytes),
+        );
+        self.enqueue(Delivery {
+            msg_id,
+            peer_ik: recipient,
+            envelope: envelope.encode()?,
+            attempt: Attempt::new(),
+            state: DeliveryState::AwaitingSession,
+            queued_ms: now_ms,
+            session_reset_used: false,
+        })
+    }
+
+    /// Пришла карточка третьего человека.
+    ///
+    /// Ложится в историю записью и **ничего не меняет**: ни контактов,
+    /// ни адресов уже известного человека. Решение принимает пользователь
+    /// ([`Command::AddSharedContact`]).
+    fn on_contact_share(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Разбор здесь, а не при показе: испорченная карточка не должна
+        // добираться до истории и ждать там нажатия, которое всё равно
+        // ничем не кончится.
+        let (card_bytes, card) = ratatosk_proto::contact_share::from_payload(&envelope.payload)
+            .map_err(|e| {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                e
+            })?;
+        // Ключи обязаны складываться в отпечаток: карточка с мусором вместо
+        // `SK` не добавится никогда, и держать её в истории незачем.
+        if ratatosk_crypto::PublicIdentity::from_bytes(card.ik, card.sk).is_err() {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+
+        let shared_ik = card.ik;
+        let mut effects =
+            self.on_incoming_text(now_ms, via, peer_ik, envelope, "", TextKind::Plain)?;
+        // Запись — после сообщения: внешний ключ ведёт на него, и обратный
+        // порядок был бы карточкой, приложенной к тому, чего ещё нет.
+        // Если сообщение не легло (дубль, надгробие), карточке тем более
+        // незачем ложиться.
+        if self.store.message(&envelope.msg_id)?.is_some() {
+            self.store.put_contact_share(&StoredContactShare {
+                msg_id: envelope.msg_id,
+                ik: shared_ik,
+                card_bytes,
+            })?;
+        } else {
+            effects.clear();
+        }
+        Ok(effects)
+    }
+
+    /// Человек решил добавить присланный контакт.
+    ///
+    /// **Всегда непроверенным.** Даже если тот, кто поделился, у нас сверен:
+    /// §4.2 — про сверку отпечатка голосом с самим человеком, а поручительство
+    /// друга это не она. Подпись бы тут не помогла — её у карточки нет
+    /// и не бывает (`ratatosk_proto::contact_share`).
+    ///
+    /// **Известный контакт не трогается.** Ни адреса, ни версия карточки,
+    /// ни признак сверки. Иначе кто угодно пришлёт «Кэрол версии 99» со своим
+    /// onion-адресом и уведёт маршрут на себя; адреса меняет только
+    /// подписанный `CardUpdate` из сессии самой Кэрол (§4.3).
+    fn on_add_shared_contact(
+        &mut self,
+        now_ms: u64,
+        msg_id: MsgId,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(share) = self.store.contact_share_of(&msg_id)? else { return Ok(Vec::new()) };
+        if share.ik == self.identity.public().ik {
+            // Своя карточка, вернувшаяся к нам. Добавлять себя в контакты
+            // нечего, и это не ошибка — просто нажатие ни к чему не ведёт.
+            return Ok(Vec::new());
+        }
+        if self.contacts.contains_key(&share.ik) {
+            // Уже знаем. Молча и без изменений — см. выше про подмену адресов.
+            return Ok(Vec::new());
+        }
+        self.add_contact(now_ms, &share.card_bytes, false)
     }
 
     /// Человек согласился принять файл.
@@ -1725,6 +1887,70 @@ impl<S: Store> Engine<S> {
             effects.extend(self.ask_for_file(now_ms, &file, true)?);
         }
         Ok(effects)
+    }
+
+    /// Кладёт сообщение в историю — единственная дверь, через которую оно
+    /// туда попадает.
+    ///
+    /// Дверь одна затем, что за ней есть учёт: уборка (§12) запускается
+    /// «каждые N сообщений», и считать их по трём разным местам значит
+    /// однажды забыть четвёртое.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn remember(&mut self, message: &StoredMessage) -> Result<(), EngineError> {
+        self.store.put_message(message)?;
+        self.messages_since_compaction = self.messages_since_compaction.saturating_add(1);
+        Ok(())
+    }
+
+    /// Прибирается, если пора (§12).
+    ///
+    /// «Compaction обязателен с первого дня. Иначе клиент перестанет
+    /// открываться на третий год» — и до этой функции он был написан целиком,
+    /// но не запускался ни разу: [`Store::compact`] звали только тесты. Ошибка
+    /// ровно того рода, о котором предупреждает спецификация: она проявляется
+    /// не падением, а медленной деградацией, и на стенде её не увидеть.
+    ///
+    /// **По событию, а не по таймеру.** Телефон значительную часть времени
+    /// спит (§13.1), и таймер там не гарантирует ничего; поэтому проверка
+    /// делается после каждого шага ядра, а условие берётся из [`Schedule`]:
+    /// накопилось довольно сообщений **или** прошло довольно времени.
+    ///
+    /// Возвращает число убранных строк — ноль означает и «было нечего»,
+    /// и «ещё не пора».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn compact_if_due(&mut self, now_ms: u64) -> Result<u64, EngineError> {
+        let last = self
+            .store
+            .meta(ratatosk_store::META_LAST_COMPACTION)?
+            .and_then(|raw| <[u8; 8]>::try_from(raw.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes);
+        if !self.schedule.due(self.messages_since_compaction, last, now_ms) {
+            return Ok(0);
+        }
+
+        // Отметка ставится **до** работы, а не после. Уборка, падающая
+        // на какой-то одной задаче, иначе повторялась бы на каждом шаге
+        // ядра — то есть отказ хранилища превращался бы в бесконечный цикл
+        // отказов. Пропустить один круг дешевле.
+        self.store.put_meta(ratatosk_store::META_LAST_COMPACTION, &now_ms.to_be_bytes())?;
+        self.messages_since_compaction = 0;
+
+        let mut removed = 0;
+        for task in Task::ALL {
+            // Отказ одной задачи не отменяет остальные: они независимы,
+            // и не убрать всё — лучше, чем не убрать ничего.
+            match self.store.compact(task, now_ms) {
+                Ok(rows) => removed += rows,
+                Err(error) => tracing::warn!(?task, ?error, "задача уборки не выполнена"),
+            }
+        }
+        Ok(removed)
     }
 
     /// Стирает с диска вложения, которых нет в базе (§12).
@@ -2515,7 +2741,7 @@ impl<S: Store> Engine<S> {
 
         // Своё сообщение кладётся в историю сразу: доставка может занять
         // сутки почтового круга (§5.3), а в чате оно должно быть видно уже.
-        self.store.put_message(&StoredMessage {
+        self.remember(&StoredMessage {
             msg_id,
             chat_id: chat,
             sender_ik: self.identity.public().ik,
@@ -3373,7 +3599,7 @@ impl<S: Store> Engine<S> {
         kind: TextKind,
     ) -> Result<Vec<Effect>, EngineError> {
         let chat = Self::chat_id_for(&peer_ik);
-        self.store.put_message(&StoredMessage {
+        self.remember(&StoredMessage {
             msg_id: envelope.msg_id,
             chat_id: chat,
             sender_ik: peer_ik,
@@ -3484,6 +3710,7 @@ impl<S: Store> Engine<S> {
             PayloadType::FileOffer => self.on_file_offer(now_ms, via, peer_ik, &envelope),
             PayloadType::FileChunk => self.on_file_chunk(now_ms, peer_ik, &envelope),
             PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
+            PayloadType::ContactShare => self.on_contact_share(now_ms, via, peer_ik, &envelope),
             // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
             // оно не ездит. Тип остаётся в перечислении, потому что он есть
             // в спецификации, а молча принимать то, чего мы не отправляем,

@@ -15,9 +15,10 @@ use zeroize::Zeroizing;
 use crate::compaction::{self, Task};
 use crate::schema;
 use crate::sql_types;
+use crate::tokens;
 use crate::{
-    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredFile, StoredMessage,
-    StoredOutbox, StoredReaction, StoredSession,
+    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredContactShare, StoredFile,
+    StoredMessage, StoredOutbox, StoredReaction, StoredSession,
 };
 
 /// Хранилище на SQLite.
@@ -35,6 +36,40 @@ impl SqliteStore {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
         conn.execute_batch(schema::PRAGMAS)?;
+        Ok(SqliteStore { conn, path, db_key })
+    }
+
+    /// Открывает базу **только на чтение**, не трогая файл.
+    ///
+    /// Нужно перебору скрытых аккаунтов (`core::vault::accepts_pin`): он идёт
+    /// по каталогу, где рядом лежит что попало, и портить соседей не вправе.
+    ///
+    /// Отличие от [`SqliteStore::open`] не в намерении, а в последствиях,
+    /// и они серьёзнее, чем кажется. Обычное открытие применяет прагмы,
+    /// среди которых `journal_mode = WAL`, — а она **записывает** в файл
+    /// и делает это необратимо: чужая база по соседству переводится в режим
+    /// WAL, рядом с ней заводятся `-wal` и `-shm`. Пустой файл при этом
+    /// перестаёт быть пустым: SQLite считает его новой базой и пишет
+    /// заголовок.
+    ///
+    /// Поэтому здесь нет ни прагм, ни миграций. Читать это позволяет ровно
+    /// то, что нужно перебору: `meta` заведена первой миграцией и есть
+    /// в любой нашей базе, а прагмы на чтение не влияют.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`], если файла нет или он недоступен. «Файл есть,
+    /// но это не база» здесь **не** ошибка: SQLite открывает лениво, и узнает
+    /// об этом первый же запрос.
+    pub fn open_readonly(
+        path: impl AsRef<Path>,
+        db_key: Zeroizing<[u8; 32]>,
+    ) -> Result<SqliteStore> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         Ok(SqliteStore { conn, path, db_key })
     }
 
@@ -74,6 +109,111 @@ impl SqliteStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    /// Переписывает поисковый индекс сообщения (§12).
+    ///
+    /// Сперва удаляет, потом вставляет: правка сообщения обязана убрать
+    /// слова, которых в нём больше нет, — иначе поиск находил бы по тексту,
+    /// который человек стёр.
+    ///
+    /// Ассоциированная функция, а не метод: зовётся изнутри транзакции,
+    /// а `&self` там уже занят заимствованием соединения.
+    fn index_words(
+        tx: &rusqlite::Transaction<'_>,
+        db_key: &[u8; 32],
+        msg_id: &MsgId,
+        body: &[u8],
+    ) -> Result<()> {
+        tx.execute("DELETE FROM message_tokens WHERE msg_id = ?1", [&msg_id[..]])?;
+
+        // Тело не текст — индексировать нечего. Не ошибка: сообщением
+        // с вложением может быть и пустая подпись.
+        let Ok(text) = std::str::from_utf8(body) else { return Ok(()) };
+        let mut insert =
+            tx.prepare("INSERT OR IGNORE INTO message_tokens (msg_id, token) VALUES (?1, ?2)")?;
+        for token in tokens::tokens_of(db_key, text) {
+            insert.execute(rusqlite::params![&msg_id[..], &token[..]])?;
+        }
+        Ok(())
+    }
+
+    /// Убирает сообщение из поискового индекса.
+    ///
+    /// Зовётся там, где тело стирается, а строка остаётся, — то есть
+    /// у надгробий (§12). Каскад внешнего ключа тут не поможет: строка
+    /// никуда не делась, делось её содержимое, и индекс по нему обязан
+    /// уйти вместе с ним. Иначе поиск находил бы удалённое.
+    fn forget_words(tx: &rusqlite::Transaction<'_>, msg_id: &MsgId) -> Result<()> {
+        tx.execute("DELETE FROM message_tokens WHERE msg_id = ?1", [&msg_id[..]])?;
+        Ok(())
+    }
+
+    /// Строит поисковый индекс заново, если он построен не по тому формату.
+    ///
+    /// Формат хранится в служебной таблице ([`crate::META_SEARCH_INDEX`]).
+    /// Нет записи — индекса нет вовсе: так выглядит и свежая база, и та,
+    /// что дожила до появления поиска.
+    fn index_if_stale(tx: &rusqlite::Transaction<'_>, db_key: &[u8; 32]) -> Result<()> {
+        let stored: Option<Vec<u8>> = tx
+            .query_row("SELECT value FROM meta WHERE key = ?1", [crate::META_SEARCH_INDEX], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        let built = stored
+            .and_then(|raw| <[u8; 4]>::try_from(raw.as_slice()).ok())
+            .map_or(0, u32::from_be_bytes);
+        if built == tokens::INDEX_FORMAT {
+            return Ok(());
+        }
+
+        // Старые токены — в мусор целиком, а не поверх: посчитанные по другим
+        // правилам, они не совпадут ни с одним запросом и останутся лежать
+        // навсегда.
+        tx.execute("DELETE FROM message_tokens", [])?;
+        Self::index_everything(tx, db_key)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![crate::META_SEARCH_INDEX, &tokens::INDEX_FORMAT.to_be_bytes()[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Индексирует всю уже накопленную переписку — один раз, при обновлении.
+    ///
+    /// Дорого ровно настолько, насколько велика история, и делается ровно
+    /// один раз: следующая запись пойдёт обычным путём. Тела приходится
+    /// расшифровывать — иначе индексировать нечего.
+    ///
+    /// Надгробия пропускаются: тело у них пустое, и найтись они не должны.
+    fn index_everything(tx: &rusqlite::Transaction<'_>, db_key: &[u8; 32]) -> Result<()> {
+        let rows: Vec<(MsgId, Vec<u8>)> = {
+            let mut statement =
+                tx.prepare("SELECT msg_id, body_enc FROM messages WHERE tombstone_ms IS NULL")?;
+            let mapped = statement
+                .query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                let (msg_id, body_enc) = row?;
+                let Ok(msg_id) = MsgId::try_from(msg_id.as_slice()) else { continue };
+                collected.push((msg_id, body_enc));
+            }
+            collected
+        };
+
+        for (msg_id, body_enc) in rows {
+            // Расшифровать нечем — значит и индексировать нечего. Ронять
+            // обновление из-за одной испорченной строки нельзя: человек
+            // остался бы без приложения вовсе.
+            let aad = Self::field_aad("messages.body_enc", &msg_id);
+            let Ok(body) = storage_key::open_field(db_key, &aad, &body_enc) else { continue };
+            Self::index_words(tx, db_key, &msg_id, &body)?;
+        }
+        Ok(())
+    }
+
     fn open_sealed(&self, column: &str, row_key: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
         storage_key::open_field(&self.db_key, &Self::field_aad(column, row_key), sealed)
             // Неверный PIN и порча файла здесь неотличимы, и различать их
@@ -103,6 +243,26 @@ impl SqliteStore {
             Some(cutoff) => Ok(self.conn.execute(sql, [sql_types::to_sql(cutoff)])?),
             None => Ok(0),
         }
+    }
+
+    /// Проверяет, что таблица, для которой уборка ещё не написана, пуста.
+    ///
+    /// Возвращает ноль всегда — убирать в ней нечего, пока в неё не пишут.
+    /// Но если строки появились, молчать нельзя: значит, функцию завели,
+    /// а уборку к ней забыли, и таблица будет расти, пока клиент не перестанет
+    /// открываться. Тихая запись в журнал — не лучший сторож, зато она есть
+    /// на устройстве пользователя, а тест на стенде — нет.
+    fn warn_if_filling(&self, table: &str, whose: &str) -> Result<usize> {
+        let rows: i64 =
+            self.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?;
+        if rows > 0 {
+            tracing::error!(
+                table,
+                rows,
+                "таблица заполняется, а уборка для неё не написана ({whose})"
+            );
+        }
+        Ok(0)
     }
 
     /// Читает строки файлов из подготовленного запроса.
@@ -207,6 +367,18 @@ impl Store for SqliteStore {
                 tx.execute_batch(migration)?;
             }
         }
+        // Поисковый индекс заводится пустым, а переписка к этому моменту уже
+        // есть. Наполнить его миграцией нельзя: токены считаются на `db_key`,
+        // а SQL про ключи не знает, — поэтому наполнение идёт здесь, в той же
+        // транзакции. Без него поиск на существующей базе молча не находил бы
+        // ничего старше обновления, и списать это было бы не на что.
+        //
+        // Признак — **формат индекса**, а не версия схемы. Сперва стояло
+        // «база младше девятой», и это работало ровно до следующей миграции:
+        // версия схемы отвечает на вопрос «какие таблицы есть», а не
+        // «заполнены ли они». Наполнение — операция над данными, и повод
+        // у неё свой: сменилась токенизация, или индекс стёрли руками.
+        Self::index_if_stale(&tx, &self.db_key)?;
         tx.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -284,6 +456,10 @@ impl Store for SqliteStore {
                 message.reply_to.map(|id| id.to_vec()),
             ],
         )?;
+        // Индекс поиска — в той же транзакции, что и тело. Это не удобство:
+        // разъехавшись, они дали бы сообщение, которое нельзя найти, либо
+        // находку, которую нельзя показать.
+        Self::index_words(&tx, &self.db_key, &message.msg_id, &message.body)?;
         tx.commit()?;
         Ok(())
     }
@@ -489,6 +665,13 @@ impl Store for SqliteStore {
         )?;
         if affected > 0 {
             tx.execute("DELETE FROM reactions WHERE msg_id = ?1", [&msg_id[..]])?;
+            // Присланная карточка — тоже содержимое сообщения, и уходит
+            // вместе с ним. Оставить её значит оставить в истории кнопку
+            // «добавить контакт» у сообщения, которого больше нет.
+            tx.execute("DELETE FROM contact_shares WHERE msg_id = ?1", [&msg_id[..]])?;
+            // И поисковый индекс: стереть текст, оставив возможность найти
+            // по нему сообщение, значит не стереть текст.
+            Self::forget_words(&tx, msg_id)?;
         }
         tx.commit()?;
         Ok(affected > 0)
@@ -507,6 +690,16 @@ impl Store for SqliteStore {
               WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
             [&chat_id[..]],
         )?;
+        tx.execute(
+            "DELETE FROM message_tokens
+              WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
+            [&chat_id[..]],
+        )?;
+        tx.execute(
+            "DELETE FROM contact_shares
+              WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
+            [&chat_id[..]],
+        )?;
         tx.commit()?;
         Ok(affected as u64)
     }
@@ -517,12 +710,19 @@ impl Store for SqliteStore {
         let body_enc = self.seal("messages.body_enc", msg_id, body)?;
         // Надгробие сильнее правки: сообщение, которое человек удалил,
         // не должно вернуться в чат из-за того, что автор его переписал.
-        let affected = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let affected = tx.execute(
             "UPDATE messages
                 SET body_enc = ?2, edited_ms = ?3
               WHERE msg_id = ?1 AND tombstone_ms IS NULL",
             rusqlite::params![&msg_id[..], body_enc, sql_types::to_sql(edited_ms)],
         )?;
+        // Индекс переписывается только если переписалось тело. Правка
+        // надгробия не проходит — и его пустой индекс трогать не за что.
+        if affected > 0 {
+            Self::index_words(&tx, &self.db_key, msg_id, body)?;
+        }
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -775,6 +975,36 @@ impl Store for SqliteStore {
         self.read_files(&mut statement, rusqlite::params![&msg_id[..]])
     }
 
+    fn put_contact_share(&mut self, share: &StoredContactShare) -> Result<()> {
+        let card_enc = self.seal("contact_shares.card_enc", &share.msg_id, &share.card_bytes)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO contact_shares (msg_id, ik, card_enc) VALUES (?1, ?2, ?3)",
+            rusqlite::params![&share.msg_id[..], &share.ik[..], card_enc],
+        )?;
+        Ok(())
+    }
+
+    fn contact_share_of(&self, msg_id: &MsgId) -> Result<Option<StoredContactShare>> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT ik, card_enc FROM contact_shares WHERE msg_id = ?1",
+                [&msg_id[..]],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        let Some((ik, card_enc)) = row else { return Ok(None) };
+
+        let ik: [u8; 32] =
+            ik.try_into().map_err(|_| StoreError::Backend("ik не 32 байта".into()))?;
+        let card_bytes = self.open_sealed("contact_shares.card_enc", msg_id, &card_enc)?;
+        Ok(Some(StoredContactShare { msg_id: *msg_id, ik, card_bytes }))
+    }
+
     fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
         let affected = self
             .conn
@@ -891,6 +1121,55 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn search(&self, chat_id: Option<&[u8; 16]>, query: &str, limit: usize) -> Result<Vec<MsgId>> {
+        let wanted = tokens::tokens_of(&self.db_key, query);
+        if wanted.is_empty() {
+            // Пустой запрос — пустой ответ. Вернуть всю историю значило бы
+            // ответить не на тот вопрос.
+            return Ok(Vec::new());
+        }
+
+        // Место под токены строится по их числу: списка переменной длины
+        // в SQL нет, а склеивать значения в текст запроса нельзя даже когда
+        // это байты, которые мы посчитали сами.
+        let places =
+            (0..wanted.len()).map(|i| format!("?{}", i + 4)).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT m.msg_id
+               FROM messages m
+               JOIN message_tokens t ON t.msg_id = m.msg_id
+              WHERE m.tombstone_ms IS NULL
+                AND (?1 IS NULL OR m.chat_id = ?1)
+                AND t.token IN ({places})
+              GROUP BY m.msg_id
+             HAVING COUNT(DISTINCT t.token) = ?2
+              ORDER BY m.hlc_wall DESC, m.hlc_logical DESC, m.msg_id DESC
+              LIMIT ?3"
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(wanted.len() + 3);
+        params.push(Box::new(chat_id.map(|id| id.to_vec())));
+        params.push(Box::new(sql_types::to_sql(wanted.len() as u64)));
+        params.push(Box::new(sql_types::to_sql(limit as u64)));
+        for token in &wanted {
+            params.push(Box::new(token.to_vec()));
+        }
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(params.iter().map(std::convert::AsRef::as_ref)),
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+
+        let mut found = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            let Ok(msg_id) = MsgId::try_from(bytes.as_slice()) else { continue };
+            found.push(msg_id);
+        }
+        Ok(found)
+    }
+
     fn note_seen(&mut self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO dedup (msg_id, seen_ms) VALUES (?1, ?2)",
@@ -945,6 +1224,16 @@ impl Store for SqliteStore {
         // остались бы висеть на идентификаторах, которых уже нет.
         tx.execute(
             "DELETE FROM reactions
+              WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
+            [&chat_id[..]],
+        )?;
+        tx.execute(
+            "DELETE FROM message_tokens
+              WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
+            [&chat_id[..]],
+        )?;
+        tx.execute(
+            "DELETE FROM contact_shares
               WHERE msg_id IN (SELECT msg_id FROM messages WHERE chat_id = ?1)",
             [&chat_id[..]],
         )?;
@@ -1126,8 +1415,19 @@ impl Store for SqliteStore {
             // Остальные задачи перечислены поимённо, а не через `_`:
             // добавление новой задачи уборки обязано сломать компиляцию
             // именно здесь. Ради этого же с Task снят `#[non_exhaustive]`.
-            Task::Reassembly => todo!("этап 0: сборки фрагментов с истёкшим TTL (§9.3)"),
-            Task::CausalRefs => todo!("этап 0: причинные ссылки за окном в 1000 (§12)"),
+            //
+            // Здесь стояло `todo!()`, и это было бы падением приложения
+            // в тот день, когда уборку наконец начали запускать. Таблицы
+            // заведены схемой, но писать в них некому: причинные ссылки
+            // (§9.1) не сохраняются, фрагментация (§9.3) придёт с почтой,
+            // снапшоты состава (§12) — с группами. Ноль здесь не заглушка,
+            // а правда о том, сколько строк подлежит уборке.
+            //
+            // Правду эту стережёт `warn_if_filling`: в день, когда в таблицу
+            // начнут писать, в журнале появится запись о том, что уборка
+            // для неё не написана, — вместо тишины на несколько лет.
+            Task::Reassembly => self.warn_if_filling("reassembly", "§9.3, фрагментация")?,
+            Task::CausalRefs => self.warn_if_filling("causal_refs", "§12, окно ссылок")?,
             // §12: надгробие живёт 90 суток и уходит вместе со строкой.
             // Тело в ней и так уже пустое — стёрли в момент удаления.
             Task::Tombstones => self.purge_by_age(
@@ -1135,7 +1435,9 @@ impl Store for SqliteStore {
                 compaction::TOMBSTONE_TTL_MS,
                 now_ms,
             )?,
-            Task::GroupSnapshot => todo!("этап 0: снапшот состава группы (§12)"),
+            Task::GroupSnapshot => {
+                self.warn_if_filling("group_baseline", "§12, снапшот состава")?
+            }
         };
         Ok(affected as u64)
     }

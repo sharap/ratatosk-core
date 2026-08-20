@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod accounts;
 pub mod companion;
 pub mod engine;
 pub mod entropy;
@@ -26,6 +27,7 @@ pub mod vault;
 #[cfg(feature = "driver")]
 pub mod driver;
 
+pub use accounts::{Account, AccountError, AccountId, Registry};
 pub use engine::{Contact, Engine, EngineError, SelfAddresses, MAX_LOCAL_NAME_CHARS};
 pub use entropy::{Entropy, OsEntropy, SeededEntropy};
 pub use io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};

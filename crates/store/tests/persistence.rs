@@ -788,3 +788,177 @@ fn deleting_a_message_takes_its_files_and_their_chunk_tally() {
     store.delete_chat(&[9u8; 16]).unwrap();
     assert!(store.file(&[3u8; 16]).unwrap().is_none());
 }
+
+/// Сообщение с заданным текстом — для тестов поиска.
+fn said(n: u8, wall: u64, text: &str) -> StoredMessage {
+    StoredMessage { body: text.as_bytes().to_vec(), ..message(n, wall) }
+}
+
+#[test]
+fn search_finds_whole_words_and_nothing_else() {
+    let db = TempDb::new("search");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_message(&said(1, 100, "Привет, как дела?")).unwrap();
+    store.put_message(&said(2, 200, "дела идут хорошо")).unwrap();
+    store.put_message(&said(3, 300, "совсем про другое")).unwrap();
+
+    let found = |q: &str| {
+        store.search(None, q, 10).unwrap().into_iter().map(|id| id[0]).collect::<Vec<_>>()
+    };
+
+    // Новые первыми: человек ищет то, о чём говорили недавно.
+    assert_eq!(found("дела"), vec![2, 1]);
+    // Регистр запроса значения не имеет.
+    assert_eq!(found("ПРИВЕТ"), vec![1]);
+    // Несколько слов — нужны все: уточняя запрос, человек ждёт меньше находок.
+    assert_eq!(found("дела привет"), vec![1]);
+    // И зафиксированное ограничение: по началу слова не ищется. Уметь это
+    // значило бы уметь перебирать индекс по началу слова.
+    assert!(found("прив").is_empty(), "префикс — не слово");
+    // Пустой запрос отвечает пусто, а не всей историей.
+    assert!(found("   ").is_empty());
+    // Чужой чат не отдаётся.
+    assert!(store.search(Some(&[7u8; 16]), "дела", 10).unwrap().is_empty());
+}
+
+#[test]
+fn the_database_file_holds_no_plain_text() {
+    // Ради этого индекс и устроен на хэшах. Полнотекстовый по открытым телам
+    // положил бы рядом с зашифрованной перепиской её незашифрованную копию,
+    // и потерянный телефон отдал бы всё, что человек написал.
+    let db = TempDb::new("plaintext");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&said(1, 100, "секретное слово капибара")).unwrap();
+    }
+
+    // WAL сливается в основной файл при закрытии соединения; читаем оба
+    // на случай, если что-то осталось.
+    let mut bytes = std::fs::read(&db.0).unwrap_or_default();
+    bytes.extend(std::fs::read(db.0.with_extension("db-wal")).unwrap_or_default());
+    let haystack = String::from_utf8_lossy(&bytes);
+    assert!(!haystack.contains("капибара"), "слово из переписки лежит в файле базы открытым");
+    assert!(!haystack.contains("секретное"), "слово из переписки лежит в файле базы открытым");
+}
+
+#[test]
+fn what_is_deleted_stops_being_found() {
+    // Найти по тексту сообщение, текст которого стёрт, — значит не стереть его.
+    let db = TempDb::new("search-delete");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&said(1, 100, "капибара")).unwrap();
+    assert_eq!(store.search(None, "капибара", 10).unwrap().len(), 1);
+
+    assert!(store.tombstone_message(&[1u8; 16], 500).unwrap());
+    assert!(
+        store.search(None, "капибара", 10).unwrap().is_empty(),
+        "удалённое обязано перестать находиться"
+    );
+}
+
+#[test]
+fn an_edit_moves_the_index_with_the_text() {
+    let db = TempDb::new("search-edit");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&said(1, 100, "первое слово")).unwrap();
+
+    assert!(store.edit_message(&[1u8; 16], "второе слово".as_bytes(), 500).unwrap());
+    assert!(
+        store.search(None, "первое", 10).unwrap().is_empty(),
+        "по стёртому слову находиться нечему"
+    );
+    assert_eq!(store.search(None, "второе", 10).unwrap().len(), 1, "а по новому — находится");
+}
+
+#[test]
+fn the_history_that_predates_the_index_is_still_searchable() {
+    // База, дожившая до обновления, обязана начать искать по всему, что в ней
+    // уже лежит. Иначе поиск молча не находил бы ничего старше обновления,
+    // и списать это было бы не на что.
+    let db = TempDb::new("reindex");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&said(1, 100, "капибара")).unwrap();
+    }
+
+    // Возвращаем базу в состояние «индекс ещё не построен»: пустая таблица
+    // токенов и стёртая отметка о формате. Схему при этом не трогаем вовсе.
+    //
+    // Две прежние попытки откатывали `user_version`, и обе разваливались:
+    // сперва миграция 0009 падала на `DROP TABLE messages_fts` (таблицы уже
+    // не было), потом 0010 — на `CREATE TABLE contact_shares` (таблица уже
+    // была). Урок не про тест: признаком «индекс пора строить» не может быть
+    // версия схемы. Схема отвечает, какие таблицы есть, а не заполнены ли
+    // они, — и каждая новая миграция ломала бы это заново.
+    //
+    // Напрямую через rusqlite, а не через `Store`: трейт такого уметь
+    // не должен, а тесту надо подделать прошлое.
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute_batch(&format!(
+            "DELETE FROM message_tokens;
+             DELETE FROM meta WHERE key = '{}';",
+            ratatosk_store::META_SEARCH_INDEX
+        ))
+        .unwrap();
+    }
+
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(
+        store.search(None, "капибара", 10).unwrap().len(),
+        1,
+        "переиндексация обязана поднять то, что записано до неё"
+    );
+}
+
+#[test]
+fn compaction_runs_over_every_task_without_panicking() {
+    // Три задачи уборки были заглушены `todo!()`, и это стало бы падением
+    // приложения в тот день, когда уборку наконец начали запускать.
+    let db = TempDb::new("compaction-all");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    for task in ratatosk_store::Task::ALL {
+        store.compact(task, 90 * 24 * 60 * 60 * 1000).expect("задача уборки обязана отработать");
+    }
+}
+
+#[test]
+fn a_changed_index_format_rebuilds_everything() {
+    // Смена токенизации — самая тихая поломка из возможных: приложение
+    // работает, поиск не падает, просто перестаёт находить написанное до
+    // обновления. Номер формата существует ровно затем, чтобы этого
+    // не случилось молча.
+    let db = TempDb::new("reindex-format");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&said(1, 100, "капибара")).unwrap();
+    }
+
+    // База, построенная по «формату 0», то есть по любому другому.
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute(
+            "UPDATE meta SET value = x'00000000' WHERE key = ?1",
+            [ratatosk_store::META_SEARCH_INDEX],
+        )
+        .unwrap();
+        raw.execute_batch("DELETE FROM message_tokens").unwrap();
+    }
+
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(
+        store.search(None, "капибара", 10).unwrap().len(),
+        1,
+        "индекс чужого формата обязан быть построен заново"
+    );
+}

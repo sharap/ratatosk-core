@@ -52,9 +52,10 @@ CHAIN = "ratatosk v0 chain"
 FILE = "ratatosk v0 file"
 SENDER_CHAIN = "ratatosk v0 sender-chain"
 SENDER_MSG = "ratatosk v0 sender-msg"
+SEARCH_TOKEN = "ratatosk v0 search-token"
 
 ALL_CONTEXTS = [IK, SK, BEACON, SESSION_ID, ROOT, CHAIN_A, CHAIN_B, MSG,
-                CHAIN, FILE, SENDER_CHAIN, SENDER_MSG]
+                CHAIN, FILE, SENDER_CHAIN, SENDER_MSG, SEARCH_TOKEN]
 
 # --- входные данные ---------------------------------------------------------
 #
@@ -75,6 +76,7 @@ NOISE_OUTPUT = bytes([0x22] * 32)
 FILE_KEY = bytes([0x33] * 32)
 BEACON_IK = bytes([0x44] * 32)
 BEACON_NONCE = bytes([0x55] * 8)
+SEARCH_DB_KEY = bytes([0x66] * 32)
 BEACON_SLOT = 1_925_000
 
 # Алфавит base32 без похожих знаков (§3): без I, L, O, U.
@@ -186,6 +188,15 @@ def gen_derive_key():
     for _ in range(3):
         rows.append((SENDER_MSG, sender.hex(), "32", b3.derive_key(SENDER_MSG, sender).hex()))
         sender = b3.derive_key(SENDER_CHAIN, sender)
+
+    rows.append("§12: токен поиска = derive(db_key ‖ слово)[0..16]")
+    # Слова взяты с намерением: русское и латинское, короткое и длинное,
+    # с цифрой и в верхнем регистре — приведение к нижнему делает вызывающий,
+    # и вектор обязан это зафиксировать, а не сгладить.
+    for word in ("привет", "hello", "a", "2024", "капибара"):
+        material = SEARCH_DB_KEY + word.encode("utf-8")
+        rows.append((SEARCH_TOKEN, material.hex(), "16",
+                     b3.derive_key(SEARCH_TOKEN, material, 16).hex()))
 
     rows.append("§5.1: маяк LAN = derive(IK ‖ slot_be ‖ nonce)[0..8]")
     for slot in (BEACON_SLOT - 1, BEACON_SLOT, BEACON_SLOT + 1):

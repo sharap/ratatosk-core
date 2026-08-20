@@ -73,6 +73,66 @@ pub fn open_encrypted(
     Ok((open_with_key(path, Zeroizing::new(*db_key))?, db_key))
 }
 
+/// Открывает ли этот PIN эту базу — **ничего не меняя**.
+///
+/// Нужно скрытым аккаунтам (`crate::accounts`): у них не записано нигде
+/// ничего, и найти нужный можно только попыткой открыть каждый файл,
+/// не числящийся в реестре.
+///
+/// «Ничего не меняя» здесь не вежливость, а требование. Перебор идёт
+/// по чужим файлам: в каталоге может лежать что угодно, и [`open_encrypted`]
+/// для проверки не годится втройне — он накатывает миграции на чужую базу,
+/// заводит соль там, где её не было, и, встретив базу без зерна, создаёт
+/// в ней личность. Каждое из трёх — порча того, что нам не принадлежит.
+/// Поэтому здесь только чтение, и даже миграции не накатываются: `meta`
+/// заведена первой миграцией и есть в любой нашей базе.
+///
+/// `false` возвращается на все случаи неудачи сразу, и различать их незачем:
+/// файла нет, это не база вовсе, это чужая база, у неё нет PIN, PIN не тот,
+/// зерно испорчено — открыть нечем во всех шести.
+///
+/// **Нечитаемый файл — тоже `false`, а не отказ.** Перебор идёт по каталогу,
+/// в котором лежит что попало, и прервать его из-за одного файла без прав
+/// на чтение значило бы не открыть человеку его аккаунт из-за чужого мусора
+/// по соседству.
+///
+/// Стоит одного вывода ключа Argon2id (§8.6) — около полусекунды. При
+/// переборе это умножается на число файлов, и человеку об ожидании
+/// стоит сказать.
+///
+/// # Errors
+///
+/// Только отказ вывода ключа. Всё, что относится к самому файлу, — `Ok(false)`.
+pub fn accepts_pin(path: &Path, pin: &str) -> Result<bool, EngineError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    // Только на чтение — и это главное в этой функции.
+    //
+    // Обычное открытие применяет прагмы, среди которых `journal_mode = WAL`.
+    // Она пишет в файл: чужая база по соседству необратимо переводится
+    // в режим WAL и обрастает `-wal` и `-shm`, а пустой файл перестаёт быть
+    // пустым — SQLite считает его новой базой и пишет заголовок. Перебор
+    // идёт по каталогу, где лежит что попало, и портить соседей он не вправе.
+    //
+    // Нулевым ключом, потому что ничего запечатанного мы этим шагом
+    // не читаем: соль лежит в `meta` открыто.
+    let Ok(probe) = SqliteStore::open_readonly(path, Zeroizing::new([0u8; 32])) else {
+        return Ok(false);
+    };
+
+    // Отказ чтения `meta` означает, что это наша база другой эпохи или
+    // чужая база вовсе: таблицы нет. Тоже не ошибка.
+    let Ok(Some(salt)) = probe.meta(META_DB_SALT) else { return Ok(false) };
+    let Ok(salt) = <[u8; storage_key::SALT_LEN]>::try_from(salt.as_slice()) else {
+        return Ok(false);
+    };
+    let Ok(Some(sealed)) = probe.meta(META_IDENTITY_SEED) else { return Ok(false) };
+
+    let db_key = storage_key::derive_from_pin(pin, &salt, storage_key::KdfParams::default())?;
+    Ok(storage_key::open_field(&db_key, SEED_AAD, &sealed).is_ok())
+}
+
 /// Открывает базу готовым ключом — тем, что пришёл из хранилища ключей ОС.
 pub fn open_with_key(path: &Path, db_key: Zeroizing<[u8; 32]>) -> Result<SqliteStore, EngineError> {
     let mut store = SqliteStore::open(path, db_key)?;
@@ -154,5 +214,89 @@ mod tests {
         let a = load_or_create(&mut store(), &key).unwrap().fingerprint();
         let b = load_or_create(&mut store(), &key).unwrap().fingerprint();
         assert_ne!(a, b, "два устройства с одним PIN — всё равно два устройства");
+    }
+
+    /// Свой временный путь: база нужна настоящая, `in_memory` тут не годится.
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ratatosk-vault-{tag}-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        for extra in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{extra}", path.display()));
+        }
+        path
+    }
+
+    fn forget(path: &Path) {
+        for extra in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{extra}", path.display()));
+        }
+    }
+
+    #[test]
+    fn only_its_own_pin_opens_a_base() {
+        // Ради этого свойства аккаунты и разведены по файлам: один PIN
+        // не открывает вторую переписку. Если это когда-нибудь перестанет
+        // выполняться, весь смысл разделения исчезнет.
+        let path = temp_db("own-pin");
+        {
+            let (mut store, db_key) = open_encrypted(&path, Some("1111")).unwrap();
+            load_or_create(&mut store, &db_key).unwrap();
+        }
+
+        assert!(accepts_pin(&path, "1111").unwrap(), "свой PIN открывает");
+        assert!(!accepts_pin(&path, "2222").unwrap(), "чужой — нет");
+        forget(&path);
+    }
+
+    #[test]
+    fn probing_a_stranger_changes_nothing() {
+        // Перебор идёт по чужим файлам: в каталоге может лежать что угодно.
+        // Накатить на такой файл миграции, завести в нём соль или личность —
+        // порча того, что нам не принадлежит.
+        let path = temp_db("stranger");
+        std::fs::write(&path, b"not a database at all").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(!accepts_pin(&path, "1111").unwrap(), "чужой файл — не аккаунт");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "и он не тронут");
+
+        // Пустой файл — случай тоньше и потому опаснее: для SQLite это
+        // законная новая база, и обычное открытие записало бы в него
+        // заголовок вместе с прагмами. Проверяем, что он остался пустым
+        // и что рядом не завелись `-wal` с `-shm`.
+        std::fs::write(&path, b"").unwrap();
+        assert!(!accepts_pin(&path, "1111").unwrap());
+        assert!(std::fs::read(&path).unwrap().is_empty(), "пустой файл обязан остаться пустым");
+        for extra in ["-wal", "-shm"] {
+            let neighbour = std::path::PathBuf::from(format!("{}{extra}", path.display()));
+            assert!(!neighbour.exists(), "перебор завёл рядом {extra} — значит, писал");
+        }
+        forget(&path);
+    }
+
+    #[test]
+    fn a_missing_file_is_not_an_error() {
+        // Файл мог исчезнуть между чтением каталога и попыткой открыть.
+        // Это не повод прерывать перебор.
+        let path = temp_db("missing");
+        assert!(!accepts_pin(&path, "1111").unwrap());
+    }
+
+    #[test]
+    fn a_base_without_a_pin_cannot_be_found_by_probing() {
+        // Отсюда правило: у скрытого аккаунта PIN обязателен. Без соли
+        // перебирать не с чем, и файл становится мёртвым грузом.
+        let path = temp_db("nopin");
+        {
+            let (mut store, db_key) = open_encrypted(&path, None).unwrap();
+            load_or_create(&mut store, &db_key).unwrap();
+        }
+
+        assert!(!accepts_pin(&path, "1111").unwrap());
+        assert!(!accepts_pin(&path, "").unwrap());
+        forget(&path);
     }
 }

@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 pub mod avatar;
+pub mod contact_share;
 pub mod edit;
 pub mod files;
 pub mod forward;

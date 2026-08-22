@@ -1766,6 +1766,9 @@ fn a_reply_without_words_is_refused() {
 
 use ratatosk_core::OutgoingFile;
 use ratatosk_proto::files;
+// Здесь оно нужно поимённо: проверяется, **каким** транспортом уходит кадр,
+// и `ratatosk_proto::Transport::Lan` внутри `matches!` читается уже плохо.
+use ratatosk_proto::Transport;
 // Под псевдонимом: имя `Blobs` в этом файле уже занято псевдонимом типа
 // разделяемого хранилища, а трейт нужен ради `put_chunk` — тесты уборки
 // кладут на «диск» то, чего ядро туда не клало.
@@ -1833,6 +1836,63 @@ fn a_file_travels_in_chunks_and_arrives_whole() {
     assert!(received.complete, "файл обязан собраться до конца");
     assert_eq!(received.preview.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
     assert_eq!(assembled(&bob, &file_id), content, "и совпасть с исходным до байта");
+}
+
+#[test]
+fn a_direct_channel_is_never_a_switched_off_lan() {
+    // Ошибка, из-за которой «сообщения через onion ходят, а файлы нет —
+    // доезжает только сообщение с превью».
+    //
+    // Прямой канал (квитанции §9.4, аватарки §4.2, просьбы и чанки §10)
+    // выбирается не очередью §5.4, а отдельно — и выбирался он раньше
+    // перебором «есть ли сессия». Сессия же переживает выключение локальной
+    // сети: она про ключи, а не про доступность. Поэтому после выключения
+    // LAN у файлов оставался «прямой канал», которого нет, и просьба
+    // о чанках уезжала в мёртвый транспорт — снова и снова, по сроку
+    // молчания. Сообщения при этом ходили: очередь §5.4 про выключенный
+    // LAN знает.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let (alice_ik, bob_ik) = (alice.own_card().ik, bob.own_card().ik);
+
+    // Оба в общей сети: сессия установится по LAN — она первая ступень.
+    alice.step(400, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    bob.step(400, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    alice.step(500, Input::SeenOnLan { peer_ik: bob_ik }).unwrap();
+    bob.step(500, Input::SeenOnLan { peer_ik: alice_ik }).unwrap();
+
+    let effects = send_text(&mut alice, &bob, 1_000, "по локальной сети");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["по локальной сети".to_string()]);
+
+    // Сеть выключили с обеих сторон. Сессия LAN осталась — и это правильно,
+    // ключи никуда не делись. Но канала больше нет.
+    alice.step(2_000, Input::Command(Command::SetLanEnabled(false))).unwrap();
+    bob.step(2_000, Input::Command(Command::SetLanEnabled(false))).unwrap();
+
+    let chat = Engine::<MemoryStore>::chat_id_for(&alice_ik);
+    let last = bob.store().messages(&chat, 10, None).unwrap().pop().unwrap().msg_id;
+    let effects = bob.step(2_100, Input::Command(Command::MarkRead { chat, up_to: last })).unwrap();
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { via: Transport::Lan, .. })),
+        "в выключенную сеть не отправляют ничего: {effects:?}"
+    );
+
+    // Onion-сессии ещё нет, поэтому квитанции сейчас ехать не на чем, и это
+    // честный исход: она уедет, когда появится канал. Появляется он от первой
+    // же переписки — §5.4 ведёт её на вторую ступень.
+    let effects = send_text(&mut alice, &bob, 3_000, "теперь через onion");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    assert_eq!(inbox(&bob, &alice).len(), 2, "второе сообщение приехало уже другим путём");
+
+    // А вот теперь прямой канал есть — и он обязан быть тем самым, который
+    // работает.
+    let last = bob.store().messages(&chat, 10, None).unwrap().pop().unwrap().msg_id;
+    let effects = bob.step(4_000, Input::Command(Command::MarkRead { chat, up_to: last })).unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Send { via: Transport::Onion, .. })),
+        "прямой канал обязан найтись там, где он есть: {effects:?}"
+    );
 }
 
 #[test]
@@ -2470,4 +2530,390 @@ fn a_shared_contact_disappears_with_its_message() {
         bob.store().contact_share_of(&msg_id).unwrap().is_none(),
         "карточка обязана уйти вместе с сообщением"
     );
+}
+
+/// Настоящий адрес v3 — иначе обновление не пройдёт проверку формата.
+///
+/// Собственный, посчитанный из ключа: адрес в §4.3 обязан быть адресом,
+/// и пара строк вида «aaaa.onion» здесь не годится, хотя в карточках
+/// остальных тестов их достаточно.
+fn some_onion(seed: u8) -> String {
+    ratatosk_crypto::OnionKey::from_seed([seed; 32]).address()
+}
+
+#[test]
+fn an_address_update_reaches_the_contact() {
+    // Ради этого §4.3 и существует: человек, добавивший вас по QR в кафе,
+    // знает карточку той минуты. Поднялся Tor — он обязан узнать адрес,
+    // иначе знакомство годно ровно до выхода из общей сети.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+
+    let before = bob.contacts()[&alice_ik].card.clone();
+    let address = some_onion(9);
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let after = &bob.contacts()[&alice_ik].card;
+    assert_eq!(after.onion, address, "адрес обязан доехать");
+    assert!(after.version > before.version, "версия карточки обязана вырасти");
+    assert!(bob.contacts()[&alice_ik].availability.has_onion, "§5.4 обязан узнать про путь");
+}
+
+#[test]
+fn an_address_update_does_not_undo_the_fingerprint_check() {
+    // Меняются адреса, ключи остаются — значит, отпечаток тот же, значит,
+    // сверять заново нечего. Сброс признака заставлял бы человека звонить
+    // собеседнику при каждом подъёме Tor и приучил бы подтверждать не глядя.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    assert!(bob.contacts()[&alice_ik].verified, "знакомство при встрече — сверено");
+
+    bob.step(
+        500,
+        Input::Command(Command::SetLocalName {
+            peer_ik: alice_ik,
+            name: Some("Аля с курсов".into()),
+        }),
+    )
+    .unwrap();
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: some_onion(9),
+                chatmail: "a7f3k9@nine.example".into(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let contact = &bob.contacts()[&alice_ik];
+    assert!(contact.verified, "сверка обязана пережить смену адресов");
+    assert_eq!(
+        contact.local_name.as_deref(),
+        Some("Аля с курсов"),
+        "подпись пользователя — его, и обновление с той стороны её не касается"
+    );
+}
+
+#[test]
+fn announcing_the_same_addresses_costs_nothing() {
+    // Подъём Tor случается при каждом возвращении сети. Поднимай версию
+    // карточки каждый раз — и рассылка обновлений станет фоновым шумом.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let address = some_onion(9);
+
+    let first = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    assert!(!first.is_empty(), "первое объявление обязано уйти");
+    pump(&mut alice, &mut bob, 1_000, first);
+    let version = alice.own_card().version;
+
+    let again = alice
+        .step(
+            2_000,
+            Input::Command(Command::AnnounceAddresses { onion: address, chatmail: String::new() }),
+        )
+        .unwrap();
+    assert!(again.is_empty(), "повтор с теми же адресами не рассылается");
+    assert_eq!(alice.own_card().version, version, "и версию не поднимает");
+}
+
+#[test]
+fn an_update_about_a_third_person_changes_nothing() {
+    // Обновление меняет ровно одну карточку — того, кто его прислал.
+    // Проверка «от владельца» живёт в `proto::card_update` и покрыта там;
+    // здесь — что рассылка не задевает соседей по списку контактов.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    introduce(&mut alice, &mut bob);
+    introduce(&mut bob, &mut carol);
+    let carol_ik = carol.own_card().ik;
+    let before = bob.contacts()[&carol_ik].card.clone();
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: some_onion(9),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    assert_eq!(bob.contacts()[&carol_ik].card, before, "чужая карточка не тронута");
+}
+
+/// Есть ли в пачке эффектов попытка что-то отправить.
+///
+/// Нужно там, где проверяется **отсутствие** досылки: «эффектов ровно один»
+/// сломается от любой будущей мелочи, а «никуда не полез» — это ровно то,
+/// что проверяется.
+fn tries_to_reach_out(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| matches!(e, Effect::Send { .. } | Effect::Connect { .. }))
+}
+
+#[test]
+fn a_contact_added_after_the_announcement_still_learns_the_address() {
+    // Дыра, из-за которой на стенде «карточки не всегда обмениваются
+    // tor-адресом». Рассылка §4.3 уходит тем контактам, которые есть
+    // на момент объявления, — а ссылку копируют когда придётся, и добавляют
+    // по ней тоже когда придётся. Достаточно один раз сделать /onion раньше,
+    // чем собеседник добавлен, — и адрес не узнает никто и никогда:
+    // повторное объявление того же адреса бесплатно и потому молчит.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let alice_ik = alice.own_card().ik;
+    let address = some_onion(9);
+
+    // Ссылка снята до объявления — в ней прежний адрес и первая версия.
+    let stale = alice.own_card().encode().unwrap();
+
+    // Объявление в пустоту: контактов ещё нет, рассылать некому.
+    let alone = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    assert!(alone.is_empty(), "объявлять некому — и нечего отправлять");
+
+    // Знакомство после объявления. Боб заводит Алису по устаревшей ссылке.
+    bob.step(2_000, Input::Command(Command::AddContact { card_bytes: stale, met_in_person: true }))
+        .unwrap();
+    let bob_card = bob.own_card().encode().unwrap();
+    let effects = alice
+        .step(
+            2_000,
+            Input::Command(Command::AddContact { card_bytes: bob_card, met_in_person: true }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    let known = &bob.contacts()[&alice_ik];
+    assert_eq!(known.card.onion, address, "адрес обязан доехать досылкой");
+    assert!(known.availability.has_onion, "§5.4 обязан узнать про путь");
+}
+
+#[test]
+fn establishing_a_session_delivers_the_address_to_whoever_missed_it() {
+    // Тот же случай с другой стороны: добавил один, а первым написал другой.
+    // Карточка едет и в первом сообщении рукопожатия (§8.2), но применяется
+    // она только к незнакомому контакту — иначе адреса известного человека
+    // менял бы кадр без подписи. Значит, знакомому наш адрес обязан приехать
+    // подписанным обновлением, и повод для него — сама установленная связь.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let alice_ik = alice.own_card().ik;
+    let address = some_onion(9);
+
+    let stale = alice.own_card().encode().unwrap();
+    alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+
+    // Боб знает Алису по старой ссылке; Алиса о Бобе не знает вовсе.
+    bob.step(2_000, Input::Command(Command::AddContact { card_bytes: stale, met_in_person: true }))
+        .unwrap();
+
+    let effects = send_text(&mut bob, &alice, 3_000, "привет");
+    pump(&mut bob, &mut alice, 3_000, effects);
+
+    assert_eq!(inbox(&alice, &bob), vec!["привет".to_string()], "сообщение обязано дойти");
+    assert_eq!(
+        bob.contacts()[&alice_ik].card.onion,
+        address,
+        "адрес обязан приехать вслед за установленной сессией"
+    );
+}
+
+#[test]
+fn the_same_card_is_not_pushed_to_the_same_contact_twice() {
+    // Досылка — страховка, а не фон. Второй раз ту же версию тому же
+    // человеку отправлять незачем: на той стороне это `Stale` (§4.3),
+    // а на этой — лишний кадр при каждом рукопожатии.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let stale = alice.own_card().encode().unwrap();
+    alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: some_onion(9),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+
+    bob.step(2_000, Input::Command(Command::AddContact { card_bytes: stale, met_in_person: true }))
+        .unwrap();
+    let bob_card = bob.own_card().encode().unwrap();
+    let first = alice
+        .step(
+            2_000,
+            Input::Command(Command::AddContact {
+                card_bytes: bob_card.clone(),
+                met_in_person: true,
+            }),
+        )
+        .unwrap();
+    assert!(tries_to_reach_out(&first), "первая досылка обязана уйти");
+    pump(&mut alice, &mut bob, 2_000, first);
+
+    // Повторное добавление того же человека — обычное дело: пересняли QR,
+    // прислали ссылку заново. Второй карточки за этим следовать не должно.
+    let again = alice
+        .step(
+            4_000,
+            Input::Command(Command::AddContact { card_bytes: bob_card, met_in_person: true }),
+        )
+        .unwrap();
+    assert!(!tries_to_reach_out(&again), "та же версия тому же человеку не повторяется: {again:?}");
+}
+
+#[test]
+fn a_new_announcement_is_pushed_again() {
+    // Обратная сторона предыдущего: запрет на повтор относится к версии,
+    // а не к человеку. Сменился адрес — досылка обязана ожить, иначе
+    // страховка сработает ровно один раз за запуск.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let alice_ik = alice.own_card().ik;
+    let stale = alice.own_card().encode().unwrap();
+    alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: some_onion(9),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+
+    bob.step(2_000, Input::Command(Command::AddContact { card_bytes: stale, met_in_person: true }))
+        .unwrap();
+    let bob_card = bob.own_card().encode().unwrap();
+    let first = alice
+        .step(
+            2_000,
+            Input::Command(Command::AddContact { card_bytes: bob_card, met_in_person: true }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 2_000, first);
+
+    let second = some_onion(11);
+    let effects = alice
+        .step(
+            5_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: second.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 5_000, effects);
+
+    assert_eq!(bob.contacts()[&alice_ik].card.onion, second, "новый адрес обязан доехать");
+}
+
+/// §16: переполнение кэша пропущенных ключей.
+///
+/// Сценарий из спецификации, которого до сих пор не было. Он проверяет
+/// не арифметику предела (её проверяют модульные тесты в `ratchet`), а то,
+/// что переполнение **не ломает сессию**: вытесненный ключ означает потерю
+/// одного сообщения, а не разрыв переписки.
+///
+/// Почему это важно и почему это не редкость. Кэш наполняется, когда кадры
+/// приходят не по порядку (§8.4), — а почта именно так их и доставляет.
+/// Достаточно долгого офлайна: собеседник пишет, письма копятся на сервере
+/// и приезжают вперемешку. Реализация, которая на переполнении роняет сессию,
+/// прошла бы все остальные тесты и сломалась бы ровно у того, кто вернулся
+/// из отпуска.
+#[test]
+fn an_overflowing_skipped_key_cache_does_not_break_the_session() {
+    use ratatosk_crypto::ratchet::MAX_SKIPPED_PER_SESSION;
+
+    // Кадр, снятый с провода: транспорт и байты.
+    type Held = (ratatosk_proto::Transport, Vec<u8>);
+
+    // Доставляет один придержанный кадр. Отдельной функцией, а не замыканием:
+    // так у ссылок обычные времена жизни, а не выведенные.
+    fn deliver(bob: &mut Node, at: u64, held: &[Held], i: usize) {
+        let (via, frame) = held[i].clone();
+        bob.step(at, Input::Received { via, frame }).expect("приём кадра не должен отказывать");
+    }
+
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Первое сообщение доходит целиком: дальше есть установленная сессия,
+    // и всё последующее — уже ретчет, а не рукопожатие.
+    let effects = send_text(&mut alice, &bob, 1_000, "здравствуй");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["здравствуй".to_string()]);
+
+    // Алиса пишет много, а провод молчит: кадры собираются, но не доставляются.
+    // Ровно так выглядит долгий офлайн получателя.
+    let total = MAX_SKIPPED_PER_SESSION + 60;
+    let mut held: Vec<Held> = Vec::with_capacity(total);
+    for i in 0..total {
+        let at = 2_000 + i as u64;
+        for effect in send_text(&mut alice, &bob, at, &format!("письмо {i}")) {
+            if let Effect::Send { via, frame, .. } = effect {
+                held.push((via, frame));
+            }
+        }
+    }
+    assert_eq!(held.len(), total, "по установленной сессии на сообщение один кадр");
+
+    // Доставка не по порядку. Числа выбраны так, чтобы каждый прыжок
+    // укладывался в предел §7.3, а суммарный кэш — вышел за предел §8.4.
+    let far = MAX_SKIPPED_PER_SESSION - 100;
+
+    deliver(&mut bob, 100_000, &held, far);
+    deliver(&mut bob, 100_001, &held, total - 5);
+
+    // Самые старые ключи вытеснены — это и есть переполнение. Их сообщения
+    // потеряны, и притвориться, что они дойдут, нельзя.
+    deliver(&mut bob, 100_002, &held, 0);
+    assert!(
+        !inbox(&bob, &alice).contains(&"письмо 0".to_string()),
+        "сообщение с вытесненным ключом не может быть прочитано — обещать обратное нечестно"
+    );
+
+    // А всё, что кэш ещё помнит, читается как ни в чём не бывало.
+    deliver(&mut bob, 100_003, &held, far - 10);
+    // И следующее по порядку — тоже: сессия жива, ретчет на месте.
+    deliver(&mut bob, 100_004, &held, total - 4);
+
+    let chat = inbox(&bob, &alice);
+    assert!(chat.contains(&format!("письмо {}", far - 10)), "кэш перестал отдавать то, что помнит");
+    assert!(chat.contains(&format!("письмо {}", total - 4)), "сессия не пережила переполнение");
+    assert!(chat.contains(&"здравствуй".to_string()), "история до переполнения обязана остаться");
 }

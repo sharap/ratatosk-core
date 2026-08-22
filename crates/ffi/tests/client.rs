@@ -74,7 +74,7 @@ impl Recorder {
 /// открывается, отдаёт карточку и тут же закрывается.
 fn someone_elses_uri(tag: &str) -> String {
     let db = TempDb::new(tag);
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "Боб".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "Боб".to_owned())
         .expect("клиент открылся");
     assert!(client.contacts().expect("список читается").is_empty(), "у свежего клиента их нет");
     let uri = client.my_contact_uri();
@@ -93,10 +93,46 @@ fn settle() {
 }
 
 #[test]
+fn a_device_secret_opens_the_base_and_a_foreign_one_does_not() {
+    // §8.6 обещал, что при отказе от PIN ключ базы уедет в хранилище ключей
+    // ОС. Проверяется здесь то, ради чего это делалось: база, унесённая
+    // с телефона, не открывается — секрета устройства в файле нет.
+    let db = TempDb::new("device-secret");
+    let secret = vec![7u8; 32];
+
+    let client = RatatoskClient::open(db.path(), None, Some(secret.clone()), "я".to_owned())
+        .expect("секрет устройства открывает базу");
+    let fingerprint = client.fingerprint();
+    drop(client);
+
+    let again = RatatoskClient::open(db.path(), None, Some(secret), "я".to_owned())
+        .expect("тот же секрет открывает ту же базу");
+    assert_eq!(again.fingerprint(), fingerprint, "личность обязана быть та же");
+    drop(again);
+
+    let stranger = RatatoskClient::open(db.path(), None, Some(vec![8u8; 32]), "я".to_owned());
+    match stranger {
+        Err(RatatoskError::Locked) => {}
+        Err(other) => panic!("ожидался отказ «заблокировано», пришло {other:?}"),
+        Ok(_) => panic!("чужой секрет открыл базу"),
+    }
+}
+
+#[test]
+fn a_device_secret_of_the_wrong_length_is_refused() {
+    // Короткий секрет означает, что клиент положил туда не то: строку,
+    // хэш пароля, идентификатор устройства. Вывести из этого ключ базы
+    // значило бы изобразить защиту.
+    let db = TempDb::new("device-short");
+    let verdict = RatatoskClient::open(db.path(), None, Some(vec![7u8; 16]), "я".to_owned());
+    assert!(verdict.is_err(), "секрет не той длины обязан быть отказом");
+}
+
+#[test]
 fn opening_twice_keeps_the_same_identity() {
     let db = TempDb::new("identity");
 
-    let first = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let first = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("первый запуск");
     let fingerprint = first.fingerprint();
     let uri = first.my_contact_uri();
@@ -104,7 +140,7 @@ fn opening_twice_keeps_the_same_identity() {
     drop(first);
     settle();
 
-    let second = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let second = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("второй запуск");
     assert_eq!(second.fingerprint(), fingerprint, "отпечаток обязан совпасть (§3)");
     assert_eq!(second.my_contact_uri(), uri, "и карточка тоже");
@@ -113,12 +149,12 @@ fn opening_twice_keeps_the_same_identity() {
 #[test]
 fn a_wrong_pin_reports_locked_and_not_a_fresh_start() {
     let db = TempDb::new("pin");
-    let first = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let first = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("первый запуск");
     drop(first);
     settle();
 
-    let verdict = RatatoskClient::open(db.path(), Some("4321".to_owned()), "я".to_owned());
+    let verdict = RatatoskClient::open(db.path(), Some("4321".to_owned()), None, "я".to_owned());
     assert!(
         matches!(verdict, Err(RatatoskError::Locked)),
         "неверный PIN обязан быть отличим от внутренней ошибки: его лечит \
@@ -131,7 +167,7 @@ fn a_contact_added_by_uri_shows_up_with_its_fingerprint() {
     let db = TempDb::new("contact");
     let uri = someone_elses_uri("peer-contact");
 
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
     let recorder = Arc::new(Recorder::default());
     client.set_observer(recorder.clone());
@@ -159,7 +195,7 @@ fn a_contact_added_by_uri_shows_up_with_its_fingerprint() {
     drop(client);
     settle();
 
-    let again = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let again = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("второй запуск");
     let contacts = again.contacts().expect("контакты поднялись с диска");
     assert_eq!(contacts.len(), 1);
@@ -173,7 +209,7 @@ fn a_sent_message_is_kept_and_reported_undeliverable() {
     let db = TempDb::new("send");
     let uri = someone_elses_uri("peer-send");
 
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
     let recorder = Arc::new(Recorder::default());
     client.set_observer(recorder.clone());
@@ -203,7 +239,7 @@ fn lan_can_be_switched_on_and_off() {
     // §5.1: LAN выключен по умолчанию и включается сознательно. Проверяется
     // не поведение сети, а то, что команда доходит и не роняет ядро.
     let db = TempDb::new("lan");
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
     client.set_lan_enabled(true).expect("включение принято");
     client.set_lan_enabled(false).expect("выключение принято");
@@ -216,7 +252,7 @@ fn a_network_change_is_survivable() {
     // точками, пробуждение. Ядро обязано пережить сообщение об этом в любом
     // состоянии — и при включённом LAN, и при выключенном.
     let db = TempDb::new("network");
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
 
     client.network_changed().expect("при выключенном LAN — тоже команда");
@@ -264,7 +300,7 @@ fn the_auto_accept_threshold_is_a_setting_and_survives_a_restart() {
     let db = TempDb::new("auto-accept");
 
     {
-        let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+        let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
             .expect("клиент открылся");
         assert_eq!(
             client.auto_accept_bytes().unwrap(),
@@ -281,7 +317,7 @@ fn the_auto_accept_threshold_is_a_setting_and_survives_a_restart() {
     }
     settle();
 
-    let again = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let again = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("второй запуск");
     assert_eq!(again.auto_accept_bytes().unwrap(), None, "настройка пережила перезапуск");
 }
@@ -294,7 +330,7 @@ fn an_edit_and_a_reaction_are_visible_through_the_boundary() {
     let db = TempDb::new("edit");
     let uri = someone_elses_uri("peer-edit");
 
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
     let recorder = Arc::new(Recorder::default());
     client.set_observer(recorder.clone());
@@ -356,7 +392,7 @@ fn a_reply_can_be_found_and_the_history_pages_backwards() {
     let db = TempDb::new("reply");
     let uri = someone_elses_uri("peer-reply");
 
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
     let recorder = Arc::new(Recorder::default());
     client.set_observer(recorder.clone());
@@ -427,7 +463,7 @@ fn an_avatar_round_trips_and_stays_hidden_until_verification() {
     };
 
     let peer_ik = {
-        let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+        let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
             .expect("клиент открылся");
 
         assert_eq!(client.my_avatar().expect("читается"), None, "у свежего профиля её нет");
@@ -459,7 +495,7 @@ fn an_avatar_round_trips_and_stays_hidden_until_verification() {
     };
 
     // Перезапуск: своя аватарка на месте, чужой по-прежнему нет.
-    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), "я".to_owned())
+    let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся снова");
     assert_eq!(client.my_avatar().expect("читается"), Some(png));
     assert_eq!(client.avatar_of(peer_ik.clone()).expect("читается"), None);

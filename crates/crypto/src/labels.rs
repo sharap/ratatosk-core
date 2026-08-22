@@ -45,8 +45,20 @@ pub const SENDER_MSG: &str = "ratatosk v0 sender-msg";
 /// всю переписку тому, у кого нет PIN.
 pub const SEARCH_TOKEN: &str = "ratatosk v0 search-token";
 
+/// Контекст вывода `db_key` из секрета, хранимого ОС (§8.6, дополнение).
+///
+/// §8.6 обещает, что при отказе от PIN ключ базы уедет в Android Keystore.
+/// Уехать туда он может только так: сам ключ Keystore не отдаёт наружу
+/// никогда, поэтому наружу приходит **секрет**, а `db_key` выводится из него
+/// вместе с солью базы.
+///
+/// Соль в материале обязательна: без неё один секрет устройства дал бы один
+/// и тот же `db_key` всем аккаунтам на телефоне, и «отдельные файлы —
+/// отдельные ключи» (см. `core::accounts`) перестало бы быть правдой.
+pub const DEVICE_KEY: &str = "ratatosk v0 device-key";
+
 /// Все контексты — для теста уникальности и для тест-векторов.
-pub const ALL: [&str; 13] = [
+pub const ALL: [&str; 14] = [
     IK,
     SK,
     BEACON,
@@ -60,6 +72,7 @@ pub const ALL: [&str; 13] = [
     SENDER_CHAIN,
     SENDER_MSG,
     SEARCH_TOKEN,
+    DEVICE_KEY,
 ];
 
 #[cfg(test)]

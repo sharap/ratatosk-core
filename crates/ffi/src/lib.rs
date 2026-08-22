@@ -11,6 +11,10 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// По той же причине, что и в стенде: ядро вместе с подъёмом Tor собирается
+// в одно глубоко вложенное будущее, и вычисление его раскладки упирается
+// в умолчание компилятора. Предел про сборку, а не про работу.
+#![recursion_limit = "512"]
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,13 +27,45 @@ use ratatosk_core::{
 };
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
-use ratatosk_transport::{LanConfig, LanRunner};
+#[cfg(feature = "tor")]
+use ratatosk_transport::{onion::arti::OnionRunner, Deferred};
+use ratatosk_transport::{Disabled, LanConfig, LanRunner, Transports};
 
 uniffi::setup_scaffolding!();
 
 impl RatatoskError {
     fn internal(reason: impl std::fmt::Display) -> RatatoskError {
         RatatoskError::Internal { reason: reason.to_string() }
+    }
+}
+
+/// Проверяет длину секрета устройства.
+///
+/// Ровно 32 байта, и отказ на всё остальное — не педантизм: секрет короче
+/// означает, что клиент положил туда что-то не то (строку, хэш пароля,
+/// идентификатор устройства), и молча вывести из этого ключ базы значило бы
+/// сделать вид, что защита есть.
+fn to_device_key(bytes: Option<Vec<u8>>) -> Result<Option<[u8; 32]>, RatatoskError> {
+    match bytes {
+        None => Ok(None),
+        Some(raw) => <[u8; 32]>::try_from(raw.as_slice()).map(Some).map_err(|_| {
+            RatatoskError::internal("секрет устройства обязан быть длиной ровно 32 байта")
+        }),
+    }
+}
+
+/// Складывает PIN и секрет устройства в способ открытия базы (§8.6).
+///
+/// Все четыре сочетания законны, и выбирает их человек вместе с клиентом:
+/// PIN — защита от того, у кого файл; секрет устройства — от того, у кого
+/// файл, но нет телефона; вместе — от обоих; ничего — открытая база,
+/// про которую клиент обязан предупредить.
+fn unlock_of<'a>(pin: Option<&'a str>, device: Option<&'a [u8; 32]>) -> vault::Unlock<'a> {
+    match (pin, device) {
+        (Some(pin), Some(device)) => vault::Unlock::PinAndDevice { pin, device },
+        (Some(pin), None) => vault::Unlock::Pin(pin),
+        (None, Some(device)) => vault::Unlock::Device(device),
+        (None, None) => vault::Unlock::Nothing,
     }
 }
 
@@ -184,6 +220,24 @@ pub enum FfiEvent {
         /// Чья.
         peer_ik: Vec<u8>,
     },
+    /// Как идёт подъём Tor (§5.2).
+    ///
+    /// Показывать это человеку **надо**, и не из любви к прогресс-барам:
+    /// bootstrap занимает десятки секунд в хорошем случае и не кончается
+    /// никогда в плохом — когда сеть Tor недоступна. Снаружи эти два случая
+    /// неотличимы, и молчание о них выглядит как сломанное приложение.
+    ///
+    /// Пока `fraction < 1` — «поднимается». Непустое `blocked` — не ошибка,
+    /// а причина остановки; она может смениться на пустую сама, когда сеть
+    /// появится. Строки приходят от arti и предназначены для показа как есть.
+    TorStatus {
+        /// Доля готовности, от 0 до 1.
+        fraction: f32,
+        /// Что происходит сейчас.
+        note: String,
+        /// Почему стоит, если стоит.
+        blocked: Option<String>,
+    },
     /// Изменился состав группы.
     GroupMembershipChanged {
         /// Чат.
@@ -329,6 +383,25 @@ pub struct FfiSharedContact {
     /// Добавлять себя в контакты нечего; показать «это вы» честнее, чем
     /// нарисовать кнопку, которая ничего не делает.
     pub mine: bool,
+}
+
+/// Своя карточка в том виде, в каком её показывают человеку (§4.1, §4.3).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiOwnCard {
+    /// Ссылка `ratatosk:v0:…` — она же содержимое QR.
+    pub uri: String,
+    /// Версия карточки. Растёт при каждой смене адресов (§4.3).
+    ///
+    /// Клиенту нужна ровно для одного: заметить, что показанный QR устарел.
+    pub version: u64,
+    /// Onion-адрес (§5.2). Пустая строка — Tor ещё не поднят.
+    ///
+    /// Пустоту стоит показать словами, а не пропуском: «пока только локальная
+    /// сеть» — правда о том, где вас найдут, и человеку она важнее, чем
+    /// аккуратный экран.
+    pub onion: String,
+    /// Почтовый адрес (§5.3). Пустая строка — ящика нет.
+    pub chatmail: String,
 }
 
 /// Открытое на чтение вложение (§10.2).
@@ -501,8 +574,25 @@ impl RatatoskClient {
     ///
     /// `pin` — `None`, если пользователь отказался от PIN. В этом случае
     /// клиент **обязан** показать [`no_pin_warning`]: §8.6 разрешает отказ,
-    /// но до подключения хранилища ключей ОС ключ базы лежит в самой базе
-    /// открыто, и содержимое доступно любому, кто получил файл.
+    /// но ключ базы лежит тогда в самой базе открыто, и содержимое доступно
+    /// любому, кто получил файл.
+    ///
+    /// `device_key` — 32 байта из хранилища ключей ОС (Android Keystore).
+    /// Их генерирует и хранит клиент; ядро их не запоминает, а только
+    /// выводит из них ключ базы вместе с солью. Что это даёт и чем за это
+    /// платят:
+    ///
+    /// * с секретом устройства база **не открывается на другом телефоне** —
+    ///   ни с PIN, ни без. Это защита от того, у кого файл, но нет аппарата;
+    /// * и это же означает, что **потеря телефона — потеря переписки**.
+    ///   Секрет из Keystore не восстанавливается ни резервной фразой,
+    ///   ни бэкапом. Сказать об этом человеку надо до, а не после;
+    /// * вместе с PIN — защита от обоих сразу: файл бесполезен без аппарата,
+    ///   аппарат — без PIN.
+    ///
+    /// Секрет обязан быть ровно 32 байта. Всё остальное — отказ: короткий
+    /// секрет означает, что клиент положил туда не то, и молча вывести
+    /// из этого ключ базы значило бы изобразить защиту.
     ///
     /// Неверный PIN возвращает [`RatatoskError::Locked`] и **не** заводит
     /// новую личность: молчаливый старт с чистого листа выглядит как
@@ -511,8 +601,10 @@ impl RatatoskClient {
     pub fn open(
         db_path: String,
         pin: Option<String>,
+        device_key: Option<Vec<u8>>,
         display_name: String,
     ) -> Result<Arc<Self>, RatatoskError> {
+        let device_key = to_device_key(device_key)?;
         let observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>> = Arc::new(Mutex::new(None));
         let pump_observer = Arc::clone(&observer);
 
@@ -533,7 +625,8 @@ impl RatatoskClient {
                         }
                     };
                 runtime.block_on(async move {
-                    let started = start(PathBuf::from(db_path), pin, display_name).await;
+                    let started =
+                        start(PathBuf::from(db_path), pin, device_key, display_name).await;
                     let (mut driver, opened, events) = match started {
                         Ok(parts) => parts,
                         Err(error) => {
@@ -573,8 +666,39 @@ impl RatatoskClient {
     }
 
     /// Своя контакт-карточка как URI для QR (§4.1).
+    ///
+    /// Спрашивается у ядра каждый раз, а не берётся из того, что было при
+    /// открытии: адреса появляются позже старта (§5.2), и после
+    /// [`RatatoskClient::announce_addresses`] прежняя ссылка уже не та, что
+    /// уедет собеседнику. Показать устаревший QR — пообещать адрес, которого
+    /// в нём нет.
+    ///
+    /// Если ядро остановлено, возвращается ссылка, снятая при открытии:
+    /// она хотя бы верна для той минуты, а пустой экран вместо QR не помог бы
+    /// никому.
     pub fn my_contact_uri(&self) -> String {
-        self.opened.contact_uri.clone()
+        self.opened
+            .handle
+            .own_card_blocking()
+            .map_or_else(|| self.opened.contact_uri.clone(), |card| card.uri)
+    }
+
+    /// Свои адреса и версия карточки (§4.1, §4.3).
+    ///
+    /// Нужно экрану «мой профиль»: пустой onion означает, что Tor ещё
+    /// не поднят, и сказать об этом честнее, чем показать QR без адреса
+    /// и промолчать.
+    pub fn my_addresses(&self) -> Result<FfiOwnCard, RatatoskError> {
+        self.opened
+            .handle
+            .own_card_blocking()
+            .map(|card| FfiOwnCard {
+                uri: card.uri,
+                version: card.version,
+                onion: card.onion,
+                chatmail: card.chatmail,
+            })
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
     }
 
     /// Идентификатор чата 1:1 с контактом.
@@ -721,6 +845,25 @@ impl RatatoskClient {
     /// Перед включением клиент обязан показать [`lan_warning`].
     pub fn set_lan_enabled(&self, enabled: bool) -> Result<(), RatatoskError> {
         self.command(Command::SetLanEnabled(enabled))
+    }
+
+    /// Объявляет свои адреса контактам (§4.3).
+    ///
+    /// Зовётся, когда поднялся onion-сервис (§5.2) или завёлся почтовый ящик
+    /// (§5.3): до этого адресов у устройства нет, и карточка, показанная
+    /// в кафе по QR, знает только локальную сеть.
+    ///
+    /// Пустая строка означает «адреса нет», и это законное значение,
+    /// а не пропуск: Tor может быть выключен человеком.
+    ///
+    /// Повтор с теми же адресами не делает ничего и ничего не стоит — звать
+    /// при каждом старте не только можно, но и нужно.
+    ///
+    /// **Версия карточки при этом растёт**, поэтому своя ссылка и QR
+    /// меняются: клиенту стоит перечитать [`RatatoskClient::contact_uri`],
+    /// если он показывает их на экране.
+    pub fn announce_addresses(&self, onion: String, chatmail: String) -> Result<(), RatatoskError> {
+        self.command(Command::AnnounceAddresses { onion, chatmail })
     }
 
     /// Удаляет сообщения **у себя**.
@@ -1314,15 +1457,37 @@ fn to_msg_ids(ids: &[Vec<u8>]) -> Result<Vec<[u8; 16]>, RatatoskError> {
         .collect()
 }
 
+/// Набор транспортов этой сборки.
+///
+/// Псевдоним, а не тип по месту: состав транспортов виден в сигнатурах,
+/// и меняется он здесь, а не в каждой из них.
+///
+/// С признаком `tor` в середине стоит настоящий onion — обёрнутый
+/// в [`Deferred`], потому что bootstrap идёт десятки секунд, а открытие
+/// аккаунта обязано быть мгновенным. Без признака там [`Disabled`], и это
+/// не заглушка, а правда о сборке: §5.4 обязан узнать, что ступень
+/// не сработала, и перейти к следующей.
+#[cfg(feature = "tor")]
+type Runners = Transports<LanRunner, Deferred<OnionRunner>, Disabled>;
+/// Набор транспортов сборки без Tor: работает одна локальная сеть.
+#[cfg(not(feature = "tor"))]
+type Runners = Transports<LanRunner, Disabled, Disabled>;
+
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
     db_path: PathBuf,
     pin: Option<String>,
+    device_key: Option<[u8; 32]>,
     display_name: String,
-) -> Result<(Driver<SqliteStore, LanRunner>, Opened, EventStream), RatatoskError> {
+) -> Result<(Driver<SqliteStore, Runners>, Opened, EventStream), RatatoskError> {
     let (mut store, db_key) =
-        vault::open_encrypted(&db_path, pin.as_deref()).map_err(engine_err)?;
+        vault::open_encrypted(&db_path, unlock_of(pin.as_deref(), device_key.as_ref()))
+            .map_err(engine_err)?;
     let identity = vault::load_or_create(&mut store, &db_key).map_err(engine_err)?;
+    // Ключ onion-сервиса — отдельной записью (§3): из зерна он не выводится
+    // и резервной фразой не восстанавливается.
+    #[cfg(feature = "tor")]
+    let onion_key = vault::load_or_create_onion(&mut store, &db_key).map_err(engine_err)?;
 
     // Байты вложений — рядом с базой, но не в ней (§10, §12). Каталог
     // соседний, чтобы жить и удаляться вместе с ней: база без чанков — это
@@ -1344,8 +1509,44 @@ async fn start(
 
     // §5.1: LAN выключен по умолчанию. Порт занимается сразу — он нужен
     // объявлению, а без объявления никого не раскрывает.
-    let runner =
+    let lan =
         LanRunner::start(LanConfig::default(), card.ik).await.map_err(RatatoskError::internal)?;
+
+    // Onion поднимается **в фоне опросов драйвера**: bootstrap идёт десятки
+    // секунд, и ждать его здесь значило бы держать человека перед пустым
+    // экраном минуту — вместе с локальной сетью, которая работает сразу.
+    // До подъёма ступень честно отказывает (§5.4).
+    #[cfg(feature = "tor")]
+    let runner = {
+        let layout = ratatosk_core::TorLayout::beside(&db_path);
+        // Ключ раскладывается до подъёма и на каждый запуск: arti читает
+        // его из каталога, а файл могли удалить или перенести базу без него.
+        ratatosk_core::write_onion_keystore(&layout.keys, &onion_key)
+            .map_err(RatatoskError::internal)?;
+        let onion = Deferred::rising(|progress| async move {
+            OnionRunner::start(
+                ratatosk_transport::onion::arti::OnionSetup {
+                    state_dir: &layout.state,
+                    cache_dir: &layout.cache,
+                    keystore_dir: &layout.keys,
+                    key: &onion_key,
+                    // На Android — и только там. Приложение живёт в своём
+                    // каталоге, чужих пользователей на устройстве нет,
+                    // а предки пути принадлежат системе и устроены не так,
+                    // как ждёт `fs-mistrust`: проверка отвергает заведомо
+                    // безопасный путь. На десктопе она остаётся включённой,
+                    // потому что там она осмысленна.
+                    dangerously_trust_filesystem: cfg!(target_os = "android"),
+                },
+                progress,
+            )
+            .await
+        });
+        Transports::new(lan, onion, Disabled)
+    };
+    // Почта (§5.3) ещё не написана, и без признака `tor` — onion тоже.
+    #[cfg(not(feature = "tor"))]
+    let runner = Transports::new(lan, Disabled, Disabled);
 
     let (driver, handle, events) = Driver::new(engine, runner);
     let opened = Opened {
@@ -1503,6 +1704,7 @@ impl AccountRegistry {
         &self,
         id: Vec<u8>,
         pin: Option<String>,
+        device_key: Option<Vec<u8>>,
         display_name: String,
     ) -> Result<Arc<RatatoskClient>, RatatoskError> {
         let id = to_account_id(&id)?;
@@ -1515,7 +1717,7 @@ impl AccountRegistry {
             .ok_or_else(|| RatatoskError::internal("путь к базе не в UTF-8"))?
             .to_owned();
 
-        let client = RatatoskClient::open(path, pin, display_name)?;
+        let client = RatatoskClient::open(path, pin, device_key, display_name)?;
         let mut opened = self.opened.lock().map_err(|_| poisoned())?;
         opened.retain(|(_, weak)| weak.strong_count() > 0);
         opened.push((id, Arc::downgrade(&client)));
@@ -1681,6 +1883,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::ContactChanged { peer_ik } => FfiEvent::ContactChanged { peer_ik: peer_ik.to_vec() },
         Event::ContactRemoved { peer_ik } => FfiEvent::ContactRemoved { peer_ik: peer_ik.to_vec() },
         Event::AvatarChanged { peer_ik } => FfiEvent::AvatarChanged { peer_ik: peer_ik.to_vec() },
+        Event::TorStatus { fraction, note, blocked } => {
+            FfiEvent::TorStatus { fraction, note, blocked }
+        }
         Event::GroupMembershipChanged { chat } => {
             FfiEvent::GroupMembershipChanged { chat_id: chat.to_vec() }
         }

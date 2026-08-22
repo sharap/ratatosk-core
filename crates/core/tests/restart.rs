@@ -181,6 +181,18 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
             .unwrap();
         engine.restore().unwrap();
 
+        // Сессия в базе локальная (`lan: true`) — значит и канал к ней
+        // локальный, а локальная сеть по умолчанию выключена (§5.1) и после
+        // перезапуска никем ещё не найдена. Без этих двух строк проверялась
+        // бы отправка в сеть, которой нет: прямой канал спрашивает §5.4
+        // наравне с очередью, и выключенный LAN он не выбирает.
+        //
+        // Это не подгонка под реализацию, а восстановление состояния, которое
+        // на устройстве создают клиент и обнаружение: сессия переживает
+        // перезапуск, видимость в сети — нет.
+        engine.step(1_900, Input::Command(Command::SetLanEnabled(true))).unwrap();
+        engine.step(1_950, Input::SeenOnLan { peer_ik }).unwrap();
+
         let effects =
             engine.step(2_000, Input::Command(Command::MarkRead { chat, up_to: msg_id })).unwrap();
         assert!(
@@ -199,6 +211,10 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
     let identity = vault::load_or_create(&mut store, &db_key).unwrap();
     let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
     engine.restore().unwrap();
+    // Канал поднимается заново — иначе тишина ниже ничего не доказывала бы:
+    // она означала бы «некуда отправить», а проверяется «нечего отправлять».
+    engine.step(2_900, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine.step(2_950, Input::SeenOnLan { peer_ik }).unwrap();
 
     let effects =
         engine.step(3_000, Input::Command(Command::MarkRead { chat, up_to: msg_id })).unwrap();
@@ -536,4 +552,82 @@ fn a_waiting_message_for_a_deleted_contact_stops_waiting() {
         .step(7_000, Input::Command(Command::DeleteContact { peer_ik, purge_history: false }))
         .unwrap();
     assert!(engine.store().outbox().unwrap().is_empty(), "ждать больше нечего и некого");
+}
+
+#[test]
+fn the_announced_card_survives_a_restart() {
+    // Версия карточки (§4.3) обязана расти монотонно через перезапуски:
+    // получатель принимает только строго большую, и сброс к единице
+    // означал бы, что адреса у собеседников застыли навсегда и молча.
+    //
+    // Адреса — вместе с ней. Без них первое же объявление после старта
+    // выглядит изменением, и на телефоне, где процесс убивают постоянно,
+    // §4.3 превратился бы в рассылку на каждый запуск.
+    let db = TempDb::new("card");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let address = ratatosk_crypto::OnionKey::from_seed([9u8; 32]).address();
+
+    // --- первый запуск: адрес появился ----------------------------------
+    {
+        let mut engine = Engine::new(
+            Identity::from_seed([7u8; 32]),
+            db.open(&db_key),
+            blobs(),
+            Box::new(OsEntropy),
+            addresses(),
+        );
+        engine.restore().expect("подъём состояния");
+        assert_eq!(engine.own_card().version, 1, "до объявления карточка первой версии");
+
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::AnnounceAddresses {
+                    onion: address.clone(),
+                    chatmail: String::new(),
+                }),
+            )
+            .expect("объявление адресов");
+        assert_eq!(engine.own_card().version, 2);
+        assert_eq!(engine.own_card().onion, address);
+    }
+
+    // --- второй запуск ---------------------------------------------------
+    let mut engine = Engine::new(
+        Identity::from_seed([7u8; 32]),
+        db.open(&db_key),
+        blobs(),
+        Box::new(OsEntropy),
+        addresses(),
+    );
+    engine.restore().expect("подъём состояния");
+
+    assert_eq!(engine.own_card().version, 2, "версия поднялась с диска");
+    assert_eq!(engine.own_card().onion, address, "и адрес вместе с ней");
+
+    // Повтор того же объявления — ровно то, что клиент делает при каждом
+    // старте, когда поднялся Tor. Он обязан быть бесплатным.
+    let effects = engine
+        .step(
+            2_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .expect("повторное объявление");
+    assert!(effects.is_empty(), "тот же адрес не рассылается заново");
+    assert_eq!(engine.own_card().version, 2, "и версию не поднимает");
+
+    // А смена — поднимает, и от двойки, а не от единицы.
+    engine
+        .step(
+            3_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: ratatosk_crypto::OnionKey::from_seed([10u8; 32]).address(),
+                chatmail: String::new(),
+            }),
+        )
+        .expect("смена адреса");
+    assert_eq!(engine.own_card().version, 3);
 }

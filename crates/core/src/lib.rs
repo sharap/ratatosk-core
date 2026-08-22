@@ -27,7 +27,9 @@ pub mod vault;
 #[cfg(feature = "driver")]
 pub mod driver;
 
-pub use accounts::{Account, AccountError, AccountId, Registry};
+pub use accounts::{
+    tor_path_beside, write_onion_keystore, Account, AccountError, AccountId, Registry, TorLayout,
+};
 pub use engine::{Contact, Engine, EngineError, SelfAddresses, MAX_LOCAL_NAME_CHARS};
 pub use entropy::{Entropy, OsEntropy, SeededEntropy};
 pub use io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};

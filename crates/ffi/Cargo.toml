@@ -42,6 +42,12 @@ thiserror.workspace = true
 # clap и camino попали бы в граф зависимостей библиотеки, то есть в `.so`
 # для Android. Инструмент вынесен в `crates/bindgen`.
 
+[features]
+# Живой Tor. **Не по умолчанию**: транспорт написан по документации arti
+# и проверяется отдельной сборкой; пока он не включён, onion честно
+# отказывает, а §5.4 переходит к следующей ступени.
+tor = ["ratatosk-transport/onion-arti"]
+
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"

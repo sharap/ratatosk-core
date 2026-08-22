@@ -52,6 +52,8 @@ use std::path::{Path, PathBuf};
 
 use ratatosk_codec::{canonical, CodecError, Value};
 
+use ratatosk_crypto::onion::{OnionKey, CTOR_HOSTNAME_FILE, CTOR_PUBLIC_FILE, CTOR_SECRET_FILE};
+
 use crate::entropy::Entropy;
 
 /// Имя файла реестра в корне.
@@ -62,6 +64,23 @@ const DB_EXTENSION: &str = "db";
 
 /// Расширение каталога вложений — то же правило, что и у одиночной базы.
 const BLOBS_EXTENSION: &str = "files";
+
+/// Расширение каталога состояния Tor: хранилище ключей сервиса и кэш
+/// директории. Соседний с базой по тому же правилу, что и вложения, —
+/// чтобы жить, переноситься и удаляться вместе с ней.
+const TOR_EXTENSION: &str = "tor";
+
+/// Права каталога с ключами: только владелец.
+///
+/// arti проверяет их сам (`fs-mistrust`) и отказывается читать хранилище,
+/// доступное группе или всем. Проверка не паранойя: ключ сервиса — это
+/// возможность выдать себя за устройство.
+#[cfg(unix)]
+const KEY_DIR_MODE: u32 = 0o700;
+
+/// Права файла с ключом.
+#[cfg(unix)]
+const KEY_FILE_MODE: u32 = 0o600;
 
 /// Сколько знаков в шестнадцатеричном имени файла.
 const ID_HEX_LEN: usize = 32;
@@ -213,6 +232,17 @@ impl Registry {
         self.root.join(hex(id)).with_extension(BLOBS_EXTENSION)
     }
 
+    /// Путь к каталогу состояния Tor для этого аккаунта.
+    ///
+    /// Свой у каждого аккаунта, и это то же решение, что и с базой: у каждого
+    /// свой Tor-клиент, своё хранилище ключей и свой bootstrap. Общий каталог
+    /// связал бы аккаунты между собой ровно там, где они обязаны быть
+    /// не связаны.
+    #[must_use]
+    pub fn tor_path(&self, id: &AccountId) -> PathBuf {
+        self.root.join(hex(id)).with_extension(TOR_EXTENSION)
+    }
+
     /// Заводит аккаунт и записывает его в реестр.
     ///
     /// Файла базы при этом не создаёт: её заводит первое открытие, и оно же
@@ -298,7 +328,7 @@ impl Registry {
         Ok(account)
     }
 
-    /// Стирает аккаунт целиком: запись в реестре, базу и вложения.
+    /// Стирает аккаунт целиком: запись в реестре, базу, вложения и ключи Tor.
     ///
     /// Работает и над скрытым — тем, кого в реестре нет.
     ///
@@ -323,10 +353,17 @@ impl Registry {
         for extra in ["db-wal", "db-shm"] {
             remove_file_if_present(&self.root.join(hex(id)).with_extension(extra))?;
         }
-        match std::fs::remove_dir_all(self.blobs_path(id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        // Вложения и каталог Tor — оба, и второй важнее первого. В нём лежит
+        // ключ onion-сервиса открытым (см. `write_onion_keystore`): оставить
+        // его после «стереть аккаунт» значит оставить возможность выдать себя
+        // за это устройство — при том, что переписки уже нет и заметить
+        // пропажу не по чему.
+        for dir in [self.blobs_path(id), self.tor_path(id)] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
 
         let before = self.listed.len();
@@ -502,6 +539,122 @@ fn decode_registry(bytes: &[u8]) -> Result<Vec<Account>> {
     Ok(listed)
 }
 
+/// Раскладка каталога Tor: что где лежит внутри `<аккаунт>.tor`.
+///
+/// Три подкаталога, и разделены они не для порядка, а по разной природе
+/// содержимого:
+///
+/// * `keys` — наш ключ сервиса в формате C Tor. **Секрет**, лежащий открыто
+///   (см. [`write_onion_keystore`]); arti читает его и не пишет туда никогда.
+/// * `state` — состояние Tor-клиента: сторожевые узлы, свои ключи arti.
+///   Переживать перезапуск обязано, иначе каждый старт выбирает новых
+///   сторожей, а частая их смена — то, по чему узла и вычисляют.
+/// * `cache` — кэш директории сети. Терять не жалко: восстанавливается
+///   загрузкой, только медленно.
+///
+/// Раскладка задана здесь одним местом намеренно. Два описания одного
+/// каталога разошлись бы при первой правке, и Tor поднялся бы с пустым
+/// хранилищем ключей — то есть с новым адресом, молча.
+#[derive(Debug, Clone)]
+pub struct TorLayout {
+    /// Корень: `<аккаунт>.tor`.
+    pub root: PathBuf,
+    /// Хранилище ключей в формате C Tor.
+    pub keys: PathBuf,
+    /// Состояние Tor-клиента.
+    pub state: PathBuf,
+    /// Кэш директории сети.
+    pub cache: PathBuf,
+}
+
+impl TorLayout {
+    /// Раскладка внутри готового корня.
+    #[must_use]
+    pub fn under(root: PathBuf) -> TorLayout {
+        TorLayout {
+            keys: root.join("keys"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            root,
+        }
+    }
+
+    /// Раскладка рядом с одиночной базой.
+    #[must_use]
+    pub fn beside(db_path: &Path) -> TorLayout {
+        TorLayout::under(tor_path_beside(db_path))
+    }
+}
+
+/// Путь к каталогу состояния Tor рядом с одиночной базой.
+///
+/// Для запусков без реестра: тот же путь, что даёт [`Registry::tor_path`],
+/// но выведенный из пути к базе. Правило одно на оба случая намеренно —
+/// два правила однажды разошлись бы, и Tor поднялся бы с пустым хранилищем,
+/// то есть с новым адресом.
+#[must_use]
+pub fn tor_path_beside(db_path: &Path) -> PathBuf {
+    db_path.with_extension(TOR_EXTENSION)
+}
+
+/// Раскладывает ключ onion-сервиса в каталог, который читает arti.
+///
+/// arti умеет брать чужой ключ только в формате C Tor и только из каталога
+/// на диске: своё хранилище он заполняет сам, снаружи в него не положить.
+/// Поэтому запечатанное в базе зерно — источник, а эти три файла — его
+/// открытая рабочая копия. Шифрование базы её не покрывает; сказано об этом
+/// в `ratatosk_crypto::onion` и в UI обязано быть сказано тоже.
+///
+/// Записывается **каждый раз**, а не однажды: файл могли удалить, испортить
+/// или перенести базу без него, и молча поднявшийся сервис с другим адресом
+/// хуже, чем перезапись одного и того же содержимого.
+///
+/// Права выставляются явно — `0700` на каталог, `0600` на файлы. arti
+/// проверяет их сам и отказывается читать хранилище, доступное группе или
+/// всем; без явной установки права зависели бы от umask, то есть от того,
+/// как запущено приложение.
+///
+/// # Errors
+///
+/// Отказ файловой системы: нет прав, нет места, путь занят файлом.
+pub fn write_onion_keystore(dir: &Path, key: &OnionKey) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    tighten_dir(dir)?;
+
+    write_key_file(&dir.join(CTOR_SECRET_FILE), &key.ctor_secret_file())?;
+    write_key_file(&dir.join(CTOR_PUBLIC_FILE), &key.ctor_public_file())?;
+    write_key_file(&dir.join(CTOR_HOSTNAME_FILE), &key.ctor_hostname_file())?;
+    Ok(())
+}
+
+/// Пишет файл и сразу ужимает права.
+///
+/// Порядок именно такой: создать, потом ужать. Обратный порядок невозможен —
+/// права выставляются существующему файлу, — а значит, между созданием
+/// и ужиманием есть окно. Оно закрывается тем, что закрыт **каталог**:
+/// `0700` не даёт чужому дойти до файла внутри.
+fn write_key_file(path: &Path, contents: &[u8]) -> Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEY_FILE_MODE))?;
+    }
+    Ok(())
+}
+
+/// Ужимает права каталога до владельца.
+fn tighten_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(KEY_DIR_MODE))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +668,99 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    #[test]
+    fn wiping_an_account_takes_the_onion_key_with_it() {
+        // Ключ сервиса лежит на диске открытым, и это единственное, что
+        // после «стереть аккаунт» позволило бы выдать себя за устройство.
+        // Переписки уже нет, и заметить пропажу не по чему.
+        let root = temp_root("wipe-tor");
+        let mut entropy = SeededEntropy::new(3);
+        let mut registry = Registry::open(&root).unwrap();
+        let id = registry.create(&mut entropy, "работа", 0).unwrap().id;
+
+        let dir = registry.tor_path(&id);
+        write_onion_keystore(&dir, &OnionKey::from_seed([9u8; 32])).unwrap();
+        assert!(dir.join(CTOR_SECRET_FILE).exists());
+
+        registry.wipe(&id).unwrap();
+        assert!(!dir.exists(), "каталог с ключом сервиса пережил стирание аккаунта");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_onion_keystore_is_written_where_arti_looks() {
+        // Три файла в раскладке C Tor: arti читает чужое хранилище только так.
+        let root = temp_root("keystore");
+        let dir = root.join("узел.tor");
+        let key = OnionKey::from_seed([9u8; 32]);
+
+        write_onion_keystore(&dir, &key).unwrap();
+
+        let hostname = std::fs::read_to_string(dir.join(CTOR_HOSTNAME_FILE)).unwrap();
+        assert_eq!(hostname.trim_end(), key.address(), "адрес в файле — тот же");
+        assert_eq!(std::fs::read(dir.join(CTOR_SECRET_FILE)).unwrap().len(), 96);
+        assert_eq!(std::fs::read(dir.join(CTOR_PUBLIC_FILE)).unwrap().len(), 64);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rewriting_the_keystore_changes_nothing() {
+        // Раскладка идёт на каждый запуск: файл могли удалить или испортить.
+        // Значит, повтор обязан быть тождественной операцией — иначе сервис
+        // однажды поднимется с другим адресом, и никто не поймёт почему.
+        let root = temp_root("keystore-twice");
+        let dir = root.join("узел.tor");
+        let key = OnionKey::from_seed([9u8; 32]);
+
+        write_onion_keystore(&dir, &key).unwrap();
+        let first = std::fs::read(dir.join(CTOR_SECRET_FILE)).unwrap();
+        write_onion_keystore(&dir, &key).unwrap();
+        let second = std::fs::read(dir.join(CTOR_SECRET_FILE)).unwrap();
+
+        assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_keystore_is_readable_only_by_its_owner() {
+        // arti проверяет права сам и отказывается читать открытое хранилище.
+        // Без явной установки права зависели бы от umask — то есть от того,
+        // как запущено приложение.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("keystore-mode");
+        let dir = root.join("узел.tor");
+        write_onion_keystore(&dir, &OnionKey::from_seed([9u8; 32])).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, KEY_DIR_MODE, "каталог с ключами открыт лишним");
+
+        let key_mode =
+            std::fs::metadata(dir.join(CTOR_SECRET_FILE)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(key_mode, KEY_FILE_MODE, "файл ключа открыт лишним");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_account_gets_its_own_tor_directory() {
+        // Общий каталог связал бы аккаунты там, где они обязаны быть
+        // не связаны: одно хранилище ключей — один сервис на всех.
+        let root = temp_root("tor-dirs");
+        let mut entropy = SeededEntropy::new(7);
+        let mut registry = Registry::open(&root).unwrap();
+        let first = registry.create(&mut entropy, "работа", 0).unwrap().id;
+        let second = registry.create(&mut entropy, "личное", 0).unwrap().id;
+
+        assert_ne!(registry.tor_path(&first), registry.tor_path(&second));
+        assert_eq!(registry.tor_path(&first), tor_path_beside(&registry.db_path(&first)));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -60,9 +60,10 @@ const HANDSHAKE_CLASS: SizeClass = SizeClass::S;
 ///
 /// [`Attempt::timeout_ms`] возвращает `None` для почты — её ответа ждать
 /// бессмысленно (§5.4). Но запись в очереди без таймера зависла бы навсегда,
-/// поэтому у прямых каналов таймаут есть всегда, а это значение — потолок
-/// из §5.4 на случай, если политика промолчит.
-const ONION_FALLBACK_TIMEOUT_MS: u64 = 45_000;
+/// поэтому у прямых каналов таймаут есть всегда, а это значение — то же,
+/// что вернула бы политика. Своего числа здесь нет намеренно: два срока
+/// ожидания ответа, живущие в разных файлах, однажды разойдутся.
+const ONION_FALLBACK_TIMEOUT_MS: u64 = ratatosk_proto::transport_policy::ONION_REPLY_TIMEOUT_MS;
 
 /// Сколько ждать, пока обнаружение (§5.1) ответит, есть ли собеседник в сети.
 ///
@@ -145,13 +146,10 @@ pub enum EngineError {
 // Теперь этот случай выражается статусом `DeliveryStatus::Undeliverable`,
 // а сообщение остаётся в истории.
 
-/// Сколько ждать чанк, прежде чем спросить заново (§10.2).
-///
-/// Сторожит **получатель**: у него есть всё, чтобы спросить, — список
-/// принятых чанков и точка возобновления. Без этого срока оборванная передача
-/// не возобновится никогда: отправитель ждёт подтверждения, получатель ждёт
-/// чанков, и оба правы.
-const FILE_STALL_MS: u64 = 10_000;
+// Срок молчания по файлу живёт в `proto::files`, а не здесь: он зависит
+// от транспорта (мебибайт по локальной сети и мебибайт через три реле Tor —
+// разные величины), и держать его рядом с размером чанка и окном честнее,
+// чем рядом с кодом, который его только заводит.
 
 /// Идущая исходящая передача файла (§10.2).
 ///
@@ -422,6 +420,25 @@ pub struct Engine<S: Store> {
     messages_since_compaction: u64,
     /// Правила уборки (§12).
     schedule: Schedule,
+    /// Своя карточка в том виде, в каком её последний раз объявили (§4.3).
+    ///
+    /// `None` — не объявляли ни разу, и карточка остаётся первой версии.
+    /// Хранится целиком, а не одной версией: без прежних адресов первое же
+    /// объявление после перезапуска выглядело бы изменением, и §4.3 стал бы
+    /// рассылкой на каждый старт процесса.
+    announced: Option<ContactCard>,
+    /// Кому текущая версия карточки уже досылалась в этом запуске (§4.3).
+    ///
+    /// В памяти, а не на диске, и это не забывчивость. На диске лежало бы
+    /// «мы отправили», а нужно «он получил», — а этого мы не знаем: квитанции
+    /// на `CardUpdate` протокол не предусматривает. Поэтому цена ошибки
+    /// выбрана в сторону лишнего кадра: после перезапуска каждый контакт
+    /// получит объявление ещё раз (двести байт при первом же рукопожатии),
+    /// зато адрес не потеряется молча.
+    ///
+    /// Обнуляется при смене карточки: прежние отправки к новой версии
+    /// отношения не имеют.
+    card_pushed: BTreeSet<[u8; 32]>,
 }
 
 impl<S: Store> Engine<S> {
@@ -460,6 +477,8 @@ impl<S: Store> Engine<S> {
             file_timers: BTreeMap::new(),
             messages_since_compaction: 0,
             schedule: Schedule::default(),
+            announced: None,
+            card_pushed: BTreeSet::new(),
         }
     }
 
@@ -489,7 +508,7 @@ impl<S: Store> Engine<S> {
             onion: self.addresses.onion.clone(),
             chatmail: self.addresses.chatmail.clone(),
             display_name: self.addresses.display_name.clone(),
-            version: 1,
+            version: self.announced.as_ref().map_or(1, |card| card.version),
         }
     }
 
@@ -604,7 +623,16 @@ impl<S: Store> Engine<S> {
     fn on_command(&mut self, now_ms: u64, command: Command) -> Result<Vec<Effect>, EngineError> {
         match command {
             Command::AddContact { card_bytes, met_in_person } => {
-                self.add_contact(now_ms, &card_bytes, met_in_person)
+                // Разбор дважды — здесь и внутри — нарочно: `add_contact`
+                // зовут ещё из трёх мест, и возвращать оттуда ключ ради
+                // одного вызывающего значит усложнить три ветки вместо одной.
+                let peer_ik = ContactCard::decode(&card_bytes)?.value().ik;
+                let mut effects = self.add_contact(now_ms, &card_bytes, met_in_person)?;
+                // Ссылку могли скопировать до того, как поднялся onion:
+                // тогда в ней пустой адрес, и без досылки собеседник узнает
+                // наш только случайно (§4.3).
+                effects.extend(self.push_own_card(now_ms, peer_ik)?);
+                Ok(effects)
             }
             Command::MarkVerified { peer_ik } => {
                 self.contacts.get_mut(&peer_ik).ok_or(EngineError::UnknownPeer)?.verified = true;
@@ -687,6 +715,9 @@ impl<S: Store> Engine<S> {
             }
             Command::AcceptFile { file_id } => self.on_accept_file(now_ms, file_id),
             Command::DeclineFile { file_id } => self.on_decline_file(file_id),
+            Command::AnnounceAddresses { onion, chatmail } => {
+                self.on_announce_addresses(now_ms, onion, chatmail)
+            }
             Command::ShareContact { chat, peer_ik } => self.on_share_contact(now_ms, chat, peer_ik),
             Command::AddSharedContact { msg_id } => self.on_add_shared_contact(now_ms, msg_id),
             Command::SetAutoAcceptBytes(limit) => {
@@ -787,6 +818,27 @@ impl<S: Store> Engine<S> {
         // принимать всё подряд. Пустое значение означает «спрашивать всегда»
         // — это выбор, а не отсутствие настройки, поэтому и хранится он
         // отдельно от «ключа нет вовсе».
+        // Своя карточка в том виде, в каком её объявляли (§4.3). Отсюда
+        // берутся и версия, и адреса: без адресов первое же объявление после
+        // старта выглядело бы изменением, а на телефоне стартов много.
+        //
+        // Имя из записи **не** восстанавливается: его задаёт клиент при
+        // открытии, и человек мог переименоваться между запусками. Разойдись
+        // они — следующее объявление это заметит и разошлёт новую карточку.
+        //
+        // Испорченная запись читается как отсутствующая: отказ открыть базу
+        // из-за одной служебной строки хуже, чем карточка первой версии,
+        // которую вылечит следующее объявление.
+        if let Some(card) = self
+            .store
+            .meta(ratatosk_store::META_SELF_CARD)?
+            .and_then(|raw| ContactCard::decode(&raw).ok().map(|decoded| decoded.into_parts().1))
+        {
+            self.addresses.onion.clone_from(&card.onion);
+            self.addresses.chatmail.clone_from(&card.chatmail);
+            self.announced = Some(card);
+        }
+
         self.auto_accept = match self.store.meta(ratatosk_store::META_AUTO_ACCEPT)? {
             Some(raw) if raw.is_empty() => None,
             Some(raw) => <[u8; 8]>::try_from(raw.as_slice())
@@ -1020,8 +1072,9 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
 
-        // Транспорт выбирается не политикой §5.4, а наличием прямой сессии:
-        // квитанция не начинает рукопожатие и не уходит почтой.
+        // Прямой канал, а не очередь §5.4: квитанция не начинает рукопожатие
+        // и не уходит почтой. Но и не мимо §5.4 — какой из прямых каналов
+        // сейчас годен, решает та же лестница, см. `direct_channel`.
         let Some(via) = self.direct_channel(&peer_ik) else {
             return Ok(Vec::new());
         };
@@ -1421,6 +1474,174 @@ impl<S: Store> Engine<S> {
         })
     }
 
+    /// Адреса устройства изменились — сказать об этом контактам (§4.3).
+    ///
+    /// **Всем сразу, а не тому, кто спросит.** Устройство не знает, какую
+    /// версию карточки помнит каждый: карточка расходится по QR, ссылкам
+    /// и пересылкам, и обратной связи в этом канале нет. Обновление уходит
+    /// каждому контакту отдельной доставкой, дальше §5.4 разбирается сам,
+    /// а тем, кого сейчас нет в сети, оно ждёт в очереди наравне с текстом.
+    ///
+    /// **Тот же адрес — ничего не происходит.** Иначе каждый подъём Tor
+    /// поднимал бы версию и рассылал обновление всем, а на телефоне подъём
+    /// случается при каждом возвращении сети.
+    ///
+    /// Записью в истории не становится: адрес — свойство устройства,
+    /// а не сообщение человеку. В чате показывать нечего.
+    fn on_announce_addresses(
+        &mut self,
+        now_ms: u64,
+        onion: String,
+        chatmail: String,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Сравнивается с **объявленным**, а не с текущим состоянием в памяти:
+        // после перезапуска адреса подняты с диска именно оттуда, и повтор
+        // того же объявления обязан остаться бесплатным.
+        //
+        // Имя тоже участвует: карточка везёт его целиком, и человек,
+        // переименовавшийся между запусками, иначе остался бы для контактов
+        // под прежним именем навсегда.
+        let unchanged = self.announced.as_ref().is_some_and(|last| {
+            last.onion == onion
+                && last.chatmail == chatmail
+                && last.display_name == self.addresses.display_name
+        });
+        if unchanged {
+            return Ok(Vec::new());
+        }
+
+        self.addresses.onion = onion;
+        self.addresses.chatmail = chatmail;
+
+        let version = self.announced.as_ref().map_or(1, |last| last.version) + 1;
+        let card = ContactCard { version, ..self.own_card() };
+
+        // Байты считаются один раз и служат трижды: их подписывают, их
+        // отправляют, их же кладут на диск. §6 требует, чтобы проверяемое
+        // проверялось над принятым представлением, и три разных вычисления
+        // «того же самого» — способ однажды получить три разных ответа.
+        let bytes = card.encode()?;
+        let signature = self.identity.sign(&bytes);
+
+        // Запись — до рассылки. Разослать и не сохранить значит после
+        // перезапуска выдать ту же версию второй раз: у получателей она
+        // уже не «строго больше», и следующая смена адреса до них не доедет.
+        self.store.put_meta(ratatosk_store::META_SELF_CARD, &bytes)?;
+        self.announced = Some(card);
+
+        let payload = ratatosk_proto::card_update::payload(&bytes, &signature);
+        let recipients: Vec<[u8; 32]> = self.contacts.keys().copied().collect();
+        // Версия сменилась — значит всё, что досылалось раньше, относилось
+        // к прежней карточке и больше ничего не значит.
+        self.card_pushed.clear();
+        let mut effects = Vec::new();
+        for peer_ik in recipients {
+            self.card_pushed.insert(peer_ik);
+            effects.extend(self.enqueue_request(
+                now_ms,
+                peer_ik,
+                PayloadType::CardUpdate,
+                payload.clone(),
+            )?);
+        }
+        Ok(effects)
+    }
+
+    /// Досылает свою карточку одному контакту (§4.3).
+    ///
+    /// Дыра, которую это закрывает, видна только на двух устройствах, и она
+    /// не в протоколе, а в том, **когда** мы им пользуемся.
+    /// [`Engine::on_announce_addresses`] рассылает обновление тем контактам,
+    /// которые есть на момент объявления, — и на этом останавливается. Дальше
+    /// возможны три случая, и во всех трёх собеседник остаётся без адреса:
+    ///
+    /// * контакт добавлен **после** объявления — рассылка его не застала;
+    /// * ссылка на карточку скопирована до объявления — в ней пустой `onion`,
+    ///   а повторное объявление того же адреса бесплатно (и потому молчит);
+    /// * контакт добавлен заново после перезапуска — `announced` поднят
+    ///   с диска, объявлять нечего, рассылки нет.
+    ///
+    /// Карточка едет и в первом сообщении рукопожатия (§8.2), но там она
+    /// применяется, только если контакт ещё не заведён: менять адреса уже
+    /// известного человека кадром без подписи нельзя. Значит, единственный
+    /// путь для нового адреса — подписанный `CardUpdate`, и досылать его надо
+    /// самим.
+    ///
+    /// Момент выбран самый ранний из возможных — установление сессии
+    /// и добавление контакта: раньше кадр всё равно некуда деть.
+    fn push_own_card(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Не объявляли ничего — и досылать нечего: у собеседника карточка
+        // первой версии, ровно та же, что у нас.
+        let Some(card) = self.announced.as_ref() else { return Ok(Vec::new()) };
+        if !self.contacts.contains_key(&peer_ik) {
+            return Ok(Vec::new());
+        }
+        // Второй раз одному и тому же в одном запуске — впустую: `Stale`
+        // на той стороне (§4.3) и лишний кадр на этой.
+        if !self.card_pushed.insert(peer_ik) {
+            return Ok(Vec::new());
+        }
+
+        // Байты пересобираются, а не берутся с диска, и это то же самое:
+        // CBOR детерминированный (§6), подпись Ed25519 — тоже.
+        let bytes = card.encode()?;
+        let signature = self.identity.sign(&bytes);
+        let payload = ratatosk_proto::card_update::payload(&bytes, &signature);
+        self.enqueue_request(now_ms, peer_ik, PayloadType::CardUpdate, payload)
+    }
+
+    /// Собеседник сменил адреса (§4.3).
+    ///
+    /// Проверки — в `ratatosk_proto::card_update`, и там же объяснено, почему
+    /// их пять и почему именно в таком порядке. Здесь остаётся то, что нельзя
+    /// проверить без состояния: обновление о неизвестном человеке применять
+    /// некуда, и это не ошибка — контакт могли удалить, пока кадр ехал.
+    ///
+    /// **Сверка (§4.2) переживает обновление.** `IK` и `SK` не изменились —
+    /// значит, отпечаток тот же, значит, сверять заново нечего. Сбрасывать
+    /// признак при каждой смене адреса значило бы просить человека звонить
+    /// собеседнику всякий раз, когда у того поднялся Tor, — и приучить его
+    /// подтверждать не глядя.
+    ///
+    /// **Локальное имя тоже остаётся.** Это подпись пользователя о своём
+    /// отношении, и обновление с той стороны её не касается.
+    fn on_card_update(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(known) = self.contacts.get(&peer_ik) else { return Ok(Vec::new()) };
+
+        let card =
+            match ratatosk_proto::card_update::accept(&envelope.payload, &peer_ik, &known.card) {
+                Ok(card) => card,
+                // Повтор старого — обычное дело: обновление ушло всем сразу,
+                // а пути у §5.4 разной длины. Тишина, а не счётчик аномалий.
+                Err(ratatosk_proto::card_update::UpdateError::Stale) => return Ok(Vec::new()),
+                Err(_) => {
+                    self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+            };
+
+        let Some(contact) = self.contacts.get_mut(&peer_ik) else { return Ok(Vec::new()) };
+        contact.availability.has_onion = !card.onion.is_empty();
+        contact.availability.has_chatmail = !card.chatmail.is_empty();
+        contact.card = card;
+        self.persist_contact(&peer_ik, now_ms)?;
+
+        // Появившийся адрес — это появившийся путь. Сообщения, которым
+        // некуда было ехать, ждали именно этого (§5.4).
+        let mut effects = vec![Effect::Notify(Event::ContactChanged { peer_ik })];
+        effects.extend(self.retry_deferred(Some(peer_ik))?);
+        Ok(effects)
+    }
+
     /// Пришла карточка третьего человека.
     ///
     /// Ложится в историю записью и **ничего не меняет**: ни контактов,
@@ -1493,7 +1714,12 @@ impl<S: Store> Engine<S> {
             // Уже знаем. Молча и без изменений — см. выше про подмену адресов.
             return Ok(Vec::new());
         }
-        self.add_contact(now_ms, &share.card_bytes, false)
+        let peer_ik = share.ik;
+        let mut effects = self.add_contact(now_ms, &share.card_bytes, false)?;
+        // Присланная третьим человеком карточка тем более может быть старой:
+        // она ехала через чужое устройство и чужую очередь.
+        effects.extend(self.push_own_card(now_ms, peer_ik)?);
+        Ok(effects)
     }
 
     /// Человек согласился принять файл.
@@ -1555,7 +1781,7 @@ impl<S: Store> Engine<S> {
             PayloadType::FileRequest,
             ratatosk_proto::files::request_payload(file.file_id, next, stalled),
         )?;
-        effects.extend(self.watch_for_stall(file.file_id));
+        effects.extend(self.watch_for_stall(file.file_id, via));
         Ok(effects)
     }
 
@@ -1564,13 +1790,13 @@ impl<S: Store> Engine<S> {
     /// Без него оборванная передача не возобновится никогда: отправитель ждёт
     /// подтверждения, получатель ждёт чанков, и оба правы. Срок сторожит
     /// получатель — у него есть всё, чтобы спросить заново.
-    fn watch_for_stall(&mut self, file_id: FileId) -> Vec<Effect> {
+    fn watch_for_stall(&mut self, file_id: FileId, via: Transport) -> Vec<Effect> {
         let token = self.allocate_timer();
         // Прежняя метка забывается, а не снимается: отменить уже поставленный
         // таймер драйверу нечем, но сработавшая метка, которой здесь больше
         // нет, ничего не делает. Живой срок у файла всегда один.
         self.file_timers.insert(file_id, token);
-        vec![Effect::SetTimer { after_ms: FILE_STALL_MS, token }]
+        vec![Effect::SetTimer { after_ms: ratatosk_proto::files::stall_ms(via), token }]
     }
 
     /// Отправляет служебный кадр файла — просьбу или чанк.
@@ -1776,6 +2002,7 @@ impl<S: Store> Engine<S> {
     fn on_file_chunk(
         &mut self,
         now_ms: u64,
+        via: Transport,
         peer_ik: [u8; 32],
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -1837,7 +2064,7 @@ impl<S: Store> Engine<S> {
         if received % files::ACK_EVERY == 0 {
             effects.extend(self.ask_for_file(now_ms, &file, false)?);
         } else {
-            effects.extend(self.watch_for_stall(file_id));
+            effects.extend(self.watch_for_stall(file_id, via));
         }
         Ok(effects)
     }
@@ -2413,9 +2640,31 @@ impl<S: Store> Engine<S> {
     /// в письме — это удвоение трафика и метаданных у сервера ради картинки
     /// в профиле. И рукопожатия ради неё тоже не начинаем.
     fn direct_channel(&self, peer_ik: &[u8; 32]) -> Option<Transport> {
-        [Transport::Lan, Transport::Onion]
-            .into_iter()
-            .find(|t| self.sessions.for_peer(peer_ik, *t).is_some())
+        // Спрашивается §5.4, а не перебирается список руками, и это
+        // исправление ошибки, которая выглядела так: сообщения через onion
+        // ходят, а файлы не идут — доезжает только само сообщение с превью.
+        //
+        // Прежний перебор `[Lan, Onion]` смотрел ровно на одно: есть ли
+        // сессия. Сессия же переживает и выключение локальной сети, и уход
+        // собеседника из неё, — она не про доступность, а про ключи. Поэтому
+        // после `/lan` выключенного (или просто после ухода из общей сети)
+        // у файлов оставался «прямой канал» LAN, которого нет: просьба
+        // о чанках уезжала в мёртвый транспорт, срок молчания (§10.2)
+        // спрашивал заново — и снова туда же, вечно.
+        //
+        // Сообщения при этом ходили, потому что они идут очередью §5.4,
+        // а та про выключенный LAN знает. Разошлись два пути выбора
+        // транспорта — разошлось и поведение.
+        let availability = self.availability_of(peer_ik).ok()?;
+        let mut attempt = Attempt::new();
+        while let Some(Decision::Use(transport)) = attempt.next(availability) {
+            // Почта сюда не годится по устройству: чанки идут мимо очереди
+            // доставки, а §9.4 у почты не обещает даже «отправлено».
+            if transport.is_direct() && self.sessions.for_peer(peer_ik, transport).is_some() {
+                return Some(transport);
+            }
+        }
+        None
     }
 
     /// Ставит или снимает свою аватарку и рассылает её сверенным контактам.
@@ -3114,6 +3363,10 @@ impl<S: Store> Engine<S> {
         // отправлять по ней нечего. Сверенному контакту уедет лицо, всем
         // остальным — ничего (§4.2).
         effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
+        // Карточка из первого сообщения (§8.2) применяется только к новому
+        // контакту, и у собеседника — то же правило. Значит, наш адрес
+        // до него доедет только подписанным обновлением (§4.3).
+        effects.extend(self.push_own_card(now_ms, peer_ik)?);
         effects.extend(self.resume_files(now_ms, peer_ik)?);
         Ok(effects)
     }
@@ -3151,6 +3404,9 @@ impl<S: Store> Engine<S> {
 
         let mut effects = self.flush_outbox(peer_ik)?;
         effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
+        // Мы звали — значит карточка уехала в первом сообщении. Но если
+        // собеседник уже знал нас, он её отбросил: см. `push_own_card`.
+        effects.extend(self.push_own_card(now_ms, peer_ik)?);
         // Сессия есть — значит связь работает. То, что не уехало раньше,
         // получает свой шанс здесь.
         effects.extend(self.retry_deferred(Some(peer_ik))?);
@@ -3708,7 +3964,7 @@ impl<S: Store> Engine<S> {
             // показать его нечем: молча пропускаем (§9.1).
             PayloadType::Unknown(_) => Ok(Vec::new()),
             PayloadType::FileOffer => self.on_file_offer(now_ms, via, peer_ik, &envelope),
-            PayloadType::FileChunk => self.on_file_chunk(now_ms, peer_ik, &envelope),
+            PayloadType::FileChunk => self.on_file_chunk(now_ms, via, peer_ik, &envelope),
             PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
             PayloadType::ContactShare => self.on_contact_share(now_ms, via, peer_ik, &envelope),
             // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
@@ -3744,7 +4000,7 @@ impl<S: Store> Engine<S> {
             PayloadType::GroupMembership | PayloadType::SenderKey => {
                 todo!("этап 5: группы (§11)")
             }
-            PayloadType::CardUpdate => todo!("этап 2: обновление карточки (§4.3)"),
+            PayloadType::CardUpdate => self.on_card_update(now_ms, peer_ik, &envelope),
         }
     }
 }

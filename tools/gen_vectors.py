@@ -53,9 +53,10 @@ FILE = "ratatosk v0 file"
 SENDER_CHAIN = "ratatosk v0 sender-chain"
 SENDER_MSG = "ratatosk v0 sender-msg"
 SEARCH_TOKEN = "ratatosk v0 search-token"
+DEVICE_KEY = "ratatosk v0 device-key"
 
 ALL_CONTEXTS = [IK, SK, BEACON, SESSION_ID, ROOT, CHAIN_A, CHAIN_B, MSG,
-                CHAIN, FILE, SENDER_CHAIN, SENDER_MSG, SEARCH_TOKEN]
+                CHAIN, FILE, SENDER_CHAIN, SENDER_MSG, SEARCH_TOKEN, DEVICE_KEY]
 
 # --- входные данные ---------------------------------------------------------
 #

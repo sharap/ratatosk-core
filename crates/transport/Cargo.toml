@@ -28,6 +28,18 @@ tracing.workspace = true
 # без arti, а сборка ядра под CI не тянет полстека Tor ради проверки логики.
 arti-client = { workspace = true, optional = true }
 tor-rtcompat = { workspace = true, optional = true }
+# Прямо, а не через переэкспорты arti-client: путь до `HsNickname`,
+# `KeystoreId` и `Connected` не должен зависеть от того, что именно
+# arti решил переэкспортировать в этой версии.
+tor-hsservice = { workspace = true, optional = true }
+tor-keymgr = { workspace = true, optional = true }
+tor-cell = { workspace = true, optional = true }
+# Разобранный запрос входящего потока (`IncomingStreamRequest`) живёт здесь,
+# а не в `tor-cell`: это уже не сырая ячейка.
+tor-proto = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+# Выбор криптопровайдера rustls — см. пояснение в общем манифесте.
+rustls = { workspace = true, optional = true }
 tokio-socks = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
@@ -36,6 +48,24 @@ mdns-sd = { workspace = true, optional = true }
 [features]
 default = ["onion", "chatmail", "lan"]
 onion = ["dep:arti-client", "dep:tor-rtcompat"]
+# Живая интеграция с arti. **Не в `default` намеренно**: API arti 0.x
+# проверяется только сборкой, и пока он не сошёлся, остальное дерево
+# обязано оставаться зелёным. Переедет в `default`, когда
+# `cargo check -p ratatosk-transport --features onion-arti` пройдёт чисто.
+onion-arti = [
+    "onion",
+    # Без этого признака arti собирается **без поддержки ctor-хранилищ**
+    # и отвергает конфиг словами `NoCompileTimeSupport`. Он объявлен здесь,
+    # а не в общем списке признаков arti-client, чтобы сборка без живого
+    # Tor не тащила лишний код.
+    "arti-client/ctor-keystore",
+    "dep:tor-hsservice",
+    "dep:tor-keymgr",
+    "dep:tor-cell",
+    "dep:tor-proto",
+    "dep:futures",
+    "dep:rustls",
+]
 chatmail = ["dep:async-imap", "dep:async-smtp", "dep:tokio-socks"]
 lan = ["dep:mdns-sd"]
 

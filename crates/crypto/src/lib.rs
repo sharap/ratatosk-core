@@ -13,6 +13,7 @@
 //! | [`labels`] | контексты деривации, все сразу |
 //! | [`kdf`] | §8.1, обёртка над `BLAKE3::derive_key` |
 //! | [`identity`] | §3 идентичность, отпечаток, §5.1 маяк LAN |
+//! | [`onion`] | §3 `onion_key`, §5.2 адрес сервиса |
 //! | [`aead`] | §7.2 запечатывание кадра |
 //! | [`file`] | §10.1 ключи и запечатывание чанков файла |
 //! | [`handshake`] | §8.2 Noise IK, §8.3 сессия, §8.5 перерукопожатие |
@@ -34,6 +35,7 @@ pub mod handshake;
 pub mod identity;
 pub mod kdf;
 pub mod labels;
+pub mod onion;
 pub mod ratchet;
 pub mod storage_key;
 
@@ -45,3 +47,4 @@ pub use handshake::{
 };
 pub use identity::{Identity, PublicIdentity};
 pub use kdf::Key32;
+pub use onion::OnionKey;

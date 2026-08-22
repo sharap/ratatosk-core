@@ -10,6 +10,19 @@
 //! * [`onion`] — встроенный arti, onion-сервис v3 (§5.2);
 //! * [`chatmail`] — SMTP/IMAP поверх SOCKS-прокси arti (§5.3).
 //!
+//! Работают они не по очереди, а вместе: [`multi::Transports`] сводит все три
+//! под одну ручку, потому что §5.4 — это лестница, а лестница из одной
+//! ступени не лестница. Драйвер при этом по-прежнему держит один раннер.
+//!
+//! Транспорт, который ещё поднимается, — [`deferred::Deferred`]: bootstrap
+//! Tor идёт десятки секунд, а открытие аккаунта обязано быть мгновенным,
+//! и всё это время onion честно отказывает.
+//!
+//! Кадрирование у LAN и onion общее и живёт в `link`: они отличаются только
+//! тем, чем открыт поток, а две полосы записи (мелкие кадры вперёд чанков)
+//! нужны обоим — на onion даже сильнее, потому что мебибайт уходит туда
+//! секундами, а не миллисекундами.
+//!
 //! Единственная внешняя инфраструктура — публичные chatmail-серверы (§1).
 //! Своих мы не пишем и не держим.
 
@@ -17,9 +30,14 @@
 #![warn(missing_docs)]
 
 pub mod chatmail;
+pub mod deferred;
 pub mod lan;
+mod link;
+pub mod multi;
 pub mod onion;
 pub mod runner;
 
+pub use deferred::Deferred;
 pub use lan::{LanConfig, LanDirectory, LanRunner};
+pub use multi::{Disabled, Transports};
 pub use runner::{PeerAddress, Runner, TransportCommand, TransportError, TransportEvent};

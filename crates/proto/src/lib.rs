@@ -8,6 +8,7 @@
 //! | Модуль | Раздел спецификации |
 //! |---|---|
 //! | [`transport_policy`] | §5.4 выбор транспорта, запрет смешивать LAN и Tor |
+//! | [`card_update`] | §4.3 обновление адресов, подписанное `SK` |
 //! | [`session`] | §7.3 маршрутизация приёма, §8.3 реестр сессий |
 //! | [`fragment`] | §9.3 фрагментация и сборка с пределами |
 //! | [`receipts`] | §9.4 квитанции только прямым каналом |
@@ -24,6 +25,7 @@
 #![warn(missing_docs)]
 
 pub mod avatar;
+pub mod card_update;
 pub mod contact_share;
 pub mod edit;
 pub mod files;
@@ -38,6 +40,7 @@ pub mod session;
 pub mod transport_policy;
 
 pub use avatar::{AvatarError, MAX_AVATAR_BYTES};
+pub use card_update::UpdateError;
 pub use edit::{EditError, MAX_EDIT_AGE_MS};
 pub use forward::MAX_FORWARD_IDS;
 pub use fragment::Reassembler;

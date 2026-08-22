@@ -27,5 +27,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+# Живой Tor. **Не по умолчанию**: транспорт написан по документации arti
+# и проверяется отдельной сборкой; пока он не включён, onion честно
+# отказывает, а §5.4 переходит к следующей ступени.
+tor = ["ratatosk-transport/onion-arti"]
+
 [lints.rust]
 unsafe_code = "forbid"

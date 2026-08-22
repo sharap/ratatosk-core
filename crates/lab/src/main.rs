@@ -16,28 +16,56 @@
 //! # обменяться напечатанными карточками через /add <карточка>
 //! ```
 //!
+//! Порядок с onion такой: `/onion` на обеих машинах, потом `/card` — и уже
+//! эту строку копировать. Карточка, скопированная до `/onion`, везёт пустой
+//! адрес; ядро дошлёт настоящий при первой же связи (§4.3), но проверять
+//! Tor на догоняющем обновлении вместо карточки — лишний повод запутаться.
+//!
 //! Обнаружение через mDNS работает не везде: мультикаст режут и гостевой
 //! Wi-Fi, и часть корпоративных сетей. Поэтому есть `/addr` — вписать адрес
 //! руками. Передача и обнаружение проверяются по отдельности намеренно:
 //! иначе неудача не отличима от «сеть не пропускает mDNS».
 
+// Предел глубины запросов компилятора поднят намеренно.
+//
+// `#[tokio::main]` заворачивает всё в одно будущее, и в нём вложены друг
+// в друга `run_persistent` → `run` → `console` вместе с подъёмом Tor.
+// Вычисление раскладки такого типа упирается в умолчание (128), и rustc
+// сам предлагает поднять предел. На поведение это не влияет: речь про
+// глубину анализа при сборке, а не про рекурсию в работе.
+#![recursion_limit = "512"]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use data_encoding::BASE64URL_NOPAD;
+use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
 use ratatosk_codec::ContactCard;
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
 use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
-use ratatosk_crypto::Identity;
+use ratatosk_crypto::{Identity, OnionKey};
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
-use ratatosk_transport::{LanConfig, LanDirectory, LanRunner};
+#[cfg(feature = "tor")]
+use ratatosk_transport::Deferred;
+use ratatosk_transport::{Disabled, LanConfig, LanDirectory, LanRunner, Transports};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Args {
     name: String,
     port: u16,
     discovery: bool,
+    /// Работать ли по локальной сети (§5.1).
+    ///
+    /// Выключается ключом `--no-lan`, и это единственный способ проверить
+    /// onion честно: LAN — первая ступень §5.4, и пока она работает,
+    /// до второй дело не доходит.
+    lan: bool,
+    /// Не проверять права на каталоги Tor (`--trust-fs`).
+    ///
+    /// Нужно там, где `fs-mistrust` отвергает заведомо безопасный путь:
+    /// каталог внутри контейнера, домашний каталог с необычными правами.
+    /// На своей машине включать незачем.
+    trust_fs: bool,
     data: Option<PathBuf>,
     pin: Option<String>,
     /// Каталог с несколькими аккаунтами (§3, дополнение).
@@ -51,6 +79,8 @@ fn parse_args() -> Args {
         name: "узел".to_owned(),
         port: 0,
         discovery: true,
+        lan: true,
+        trust_fs: false,
         data: None,
         pin: None,
         accounts: None,
@@ -62,6 +92,8 @@ fn parse_args() -> Args {
             "--name" => args.name = argv.next().unwrap_or_default(),
             "--port" => args.port = argv.next().and_then(|p| p.parse().ok()).unwrap_or(0),
             "--no-mdns" => args.discovery = false,
+            "--no-lan" => args.lan = false,
+            "--trust-fs" => args.trust_fs = true,
             "--data" => args.data = argv.next().map(PathBuf::from),
             "--pin" => args.pin = argv.next(),
             "--accounts" => args.accounts = argv.next().map(PathBuf::from),
@@ -74,7 +106,18 @@ fn parse_args() -> Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_env_filter("ratatosk=debug").init();
+    // Фильтр берётся из `RUST_LOG`, а умолчание включает и arti.
+    //
+    // Прежнее умолчание («ratatosk=debug») скрывало журнал Tor целиком —
+    // и вопрос «поднимается или уже нет» оставался без ответа при полном
+    // молчании в консоли. Свой журнал у arti подробный и внятный; прятать
+    // его от того, кто отлаживает сеть, незачем.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        "ratatosk=debug,arti_client=info,tor_dirmgr=info,tor_guardmgr=info,\
+         tor_circmgr=info,tor_chanmgr=info,tor_hsservice=info"
+            .to_owned()
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let mut args = parse_args();
 
     // Каталог аккаунтов сводится к пути базы: дальше всё работает как
@@ -130,8 +173,15 @@ async fn run_ephemeral(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = MemoryStore::new();
     store.migrate()?;
     let identity = Identity::generate();
+    // Ключ onion-сервиса тоже на один запуск: адрес нужен команде `/onion`,
+    // а постоянство адреса проверяется на дисковом хранилище.
+    let onion = OnionKey::generate();
     println!("хранилище: в памяти — перезапуск сотрёт личность и историю");
-    run(args, identity, store).await
+    // Без каталога: поднимать Tor на одноразовом ключе незачем — адрес
+    // всё равно исчезнет вместе с процессом, а bootstrap стоит десятков
+    // секунд. Команда `/onion` при этом работает: она проверяет §4.3,
+    // а не сеть.
+    run(args, identity, store, onion, None).await
 }
 
 /// Хранилище на диске: личность и переписка переживают перезапуск.
@@ -142,20 +192,46 @@ async fn run_persistent(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Тот же путь, которым идёт клиент через UniFFI: политика ключей одна
     // на всех, иначе стенд проверял бы не то, что поедет пользователю.
-    let (mut store, db_key) = vault::open_encrypted(&path, Some(&pin))?;
+    let (mut store, db_key) = vault::open_encrypted(&path, vault::Unlock::Pin(&pin))?;
 
     // Порядок важен: сначала личность, потом всё остальное. Сгенерировать
     // её поверх существующего зерна значит выбросить устройство целиком.
     let identity = vault::load_or_create(&mut store, &db_key)?;
+
+    // Ключ onion-сервиса заводится здесь же и тем же `db_key`, но отдельной
+    // записью: §3 выводит его независимо от зерна, и резервная фраза его
+    // не возвращает. Адрес печатается ради проверки руками — перезапуск
+    // обязан дать ту же строку. В карточку он при этом не попадает: сервиса
+    // ещё нет, а обещать адрес, который никто не слушает, §14 запрещает.
+    let onion = vault::load_or_create_onion(&mut store, &db_key)?;
+
+    // Раскладка ключа в каталог, который читает arti (§5.2). Делается на
+    // каждый запуск: файл могли удалить или перенести базу без него, а молча
+    // поднявшийся сервис с другим адресом хуже, чем перезапись того же.
+    //
+    // Проверить руками стоит именно здесь: содержимое каталога видно `ls`,
+    // и `hostname` обязан совпасть с напечатанным адресом.
+    let layout = ratatosk_core::TorLayout::beside(&path);
+    ratatosk_core::write_onion_keystore(&layout.keys, &onion)?;
+
     println!("хранилище: {}", path.display());
-    run(args, identity, store).await
+    // «Посчитан», а не «onion»: это предсказание из нашего ключа, а сервис
+    // назовёт свой. Совпасть они обязаны, и пока это подписано как факт,
+    // расхождение никто не заметит — см. `/tor`.
+    println!("посчитан : {}", onion.address());
+    println!("ключи    : {}", layout.keys.display());
+    println!("состояние: {}", layout.state.display());
+    run(args, identity, store, onion, Some(layout)).await
 }
 
 async fn run<S: Store + 'static>(
     args: &Args,
     identity: Identity,
     store: S,
+    onion: OnionKey,
+    layout: Option<ratatosk_core::TorLayout>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let onion_address = onion.address();
     // Адреса onion и chatmail намеренно пустые: этот стенд проверяет LAN,
     // а §5.4 с непустыми адресами увёл бы доставку на транспорты, которых
     // ещё нет, — и отказ выглядел бы как отказ локальной сети.
@@ -178,14 +254,59 @@ async fn run<S: Store + 'static>(
     let card = BASE64URL_NOPAD.encode(&engine.own_card().encode()?);
     let fingerprint = engine.fingerprint();
 
-    let config = LanConfig { enabled: true, port: args.port, discovery: args.discovery };
-    let runner = LanRunner::start(config, engine.own_card().ik).await?;
-    let port = runner.port();
-    let directory = runner.directory();
+    let config = LanConfig { enabled: args.lan, port: args.port, discovery: args.discovery };
+    let lan = LanRunner::start(config, engine.own_card().ik).await?;
+    let port = lan.port();
+    let directory = lan.directory();
+
+    // С признаком `tor` и дисковым хранилищем стенд поднимает настоящий
+    // onion — в фоне, как это делает клиент: bootstrap идёт десятки секунд,
+    // а команды со stdin обязаны работать сразу.
+    #[cfg(feature = "tor")]
+    let runner = {
+        // Оба случая дают **один тип**: без каталога подъём сразу
+        // объявляется неудавшимся. Так стенд с хранилищем в памяти
+        // не поднимает Tor на одноразовом ключе — адрес всё равно исчез бы
+        // вместе с процессом, — но составной раннер остаётся тем же.
+        let trust_fs = args.trust_fs;
+        let onion = Deferred::rising(|progress| async move {
+            let Some(layout) = layout else {
+                return Err(ratatosk_transport::TransportError::Unavailable);
+            };
+            ratatosk_transport::onion::arti::OnionRunner::start(
+                ratatosk_transport::onion::arti::OnionSetup {
+                    state_dir: &layout.state,
+                    cache_dir: &layout.cache,
+                    keystore_dir: &layout.keys,
+                    key: &onion,
+                    dangerously_trust_filesystem: trust_fs,
+                },
+                progress,
+            )
+            .await
+        });
+        Transports::new(lan, onion, Disabled)
+    };
+    #[cfg(not(feature = "tor"))]
+    let runner = {
+        // Без признака onion и почта — [`Disabled`]: честный отказ, а не
+        // молчаливый успех. Ровно это увидит §5.4 и перейдёт к следующей
+        // ступени.
+        let _ = (&layout, &onion);
+        Transports::new(lan, Disabled, Disabled)
+    };
 
     println!("узел     : {}", args.name);
     println!("отпечаток: {fingerprint}");
     println!("порт     : {port}");
+    println!(
+        "сеть     : {}",
+        if args.lan {
+            "LAN включена — она первая ступень §5.4; выключить: /lan"
+        } else {
+            "LAN выключена (--no-lan) — доставка пойдёт через onion"
+        }
+    );
     if known > 0 {
         println!("контакты : {known} поднято с диска — /who");
     }
@@ -200,8 +321,11 @@ async fn run<S: Store + 'static>(
     println!("если mDNS в вашей сети не работает, допишите через пробел адрес");
     println!("этой машины: /add <карточка> 192.168.1.5:{port}");
     println!();
+    println!("строка выше — снимок на момент старта. После /onion карточка");
+    println!("меняется, и свежую печатает /card — копировать нужно её.");
+    println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /who   /net   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -211,7 +335,7 @@ async fn run<S: Store + 'static>(
     // §5.1: LAN выключен по умолчанию. Стенд включает его явно — ровно так же,
     // как это должен будет сделать пользователь в UI. Команда идёт первой:
     // она проставляет `lan_enabled` уже поднятым с диска контактам.
-    handle.send(Command::SetLanEnabled(true)).await.ok();
+    handle.send(Command::SetLanEnabled(args.lan)).await.ok();
 
     tokio::select! {
         result = driver.run() => {
@@ -219,7 +343,7 @@ async fn run<S: Store + 'static>(
                 eprintln!("ядро остановилось: {error}");
             }
         }
-        () = console(handle, events, directory, own_ik) => {}
+        () = console(handle, events, directory, own_ik, onion_address, args.lan) => {}
     }
     Ok(())
 }
@@ -230,7 +354,14 @@ async fn console(
     mut events: EventStream,
     directory: LanDirectory,
     own_ik: [u8; 32],
+    // Свой onion-адрес — для команды `/onion` (§4.3).
+    onion_address: String,
+    // Включена ли сейчас локальная сеть; переключается командой `/lan`.
+    mut lan_on: bool,
 ) {
+    // Последняя новость о Tor — для команды `/tor`. Именно последняя,
+    // а не все: новости о подъёме это состояние, а не история.
+    let mut tor: Option<String> = None;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut peer: Option<[u8; 32]> = None;
 
@@ -311,6 +442,85 @@ async fn console(
                             swept.files, swept.chunks, swept.bytes
                         ),
                         None => return,
+                    }
+                    continue;
+                }
+                if line == "/card" {
+                    // Карточка спрашивается у ядра, а не берётся из снимка,
+                    // сделанного при старте. Снимок был правдой ровно до
+                    // первого `/onion`: после него в карточке адрес и версия
+                    // на единицу больше, а на экране — прежняя строка. Именно
+                    // это и приводило к тому, что вторая машина заводила
+                    // контакт без onion-адреса.
+                    print_card(&handle).await;
+                    continue;
+                }
+                if line == "/onion" {
+                    // Объявление адресов (§4.3) руками — тем же путём, каким
+                    // его зовёт драйвер, когда сервис опубликован.
+                    //
+                    // Объявляется **то, что уже в карточке**, а посчитанный
+                    // адрес идёт только если карточка пуста. Иначе эта команда
+                    // затирала бы работающий адрес, который назвал сервис,
+                    // посчитанным — а они, как выяснилось на стенде, совпадают
+                    // не всегда.
+                    let current =
+                        handle.own_card().await.map(|c| c.onion).unwrap_or_default();
+                    let announce =
+                        if current.is_empty() { onion_address.clone() } else { current };
+                    handle
+                        .send(Command::AnnounceAddresses {
+                            onion: announce.clone(),
+                            chatmail: String::new(),
+                        })
+                        .await
+                        .ok();
+                    println!("< адрес объявлен контактам: {announce}");
+                    // Карточка изменилась — значит всё, что было напечатано
+                    // раньше, устарело. Печатаем новую сразу: иначе человек
+                    // скопирует прежнюю строку, и адреса в ней не окажется.
+                    print_card(&handle).await;
+                    continue;
+                }
+                if line == "/tor" {
+                    // Вопрос, на который иначе отвечать нечем: «сообщения
+                    // не ходят — это Tor ещё не готов или уже сломан?»
+                    // Порядок строк — порядок причин: сперва наш сервис,
+                    // потом адрес собеседника, потом сеть.
+                    match &tor {
+                        Some(note) => println!("< tor: {note}"),
+                        None => println!("< tor: новостей не было — транспорт не поднимался"),
+                    }
+                    // Два адреса, а не один, и это не многословие. Первый
+                    // посчитан из нашего ключа, второй — тот, что уехал
+                    // контактам. Разошлись — arti обслуживает не наш ключ,
+                    // и это объясняет тишину целиком.
+                    println!("< посчитан из ключа : {onion_address}");
+                    let in_card = handle.own_card().await.map(|c| c.onion).unwrap_or_default();
+                    if in_card.is_empty() {
+                        println!("  в карточке        : пусто — сервис ещё не назвал адрес");
+                    } else if in_card == onion_address {
+                        println!("  в карточке        : тот же — так и должно быть");
+                    } else {
+                        println!("  в карточке        : {in_card}");
+                        println!("  ЭТО РАСХОЖДЕНИЕ: arti взял не наш ключ (см. строку «встало»)");
+                    }
+                    println!("  адрес собеседника и видимость — /who");
+                    println!("  свой адрес объявляется командой /onion; контактам,");
+                    println!("  добавленным позже, он доедет сам при первой связи (§4.3)");
+                    continue;
+                }
+                if line == "/lan" {
+                    // Пока LAN работает, до onion дело не доходит: §5.4 —
+                    // лестница, и локальная сеть на ней первая. Поэтому
+                    // проверить второй транспорт можно только выключив
+                    // первый, и это же делает человек в UI.
+                    lan_on = !lan_on;
+                    handle.send(Command::SetLanEnabled(lan_on)).await.ok();
+                    if lan_on {
+                        println!("< локальная сеть включена — она снова первая ступень");
+                    } else {
+                        println!("< локальная сеть выключена — доставка пойдёт через onion");
                     }
                     continue;
                 }
@@ -409,7 +619,17 @@ async fn console(
                     | Event::AvatarChanged { .. }
                     | Event::GroupMembershipChanged { .. }
                     | Event::FileProgress { .. }
+                    // Печатается в `report`, а здесь делать нечего: ход
+                    // подъёма Tor ничего не меняет в состоянии стенда.
                     | Event::HonestNotice { .. } => {}
+                    // Печатается в `report`, а здесь запоминается: `/tor`
+                    // обязан отвечать и тогда, когда строка уехала вверх.
+                    Event::TorStatus { note, blocked, .. } => {
+                        tor = Some(match blocked {
+                            Some(reason) => format!("{note} (встало: {reason})"),
+                            None => note.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -491,6 +711,25 @@ fn yes(value: bool) -> &'static str {
     }
 }
 
+/// Печатает свою карточку такой, какая она сейчас (§4.1).
+///
+/// Печатается ссылка `ratatosk:v0:…`, а не голый base64: ровно её показывает
+/// клиент и кладёт в QR, и стенд не должен приучать к другому виду. `/add`
+/// принимает оба.
+async fn print_card(handle: &DriverHandle) {
+    let Some(card) = handle.own_card().await else { return };
+    println!();
+    println!("< своя карточка, версия {}:", card.version);
+    println!();
+    println!("/add {}", card.uri);
+    println!();
+    if card.onion.is_empty() {
+        println!("  onion в карточке нет — сперва /onion, потом копировать");
+    } else {
+        println!("  onion: {}", card.onion);
+    }
+}
+
 /// `/add <карточка> [ip:порт]`.
 async fn add_contact(
     handle: &DriverHandle,
@@ -541,6 +780,22 @@ fn decode_card(encoded: &str) -> Result<Vec<u8>, String> {
     // Перенос строки при копировании — самая частая порча длинной строки,
     // и она безобидна: пробелы в base64 не значат ничего.
     let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Ссылка `ratatosk:v0:…` (§4.1) принимается наравне с голым base64:
+    // именно её показывает клиент и кладёт в QR, и требовать от человека
+    // отличать одно представление от другого не за что. Внутри неё base32,
+    // и отдельная ветка нужна ровно поэтому.
+    if let Some(body) = cleaned.strip_prefix(ratatosk_codec::URI_PREFIX) {
+        return BASE32_NOPAD.decode(body.to_ascii_uppercase().as_bytes()).map_err(|error| {
+            format!(
+                "{error}: после «{}» идёт base32, и здесь его {} символов — \
+                 похоже, ссылка скопирована не целиком",
+                ratatosk_codec::URI_PREFIX,
+                body.chars().count()
+            )
+        });
+    }
+
     BASE64URL_NOPAD.decode(cleaned.as_bytes()).map_err(|error| {
         let at = error.position;
         let symbol = cleaned
@@ -572,6 +827,18 @@ fn report(event: &Event) {
                     println!("    собеседника нет в сети; уйдёт само, когда появится");
                 }
                 _ => {}
+            }
+        }
+        Event::TorStatus { note, blocked, .. } => {
+            // Ради этой строки событие и заведено: молчащая консоль
+            // не отличает «поднимается долго» от «не поднимется никогда».
+            //
+            // Доля не печатается: arti уже начинает свою строку с процентов,
+            // и получалось «tor 0%: 0%: …». Клиенту доля нужна — ему рисовать
+            // полосу, — а здесь есть готовый текст.
+            println!("< tor: {note}");
+            if let Some(reason) = blocked {
+                println!("    встало: {reason}");
             }
         }
         Event::ContactAdded { fingerprint, verified, .. } => {

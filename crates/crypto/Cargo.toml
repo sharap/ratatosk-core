@@ -14,6 +14,8 @@ description = "Криптостек Ratatosk v0.1: идентичность, Noi
 ratatosk-wire.workspace = true
 
 blake3.workspace = true
+sha2.workspace = true
+sha3.workspace = true
 x25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 chacha20poly1305.workspace = true
@@ -27,6 +29,9 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+# Инварианты §16: «decrypt(encrypt(x)) == x при любых перестановках»
+# и «ключ сообщения не выдаётся дважды».
+proptest.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

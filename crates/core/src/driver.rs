@@ -16,7 +16,7 @@ use std::time::Duration;
 use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_proto::transport_policy::PeerAvailability;
 use ratatosk_store::{FileId, Store, StoredFile, StoredMessage, StoredReaction};
-use ratatosk_transport::{Runner, TransportCommand, TransportEvent};
+use ratatosk_transport::{Runner, TransportCommand, TransportError, TransportEvent};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::{Engine, EngineError};
@@ -27,6 +27,15 @@ use ratatosk_transport::runner::PeerAddress;
 /// Сколько команд и уведомлений помещается в очередь, прежде чем отправитель
 /// начнёт ждать.
 const CHANNEL_DEPTH: usize = 64;
+
+/// Сколько раз один вход имеет право породить следующий, прежде чем это
+/// перестанет быть лестницей §5.4 и станет кольцом.
+///
+/// Настоящая глубина мала: отказ транспорта переводит доставку на следующую
+/// ступень, ступеней три, и на этом всё. Но отказать может и целая пачка
+/// сообщений сразу, каждое своим кругом, поэтому запас взят с избытком —
+/// он страховка от ошибки в ядре, а не рабочий предел.
+const MAX_FEED_ROUNDS: usize = 256;
 
 /// Что клиент прислал драйверу: команду или запрос.
 ///
@@ -150,6 +159,13 @@ enum Query {
     OpenFile { file_id: FileId, reply: oneshot::Sender<Option<FileReader>> },
     /// Порог автоматического приёма файлов.
     AutoAccept { reply: oneshot::Sender<Option<u64>> },
+    /// Своя карточка прямо сейчас — ссылка и её версия (§4.1, §4.3).
+    ///
+    /// Запросом, а не значением, полученным при открытии: адреса появляются
+    /// позже старта (§5.2), версия карточки при этом растёт, и ссылка,
+    /// показанная на экране, перестаёт быть той, что уедет к собеседнику.
+    /// Показывать устаревший QR — обещать адрес, которого в нём нет.
+    OwnCard { reply: oneshot::Sender<OwnCard> },
     /// Поиск по словам (§12).
     ///
     /// `chat` = `None` — по всей переписке. Возвращает сами сообщения, а не
@@ -179,6 +195,23 @@ enum Query {
     /// Клиент берёт байты, когда дошёл до отрисовки, и обновляет по событию
     /// [`Event::AvatarChanged`].
     Avatar { owner: Option<[u8; 32]>, reply: oneshot::Sender<Option<Vec<u8>>> },
+}
+
+/// Своя карточка в том виде, в каком её показывают человеку.
+///
+/// Отдельная структура, а не `ContactCard`: наружу отдаётся готовая ссылка
+/// и то, по чему видно, изменилась ли она, — ключи в UI не нужны, а версия
+/// нужна, потому что по ней клиент понимает, что показанный QR устарел.
+#[derive(Debug, Clone)]
+pub struct OwnCard {
+    /// Ссылка `ratatosk:v0:…` — она же содержимое QR (§4.1).
+    pub uri: String,
+    /// Версия карточки (§4.3). Растёт при каждой смене адресов.
+    pub version: u64,
+    /// Onion-адрес. Пустая строка — «ещё нет».
+    pub onion: String,
+    /// Почтовый адрес. Пустая строка — «ещё нет».
+    pub chatmail: String,
 }
 
 /// Что клиент знает о контакте.
@@ -219,6 +252,19 @@ enum Wake {
     Chore(Chore),
     Timers,
     Stop,
+    /// Tor опубликовал сервис — пора сказать об этом контактам (§4.3).
+    ///
+    /// Отдельная ветка, а не готовый [`Input`], потому что команда объявления
+    /// несёт карточку целиком: и onion, и почту. Транспорт знает только свою
+    /// половину, вторую надо взять у ядра — а до ядра в ветке `select!`
+    /// не дотянуться.
+    Announce(String),
+    /// Новость для UI, которой ядро не касается вовсе.
+    ///
+    /// Ход подъёма Tor — не состояние протокола: ни одно решение §5.4
+    /// на него не опирается, и заводить ради него вход в ядро значило бы
+    /// провести через `Engine::step` то, что там нечего делать.
+    Notice(Event),
 }
 
 /// Ручка, через которую UI разговаривает с драйвером.
@@ -274,6 +320,17 @@ impl DriverHandle {
     pub async fn contacts(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::Contacts { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает свою карточку (§4.1). `None` — драйвер остановлен.
+    ///
+    /// Именно запросом, а не значением, взятым при открытии: адреса
+    /// появляются позже старта (§5.2), и снимок, сделанный один раз,
+    /// врёт ровно про то, ради чего карточку и показывают.
+    pub async fn own_card(&self) -> Option<OwnCard> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::OwnCard { reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -398,6 +455,13 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает свою карточку, блокируя вызывающий поток.
+    pub fn own_card_blocking(&self) -> Option<OwnCard> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::OwnCard { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает порог автоматического приёма файлов.
     pub fn auto_accept_blocking(&self) -> Option<Option<u64>> {
         let (reply, answer) = oneshot::channel();
@@ -476,7 +540,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // может быть — они приходят снаружи.
             let wake = tokio::select! {
                 event = self.runner.next_event() => match event {
-                    Some(event) => Wake::Input(translate(event)),
+                    Some(event) => translate(event),
                     None => Wake::Stop,
                 },
                 request = self.requests.recv() => match request {
@@ -493,6 +557,22 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 Wake::Query(query) => self.answer(query),
                 Wake::Chore(chore) => self.do_chore(chore),
                 Wake::Timers => self.fire_due_timers().await?,
+                Wake::Notice(event) => {
+                    // Тот же путь, что и у уведомлений ядра: переполненная
+                    // очередь UI не вправе останавливать протокол.
+                    if self.notices.try_send(event).is_err() {
+                        tracing::debug!("очередь событий UI переполнена, новость отброшена");
+                    }
+                }
+                Wake::Announce(onion) => {
+                    // Почта берётся из текущей карточки, а не из пустоты:
+                    // объявление заявляет оба адреса разом, и подставить
+                    // сюда пустую строку значило бы сказать контактам, что
+                    // почтового ящика больше нет.
+                    let chatmail = self.engine.own_card().chatmail;
+                    let command = Command::AnnounceAddresses { onion, chatmail };
+                    self.tolerate(Input::Command(command)).await?;
+                }
                 Wake::Stop => return Ok(()),
             }
 
@@ -570,6 +650,19 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::AutoAccept { reply } => {
                 let _ = reply.send(self.engine.auto_accept_bytes());
+            }
+            Query::OwnCard { reply } => {
+                let card = self.engine.own_card();
+                // Кодирование карточки может отказать только на испорченной
+                // памяти, но ронять из-за него ядро нечего: пустая ссылка
+                // видна на экране сразу, а упавший драйвер уносит с собой
+                // переписку.
+                let _ = reply.send(OwnCard {
+                    uri: card.to_uri().unwrap_or_default(),
+                    version: card.version,
+                    onion: card.onion,
+                    chatmail: card.chatmail,
+                });
             }
             Query::Search { chat, query, limit, reply } => {
                 let store = self.engine.store();
@@ -703,9 +796,26 @@ impl<S: Store, R: Runner> Driver<S, R> {
 
     /// Подаёт вход ядру и исполняет всё, что оно вернуло.
     async fn feed(&mut self, input: Input) -> Result<(), EngineError> {
-        let now_ms = now_ms();
-        for effect in self.engine.step(now_ms, input)? {
-            self.apply(now_ms, effect).await;
+        // Очередь, а не рекурсия: отказ транспорта рождает новый вход, тот —
+        // новые эффекты, и так пока лестница §5.4 не кончится. Рекурсивный
+        // `async fn` пришлось бы боксировать на каждом обороте, а тут хватает
+        // очереди из нескольких элементов.
+        let mut inputs = std::collections::VecDeque::from([input]);
+        let mut rounds = 0usize;
+        while let Some(input) = inputs.pop_front() {
+            rounds += 1;
+            if rounds > MAX_FEED_ROUNDS {
+                // Кольцо эффектов. Оборвать и сказать вслух: молча крутиться
+                // тут значит съесть процессор телефона на ровном месте.
+                tracing::error!(rounds, "кольцо эффектов в драйвере — обрываю круг");
+                return Ok(());
+            }
+            let now_ms = now_ms();
+            for effect in self.engine.step(now_ms, input)? {
+                if let Some(failed) = self.apply(now_ms, effect).await {
+                    inputs.push_back(failed);
+                }
+            }
         }
         Ok(())
     }
@@ -753,7 +863,26 @@ impl<S: Store, R: Runner> Driver<S, R> {
         Ok(())
     }
 
-    async fn apply(&mut self, now_ms: u64, effect: Effect) {
+    /// Исполняет один эффект.
+    ///
+    /// Возвращает вход, который надо подать ядру следом, — сейчас это ровно
+    /// один случай: транспорт отказал прямо здесь, синхронно. Ядру про такой
+    /// отказ надо сказать тем же входом, каким сказал бы сам транспорт,
+    /// случись отказ позже.
+    async fn apply(&mut self, now_ms: u64, effect: Effect) -> Option<Input> {
+        // Кого касается отказ — запоминается до того, как эффект разберут
+        // на части: `frame` уезжает в команду, а ключ и транспорт нужны после.
+        let addressee = match &effect {
+            Effect::Send { peer_ik, via, .. } | Effect::Connect { peer_ik, via } => {
+                Some((*peer_ik, *via))
+            }
+            Effect::SetLanEnabled(_)
+            | Effect::WatchLanPeers(_)
+            | Effect::RestartLan
+            | Effect::SetTimer { .. }
+            | Effect::Notify(_) => None,
+        };
+
         let command = match effect {
             Effect::Send { peer_ik, via, frame } => {
                 Some(TransportCommand::Send { peer: self.address_of(peer_ik), via, frame })
@@ -778,13 +907,35 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 None
             }
         };
-        if let Some(command) = command {
-            if let Err(error) = self.runner.execute(command).await {
-                // Отказ транспорта — не отказ ядра: сообщение остаётся
-                // в очереди и уйдёт следующим транспортом по §5.4.
-                tracing::debug!(?error, "транспорт отказал, переходим к следующему");
-            }
+        let Some(command) = command else { return None };
+        let Err(error) = self.runner.execute(command).await else { return None };
+
+        // Отказ транспорта — не отказ ядра: сообщение остаётся в очереди
+        // и уходит следующим транспортом по §5.4. Но узнать об этом ядро
+        // обязано **сейчас**, а не по сроку ожидания ответа.
+        //
+        // Раньше здесь стояла только эта запись в журнал, и она была
+        // неправдой: «переходим к следующему» никто не делал. Ядро ничего
+        // не знало об отказе и честно ждало ответа — а ответить было некому,
+        // потому что кадр никуда не уехал. Каждое сообщение платило полным
+        // сроком (§5.4) за отказ, случившийся мгновенно, и на стенде это
+        // выглядело как пачка «ждём, когда появится» через полторы минуты
+        // после отправки.
+        // «Занято» — не отказ. Очередь записи забита большой передачей,
+        // соединение живо и пишет; увести доставку на следующую ступень
+        // из-за затора значило бы лечить медлительность разрывом.
+        if matches!(error, TransportError::Busy) {
+            tracing::debug!("транспорт занят — ступень не меняем");
+            return None;
         }
+
+        tracing::debug!(?error, "транспорт отказал, переходим к следующему");
+        let (peer_ik, via) = addressee?;
+        // Повтор безвреден: тот же отказ может приехать ещё раз событием
+        // от самого транспорта (LAN так и делает), но ядро сверяет транспорт
+        // с тем, на котором сообщение сейчас, — а оно к тому моменту уже
+        // на следующей ступени, и второй отказ ничего не сжигает.
+        Some(Input::ConnectionLost { peer_ik, via })
     }
 
     /// Адреса контакта для транспорта.
@@ -824,15 +975,25 @@ async fn sleep_until(deadline_ms: Option<u64>) {
     }
 }
 
-fn translate(event: TransportEvent) -> Input {
-    match event {
+/// Переводит событие транспорта в то, что с ним будет делать цикл.
+///
+/// Возвращает [`Wake`], а не [`Input`], из-за единственного случая: подъём
+/// onion-сервиса приводит не к входу в ядро, а к команде, которую надо
+/// собрать, заглянув в ядро. Раньше на его месте стоял `Input::Timer`
+/// с нулевой меткой — то есть событие молча выбрасывалось.
+fn translate(event: TransportEvent) -> Wake {
+    let input = match event {
         TransportEvent::Received { via, frame, .. } => Input::Received { via, frame },
         TransportEvent::Connected { peer_ik, via } => Input::Connected { peer_ik, via },
         TransportEvent::Disconnected { peer_ik, via }
         | TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectionLost { peer_ik, via },
         TransportEvent::SeenOnLan { peer_ik } => Input::SeenOnLan { peer_ik },
-        TransportEvent::TorReady => Input::Timer { token: 0 },
-    }
+        TransportEvent::TorReady { onion } => return Wake::Announce(onion),
+        TransportEvent::TorProgress { fraction, note, blocked } => {
+            return Wake::Notice(Event::TorStatus { fraction, note, blocked })
+        }
+    };
+    Wake::Input(input)
 }
 
 /// Системное время в миллисекундах.

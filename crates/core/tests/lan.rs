@@ -69,7 +69,13 @@ async fn spawn_node(name: &str) -> Wired {
 
     // §5.1: LAN выключен по умолчанию, включается сознательно. Команда
     // ложится в очередь и будет обработана, как только цикл начнёт крутиться.
-    handle.send(Command::SetLanEnabled(true)).await.expect("драйвер жив");
+    handle
+        .send(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: true,
+        })
+        .await
+        .expect("драйвер жив");
 
     (driver, Node { handle, events, directory, card, ik, port })
 }

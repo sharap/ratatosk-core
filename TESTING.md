@@ -321,6 +321,7 @@ cargo run -p ratatosk-lab -- --name Боб
 ```text
 /add <карточка> [ip:порт]   добавить контакт; без адреса его найдёт mDNS
 /card                       своя карточка такой, какая она сейчас
+/tor on | /tor off          включить или выключить onion (§5.4)
 /who                        кого добавили и по какому адресу
 /quit
 ```
@@ -671,6 +672,22 @@ cargo test -p ratatosk-transport
 | `the_resume_point_is_the_first_gap` | продолжать надо с дырки, а не с числа принятых |
 | `a_file_travels_in_chunks_and_arrives_whole` | передача целиком, файл длиннее окна |
 | `a_direct_channel_is_never_a_switched_off_lan` | сессия переживает выключение сети, канал — нет: иначе файлы стоят там, где сообщения ходят |
+| `a_switched_off_transport_does_not_rise_at_all` | выключенный в прошлый раз Tor не поднимается вовсе — ни bootstrap, ни цепочек |
+| `switching_on_rises_and_switching_off_drops_it` | погасить — уронить раннера; включить заново — поднять заново |
+| `a_failed_start_refuses_out_loud_and_can_be_retried` | из отказа подъёма есть выход, и он не перезапуск приложения |
+| `switching_tor_off_takes_the_address_out_of_the_card` | §14: адрес, за которым никого нет, — обещание пути, которого не существует |
+| `switching_a_transport_off_releases_what_was_riding_it` | выключатель, действующий только на новые отправки, — половина выключателя; сойти с выключенной ступени значит оказаться на следующей |
+| `silence_on_our_side_does_not_deafen_us_to_theirs` | молчание — свидетельство об одном направлении; сессия двусторонняя |
+| `each_rung_of_the_ladder_gets_its_own_handshake` | тот же кадр двумя путями разводит привязки сессии: у каждого своя «онион-сессия», и оба шлют в пустоту |
+| `a_retired_session_still_receives_but_no_longer_sends` | покой: `for_peer` пропускает, `route` принимает |
+| `a_retired_session_is_superseded_like_any_other` | покой — не бессмертие: до появления новой сессии |
+| `removing_a_contact_finds_retired_sessions_too` | удаление спрашивает «что связано», а не «по чему отправлять» |
+| `a_transport_that_is_still_coming_up_is_not_a_step_either` | «включён» и «работает» разделяют десятки секунд; ступень, которой ещё нет, тратить нельзя |
+| `a_message_waits_for_tor_to_come_up_instead_of_burning_the_step` | ступень появилась — ждавшее уехало без единого действия человека |
+| `a_switched_off_transport_is_not_a_step` | выключенный транспорт выпадает из лестницы, а не «пробуется и отказывает» |
+| `everything_switched_off_is_undeliverable_not_silence` | §14: некуда — значит некуда, и сказать надо сразу |
+| `a_set_survives_a_round_trip_through_a_byte` | набор уезжает в `meta` одним байтом и возвращается оттуда |
+| `a_switched_off_transport_stays_switched_off_after_a_restart` | выключатель «до следующего запуска» не означает ничего |
 | `the_stall_deadline_outlasts_a_window_on_the_slowest_transport` | срок короче времени передачи не ускоряет возобновление, а ломает его: «загружается и никогда не догружается» |
 | `a_file_over_the_threshold_waits_for_the_button` | до нажатия — ни байта на диск |
 | `a_declined_file_leaves_nothing_behind` | отказ убирает и запись, и байты |

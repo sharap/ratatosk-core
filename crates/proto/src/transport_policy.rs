@@ -2,13 +2,20 @@
 //!
 //! **Не гонка.** Строгая последовательность с таймаутами:
 //!
-//! 1. Если контакт виден в LAN и LAN включён → LAN.
+//! 1. Если LAN включён и контакт в нём виден → LAN.
 //! 2. Иначе попытка соединения с onion-адресом, таймаут 45 с.
 //! 3. Если не удалось → отправка почтой.
 //!
 //! Одновременная отправка одним и тем же сообщением по нескольким транспортам
 //! запрещена. Дублирование на приёме допускается и разрешается дедупликацией
 //! (§9.2).
+//!
+//! **Выключенный транспорт из лестницы выпадает целиком.** Разрешение
+//! ([`TransportSet`]) и достижимость (адрес в карточке, маяк в эфире) —
+//! разные вещи, и проверяются они по отдельности: первое чинится
+//! переключателем в UI, второе — обменом карточками. Ступень, которую
+//! человек выключил, не «пробуется и отказывает», а не пробуется вовсе:
+//! иначе каждое сообщение платило бы за неё сроком ожидания.
 //!
 //! **Единственное исключение:** LAN и Tor не смешиваются в одной сессии
 //! никогда. Сессия, начатая в LAN, при потере связи не продолжается через
@@ -104,12 +111,103 @@ impl Transport {
 pub struct PeerAvailability {
     /// Контакт виден в LAN по маяку mDNS (§5.1).
     pub seen_on_lan: bool,
-    /// Пользователь включил LAN. По умолчанию выключен (§5.1).
-    pub lan_enabled: bool,
+    /// Какие транспорты включены на этом устройстве.
+    ///
+    /// Не «есть ли адрес», а «разрешено ли им пользоваться»: это выбор
+    /// человека, и он одинаков для всех контактов. Лежит здесь, а не рядом,
+    /// потому что §5.4 принимает решение по одной структуре — иначе часть
+    /// правила оказалась бы в другом месте и однажды разошлась бы.
+    pub enabled: TransportSet,
+    /// Какие транспорты **уже работают**.
+    ///
+    /// Отдельно от [`PeerAvailability::enabled`], и это не тонкость.
+    /// «Человек включил Tor» и «Tor работает» разделяют десятки секунд:
+    /// bootstrap, а за ним публикация сервиса. Считай мы включение
+    /// готовностью, первое же сообщение после включения ушло бы в ступень,
+    /// которой ещё нет, получило бы отказ — и **сожгло бы её**: §5.4
+    /// не повторяет транспорт после отказа, и сообщение уехало бы дальше
+    /// по лестнице или встало бы в ожидание, хотя Tor поднимется через
+    /// полминуты.
+    ///
+    /// У LAN и почты этого разрыва нет: порт занят при старте, а почта
+    /// асинхронна по устройству — ждать там нечего, и они готовы вместе
+    /// с включением.
+    pub ready: TransportSet,
     /// Известен onion-адрес.
     pub has_onion: bool,
     /// Известен chatmail-адрес.
     pub has_chatmail: bool,
+}
+
+/// Набор включённых транспортов.
+///
+/// Множество, а не поле на каждый транспорт, и это не украшение. Транспортов
+/// станет больше (§5.3 ещё не написан, и он не последний), а каждый новый
+/// выключатель отдельным `bool` означает новое поле в [`PeerAvailability`],
+/// новую ветку в §5.4 и новый повод забыть одно из трёх мест.
+///
+/// Хранится одним байтом: набор целиком помещается в `meta` (§8.6) и
+/// переживает перезапуск, не заводя себе ни таблицы, ни формата.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransportSet(u8);
+
+impl TransportSet {
+    /// Бит транспорта. Значения фиксированы: они уезжают на диск.
+    const fn bit(transport: Transport) -> u8 {
+        match transport {
+            Transport::Lan => 1,
+            Transport::Onion => 2,
+            Transport::Mail => 4,
+        }
+    }
+
+    /// Все известные биты — маска для чтения с диска.
+    const KNOWN: u8 = 1 | 2 | 4;
+
+    /// Пустой набор: не разрешён ни один транспорт.
+    #[must_use]
+    pub const fn none() -> TransportSet {
+        TransportSet(0)
+    }
+
+    /// Разрешено ли пользоваться этим транспортом.
+    #[must_use]
+    pub const fn contains(self, transport: Transport) -> bool {
+        self.0 & Self::bit(transport) != 0
+    }
+
+    /// Тот же набор плюс один транспорт.
+    ///
+    /// Отдельно от [`TransportSet::set`], потому что умеет то, чего тот
+    /// не умеет: собирать набор в константе.
+    #[must_use]
+    pub const fn with(self, transport: Transport) -> TransportSet {
+        TransportSet(self.0 | Self::bit(transport))
+    }
+
+    /// Включает или выключает транспорт.
+    pub fn set(&mut self, transport: Transport, enabled: bool) {
+        if enabled {
+            self.0 |= Self::bit(transport);
+        } else {
+            self.0 &= !Self::bit(transport);
+        }
+    }
+
+    /// Байт для записи на диск.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Набор из байта с диска.
+    ///
+    /// Незнакомые биты отбрасываются: запись могла лечь более новой версией,
+    /// и включать по ней транспорт, которого в этой сборке нет, нечем.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> TransportSet {
+        TransportSet(bits & Self::KNOWN)
+    }
 }
 
 /// Решение о том, куда отправлять.
@@ -171,16 +269,28 @@ impl Attempt {
             return None;
         }
 
-        let candidate =
-            if peer.lan_enabled && peer.seen_on_lan && !self.tried.contains(&Transport::Lan) {
-                Some(Transport::Lan)
-            } else if peer.has_onion && !self.tried.contains(&Transport::Onion) {
-                Some(Transport::Onion)
-            } else if peer.has_chatmail && !self.tried.contains(&Transport::Mail) {
-                Some(Transport::Mail)
-            } else {
-                None
-            };
+        // Лестница списком, а не цепочкой `if`: порядок ступеней — это и есть
+        // §5.4, и он должен читаться сверху вниз одним взглядом. Добавить
+        // транспорт значит дописать строку, а не разобраться в развилке.
+        //
+        // У каждой ступени три условия, и они разного рода: **разрешён** ли
+        // транспорт человеком, **работает** ли он уже и **есть ли куда** им
+        // ехать. Раздельно, потому что и лечится это разным: первое —
+        // переключателем в UI, второе — временем (bootstrap идёт десятки
+        // секунд), третье — обменом карточками (§4.3) или появлением
+        // в эфире (§5.1).
+        let ladder = [
+            (Transport::Lan, peer.seen_on_lan),
+            (Transport::Onion, peer.has_onion),
+            (Transport::Mail, peer.has_chatmail),
+        ];
+        let candidate = ladder.into_iter().find_map(|(transport, addressable)| {
+            let usable = peer.enabled.contains(transport)
+                && peer.ready.contains(transport)
+                && addressable
+                && !self.tried.contains(&transport);
+            usable.then_some(transport)
+        });
 
         match candidate {
             Some(t) => {
@@ -246,13 +356,32 @@ impl SessionBinding {
 mod tests {
     use super::*;
 
+    /// Всё разрешено, всё работает и всё достижимо — от этого отталкиваются
+    /// проверки.
     fn full() -> PeerAvailability {
         PeerAvailability {
             seen_on_lan: true,
-            lan_enabled: true,
+            enabled: everything(),
+            ready: everything(),
             has_onion: true,
             has_chatmail: true,
         }
+    }
+
+    /// Набор со всеми транспортами.
+    fn everything() -> TransportSet {
+        let mut set = TransportSet::none();
+        for transport in [Transport::Lan, Transport::Onion, Transport::Mail] {
+            set.set(transport, true);
+        }
+        set
+    }
+
+    /// То же, но без одного.
+    fn without(transport: Transport) -> PeerAvailability {
+        let mut enabled = everything();
+        enabled.set(transport, false);
+        PeerAvailability { enabled, ..full() }
     }
 
     #[test]
@@ -264,7 +393,7 @@ mod tests {
     #[test]
     fn lan_is_skipped_when_disabled() {
         // §5.1: по умолчанию LAN выключен, даже если контакт виден.
-        let peer = PeerAvailability { lan_enabled: false, ..full() };
+        let peer = without(Transport::Lan);
         let mut a = Attempt::new();
         assert_eq!(a.next(peer), Some(Decision::Use(Transport::Onion)));
     }
@@ -306,6 +435,77 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_that_is_still_coming_up_is_not_a_step_either() {
+        // Ошибка, ради которой это поле и заведено: «включён» и «работает»
+        // разделяют десятки секунд bootstrap и публикации сервиса. Считай
+        // включение готовностью — первое же сообщение после включения ушло
+        // бы в ступень, которой ещё нет, получило бы отказ и **сожгло бы
+        // её**: §5.4 транспорт после отказа не повторяет.
+        let mut rising = everything();
+        rising.set(Transport::Onion, false);
+        let peer = PeerAvailability { ready: rising, ..without(Transport::Lan) };
+
+        let mut a = Attempt::new();
+        assert_eq!(
+            a.next(peer),
+            Some(Decision::Use(Transport::Mail)),
+            "поднимающийся onion пропускается, а не тратится"
+        );
+
+        // А когда поднялся — он снова ступень, и притом первая из оставшихся.
+        let mut a = Attempt::new();
+        assert_eq!(a.next(without(Transport::Lan)), Some(Decision::Use(Transport::Onion)));
+    }
+
+    #[test]
+    fn a_switched_off_transport_is_not_a_step() {
+        // Разрешение и достижимость — разные вещи. Выключенный транспорт
+        // не «пробуется и отказывает», а выпадает из лестницы целиком:
+        // иначе каждое сообщение платило бы за него сроком ожидания,
+        // а человек видел бы «не доставлено» вместо «выключено».
+        let mut a = Attempt::new();
+        assert_eq!(
+            a.next(without(Transport::Onion)),
+            Some(Decision::Use(Transport::Lan)),
+            "первая ступень на месте"
+        );
+        assert_eq!(
+            a.next(without(Transport::Onion)),
+            Some(Decision::Use(Transport::Mail)),
+            "выключенный onion пропускается целиком, а не пробуется"
+        );
+    }
+
+    #[test]
+    fn everything_switched_off_is_undeliverable_not_silence() {
+        // §14: некуда — значит некуда, и сказать об этом надо сразу.
+        // Молчание здесь превратилось бы в сообщение, которое «отправляется»
+        // вечно.
+        let peer = PeerAvailability { enabled: TransportSet::none(), ..full() };
+        let mut a = Attempt::new();
+        assert_eq!(a.next(peer), Some(Decision::Undeliverable));
+    }
+
+    #[test]
+    fn a_set_survives_a_round_trip_through_a_byte() {
+        // Набор уезжает в `meta` одним байтом и возвращается оттуда.
+        let mut set = TransportSet::none();
+        set.set(Transport::Onion, true);
+        set.set(Transport::Mail, true);
+        assert_eq!(TransportSet::from_bits(set.bits()), set);
+
+        // Незнакомые биты отбрасываются: запись могла лечь более новой
+        // версией, и включать по ней транспорт, которого в этой сборке нет,
+        // нечем.
+        assert_eq!(TransportSet::from_bits(0b1111_1111), TransportSet::from_bits(0b0000_0111));
+
+        // Выключение действительно выключает, а не «почти».
+        set.set(Transport::Onion, false);
+        assert!(!set.contains(Transport::Onion));
+        assert!(set.contains(Transport::Mail), "соседа выключение не задело");
+    }
+
+    #[test]
     fn onion_connect_timeout_matches_spec() {
         assert_eq!(ONION_CONNECT_TIMEOUT_MS, 45_000, "§5.4 задаёт срок соединения прямо");
     }
@@ -318,7 +518,7 @@ mod tests {
         // первое же сообщение объявляется недоставленным ровно тогда, когда
         // оно доставлено.
         let mut a = Attempt::new();
-        a.next(PeerAvailability { lan_enabled: false, ..full() });
+        a.next(without(Transport::Lan));
         assert_eq!(a.timeout_ms(), Some(ONION_REPLY_TIMEOUT_MS));
         assert!(
             ONION_REPLY_TIMEOUT_MS >= 2 * ONION_CONNECT_TIMEOUT_MS,
@@ -328,7 +528,12 @@ mod tests {
 
     #[test]
     fn mail_has_no_timeout() {
-        let peer = PeerAvailability { has_chatmail: true, ..PeerAvailability::default() };
+        let peer = PeerAvailability {
+            has_chatmail: true,
+            enabled: everything(),
+            ready: everything(),
+            ..Default::default()
+        };
         let mut a = Attempt::new();
         a.next(peer);
         assert_eq!(a.timeout_ms(), None, "почта асинхронна, ждать ответа бессмысленно");

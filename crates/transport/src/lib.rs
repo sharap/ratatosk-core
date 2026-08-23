@@ -14,9 +14,11 @@
 //! под одну ручку, потому что §5.4 — это лестница, а лестница из одной
 //! ступени не лестница. Драйвер при этом по-прежнему держит один раннер.
 //!
-//! Транспорт, который ещё поднимается, — [`deferred::Deferred`]: bootstrap
-//! Tor идёт десятки секунд, а открытие аккаунта обязано быть мгновенным,
-//! и всё это время onion честно отказывает.
+//! Транспорт под выключателем — [`switched::Switched`]. Он решает две
+//! задачи сразу, и обе про время: bootstrap Tor идёт десятки секунд, а
+//! открытие аккаунта обязано быть мгновенным (всё это время onion честно
+//! отказывает); и человек вправе выключить Tor так, чтобы Tor выключился,
+//! а не только выпал из лестницы §5.4.
 //!
 //! Кадрирование у LAN и onion общее и живёт в `link`: они отличаются только
 //! тем, чем открыт поток, а две полосы записи (мелкие кадры вперёд чанков)
@@ -30,14 +32,14 @@
 #![warn(missing_docs)]
 
 pub mod chatmail;
-pub mod deferred;
 pub mod lan;
 mod link;
 pub mod multi;
 pub mod onion;
 pub mod runner;
+pub mod switched;
 
-pub use deferred::Deferred;
 pub use lan::{LanConfig, LanDirectory, LanRunner};
 pub use multi::{Disabled, Transports};
 pub use runner::{PeerAddress, Runner, TransportCommand, TransportError, TransportEvent};
+pub use switched::Switched;

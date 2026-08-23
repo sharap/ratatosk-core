@@ -64,6 +64,24 @@ pub struct BoundSession {
     pub session: Session,
     /// LAN или Tor. Смешивать нельзя никогда (§5.4).
     pub binding: SessionBinding,
+    /// Сессия отправлена на покой: принимать по ней можно, отправлять — нет.
+    ///
+    /// Различие появилось из разбора живой поломки, и оно того стоит.
+    /// Молчание в ответ на ушедший кадр — свидетельство об **одном
+    /// направлении**: наши кадры до собеседника не доходят или его квитанции
+    /// не доходят до нас. О том, доходят ли **его** сообщения до нас, оно
+    /// не говорит ничего.
+    ///
+    /// Раньше такая сессия просто удалялась. Итог на стенде: мы её забыли,
+    /// собеседник — нет, он продолжает слать по ней, а мы каждый его кадр
+    /// молча отбрасываем как «неизвестная сессия». Сказать ему об этом
+    /// нечем: кадр не расшифрован, кто прислал — неизвестно. Переписка
+    /// умирает в одну сторону навсегда, при живой связи с обеих.
+    ///
+    /// Поэтому теперь такая сессия остаётся принимать. Отправка идёт через
+    /// новое рукопожатие, а когда оно закончится, покойную вытеснит
+    /// [`SessionRegistry::insert`] обычным порядком.
+    pub retired: bool,
 }
 
 /// Реестр активных сессий.
@@ -112,6 +130,9 @@ impl SessionRegistry {
     ///
     /// Второй, менее заметный итог накопления: ключевой материал старых
     /// сессий продолжал лежать в памяти и на диске без всякой пользы.
+    ///
+    /// Вытесняются и сессии «на покое» ([`BoundSession::retired`]): они
+    /// оставались принимать ровно до появления новой, и эта минута прошла.
     pub fn insert(&mut self, session: Session, binding: SessionBinding) -> Vec<u64> {
         let id = session.session_id;
         let peer = session.peer_ik;
@@ -131,7 +152,7 @@ impl SessionRegistry {
             self.remove(*old);
         }
 
-        self.by_id.insert(id, BoundSession { session, binding });
+        self.by_id.insert(id, BoundSession { session, binding, retired: false });
         let ids = self.by_peer.entry(peer).or_default();
         if !ids.contains(&id) {
             ids.push(id);
@@ -160,8 +181,43 @@ impl SessionRegistry {
             .get(peer_ik)?
             .iter()
             .rev()
-            .find(|id| self.by_id.get(id).is_some_and(|bound| bound.binding.allows(transport)))
+            .find(|id| {
+                self.by_id
+                    .get(id)
+                    .is_some_and(|bound| !bound.retired && bound.binding.allows(transport))
+            })
             .copied()
+    }
+
+    /// Все сессии с этим контактом — включая отправленные на покой.
+    ///
+    /// Отдельно от [`SessionRegistry::for_peer`], и разница существенная:
+    /// тот отвечает на вопрос «по чему отправлять», а этот — «что вообще
+    /// связано с этим человеком». Удаление контакта спрашивает второе:
+    /// пережившая удаление сессия продолжала бы расшифровывать кадры
+    /// от того, кого в контактах больше нет.
+    #[must_use]
+    pub fn all_for_peer(&self, peer_ik: &[u8; 32]) -> Vec<u64> {
+        self.by_peer.get(peer_ik).cloned().unwrap_or_default()
+    }
+
+    /// Отправляет сессию на покой: принимать по ней можно, отправлять — нет.
+    ///
+    /// Возвращает `true`, если было что отправлять. Зовётся, когда кадр ушёл,
+    /// а ответа в срок не пришло: это свидетельство об одном направлении,
+    /// и рвать из-за него второе — та самая поломка, ради которой признак
+    /// и заведён (см. [`BoundSession::retired`]).
+    pub fn retire(&mut self, peer_ik: &[u8; 32], transport: Transport) -> bool {
+        let Some(session_id) = self.for_peer(peer_ik, transport) else {
+            return false;
+        };
+        match self.by_id.get_mut(&session_id) {
+            Some(bound) => {
+                bound.retired = true;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Закрывает сессию — при перерукопожатии (§8.5) или отзыве сопряжения (§13.4).
@@ -204,6 +260,76 @@ mod tests {
 
     fn session(peer: u8, transcript: &[u8]) -> Session {
         Session::derive(Role::Initiator, [peer; 32], transcript, b"out", 0)
+    }
+
+    #[test]
+    fn a_retired_session_still_receives_but_no_longer_sends() {
+        // Разбор живой поломки. Молчание в ответ на ушедший кадр — это
+        // свидетельство об **одном** направлении. Закрывая из-за него сессию
+        // целиком, мы её забывали, а собеседник нет: он продолжал слать
+        // по ней, мы каждый его кадр отбрасывали как «неизвестная сессия»,
+        // и сказать ему об этом было нечем — кадр не расшифрован, кто
+        // прислал, неизвестно. Переписка умирала в одну сторону навсегда.
+        let mut r = SessionRegistry::new();
+        let live = session(1, b"handshake");
+        let id = live.session_id;
+        r.insert(live, SessionBinding::of(Transport::Onion));
+
+        assert!(r.retire(&[1u8; 32], Transport::Onion), "было что отправлять на покой");
+        assert_eq!(
+            r.route(id),
+            Route::Session(id),
+            "принимать по ней обязаны: собеседник о нашем молчании не знает"
+        );
+        assert_eq!(
+            r.for_peer(&[1u8; 32], Transport::Onion),
+            None,
+            "а отправлять по ней больше нельзя — на то она и на покое"
+        );
+        assert!(!r.retire(&[1u8; 32], Transport::Onion), "второй раз отправлять на покой нечего");
+    }
+
+    #[test]
+    fn a_retired_session_is_superseded_like_any_other() {
+        // Покой — не бессмертие: сессия остаётся принимать ровно до тех пор,
+        // пока не появится новая. Иначе ключевой материал копился бы
+        // в памяти и на диске без всякой пользы.
+        let mut r = SessionRegistry::new();
+        let old = session(1, b"first");
+        let old_id = old.session_id;
+        r.insert(old, SessionBinding::of(Transport::Onion));
+        r.retire(&[1u8; 32], Transport::Onion);
+
+        let fresh = session(1, b"second");
+        let new_id = fresh.session_id;
+        let superseded = r.insert(fresh, SessionBinding::of(Transport::Onion));
+
+        assert_eq!(superseded, vec![old_id], "покойную обязаны вытеснить и назвать");
+        assert_eq!(r.route(old_id), Route::Unknown);
+        assert_eq!(r.for_peer(&[1u8; 32], Transport::Onion), Some(new_id));
+    }
+
+    #[test]
+    fn removing_a_contact_finds_retired_sessions_too() {
+        // `for_peer` отвечает на вопрос «по чему отправлять», а удаление
+        // контакта спрашивает другое: «что вообще связано с этим человеком».
+        // Спроси оно первое — покойная сессия пережила бы удаление и
+        // продолжала расшифровывать кадры от того, кого в контактах нет.
+        let mut r = SessionRegistry::new();
+        let live = session(1, b"handshake");
+        let id = live.session_id;
+        r.insert(live, SessionBinding::of(Transport::Onion));
+        r.retire(&[1u8; 32], Transport::Onion);
+
+        assert_eq!(r.all_for_peer(&[1u8; 32]), vec![id], "покойная обязана найтись");
+        for session_id in r.all_for_peer(&[1u8; 32]) {
+            r.remove(session_id);
+        }
+        assert_eq!(
+            r.route(id),
+            Route::Unknown,
+            "после удаления контакта не расшифровывается ничто"
+        );
     }
 
     #[test]

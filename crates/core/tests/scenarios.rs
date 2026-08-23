@@ -75,7 +75,7 @@ impl Node {
         store.migrate().expect("миграция");
 
         let name = format!("node{index}");
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             identity,
             store,
             Box::new(ratatosk_store::MemoryBlobs::new()),
@@ -90,6 +90,12 @@ impl Node {
                 display_name: name,
             },
         );
+        // Onion объявляется работающим сразу: симуляция проверяет протокол,
+        // а не подъём Tor. На устройстве этот вход приходит от транспорта
+        // после публикации сервиса, десятками секунд позже включения.
+        engine
+            .step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Onion })
+            .expect("готовность транспорта");
         Node { engine, peers: BTreeMap::new(), events: Vec::new(), arrivals: Vec::new() }
     }
 
@@ -115,7 +121,7 @@ impl Node {
                 }
                 Effect::SetTimer { after_ms, token } => ctx.set_timer(after_ms, token),
                 Effect::Connect { .. }
-                | Effect::SetLanEnabled(_)
+                | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
                 | Effect::RestartLan => {}
             }

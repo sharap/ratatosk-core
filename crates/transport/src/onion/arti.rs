@@ -128,6 +128,26 @@ pub struct OnionRunner {
     events_rx: mpsc::Receiver<TransportEvent>,
     /// Свой адрес — посчитанный из ключа, а не спрошенный у сети.
     address: String,
+    /// Фоновые задачи этого раннера — чтобы снять их вместе с ним.
+    ///
+    /// Без этого «выключить Tor» не выключало бы Tor. Наблюдатель
+    /// за состоянием сервиса держит `Arc<RunningOnionService>`, то есть
+    /// сервис пережил бы собственный раннер и остался бы опубликованным;
+    /// приёмник входящих держит поток запросов встречи. Уронить раннера
+    /// достаточно только тогда, когда его задачи не держат его частей
+    /// у себя, — а они держат.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for OnionRunner {
+    fn drop(&mut self) {
+        // Снимаются явно, а не «сами кончатся»: задача живёт, пока жив её
+        // поток событий, а поток событий жив, пока жив сервис, который эта
+        // же задача и держит. Круг разрывается здесь.
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
 }
 
 impl OnionRunner {
@@ -173,7 +193,13 @@ impl OnionRunner {
 
         // Подписка — до подъёма, иначе первые новости пройдут мимо.
         // СВЕРИТЬ: имя метода подписки.
-        spawn_status_loop(client.bootstrap_events(), progress);
+        //
+        // Под сторожем: от этой строки до конца функции есть полдюжины
+        // мест, где мы вправе отказать, — и на каждом брошенный `JoinHandle`
+        // не остановил бы задачу, а отвязался от неё. Наблюдатель за
+        // bootstrap пережил бы весь отказ и остался бы висеть в рантайме.
+        let mut status_task =
+            Abandoned(Some(spawn_status_loop(client.bootstrap_events(), progress)));
 
         client.bootstrap().await.map_err(|error| failed("bootstrap не прошёл", &error))?;
 
@@ -188,9 +214,6 @@ impl OnionRunner {
             .launch_onion_service(service_config)
             .map_err(|error| failed("сервис не запустился", &error))?
             .ok_or(TransportError::Unavailable)?;
-
-        let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
-        spawn_accept_loop(rend_requests, events_tx.clone());
 
         // Что мы посчитали из ключа — и что сервис на самом деле обслуживает.
         // Расхождение здесь объясняет всё сразу: карточка везёт один адрес,
@@ -220,6 +243,10 @@ impl OnionRunner {
             });
             return Err(TransportError::Unavailable);
         }
+
+        let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
+        let mut tasks =
+            vec![status_task.keep(), spawn_accept_loop(rend_requests, events_tx.clone())];
         // Адрес объявляется **не здесь**, и это исправление ошибки, которая
         // выглядела как «Tor поднялся, а сообщения не ходят».
         //
@@ -232,7 +259,11 @@ impl OnionRunner {
         //
         // Поэтому `TorReady` уходит из наблюдателя за состоянием сервиса,
         // когда тот скажет о себе «работаю».
-        spawn_service_status_loop(Arc::clone(&service), address.clone(), events_tx.clone());
+        tasks.push(spawn_service_status_loop(
+            Arc::clone(&service),
+            address.clone(),
+            events_tx.clone(),
+        ));
 
         Ok(OnionRunner {
             client,
@@ -241,6 +272,7 @@ impl OnionRunner {
             events_tx,
             events_rx,
             address,
+            tasks,
         })
     }
 
@@ -346,6 +378,12 @@ impl Runner for OnionRunner {
                 self.links.remove(&peer.ik);
                 Ok(())
             }
+            // Сюда переключатель (§5.4) не доходит: его перехватывает
+            // `Switched`, который этот раннер и держит, — гасить Tor значит
+            // уронить раннера целиком, а не сказать ему «погасни». Ветка
+            // оставлена на случай, если раннер поднимут напрямую: отказ
+            // выглядел бы в журнале поломкой, которой нет.
+            TransportCommand::SetEnabled { transport: Transport::Onion, .. } => Ok(()),
             // Всё остальное — не наше: LAN-настройки, чужие транспорты.
             _ => Err(TransportError::Unavailable),
         }
@@ -371,7 +409,7 @@ fn spawn_service_status_loop(
     service: Arc<RunningOnionService>,
     address: String,
     events: mpsc::Sender<TransportEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut announced = false;
         // Прошлая строка — чтобы не повторять одну и ту же новость.
@@ -411,7 +449,7 @@ fn spawn_service_status_loop(
                 }
             }
         }
-    });
+    })
 }
 
 /// Пересказывает новости о подъёме Tor в события транспорта.
@@ -424,7 +462,10 @@ fn spawn_service_status_loop(
 /// новость молча. Так и надо: новости — это состояние, а не история.
 /// Отстал читатель — важна последняя строка, а не все пропущенные, и уж точно
 /// не стоит задерживать из-за них bootstrap.
-fn spawn_status_loop<S>(mut events: S, progress: mpsc::Sender<TransportEvent>)
+fn spawn_status_loop<S>(
+    mut events: S,
+    progress: mpsc::Sender<TransportEvent>,
+) -> tokio::task::JoinHandle<()>
 where
     S: futures::Stream<Item = arti_client::status::BootstrapStatus> + Send + Unpin + 'static,
 {
@@ -440,7 +481,7 @@ where
                 tracing::debug!("очередь новостей о Tor переполнена, новость отброшена");
             }
         }
-    });
+    })
 }
 
 /// Называет криптопровайдера rustls — один раз на процесс.
@@ -520,7 +561,10 @@ fn keystore_id() -> Result<KeystoreId, TransportError> {
 /// документация arti прямо предупреждает, что сервис, принимающий не только
 /// `BEGIN` и не только на один порт, **отличим** от прочих onion-сервисов.
 /// Это ровно §14 чужими словами: не выделяться там, где выделяться нечем.
-fn spawn_accept_loop<S>(rend_requests: S, events: mpsc::Sender<TransportEvent>)
+fn spawn_accept_loop<S>(
+    rend_requests: S,
+    events: mpsc::Sender<TransportEvent>,
+) -> tokio::task::JoinHandle<()>
 where
     S: futures::Stream<Item = tor_hsservice::RendRequest> + Send + 'static,
 {
@@ -548,7 +592,7 @@ where
                 }
             }
         }
-    });
+    })
 }
 
 /// На наш ли порт этот поток.
@@ -589,6 +633,30 @@ fn foreign_address(service: &RunningOnionService, key: &OnionKey) -> Option<Stri
         return None;
     }
     Some(ratatosk_crypto::onion::address_of(&bytes))
+}
+
+/// Задача, которую снимут, если её не забрали.
+///
+/// `JoinHandle` при уничтожении **не** останавливает задачу — он от неё
+/// отвязывается. Для задачи, порождённой на середине подъёма, это значит:
+/// любой отказ ниже по коду оставляет её жить в рантайме навсегда,
+/// а вместе с ней и всё, что она держит. Сторож переворачивает умолчание:
+/// не забрали — сняли.
+struct Abandoned(Option<tokio::task::JoinHandle<()>>);
+
+impl Abandoned {
+    /// Забирает задачу: дальше за ней следит тот, кто забрал.
+    fn keep(&mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("задачу забирают ровно один раз")
+    }
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Короткий вид ключа — для строк, которые читает человек.

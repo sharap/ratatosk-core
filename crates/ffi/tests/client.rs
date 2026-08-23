@@ -13,7 +13,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ratatosk_ffi::{EventObserver, FfiDeliveryStatus, FfiEvent, RatatoskClient, RatatoskError};
+use ratatosk_ffi::{
+    EventObserver, FfiDeliveryStatus, FfiEvent, FfiTransport, RatatoskClient, RatatoskError,
+};
 
 struct TempDb(PathBuf);
 
@@ -241,8 +243,8 @@ fn lan_can_be_switched_on_and_off() {
     let db = TempDb::new("lan");
     let client = RatatoskClient::open(db.path(), Some("1234".to_owned()), None, "я".to_owned())
         .expect("клиент открылся");
-    client.set_lan_enabled(true).expect("включение принято");
-    client.set_lan_enabled(false).expect("выключение принято");
+    client.set_transport_enabled(FfiTransport::Lan, true).expect("включение принято");
+    client.set_transport_enabled(FfiTransport::Lan, false).expect("выключение принято");
     assert!(!client.fingerprint().is_empty(), "ядро живо");
 }
 
@@ -256,7 +258,7 @@ fn a_network_change_is_survivable() {
         .expect("клиент открылся");
 
     client.network_changed().expect("при выключенном LAN — тоже команда");
-    client.set_lan_enabled(true).expect("включение принято");
+    client.set_transport_enabled(FfiTransport::Lan, true).expect("включение принято");
     client.network_changed().expect("и при включённом");
     client.network_changed().expect("лишний вызов стоит одного переобъявления");
 

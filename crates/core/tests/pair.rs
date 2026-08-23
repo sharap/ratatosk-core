@@ -36,7 +36,7 @@ fn node_with_blobs(seed: u8, name: &str) -> (Node, Blobs) {
     store.migrate().expect("миграция in-memory хранилища");
 
     let blobs: Blobs = Arc::new(Mutex::new(MemoryBlobs::new()));
-    let engine = Engine::new(
+    let mut engine = Engine::new(
         identity,
         store,
         Box::new(Arc::clone(&blobs)),
@@ -47,6 +47,15 @@ fn node_with_blobs(seed: u8, name: &str) -> (Node, Blobs) {
             display_name: name.to_owned(),
         },
     );
+    // Транспорты объявляются работающими сразу, и это подмена настоящего
+    // порядка вещей — сознательная. На устройстве onion говорит о своей
+    // готовности сам, десятками секунд позже включения (§5.4,
+    // `Input::TransportReady`), и §5.4 до этого момента его не выбирает.
+    // Проверяется это отдельно; здесь же ждать нечего и незачем — иначе
+    // каждый тест начинался бы с имитации подъёма Tor.
+    engine
+        .step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Onion })
+        .expect("объявление готовности транспорта");
     (engine, blobs)
 }
 
@@ -84,7 +93,7 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 Effect::SetTimer { token, .. } => timers.push((from_first, token)),
                 Effect::Notify(event) => events.push(event),
                 Effect::Connect { .. }
-                | Effect::SetLanEnabled(_)
+                | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
                 | Effect::RestartLan => {}
             }
@@ -296,7 +305,14 @@ fn lan_only_contact(node: &mut Node, seed: u8) -> [u8; 32] {
         version: 1,
     };
     let peer_ik = card.ik;
-    node.step(0, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    node.step(
+        0,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: true,
+        }),
+    )
+    .unwrap();
     node.step(
         0,
         Input::Command(Command::AddContact {
@@ -982,7 +998,10 @@ fn a_peer_that_forgot_our_session_gets_a_new_one() {
         vec!["второе".to_string()],
         "молчание в ответ на кадр обязано привести к новому рукопожатию, а не к тишине"
     );
-    assert_eq!(alice.session_count(), 1, "прежняя сессия закрыта, новая одна");
+    // Прежнюю не закрыли, а вытеснили: молчание отправило её на покой (5ю),
+    // и как только новое рукопожатие закончилось, покойную убрал `insert`
+    // обычным порядком. Покой — не бессмертие.
+    assert_eq!(alice.session_count(), 1, "покойная вытеснена новой, а не накопилась рядом");
 }
 
 #[test]
@@ -1106,7 +1125,8 @@ fn a_replayed_frame_is_refused_by_the_ratchet() {
 /// отправитель доходит до срока ожидания и берётся за дело сам.
 ///
 /// Возвращает то, что он при этом выпустил: там и новое рукопожатие (молчание
-/// закрывает сессию, §8.5), и та же самая посылка вторым заходом. Копия придёт
+/// отправляет сессию на покой, §8.5 и 5ю), и та же самая посылка вторым
+/// заходом. Копия придёт
 /// **новым кадром с тем же `msg_id`** — точный повтор кадра ретчет не принял бы
 /// вовсе, и никакого дубля получатель бы не увидел.
 fn send_and_lose_the_receipt(
@@ -1135,6 +1155,43 @@ fn send_and_lose_the_receipt(
     alice
         .step(now_ms + 60_000, Input::Timer { token: deadline.expect("срок ожидания квитанции") })
         .expect("срок вышел")
+}
+
+#[test]
+fn silence_on_our_side_does_not_deafen_us_to_theirs() {
+    // Живая поломка со стенда, и разбор её стоит запомнить.
+    //
+    // Молчание в ответ на ушедший кадр — свидетельство об **одном**
+    // направлении: наши кадры не доходят или их квитанции не доходят.
+    // О том, доходят ли **его** сообщения до нас, оно не говорит ничего.
+    // Мы же закрывали сессию целиком: мы её забыли, собеседник нет,
+    // он продолжал слать по ней, а мы каждый его кадр молча отбрасывали
+    // как «неизвестная сессия». Сказать ему об этом нечем — кадр
+    // не расшифрован, кто прислал, неизвестно. Переписка умирала в одну
+    // сторону навсегда, при живой связи с обеих.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Сессия устанавливается по-настоящему, обычным обменом.
+    let effects = send_text(&mut alice, &bob, 1_000, "здравствуй");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["здравствуй".to_string()]);
+
+    // Теперь Алисин кадр уходит, а квитанция до неё не доезжает: срок
+    // ожидания выходит, и §5.4 объявляет попытку неудавшейся.
+    let after = send_and_lose_the_receipt(&mut alice, &mut bob, 2_000, "меня не слышно");
+    assert!(!after.is_empty(), "срок ожидания обязан что-то предпринять");
+
+    // И вот здесь проверяется всё. Боб о нашем молчании не знает и шлёт
+    // по той же сессии — она обязана принять.
+    let effects = send_text(&mut bob, &alice, 3_000, "а я тебя слышу");
+    pump(&mut bob, &mut alice, 3_000, effects);
+
+    assert!(
+        inbox(&alice, &bob).contains(&"а я тебя слышу".to_string()),
+        "сессия ушла на покой для отправки, но принимать обязана: {:?}",
+        inbox(&alice, &bob)
+    );
 }
 
 #[test]
@@ -1768,7 +1825,7 @@ use ratatosk_core::OutgoingFile;
 use ratatosk_proto::files;
 // Здесь оно нужно поимённо: проверяется, **каким** транспортом уходит кадр,
 // и `ratatosk_proto::Transport::Lan` внутри `matches!` читается уже плохо.
-use ratatosk_proto::Transport;
+use ratatosk_proto::{DeliveryStatus, Transport};
 // Под псевдонимом: имя `Blobs` в этом файле уже занято псевдонимом типа
 // разделяемого хранилища, а трейт нужен ради `put_chunk` — тесты уборки
 // кладут на «диск» то, чего ядро туда не клало.
@@ -1839,6 +1896,190 @@ fn a_file_travels_in_chunks_and_arrives_whole() {
 }
 
 #[test]
+fn a_message_waits_for_tor_to_come_up_instead_of_burning_the_step() {
+    // Ошибка со стенда: ядро отправляло сразу после включения Tor,
+    // не дожидаясь публикации сервиса, получало отказ транспорта — и §5.4
+    // считал ступень потраченной. Транспорт после отказа не повторяется,
+    // так что сообщение уезжало дальше по лестнице или вставало в ожидание,
+    // хотя Tor поднимался через полминуты.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Почта в этом тесте лишняя: у заготовки узла есть и почтовый адрес,
+    // а §5.4 честно ушёл бы на неё — и проверялась бы не та ступень.
+    alice
+        .step(
+            400,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Mail,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+
+    // Возвращаем узел в настоящее положение вещей: onion включён, но ещё
+    // не поднялся. (Заготовка узла объявляет его готовым, чтобы каждый тест
+    // не начинался с имитации подъёма Tor.)
+    let off = alice
+        .step(
+            500,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+    assert!(off.iter().any(|e| matches!(e, Effect::SetTransportEnabled { .. })));
+    alice
+        .step(
+            600,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: true,
+            }),
+        )
+        .unwrap();
+
+    // LAN выключен, onion включён, но не работает — ехать сейчас некуда.
+    let effects = send_text(&mut alice, &bob, 1_000, "подожду");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "в ступень, которой ещё нет, кадр уходить не должен: {effects:?}"
+    );
+
+    // Сервис опубликовался — и вот теперь сообщение едет само.
+    let effects = alice
+        .step(2_000, Input::TransportReady { transport: Transport::Onion })
+        .expect("готовность транспорта");
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["подожду".to_string()],
+        "ступень появилась — ждавшее уехало без единого действия человека"
+    );
+}
+
+#[test]
+fn switching_tor_off_takes_the_address_out_of_the_card() {
+    // §14: выключенный Tor означает, что по нашему адресу больше никого нет.
+    // Оставить адрес в карточке — обещать путь, которого не существует:
+    // собеседник честно набирал бы его при каждой отправке, платил сроком
+    // ожидания и видел «не доставлено» там, где правильный ответ —
+    // «он выключил Tor».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+
+    let address = some_onion(9);
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: address.clone(),
+                chatmail: String::new(),
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(bob.contacts()[&alice_ik].card.onion, address, "адрес доехал");
+
+    let effects = alice
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    let known = &bob.contacts()[&alice_ik];
+    assert!(known.card.onion.is_empty(), "адрес обязан быть снят: {:?}", known.card.onion);
+    assert!(!known.availability.has_onion, "и §5.4 обязан узнать, что пути больше нет");
+    assert!(alice.own_card().version > 1, "версия карточки растёт — это обычное §4.3");
+}
+
+#[test]
+fn switching_a_transport_off_releases_what_was_riding_it() {
+    // Выключатель, который действует только на новые отправки, — половина
+    // выключателя. Всё, что уже выбрало этот транспорт, продолжало его
+    // ждать: Tor выключен, а сообщение «ждёт отправки через Tor» и не едет
+    // даже по включённой позже локальной сети, потому что висит не в очереди
+    // ожидающих, а в попытке, привязанной к onion.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let (alice_ik, bob_ik) = (alice.own_card().ik, bob.own_card().ik);
+
+    // LAN по умолчанию выключен, onion включён — значит §5.4 идёт в onion.
+    // Провод не двигаем: собеседник недоступен, рукопожатие висит.
+    let effects = send_text(&mut alice, &bob, 1_000, "через onion");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Send { via: Transport::Onion, .. })),
+        "первая ступень при выключенном LAN — onion: {effects:?}"
+    );
+
+    // Человек выключает Tor.
+    let released = alice
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+    // Сойти с выключенной ступени — значит оказаться на следующей, а не
+    // сразу в ожидании: §5.4 ведёт дальше по лестнице, и для неё «человек
+    // выключил» и «не сработало» — один исход. Видно это по рукопожатию:
+    // оно уходит почтой, и сообщение ждёт уже её.
+    assert!(
+        released.iter().any(|e| matches!(e, Effect::Send { via: Transport::Mail, .. })),
+        "сообщение обязано сойти с выключенной ступени на следующую: {released:?}"
+    );
+
+    // А почта (§5.3) ещё не написана: на устройстве раннер откажет. Это
+    // не подгонка теста под код — это то, что там сейчас происходит,
+    // и без этого шага лестница не кончится никогда.
+    let refused =
+        alice.step(2_100, Input::ConnectionLost { peer_ik: bob_ik, via: Transport::Mail }).unwrap();
+    assert!(
+        refused.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged { status: DeliveryStatus::Waiting, .. })
+        )),
+        "ступени кончились — сообщение обязано честно встать в ожидание: {refused:?}"
+    );
+
+    // Теперь локальная сеть — на обеих машинах.
+    let lan_on = || {
+        Input::Command(Command::SetTransportEnabled { transport: Transport::Lan, enabled: true })
+    };
+    bob.step(3_000, lan_on()).unwrap();
+    bob.step(3_050, Input::SeenOnLan { peer_ik: alice_ik }).unwrap();
+
+    // Провод двигаем с самого включения, а не только после маячка. Отложенное
+    // поднимается уже здесь, и вместе с сообщением поднимается досылка
+    // карточки (§4.3): выключение Tor сняло адрес, а снятое надо разослать.
+    // Паузу на обнаружение (§5.1) в этом сеансе получает только первая
+    // отправка — вторая идёт сразу и начинает рукопожатие. Бросить эти
+    // эффекты значит бросить рукопожатие: второго `ensure_handshake`
+    // не начнёт, оно у контакта одно, — и всё дальнейшее молча стояло бы.
+    let woken = alice.step(3_100, lan_on()).unwrap();
+    pump(&mut alice, &mut bob, 3_100, woken);
+
+    let effects = alice.step(3_200, Input::SeenOnLan { peer_ik: bob_ik }).unwrap();
+    pump(&mut alice, &mut bob, 3_200, effects);
+
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["через onion".to_string()],
+        "сообщение обязано уехать той ступенью, которая появилась"
+    );
+}
+
+#[test]
 fn a_direct_channel_is_never_a_switched_off_lan() {
     // Ошибка, из-за которой «сообщения через onion ходят, а файлы нет —
     // доезжает только сообщение с превью».
@@ -1856,8 +2097,23 @@ fn a_direct_channel_is_never_a_switched_off_lan() {
     let (alice_ik, bob_ik) = (alice.own_card().ik, bob.own_card().ik);
 
     // Оба в общей сети: сессия установится по LAN — она первая ступень.
-    alice.step(400, Input::Command(Command::SetLanEnabled(true))).unwrap();
-    bob.step(400, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    alice
+        .step(
+            400,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
+    bob.step(
+        400,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: true,
+        }),
+    )
+    .unwrap();
     alice.step(500, Input::SeenOnLan { peer_ik: bob_ik }).unwrap();
     bob.step(500, Input::SeenOnLan { peer_ik: alice_ik }).unwrap();
 
@@ -1867,8 +2123,23 @@ fn a_direct_channel_is_never_a_switched_off_lan() {
 
     // Сеть выключили с обеих сторон. Сессия LAN осталась — и это правильно,
     // ключи никуда не делись. Но канала больше нет.
-    alice.step(2_000, Input::Command(Command::SetLanEnabled(false))).unwrap();
-    bob.step(2_000, Input::Command(Command::SetLanEnabled(false))).unwrap();
+    alice
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+    bob.step(
+        2_000,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: false,
+        }),
+    )
+    .unwrap();
 
     let chat = Engine::<MemoryStore>::chat_id_for(&alice_ik);
     let last = bob.store().messages(&chat, 10, None).unwrap().pop().unwrap().msg_id;
@@ -1892,6 +2163,96 @@ fn a_direct_channel_is_never_a_switched_off_lan() {
     assert!(
         effects.iter().any(|e| matches!(e, Effect::Send { via: Transport::Onion, .. })),
         "прямой канал обязан найтись там, где он есть: {effects:?}"
+    );
+}
+
+#[test]
+fn each_rung_of_the_ladder_gets_its_own_handshake() {
+    // Поломка со стенда, из-за которой переписка умирала при живом Tor
+    // с обеих сторон: «кадр записан, кадр прочитан, а сообщений нет».
+    //
+    // Раньше на следующую ступень §5.4 уходил тот же самый кадр первого
+    // сообщения — рукопожатие Noise про транспорт ничего не знает, зачем
+    // считать его дважды. Затем, что семейство транспортов приписывает
+    // сессии каждая сторона отдельно, по тому пути, которым кадр пришёл
+    // к ней. Повтор разводит эти два мнения, и дальше каждая сторона шлёт
+    // в сессию, которой у другой нет.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+
+    // Шаг 1. Онион-сессия живёт у обеих сторон, переписка идёт.
+    let effects = send_text(&mut alice, &bob, 1_000, "через onion");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["через onion".to_string()]);
+
+    // Шаг 2. У обоих включают локальную сеть, но маячок Алисы до Боба
+    // не доходит: соединения односторонние (ARCHITECTURE 5ц), и его
+    // сторона не поднимается. Значит, LAN станет первой ступенью только
+    // у Алисы — ровно как на стенде.
+    let lan_on = || {
+        Input::Command(Command::SetTransportEnabled { transport: Transport::Lan, enabled: true })
+    };
+    alice.step(2_000, lan_on()).unwrap();
+    bob.step(2_000, lan_on()).unwrap();
+    alice.step(2_100, Input::SeenOnLan { peer_ik: bob_ik }).unwrap();
+
+    // Шаг 3. Первая ступень — LAN, сессии для неё нет: рукопожатие.
+    let (mut lan_frame, mut tokens) = (None, Vec::new());
+    for effect in send_text(&mut alice, &bob, 3_000, "второе") {
+        match effect {
+            Effect::Send { via: Transport::Lan, frame, .. } => lan_frame = Some(frame),
+            Effect::SetTimer { token, .. } => tokens.push(token),
+            _ => {}
+        }
+    }
+    let lan_frame = lan_frame.expect("при виденном в LAN собеседнике первая ступень — LAN");
+
+    // Шаг 4. Боб кадр принимает и заводит сессию, привязанную к LAN.
+    // А его ответ по LAN не уезжает: обратной стороны соединения нет.
+    let answered =
+        bob.step(3_100, Input::Received { via: Transport::Lan, frame: lan_frame.clone() }).unwrap();
+    assert!(
+        answered.iter().any(|e| matches!(e, Effect::Send { via: Transport::Lan, .. })),
+        "рукопожатие обязано получить ответ тем же путём: {answered:?}"
+    );
+
+    // Шаг 5. У Алисы выходит срок, и §5.4 ведёт её на onion.
+    let mut onion_frame = None;
+    for token in tokens {
+        for effect in alice.step(60_000, Input::Timer { token }).unwrap() {
+            if let Effect::Send { via: Transport::Onion, frame, .. } = effect {
+                onion_frame = Some(frame);
+            }
+        }
+    }
+    let onion_frame = onion_frame.expect("после молчания LAN §5.4 обязан привести на onion");
+    assert_ne!(
+        onion_frame, lan_frame,
+        "каждой ступени — своё рукопожатие: повтор кадра разводит привязки сессии"
+    );
+
+    // Шаг 6. Для Боба это новое рукопожатие, а не повтор: он заводит
+    // онион-сессию, вытесняя прежнюю, и отвечает по onion.
+    let effects =
+        bob.step(61_000, Input::Received { via: Transport::Onion, frame: onion_frame }).unwrap();
+    pump(&mut bob, &mut alice, 61_000, effects);
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["через onion".to_string(), "второе".to_string()],
+        "сообщение обязано уехать второй ступенью"
+    );
+
+    // Шаг 7. И вот ради чего всё. Боб отвечает; Алисиного маячка он
+    // не видел, поэтому его прямой канал — onion. Сессия там обязана быть
+    // той же самой, что и у Алисы.
+    let effects = send_text(&mut bob, &alice, 70_000, "третье");
+    pump(&mut bob, &mut alice, 70_000, effects);
+    assert!(
+        inbox(&alice, &bob).contains(&"третье".to_string()),
+        "онион-сессия обязана быть одной на двоих, иначе кадр отбрасывается \
+         как «неизвестная сессия»: {:?}",
+        inbox(&alice, &bob)
     );
 }
 

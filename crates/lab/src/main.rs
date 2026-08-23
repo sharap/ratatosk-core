@@ -46,7 +46,7 @@ use ratatosk_crypto::{Identity, OnionKey};
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
 #[cfg(feature = "tor")]
-use ratatosk_transport::Deferred;
+use ratatosk_transport::Switched;
 use ratatosk_transport::{Disabled, LanConfig, LanDirectory, LanRunner, Transports};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -268,22 +268,30 @@ async fn run<S: Store + 'static>(
         // объявляется неудавшимся. Так стенд с хранилищем в памяти
         // не поднимает Tor на одноразовом ключе — адрес всё равно исчез бы
         // вместе с процессом, — но составной раннер остаётся тем же.
-        let trust_fs = args.trust_fs;
-        let onion = Deferred::rising(|progress| async move {
-            let Some(layout) = layout else {
-                return Err(ratatosk_transport::TransportError::Unavailable);
-            };
-            ratatosk_transport::onion::arti::OnionRunner::start(
-                ratatosk_transport::onion::arti::OnionSetup {
-                    state_dir: &layout.state,
-                    cache_dir: &layout.cache,
-                    keystore_dir: &layout.keys,
-                    key: &onion,
-                    dangerously_trust_filesystem: trust_fs,
-                },
-                progress,
-            )
-            .await
+        // Всё нужное для подъёма — под `Arc`, и это не украшение:
+        // поднимать придётся столько раз, сколько человек передумает
+        // (`/tor on`, `/tor off`), а замыкание-фабрика забирать в себя
+        // ничего не вправе.
+        let setup = std::sync::Arc::new((layout, onion, args.trust_fs));
+        let onion = Switched::new(move |progress| {
+            let setup = std::sync::Arc::clone(&setup);
+            async move {
+                let (layout, key, trust_fs) = &*setup;
+                let Some(layout) = layout.as_ref() else {
+                    return Err(ratatosk_transport::TransportError::Unavailable);
+                };
+                ratatosk_transport::onion::arti::OnionRunner::start(
+                    ratatosk_transport::onion::arti::OnionSetup {
+                        state_dir: &layout.state,
+                        cache_dir: &layout.cache,
+                        keystore_dir: &layout.keys,
+                        key,
+                        dangerously_trust_filesystem: *trust_fs,
+                    },
+                    progress,
+                )
+                .await
+            }
         });
         Transports::new(lan, onion, Disabled)
     };
@@ -325,7 +333,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -334,8 +342,14 @@ async fn run<S: Store + 'static>(
 
     // §5.1: LAN выключен по умолчанию. Стенд включает его явно — ровно так же,
     // как это должен будет сделать пользователь в UI. Команда идёт первой:
-    // она проставляет `lan_enabled` уже поднятым с диска контактам.
-    handle.send(Command::SetLanEnabled(args.lan)).await.ok();
+    // она проставляет разрешение уже поднятым с диска контактам.
+    handle
+        .send(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: args.lan,
+        })
+        .await
+        .ok();
 
     tokio::select! {
         result = driver.run() => {
@@ -482,6 +496,34 @@ async fn console(
                     print_card(&handle).await;
                     continue;
                 }
+                if let Some(word) = line.strip_prefix("/tor ") {
+                    // Переключатель, а не «остановить процесс»: ядро запомнит
+                    // выбор и сообщит транспорту, а тот решит, что с собой
+                    // делать. §5.4 перестаёт выбирать onion сразу — до того,
+                    // как arti успеет что-либо предпринять.
+                    let enabled = match word.trim() {
+                        "on" | "вкл" => true,
+                        "off" | "выкл" => false,
+                        other => {
+                            println!("< /tor on | /tor off (а не «{other}»)");
+                            continue;
+                        }
+                    };
+                    handle
+                        .send(Command::SetTransportEnabled {
+                            transport: ratatosk_proto::Transport::Onion,
+                            enabled,
+                        })
+                        .await
+                        .ok();
+                    if enabled {
+                        println!("< onion включён — §5.4 снова может его выбрать");
+                    } else {
+                        println!("< onion выключен — §5.4 его больше не выбирает");
+                        println!("  выбор запомнен и переживёт перезапуск");
+                    }
+                    continue;
+                }
                 if line == "/tor" {
                     // Вопрос, на который иначе отвечать нечем: «сообщения
                     // не ходят — это Tor ещё не готов или уже сломан?»
@@ -505,6 +547,17 @@ async fn console(
                         println!("  в карточке        : {in_card}");
                         println!("  ЭТО РАСХОЖДЕНИЕ: arti взял не наш ключ (см. строку «встало»)");
                     }
+                    // Главный вопрос при «Tor запущен, а не идёт»: считает ли
+                    // ядро ступень работающей. Включённая и работающая —
+                    // разные вещи, и §5.4 выбирает только вторую.
+                    if let Some(status) = handle.transports().await {
+                        let onion = ratatosk_proto::Transport::Onion;
+                        println!(
+                            "  ступень onion: включена={}  работает={}",
+                            yes(status.enabled.contains(onion)),
+                            yes(status.ready.contains(onion))
+                        );
+                    }
                     println!("  адрес собеседника и видимость — /who");
                     println!("  свой адрес объявляется командой /onion; контактам,");
                     println!("  добавленным позже, он доедет сам при первой связи (§4.3)");
@@ -516,7 +569,13 @@ async fn console(
                     // проверить второй транспорт можно только выключив
                     // первый, и это же делает человек в UI.
                     lan_on = !lan_on;
-                    handle.send(Command::SetLanEnabled(lan_on)).await.ok();
+                    handle
+                        .send(Command::SetTransportEnabled {
+                            transport: ratatosk_proto::Transport::Lan,
+                            enabled: lan_on,
+                        })
+                        .await
+                        .ok();
                     if lan_on {
                         println!("< локальная сеть включена — она снова первая ступень");
                     } else {
@@ -679,22 +738,46 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         let addr = directory
             .get(&contact.peer_ik)
             .map_or_else(|| "неизвестен".to_owned(), |addr| addr.to_string());
+        // Три признака у каждой ступени, и все три печатаются: «включён»
+        // чинится переключателем, «работает» — временем (bootstrap идёт
+        // десятки секунд), «адрес» — обменом карточками. Слив их в одно
+        // слово, стенд отвечал бы на вопрос «почему не идёт» одинаково
+        // для трёх разных бед.
+        let step = |t| (a.enabled.contains(t), a.ready.contains(t));
+        let (lan_on, lan_up) = step(ratatosk_proto::Transport::Lan);
+        let (onion_on, onion_up) = step(ratatosk_proto::Transport::Onion);
+        let (mail_on, mail_up) = step(ratatosk_proto::Transport::Mail);
         println!(
-            "    LAN: включён={}  виден={}  адрес: {addr}",
-            yes(a.lan_enabled),
+            "    LAN:   включён={}  работает={}  виден={}  адрес: {addr}",
+            yes(lan_on),
+            yes(lan_up),
             yes(a.seen_on_lan)
         );
-        println!("    onion={}  почта={}", yes(a.has_onion), yes(a.has_chatmail));
+        println!(
+            "    onion: включён={}  работает={}  адрес={}",
+            yes(onion_on),
+            yes(onion_up),
+            yes(a.has_onion)
+        );
+        println!(
+            "    почта: включена={}  работает={}  адрес={}",
+            yes(mail_on),
+            yes(mail_up),
+            yes(a.has_chatmail)
+        );
 
         // Ровно та цепочка условий, что в `transport_policy::Attempt::next`.
-        let verdict = if a.lan_enabled && a.seen_on_lan {
+        let verdict = if lan_on && lan_up && a.seen_on_lan {
             "пойдёт по LAN"
-        } else if a.has_onion {
+        } else if onion_on && onion_up && a.has_onion {
             "пойдёт через onion"
-        } else if a.has_chatmail {
+        } else if onion_on && a.has_onion {
+            "onion ещё поднимается — уйдёт, как только сервис опубликуется"
+        } else if mail_on && mail_up && a.has_chatmail {
             "пойдёт почтой"
-        } else if !a.lan_enabled {
-            "отправлять некуда: LAN выключен, других адресов в карточке нет"
+        } else if !lan_on {
+            "отправлять некуда: LAN выключен, других путей нет — \
+             проверьте /tor и адреса в карточке"
         } else {
             "отправлять некуда: контакт не виден в LAN. \
              Допишите адрес: /add <карточка> <ip:порт> — на обеих машинах"

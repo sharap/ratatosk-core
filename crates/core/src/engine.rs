@@ -25,7 +25,9 @@ use ratatosk_crypto::handshake::{
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
 use ratatosk_proto::fragment::Reassembler;
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
-use ratatosk_proto::transport_policy::{Attempt, Decision, PeerAvailability, SessionBinding};
+use ratatosk_proto::transport_policy::{
+    Attempt, Decision, PeerAvailability, SessionBinding, TransportSet,
+};
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{
     Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredMessage, Task,
@@ -49,6 +51,28 @@ use crate::reader::FileReader;
 pub const HANDSHAKE_STEP_FIRST: u64 = 0;
 /// Номер ответного сообщения рукопожатия.
 pub const HANDSHAKE_STEP_RESPONSE: u64 = 1;
+
+/// Какие транспорты включены у только что заведённого ядра.
+///
+/// Локальная сеть — выключена: §5.1 требует этого прямо, и причина
+/// не в трафике, а в том, что маяк в эфире выдаёт присутствие устройства
+/// всем, кто слушает. Такое включают осознанно.
+///
+/// Onion и почта — включены: это транспорты, ради которых мессенджер
+/// и существует, и выключенными по умолчанию они означали бы устройство,
+/// которое из коробки не работает нигде.
+const DEFAULT_TRANSPORTS: TransportSet =
+    TransportSet::none().with(Transport::Onion).with(Transport::Mail);
+
+/// Транспорты, которым нечего ждать: включили — значит работает.
+///
+/// Локальная сеть занимает порт при открытии аккаунта, до всякой команды;
+/// почта асинхронна по устройству — у неё нет ни соединения, ни сессии,
+/// которых надо дождаться. Единственный, у кого между «включили»
+/// и «работает» лежат десятки секунд, — Tor, и он говорит о своей
+/// готовности сам ([`Input::TransportReady`]).
+const IMMEDIATE_TRANSPORTS: TransportSet =
+    TransportSet::none().with(Transport::Lan).with(Transport::Mail);
 
 /// Класс кадра для рукопожатия (§5.5).
 ///
@@ -277,6 +301,48 @@ enum Failure {
     Silent,
 }
 
+/// Что стало с рукопожатием, которое ждало отказавший транспорт.
+///
+/// Три исхода, и путать их нельзя. «Его там не было» — не то же, что
+/// «ступени кончились»: первое означает «этой доставки касаться нечем»,
+/// второе — «сессии не будет, объявляй исход». А `Moved` обязан увести
+/// за собой сообщения, которые ждали именно эту сессию, — иначе доставка
+/// остаётся приколотой к ступени, рукопожатие которой уже брошено.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeStep {
+    /// Рукопожатия на этом транспорте не было — трогать нечего.
+    Absent,
+    /// Перешло на следующую ступень §5.4.
+    Moved(Transport),
+    /// Ступени кончились: сессии не будет.
+    Exhausted,
+}
+
+/// Доводит попытку до указанной ступени §5.4, отметив пройденные.
+///
+/// Нужна там, где транспорт выбран не лестницей, а обстоятельствами:
+/// рукопожатие уже ушло на эту ступень, и данные обязаны оказаться на той
+/// же — но с честной записью о том, что предыдущие израсходованы.
+///
+/// Возвращает `false`, если ступень недостижима (её уже пробовали, или
+/// availability её больше не пускает). В этом случае попытка остаётся
+/// **нетронутой**: пройтись по лестнице до конца и молча сжечь все ступени
+/// было бы хуже, чем не сделать ничего.
+fn walk_attempt_to(
+    attempt: &mut Attempt,
+    availability: PeerAvailability,
+    target: Transport,
+) -> bool {
+    let saved = attempt.clone();
+    while let Some(Decision::Use(transport)) = attempt.next(availability) {
+        if transport == target {
+            return true;
+        }
+    }
+    *attempt = saved;
+    false
+}
+
 /// Что сейчас с сообщением на пути к получателю (§5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveryState {
@@ -307,11 +373,12 @@ enum DeliveryState {
 /// Без собственной попытки по §5.4 получалась бы тупиковая связка: данные
 /// переходят на почту, а рукопожатие, без которого они не поедут, осталось
 /// в упавшем onion.
+/// Готового кадра здесь намеренно нет. Раньше он лежал рядом с состоянием,
+/// и следующая ступень §5.4 пересылала **тот же самый** кадр — «зачем
+/// начинать рукопожатие заново». Разбор поломки на стенде показал, зачем.
+/// Смотри [`Engine::retry_handshake`].
 struct OutgoingHandshake {
     state: PendingHandshake,
-    /// Готовый кадр первого сообщения — чтобы переслать его другим
-    /// транспортом, не начиная рукопожатие заново.
-    frame: Vec<u8>,
     attempt: Attempt,
     peer_ik: [u8; 32],
     /// Метка таймера текущей попытки, если транспорт прямой.
@@ -367,9 +434,24 @@ pub struct Engine<S: Store> {
     pending: Vec<OutgoingHandshake>,
     outbox: Vec<Delivery>,
     next_timer_token: u64,
-    /// §5.1: по умолчанию выключен. Хранится отдельно от контактов, потому
-    /// что состояние переключателя существует и когда контактов ещё нет.
-    lan_enabled: bool,
+    /// Какие транспорты разрешил человек (§5.4).
+    ///
+    /// Отдельно от контактов, потому что состояние переключателей существует
+    /// и когда контактов ещё нет; в [`PeerAvailability`] оно копируется,
+    /// чтобы §5.4 принимал решение по одной структуре.
+    ///
+    /// Переживает перезапуск ([`META_TRANSPORTS`]): выключивший Tor обязан
+    /// обнаружить его выключенным и назавтра, а хранить это у себя клиенту
+    /// §13.3 не разрешает — «каким транспортом ехать» протокольное решение.
+    ///
+    /// [`META_TRANSPORTS`]: ratatosk_store::META_TRANSPORTS
+    enabled: TransportSet,
+    /// Какие транспорты уже работают.
+    ///
+    /// На диске не хранится и храниться не должно: это не выбор человека,
+    /// а состояние сети в этом запуске. Поднятым Tor не бывает до того,
+    /// как поднялся.
+    ready: TransportSet,
     /// Кого заметили в LAN раньше, чем добавили в контакты.
     seen_on_lan: BTreeSet<[u8; 32]>,
     /// Сообщения, которым некуда было ехать. Ждут случая (§5.4).
@@ -466,7 +548,8 @@ impl<S: Store> Engine<S> {
             pending: Vec::new(),
             outbox: Vec::new(),
             next_timer_token: 1,
-            lan_enabled: false,
+            enabled: DEFAULT_TRANSPORTS,
+            ready: IMMEDIATE_TRANSPORTS,
             seen_on_lan: BTreeSet::new(),
             deferred: Vec::new(),
             awaited_discovery: BTreeSet::new(),
@@ -550,6 +633,7 @@ impl<S: Store> Engine<S> {
         match input {
             Input::Command(command) => self.on_command(now_ms, command),
             Input::Received { via, frame } => self.on_frame(now_ms, via, &frame),
+            Input::TransportReady { transport } => self.on_transport_ready(transport),
             Input::SeenOnLan { peer_ik } => {
                 // mDNS повторяет объявления, поэтому важен именно **переход**
                 // «не видели → видим»: на каждом повторе перебирать очередь
@@ -690,24 +774,8 @@ impl<S: Store> Engine<S> {
             }
             Command::ClearChat { chat } => self.on_clear_chat(now_ms, chat),
             Command::SetAvatar(bytes) => self.on_set_avatar(now_ms, &bytes),
-            Command::SetLanEnabled(on) => {
-                self.lan_enabled = on;
-                for contact in self.contacts.values_mut() {
-                    contact.availability.lan_enabled = on;
-                }
-                // Прежние «не слышно» устарели: эфир только что открылся,
-                // и каждому контакту снова полагается срок на обнаружение.
-                self.awaited_discovery.clear();
-                let mut effects = vec![Effect::SetLanEnabled(on)];
-                if on {
-                    effects.push(self.watch_lan_peers());
-                    // Локальная сеть только что появилась как возможность —
-                    // значит у отложенных сообщений появился шанс. Это же
-                    // и путь после перезапуска: клиент включает LAN при
-                    // старте, и очередь с диска приходит в движение.
-                    effects.extend(self.retry_deferred(None)?);
-                }
-                Ok(effects)
+            Command::SetTransportEnabled { transport, enabled } => {
+                self.on_set_transport_enabled(now_ms, transport, enabled)
             }
             Command::NetworkChanged => self.on_network_changed(),
             Command::SendFiles { chat, files, text } => {
@@ -750,9 +818,24 @@ impl<S: Store> Engine<S> {
     ///
     /// Эффектов здесь нет намеренно: `restore` вызывается до того, как
     /// появился драйвер, и вернуть их было бы некуда. Список маяков для
-    /// транспорта (§5.1) выставит `Command::SetLanEnabled`, который клиент
-    /// подаёт в любом случае — а при выключенном LAN он и не нужен.
+    /// транспорта (§5.1) выдаст [`Engine::startup_effects`] — он же включит
+    /// транспорты, которые человек оставил включёнными в прошлый раз.
     pub fn restore(&mut self) -> Result<usize, EngineError> {
+        // Набор транспортов — первым: он копируется в каждый поднимаемый
+        // контакт, и подними мы его после, все контакты остались бы
+        // с умолчанием, а §5.4 — с разрешением, которого человек не давал.
+        //
+        // Записи нет — значит переключателей никто не трогал: умолчание.
+        // Пустая или длинная запись означает порчу, и умолчание для неё
+        // честнее, чем «выключить всё»: молчащий мессенджер выглядит
+        // сломанным, а лишний включённый транспорт человек видит в UI.
+        if let Some(raw) = self.store.meta(ratatosk_store::META_TRANSPORTS)? {
+            self.enabled = match raw.as_slice() {
+                [bits] => TransportSet::from_bits(*bits),
+                _ => DEFAULT_TRANSPORTS,
+            };
+        }
+
         let stored = self.store.contacts()?;
         let restored = stored.len();
         for contact in stored {
@@ -761,7 +844,8 @@ impl<S: Store> Engine<S> {
             let availability = PeerAvailability {
                 has_onion: !card.onion.is_empty(),
                 has_chatmail: !card.chatmail.is_empty(),
-                lan_enabled: self.lan_enabled,
+                enabled: self.enabled,
+                ready: self.ready,
                 // Видимость в LAN живёт ровно столько, сколько работает
                 // устройство: адрес в локальной сети меняется при каждом
                 // подключении, и поднимать его с диска значило бы врать.
@@ -874,18 +958,6 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
 
-    /// Закрывает сессию с контактом — в памяти и на диске.
-    ///
-    /// Возвращает `true`, если было что закрывать.
-    fn drop_session(&mut self, peer_ik: &[u8; 32], via: Transport) -> Result<bool, EngineError> {
-        let Some(session_id) = self.sessions.for_peer(peer_ik, via) else {
-            return Ok(false);
-        };
-        self.sessions.remove(session_id);
-        self.store.delete_session(session_id)?;
-        Ok(true)
-    }
-
     /// Складывает состояние сессии на диск (§8.3, §12).
     ///
     /// **Вызывается до того, как кадр уйдёт в сеть.** Порядок здесь — не
@@ -956,11 +1028,12 @@ impl<S: Store> Engine<S> {
         // §4.2: QR при личной встрече — канал доверенный по построению,
         // ссылка — нет, и контакт остаётся непроверенным до сверки голосом.
         // Новый контакт наследует текущее состояние LAN: иначе контакт,
-        // добавленный после включения, остался бы с `lan_enabled = false`,
+        // добавленный после включения, остался бы с выключенным LAN,
         // и §5.4 отправил бы его сообщения мимо локальной сети — молча,
         // потому что onion и почта тоже «работают».
         let availability = PeerAvailability {
-            lan_enabled: self.lan_enabled,
+            enabled: self.enabled,
+            ready: self.ready,
             seen_on_lan: self.seen_on_lan.remove(&peer_ik),
             ..availability
         };
@@ -985,10 +1058,234 @@ impl<S: Store> Engine<S> {
             verified: met_in_person,
         })];
         // Маяк нового контакта транспорт ещё не ищет — список изменился.
-        if self.lan_enabled {
+        if self.enabled.contains(Transport::Lan) {
             effects.push(self.watch_lan_peers());
         }
         Ok(effects)
+    }
+
+    /// Человек включил или выключил транспорт (§5.4).
+    ///
+    /// Один обработчик на все транспорты, а не по одному на каждый, и это
+    /// главное, ради чего переключатель стал общим: транспортов станет
+    /// больше, а мест, где о них принимают решение, — нет.
+    ///
+    /// Что здесь происходит по порядку и почему именно так:
+    ///
+    /// * набор пишется **на диск** до всего остального. Выбор человека
+    ///   не должен зависеть от того, доживёт ли процесс до следующего шага;
+    /// * копия набора расходится по контактам: §5.4 принимает решение
+    ///   по [`PeerAvailability`], и рассогласование её с состоянием ядра
+    ///   означало бы, что лестница живёт по устаревшему разрешению;
+    /// * транспорту уходит [`Effect::SetTransportEnabled`] — это его дело,
+    ///   поднимать он себя будет или гасить;
+    /// * включение даёт отложенным сообщениям новый шанс: появилась ступень,
+    ///   которой раньше не было.
+    ///
+    /// Выключение очередь **не** трогает. Сообщение, ждавшее LAN, ждёт
+    /// теперь onion, а если и его выключили — упрётся в «отправить некуда»
+    /// своим чередом и честно скажет об этом (§14). Отменять обещание
+    /// доставки из-за переключателя нельзя: человек выключил транспорт,
+    /// а не отказался от переписки.
+    fn on_set_transport_enabled(
+        &mut self,
+        now_ms: u64,
+        transport: Transport,
+        enabled: bool,
+    ) -> Result<Vec<Effect>, EngineError> {
+        if self.enabled.contains(transport) == enabled {
+            // Повтор того же — обычное дело: клиент выставляет все
+            // переключатели при старте. Молча и бесплатно.
+            return Ok(Vec::new());
+        }
+        self.enabled.set(transport, enabled);
+        self.store.put_meta(ratatosk_store::META_TRANSPORTS, &[self.enabled.bits()])?;
+        for contact in self.contacts.values_mut() {
+            contact.availability.enabled = self.enabled;
+        }
+
+        // Готовность идёт следом за разрешением, но не совпадает с ним.
+        // Выключенный транспорт не работает по определению; включённый —
+        // работает не сразу, и у Tor это десятки секунд. Кто ждать
+        // не заставляет, тот готов вместе с включением.
+        self.ready.set(transport, enabled && IMMEDIATE_TRANSPORTS.contains(transport));
+        for contact in self.contacts.values_mut() {
+            contact.availability.ready = self.ready;
+        }
+
+        let mut effects = vec![Effect::SetTransportEnabled { transport, enabled }];
+        if transport == Transport::Lan {
+            // Прежние «не слышно» устарели: эфир только что открылся или
+            // закрылся, и каждому контакту снова полагается срок на
+            // обнаружение.
+            self.awaited_discovery.clear();
+            if enabled {
+                effects.push(self.watch_lan_peers());
+            } else {
+                // И «слышно» устарело тоже. Видимость в эфире — не память
+                // о том, что когда-то слышали, а знание о том, что слышим
+                // сейчас; с выключенным LAN маяков никто не ловит. Оставь
+                // мы отметку — §5.4 при следующем включении пошёл бы в LAN
+                // по устаревшему свидетельству и заплатил бы за это сроком.
+                for contact in self.contacts.values_mut() {
+                    contact.availability.seen_on_lan = false;
+                }
+                self.seen_on_lan.clear();
+            }
+        }
+
+        if enabled {
+            // Ступень появилась — у отложенных сообщений появился шанс.
+            effects.extend(self.retry_deferred(None)?);
+        } else {
+            effects.extend(self.release_from(transport)?);
+            effects.extend(self.withdraw_address(now_ms, transport)?);
+        }
+        Ok(effects)
+    }
+
+    /// Снимает с карточки адрес выключенного транспорта (§4.3, §14).
+    ///
+    /// Выключенный Tor означает, что по нашему onion-адресу больше никого
+    /// нет. Оставить адрес в карточке — обещать путь, которого не существует:
+    /// собеседник будет честно набирать его при каждой отправке и платить
+    /// за это сроком ожидания, а потом видеть «не доставлено» там, где
+    /// правильный ответ — «он выключил Tor».
+    ///
+    /// Плата названа прямо: версия карточки растёт на каждое выключение
+    /// и на каждое включение обратно. Это приемлемо ровно потому, что
+    /// переключатель — редкое и осознанное действие; будь он частым,
+    /// правильнее было бы не снимать адрес, а везти в карточке признак
+    /// «сейчас недоступен», и это уже другая форма §4.3.
+    ///
+    /// Обратно адрес возвращает не эта функция, а сам транспорт: поднявшийся
+    /// сервис объявляет свой адрес (`TransportEvent::TorReady`), и объявляет
+    /// он тот, который **действительно** обслуживает.
+    fn withdraw_address(
+        &mut self,
+        now_ms: u64,
+        transport: Transport,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Локальная сеть в карточке не живёт: её адрес меняется при каждом
+        // подключении, и в §4.1 его нет.
+        let (onion, chatmail) = match transport {
+            Transport::Lan => return Ok(Vec::new()),
+            Transport::Onion => (String::new(), self.addresses.chatmail.clone()),
+            Transport::Mail => (self.addresses.onion.clone(), String::new()),
+        };
+        // Снимать нечего — и объявлять нечего: §4.3 не рассылает то, что
+        // не изменилось, но проверить дешевле здесь, чем разбираться потом,
+        // почему версия выросла на ровном месте.
+        if onion == self.addresses.onion && chatmail == self.addresses.chatmail {
+            return Ok(Vec::new());
+        }
+        self.on_announce_addresses(now_ms, onion, chatmail)
+    }
+
+    /// Снимает с выключенного транспорта всё, что на нём ехало (§5.4).
+    ///
+    /// Без этого выключатель действовал только на **новые** отправки, а всё,
+    /// что уже успело выбрать этот транспорт, продолжало его ждать. Снаружи
+    /// это выглядит так: Tor выключен, а сообщение «ждёт отправки через Tor»
+    /// — и не уезжает даже по включённой позже локальной сети, потому что
+    /// оно висит не в очереди ожидающих, а в попытке, привязанной к onion.
+    ///
+    /// Освобождение делается тем же путём, что и отказ транспорта: для §5.4
+    /// «человек выключил» и «не сработало» — один и тот же исход одной
+    /// ступени, и вести себя дальше надо одинаково. Разница только в причине,
+    /// а причина в лестницу не входит.
+    ///
+    /// Сессии при этом не закрываются. Ключевой материал к транспорту
+    /// не привязан, и выбрасывать его из-за переключателя значило бы платить
+    /// новым рукопожатием за каждое включение-выключение. §5.4 выключенную
+    /// ступень всё равно не выберет, а входящие кадры по ней — если они ещё
+    /// придут — расшифровать надо: принять сообщение мы можем всегда.
+    fn release_from(&mut self, transport: Transport) -> Result<Vec<Effect>, EngineError> {
+        // Собеседники, у которых на этом транспорте что-то висит: отправка
+        // в полёте либо рукопожатие, которого ждут сообщения. Список сначала,
+        // потому что дальше идёт `&mut self`.
+        let mut peers: BTreeSet<[u8; 32]> = self
+            .outbox
+            .iter()
+            .filter(|d| matches!(d.state, DeliveryState::InFlight { via, .. } if via == transport))
+            .map(|d| d.peer_ik)
+            .collect();
+        peers.extend(
+            self.pending
+                .iter()
+                .filter(|p| p.attempt.tried().last() == Some(&transport))
+                .map(|p| p.peer_ik),
+        );
+
+        let mut effects = Vec::new();
+        for peer_ik in peers {
+            effects.extend(self.on_delivery_failed(peer_ik, transport, Failure::Reported)?);
+        }
+        Ok(effects)
+    }
+
+    /// Транспорт доложил, что заработал (§5.4).
+    ///
+    /// Для Tor это не конец bootstrap, а **публикация сервиса**: пока
+    /// дескриптор не разошёлся по HSDir, дозвониться по адресу нельзя,
+    /// и объявлять ступень рабочей значит обещать путь, которого ещё нет.
+    ///
+    /// Здесь же — второй шанс всему, что ждало: ступень появилась, и это
+    /// ровно то событие, ради которого очередь отложенных и существует.
+    fn on_transport_ready(&mut self, transport: Transport) -> Result<Vec<Effect>, EngineError> {
+        // Готовым может быть только разрешённый. Иначе выключенный
+        // человеком транспорт, чей подъём успел договорить своё последнее
+        // слово, тихо вернулся бы в лестницу.
+        if !self.enabled.contains(transport) || self.ready.contains(transport) {
+            return Ok(Vec::new());
+        }
+        self.ready.set(transport, true);
+        for contact in self.contacts.values_mut() {
+            contact.availability.ready = self.ready;
+        }
+        self.retry_deferred(None)
+    }
+
+    /// Что надо сделать один раз при запуске, до первой команды клиента.
+    ///
+    /// Сейчас это ровно одно: сказать транспортам, кого из них человек
+    /// оставил включённым в прошлый раз, и выдать список маяков, если
+    /// включена локальная сеть.
+    ///
+    /// Отдельно от [`Engine::restore`] потому, что `restore` эффектов
+    /// не возвращает по устройству: он зовётся до того, как появился
+    /// драйвер, и вернуть их было бы некуда. Здесь же они нужны — и зовёт
+    /// это драйвер, когда уже готов их исполнить.
+    #[must_use]
+    pub fn startup_effects(&self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for transport in [Transport::Lan, Transport::Onion, Transport::Mail] {
+            effects.push(Effect::SetTransportEnabled {
+                transport,
+                enabled: self.enabled.contains(transport),
+            });
+        }
+        if self.enabled.contains(Transport::Lan) {
+            effects.push(self.watch_lan_peers());
+        }
+        effects
+    }
+
+    /// Какие транспорты сейчас разрешены (§5.4).
+    #[must_use]
+    pub const fn transports(&self) -> TransportSet {
+        self.enabled
+    }
+
+    /// Какие транспорты сейчас **работают** (§5.4).
+    ///
+    /// Отдельно от разрешённых, и разница видна человеку: включённый Tor
+    /// становится работающим через десятки секунд, и всё это время §5.4
+    /// его не выбирает. Клиенту это нужно, чтобы сказать «поднимается»
+    /// вместо «не работает».
+    #[must_use]
+    pub const fn transports_ready(&self) -> TransportSet {
+        self.ready
     }
 
     /// Сеть сменилась: всё, что известно о локальной, устарело (§5.1).
@@ -1012,7 +1309,7 @@ impl<S: Store> Engine<S> {
         // к прежней. Срок на обнаружение выдаётся заново.
         self.awaited_discovery.clear();
 
-        if !self.lan_enabled {
+        if !self.enabled.contains(Transport::Lan) {
             // Выключенный LAN переоткрывать нечего, и объявляться незачем.
             return Ok(Vec::new());
         }
@@ -2577,11 +2874,13 @@ impl<S: Store> Engine<S> {
         // Сессии — первыми и из обоих мест сразу: из реестра в памяти и
         // с диска. Пережившая удаление запись в реестре продолжала бы
         // расшифровывать кадры от человека, которого больше нет в контактах.
-        for transport in [Transport::Lan, Transport::Onion, Transport::Mail] {
-            if let Some(session_id) = self.sessions.for_peer(&peer_ik, transport) {
-                self.sessions.remove(session_id);
-                self.store.delete_session(session_id)?;
-            }
+        //
+        // **Все**, а не «по одной на транспорт»: спрашивать здесь `for_peer`
+        // значило бы пропустить отправленные на покой — а они как раз и живут
+        // ради приёма, то есть ровно того, что удаление обязано прекратить.
+        for session_id in self.sessions.all_for_peer(&peer_ik) {
+            self.sessions.remove(session_id);
+            self.store.delete_session(session_id)?;
         }
 
         // Незаконченное рукопожатие и очередь: без контакта `advance` всё
@@ -2623,7 +2922,7 @@ impl<S: Store> Engine<S> {
         // Список маяков изменился — транспорт больше не должен искать его
         // в эфире (§5.1). Без этого удалённый контакт продолжал бы
         // «находиться» в локальной сети, а ядро — заводить его заново.
-        if self.lan_enabled {
+        if self.enabled.contains(Transport::Lan) {
             effects.push(self.watch_lan_peers());
         }
         Ok(effects)
@@ -3099,7 +3398,15 @@ impl<S: Store> Engine<S> {
             // продолжать LAN-сессию через onion, поэтому «нет сессии» здесь
             // означает именно новое рукопожатие, а не переиспользование.
             delivery.state = DeliveryState::AwaitingSession;
-            return self.ensure_handshake(delivery.peer_ik, transport);
+            // Рукопожатие могло уже уйти на другую ступень: у него своя
+            // попытка, и §5.4 ведёт её независимо. Тогда идти надо за ним,
+            // а не за своей лестницей: сессия появится там, где рукопожатие,
+            // и отправка по своей ступени уехала бы в пустоту.
+            let (effects, on) = self.ensure_handshake(delivery.peer_ik, transport)?;
+            if on != transport {
+                walk_attempt_to(&mut delivery.attempt, availability, on);
+            }
+            return Ok(effects);
         };
 
         let frame = self.seal_for(session_id, &delivery.envelope)?;
@@ -3125,17 +3432,25 @@ impl<S: Store> Engine<S> {
     }
 
     /// Начинает рукопожатие, если оно ещё не в пути.
+    ///
+    /// Второе возвращаемое значение — ступень, на которой рукопожатие
+    /// **на самом деле** находится. Она не всегда та, о которой просили:
+    /// рукопожатие идёт своей попыткой по §5.4 и могло уйти дальше, пока
+    /// это сообщение ждало. Вызывающий обязан посмотреть на ответ, а не
+    /// на свой вопрос, — иначе сессия появится на одной ступени, а отправка
+    /// пойдёт по другой.
     fn ensure_handshake(
         &mut self,
         peer_ik: [u8; 32],
         transport: Transport,
-    ) -> Result<Vec<Effect>, EngineError> {
-        if self.pending.iter().any(|p| p.peer_ik == peer_ik) {
+    ) -> Result<(Vec<Effect>, Transport), EngineError> {
+        if let Some(pending) = self.pending.iter().find(|p| p.peer_ik == peer_ik) {
             // Второе рукопожатие только потратило бы ещё одну операцию
             // у получателя и породило вторую сессию.
-            return Ok(Vec::new());
+            let on = pending.attempt.tried().last().copied().unwrap_or(transport);
+            return Ok((Vec::new(), on));
         }
-        self.begin_handshake(peer_ik, transport)
+        Ok((self.begin_handshake(peer_ik, transport)?, transport))
     }
 
     fn allocate_timer(&mut self) -> u64 {
@@ -3159,13 +3474,9 @@ impl<S: Store> Engine<S> {
         // установится не в том семействе транспортов (§5.4).
         let mut attempt = Attempt::new();
         let availability = self.availability_of(&peer_ik)?;
-        while let Some(Decision::Use(t)) = attempt.next(availability) {
-            if t == transport {
-                break;
-            }
-        }
+        walk_attempt_to(&mut attempt, availability, transport);
 
-        let mut effects = vec![Effect::Send { peer_ik, via: transport, frame: frame.clone() }];
+        let mut effects = vec![Effect::Send { peer_ik, via: transport, frame }];
         let mut timer = None;
         if transport.is_direct() {
             let token = self.allocate_timer();
@@ -3173,27 +3484,65 @@ impl<S: Store> Engine<S> {
             effects.push(Effect::SetTimer { after_ms, token });
             timer = Some(token);
         }
-        self.pending.push(OutgoingHandshake { state, frame, attempt, peer_ik, timer });
+        self.pending.push(OutgoingHandshake { state, attempt, peer_ik, timer });
         Ok(effects)
     }
 
-    /// Пересылает незавершённое рукопожатие следующим транспортом (§5.4).
+    /// Начинает рукопожатие заново на следующей ступени §5.4.
     ///
-    /// Второе возвращаемое значение — «транспорты для рукопожатия кончились».
-    /// Оно нужно вызывающему: сессии не будет, а значит и сообщения, которые
-    /// её ждут, никогда не уедут. Молча оставить их в очереди нельзя (§14).
+    /// Второе возвращаемое значение — судьба рукопожатия ([`HandshakeStep`]).
+    /// Оно нужно вызывающему дважды: сообщения, ждавшие эту сессию, обязаны
+    /// уйти на ту же новую ступень, а если ступени кончились — узнать исход.
+    /// Молча оставить их в очереди нельзя (§14).
+    ///
+    /// # Почему именно заново
+    ///
+    /// Раньше на следующую ступень уходил **тот же самый** кадр первого
+    /// сообщения. Экономия выглядела очевидной: рукопожатие Noise про
+    /// транспорт ничего не знает, зачем считать его дважды.
+    ///
+    /// Затем, что сессию к семейству транспортов привязывает **каждая
+    /// сторона отдельно, по тому пути, которым кадр к ней пришёл**
+    /// ([`SessionBinding::of`]). Разбор поломки со стенда, шаг за шагом:
+    ///
+    /// 1. У обеих сторон живёт онион-сессия `S1`, переписка идёт.
+    /// 2. На одной машине включают локальную сеть, собеседник виден
+    ///    маячком — и §5.4 отправляет следующее сообщение первой ступенью.
+    ///    Сессии для LAN нет, начинается рукопожатие по LAN.
+    /// 3. Собеседник кадр принимает и заводит `S2`, привязав её к LAN.
+    ///    А вот его ответ по LAN не уходит: его сторона соединения не
+    ///    поднимается (односторонние соединения, ARCHITECTURE 5ц), транспорт
+    ///    отвечает `Unavailable`.
+    /// 4. У нас выходит срок, и мы шлём **тот же** кадр через onion.
+    /// 5. Для собеседника это точный повтор: сторож рукопожатий отдаёт
+    ///    [`HandshakeOutcome::Repeat`], он пересылает прежний ответ и
+    ///    **оставляет `S2` привязанной к LAN**.
+    /// 6. Мы этот ответ получаем через onion и привязываем ту же `S2`
+    ///    к **onion** — вытеснив `S1`, свою онион-сессию.
+    ///
+    /// Итог: у нас онион-семейство — это `S2`, у собеседника — по-прежнему
+    /// `S1`. Он шлёт по `S1`, мы её уже забыли: «кадр для неизвестной
+    /// сессии — отброшен». В обратную сторону — то же самое. Переписка
+    /// умирает при живом Tor с обеих сторон, и §5.4 («LAN и Tor не
+    /// смешиваются в одной сессии никогда») оказывается нарушен не выбором
+    /// транспорта, а бухгалтерией сессий.
+    ///
+    /// Поэтому каждая ступень получает своё рукопожатие: новый кадр — новая
+    /// сессия, и обе стороны привязывают её к одному и тому же семейству,
+    /// потому что видели её на одном и том же пути. Цена — ещё одна операция
+    /// Noise на ступень; она несравнима с молча умершей перепиской (§14).
     fn retry_handshake(
         &mut self,
         peer_ik: [u8; 32],
         via: Transport,
-    ) -> Result<(Vec<Effect>, bool), EngineError> {
+    ) -> Result<(Vec<Effect>, HandshakeStep), EngineError> {
         let availability = match self.availability_of(&peer_ik) {
             Ok(a) => a,
-            Err(_) => return Ok((Vec::new(), false)),
+            Err(_) => return Ok((Vec::new(), HandshakeStep::Absent)),
         };
 
         let mut effects = Vec::new();
-        let mut exhausted = false;
+        let mut step = HandshakeStep::Absent;
         let mut pending = std::mem::take(&mut self.pending);
         for handshake in &mut pending {
             if handshake.peer_ik != peer_ik || handshake.attempt.tried().last() != Some(&via) {
@@ -3201,11 +3550,15 @@ impl<S: Store> Engine<S> {
             }
             match handshake.attempt.next(availability) {
                 Some(Decision::Use(next)) => {
-                    effects.push(Effect::Send {
-                        peer_ik,
-                        via: next,
-                        frame: handshake.frame.clone(),
-                    });
+                    // Новая ступень — новое рукопожатие; разбор см. выше.
+                    // Прежнее состояние `snow` здесь и умирает: запоздалый
+                    // ответ на него больше никого не найдёт, и это правильно —
+                    // та ступень признана неудавшейся.
+                    let card = self.own_card().encode()?;
+                    let (message, state) = Initiator::start(&self.identity, &peer_ik, &card)?;
+                    let frame = self.handshake_frame(HANDSHAKE_STEP_FIRST, &message)?;
+                    handshake.state = state;
+                    effects.push(Effect::Send { peer_ik, via: next, frame });
                     // Новой попытке — новый срок. Без него молчание второго
                     // транспорта не приводит к третьему, и откат §5.4
                     // обрывается на середине.
@@ -3217,19 +3570,20 @@ impl<S: Store> Engine<S> {
                         effects.push(Effect::SetTimer { after_ms, token });
                         handshake.timer = Some(token);
                     }
+                    step = HandshakeStep::Moved(next);
                 }
-                Some(Decision::Undeliverable) | None => exhausted = true,
+                Some(Decision::Undeliverable) | None => step = HandshakeStep::Exhausted,
             }
         }
         // Исчерпанное рукопожатие выбрасывается. Оставшись, оно не только
         // текло бы памятью, но и блокировало `ensure_handshake`: тот считает
         // запись в `pending` признаком «рукопожатие уже в пути», и следующая
         // попытка связаться с этим контактом не началась бы никогда.
-        if exhausted {
+        if step == HandshakeStep::Exhausted {
             pending.retain(|p| p.peer_ik != peer_ik || !p.attempt.is_finished());
         }
         self.pending = pending;
-        Ok((effects, exhausted))
+        Ok((effects, step))
     }
 
     fn availability_of(&self, peer_ik: &[u8; 32]) -> Result<PeerAvailability, EngineError> {
@@ -3289,22 +3643,42 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         let view = ratatosk_wire::parse(frame)?;
 
+        // Журнал ровно на этой границе, и он не украшение. Снаружи видно
+        // «кадр прочитан» у транспорта и видно (или не видно) сообщение
+        // на экране, а между ними — три развилки, каждая со своим молчаливым
+        // исходом: не тот шаг рукопожатия, неизвестная сессия, не сошёлся
+        // тег. Без этой строки все три выглядят одинаково — как тишина.
         match self.sessions.route(view.header.session_id) {
             ratatosk_proto::Route::Handshake => {
+                tracing::debug!(?via, step = view.header.counter, "кадр: рукопожатие");
                 let message = unpad(view.sealed)?.to_vec();
                 match view.header.counter {
                     HANDSHAKE_STEP_FIRST => self.on_handshake_first(now_ms, via, &message),
                     HANDSHAKE_STEP_RESPONSE => self.on_handshake_response(now_ms, via, &message),
-                    _ => Ok(Vec::new()),
+                    step => {
+                        tracing::debug!(step, "шаг рукопожатия неизвестен — кадр отброшен");
+                        Ok(Vec::new())
+                    }
                 }
             }
             ratatosk_proto::Route::Session(session_id) => {
                 let counter = view.header.counter;
+                tracing::debug!(?via, session_id, counter, "кадр: данные сессии");
                 self.on_data(now_ms, via, session_id, counter, frame)
             }
             ratatosk_proto::Route::Unknown => {
                 // §7.3, шаг 4: отбросить и посчитать. Источник неизвестен —
                 // кадр не расшифрован, — поэтому аномалия пишется на нули.
+                //
+                // Вслух, потому что снаружи это неотличимо от «ничего
+                // не пришло»: у собеседника сессия есть, у нас её нет,
+                // и каждый кадр молча исчезает.
+                tracing::debug!(
+                    ?via,
+                    session_id = view.header.session_id,
+                    known = self.sessions.len(),
+                    "кадр для неизвестной сессии — отброшен"
+                );
                 self.sessions.note_anomaly([0u8; 32], |c| c.unknown_session += 1);
                 Ok(Vec::new())
             }
@@ -3469,7 +3843,7 @@ impl<S: Store> Engine<S> {
     /// важнее, чем кажется: без него каждое сообщение собеседнику из другой
     /// сети начиналось бы с трёхсекундной паузы.
     fn park_for_discovery(&mut self, delivery: &mut Delivery) -> Option<Effect> {
-        if !self.lan_enabled || !delivery.attempt.tried().is_empty() {
+        if !self.enabled.contains(Transport::Lan) || !delivery.attempt.tried().is_empty() {
             return None;
         }
         let contact = self.contacts.get(&delivery.peer_ik)?;
@@ -3533,7 +3907,8 @@ impl<S: Store> Engine<S> {
         // ждать нечего в буквальном смысле — и обещать «отправим позже» было бы
         // выдумкой. Тогда это «не доставлено», без обещаний.
         let availability = contact.availability;
-        if !availability.lan_enabled && !availability.has_onion && !availability.has_chatmail {
+        let lan_may_open = availability.enabled.contains(Transport::Lan);
+        if !lan_may_open && !availability.has_onion && !availability.has_chatmail {
             return Ok((false, Vec::new()));
         }
         if self.deferred.iter().any(|d| d.msg_id == delivery.msg_id) {
@@ -3607,11 +3982,21 @@ impl<S: Store> Engine<S> {
         via: Transport,
         why: Failure,
     ) -> Result<Vec<Effect>, EngineError> {
-        // Молчание в ответ на ушедший кадр — единственная причина закрыть
-        // сессию. Закрываем **до** переноса попытки: следующий шаг должен
-        // увидеть, что сессии нет, и начать рукопожатие.
+        // Молчание в ответ на ушедший кадр — причина перестать по этой
+        // сессии **отправлять**. Не закрыть её: молчание свидетельствует
+        // об одном направлении, а сессия двусторонняя.
+        //
+        // Закрывали — и это была настоящая поломка, найденная на стенде.
+        // Мы сессию забывали, собеседник нет; он продолжал слать по ней,
+        // а мы каждый его кадр отбрасывали как «неизвестная сессия»
+        // и сказать ему об этом не могли: кадр не расшифрован, кто прислал —
+        // неизвестно. Переписка умирала в одну сторону навсегда, при живой
+        // связи с обеих.
+        //
+        // Отправка на покой — **до** переноса попытки: следующий шаг должен
+        // увидеть, что отправлять не по чему, и начать рукопожатие.
         let stale_session =
-            why == Failure::Silent && via.is_direct() && self.drop_session(&peer_ik, via)?;
+            why == Failure::Silent && via.is_direct() && self.sessions.retire(&peer_ik, via);
 
         // Адрес в локальной сети забывается только при **явном** отказе:
         // соединиться не удалось — значит устройства там больше нет.
@@ -3628,12 +4013,26 @@ impl<S: Store> Engine<S> {
 
         // Рукопожатие переносится первым: без сессии данные всё равно
         // упрутся в ожидание, и порядок эффектов станет непонятным.
-        let (mut effects, handshake_exhausted) = self.retry_handshake(peer_ik, via)?;
+        let (mut effects, step) = self.retry_handshake(peer_ik, via)?;
+        let availability = self.availability_of(&peer_ik).ok();
         let mut queue = std::mem::take(&mut self.outbox);
 
         for delivery in &mut queue {
             if delivery.peer_ik != peer_ik {
                 continue;
+            }
+            // Рукопожатие ушло на следующую ступень — сообщения, ждавшие
+            // его сессию, обязаны уйти туда же. Иначе доставка остаётся
+            // приколотой к ступени, рукопожатие которой уже брошено: сессия
+            // появится на новой, `flush_outbox` отправит по старой, и кадр
+            // уедет в пустоту. Найдено тестом на семь шагов, где отказ LAN
+            // уводил рукопожатие в onion, а сообщение — нет.
+            if let (HandshakeStep::Moved(next), Some(availability)) = (step, availability) {
+                if matches!(delivery.state, DeliveryState::AwaitingSession)
+                    && delivery.attempt.tried().last() == Some(&via)
+                {
+                    walk_attempt_to(&mut delivery.attempt, availability, next);
+                }
             }
             let failed_here = match delivery.state {
                 DeliveryState::InFlight { via: v, .. } => v == via,
@@ -3641,7 +4040,7 @@ impl<S: Store> Engine<S> {
                 // Ждать нечего: попытка обязана дойти до конца и объявить
                 // исход, иначе сообщение зависает в очереди навсегда — ровно
                 // то молчание, которое §14 запрещает.
-                DeliveryState::AwaitingSession => handshake_exhausted,
+                DeliveryState::AwaitingSession => step == HandshakeStep::Exhausted,
                 // Это сообщение ещё не выходило в сеть и потому здесь ничего
                 // не теряло: у него свой срок, и снимет паузу он, а не чужой
                 // отказ. Тронуть его тут значило бы сжечь LAN за компанию —
@@ -3765,8 +4164,12 @@ impl<S: Store> Engine<S> {
             // `msg_id` — подтверждает дедупликация ниже, и именно она случается
             // на практике: отправитель, не получивший квитанцию, шлёт сообщение
             // заново и запечатывает его следующим ключом цепочки.
-            Err(ratatosk_crypto::CryptoError::MessageKeyConsumed) => return Ok(Vec::new()),
-            Err(_) => {
+            Err(ratatosk_crypto::CryptoError::MessageKeyConsumed) => {
+                tracing::debug!(counter, "ключ этой позиции израсходован — точный повтор кадра");
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                tracing::debug!(?error, counter, "ключ позиции не выведен — кадр отброшен");
                 self.sessions.note_anomaly(peer_ik, |c| c.bad_tag += 1);
                 return Ok(Vec::new());
             }
@@ -3776,6 +4179,7 @@ impl<S: Store> Engine<S> {
         let (_, plaintext) = match opened {
             Ok(v) => v,
             Err(_) => {
+                tracing::debug!(counter, "тег не сошёлся — кадр отброшен");
                 self.sessions.note_anomaly(peer_ik, |c| c.bad_tag += 1);
                 return Ok(Vec::new());
             }
@@ -3786,6 +4190,12 @@ impl<S: Store> Engine<S> {
         self.persist_session(session_id)?;
 
         let envelope = Envelope::decode(&plaintext)?.into_parts().1;
+        // Что именно приехало. Между «кадр расшифрован» и «сообщение
+        // на экране» лежит разбор нагрузки, и типов у неё полтора десятка:
+        // текст, квитанция, карточка, чанк файла. Строка отвечает на вопрос,
+        // который иначе не разрешается ничем: пришло не то или пришло то,
+        // но не показалось.
+        tracing::debug!(kind = ?envelope.payload_type, "кадр разобран");
 
         // §9.2: одно сообщение может законно прийти дважды — разными
         // транспортами или повторной отправкой. Это нормальный режим, а не

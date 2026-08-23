@@ -28,7 +28,7 @@ use ratatosk_core::{
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 #[cfg(feature = "tor")]
-use ratatosk_transport::{onion::arti::OnionRunner, Deferred};
+use ratatosk_transport::{onion::arti::OnionRunner, Switched};
 use ratatosk_transport::{Disabled, LanConfig, LanRunner, Transports};
 
 uniffi::setup_scaffolding!();
@@ -141,6 +141,32 @@ pub enum FfiDeliveryStatus {
     Delivered,
     /// Прочитано. Только прямой канал.
     Read,
+}
+
+/// Транспорт на границе §13.3.
+///
+/// Своё перечисление, а не `ratatosk_proto::Transport`: типы протокола
+/// наружу не отдаются (§13.3), и превращение одного в другой — единственное
+/// место, где о них знают обе стороны.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTransport {
+    /// Локальная сеть (§5.1). По умолчанию **выключена**: маяк в эфире
+    /// выдаёт присутствие устройства всем, кто слушает.
+    Lan,
+    /// Tor onion-to-onion (§5.2). По умолчанию включён.
+    Onion,
+    /// Почта chatmail поверх Tor (§5.3). По умолчанию включена.
+    Mail,
+}
+
+impl From<FfiTransport> for ratatosk_proto::Transport {
+    fn from(value: FfiTransport) -> ratatosk_proto::Transport {
+        match value {
+            FfiTransport::Lan => ratatosk_proto::Transport::Lan,
+            FfiTransport::Onion => ratatosk_proto::Transport::Onion,
+            FfiTransport::Mail => ratatosk_proto::Transport::Mail,
+        }
+    }
 }
 
 /// Событие для UI.
@@ -840,11 +866,38 @@ impl RatatoskClient {
             .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
     }
 
-    /// Включает или выключает LAN (§5.1).
+    /// Включает или выключает транспорт (§5.4).
     ///
-    /// Перед включением клиент обязан показать [`lan_warning`].
-    pub fn set_lan_enabled(&self, enabled: bool) -> Result<(), RatatoskError> {
-        self.command(Command::SetLanEnabled(enabled))
+    /// Одна ручка на все транспорты: их станет больше, и по ручке на каждый
+    /// означало бы новую функцию на границе §13.3 при каждом добавлении.
+    ///
+    /// Перед включением LAN клиент обязан показать [`lan_warning`].
+    ///
+    /// Выбор **хранит ядро** и переживает перезапуск. Клиенту дублировать его
+    /// в своих настройках не нужно и не следует: два экземпляра одной правды
+    /// однажды разойдутся, и разойдутся молча. Прочитать текущее состояние —
+    /// [`RatatoskClient::transport_enabled`].
+    pub fn set_transport_enabled(
+        &self,
+        transport: FfiTransport,
+        enabled: bool,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::SetTransportEnabled { transport: transport.into(), enabled })
+    }
+
+    /// Включён ли транспорт прямо сейчас (§5.4).
+    pub fn transport_enabled(&self, transport: FfiTransport) -> Result<bool, RatatoskError> {
+        Ok(self.transport_status()?.enabled.contains(transport.into()))
+    }
+
+    /// **Работает** ли транспорт прямо сейчас (§5.4).
+    ///
+    /// Не то же, что включён, и разницу надо показывать человеку: между
+    /// «включил Tor» и «Tor работает» лежат десятки секунд bootstrap
+    /// и публикации сервиса, и всё это время §5.4 его не выбирает.
+    /// «Поднимается» — правда, «не работает» — нет.
+    pub fn transport_ready(&self, transport: FfiTransport) -> Result<bool, RatatoskError> {
+        Ok(self.transport_status()?.ready.contains(transport.into()))
     }
 
     /// Объявляет свои адреса контактам (§4.3).
@@ -1414,6 +1467,21 @@ impl RatatoskClient {
             .send_blocking(command)
             .map_err(|_| RatatoskError::internal("ядро остановлено"))
     }
+
+    /// Состояние транспортов одним запросом — «включён» и «работает» сразу.
+    ///
+    /// Живёт **в этом** блоке, а не в экспортируемом, и это не вкусовщина:
+    /// `#[uniffi::export]` берёт из блока все методы, не разбирая, какие
+    /// из них `pub`. Приватный помощник, возвращающий `TransportStatus`
+    /// (тип ядра, а не тип моста), требовал бы от него `LowerReturn` —
+    /// и весь блок переставал собираться. Помощники ядра — сюда,
+    /// в экспорт — только то, что переводит на язык клиента.
+    fn transport_status(&self) -> Result<ratatosk_core::driver::TransportStatus, RatatoskError> {
+        self.opened
+            .handle
+            .transports_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
 }
 
 /// Перевод лестницы статусов §9.4 в то, что видит UI.
@@ -1468,7 +1536,7 @@ fn to_msg_ids(ids: &[Vec<u8>]) -> Result<Vec<[u8; 16]>, RatatoskError> {
 /// не заглушка, а правда о сборке: §5.4 обязан узнать, что ступень
 /// не сработала, и перейти к следующей.
 #[cfg(feature = "tor")]
-type Runners = Transports<LanRunner, Deferred<OnionRunner>, Disabled>;
+type Runners = Transports<LanRunner, Switched<OnionRunner>, Disabled>;
 /// Набор транспортов сборки без Tor: работает одна локальная сеть.
 #[cfg(not(feature = "tor"))]
 type Runners = Transports<LanRunner, Disabled, Disabled>;
@@ -1516,6 +1584,11 @@ async fn start(
     // секунд, и ждать его здесь значило бы держать человека перед пустым
     // экраном минуту — вместе с локальной сетью, которая работает сразу.
     // До подъёма ступень честно отказывает (§5.4).
+    //
+    // И поднимается он не сразу, а когда ядро скажет, что человек его
+    // включил: `Engine::startup_effects` объявляет включённые транспорты
+    // первым делом в `Driver::run`. Выключенный в прошлый раз Tor
+    // не поднимается вовсе — ни bootstrap, ни каталога сети, ни цепочек.
     #[cfg(feature = "tor")]
     let runner = {
         let layout = ratatosk_core::TorLayout::beside(&db_path);
@@ -1523,24 +1596,32 @@ async fn start(
         // его из каталога, а файл могли удалить или перенести базу без него.
         ratatosk_core::write_onion_keystore(&layout.keys, &onion_key)
             .map_err(RatatoskError::internal)?;
-        let onion = Deferred::rising(|progress| async move {
-            OnionRunner::start(
-                ratatosk_transport::onion::arti::OnionSetup {
-                    state_dir: &layout.state,
-                    cache_dir: &layout.cache,
-                    keystore_dir: &layout.keys,
-                    key: &onion_key,
-                    // На Android — и только там. Приложение живёт в своём
-                    // каталоге, чужих пользователей на устройстве нет,
-                    // а предки пути принадлежат системе и устроены не так,
-                    // как ждёт `fs-mistrust`: проверка отвергает заведомо
-                    // безопасный путь. На десктопе она остаётся включённой,
-                    // потому что там она осмысленна.
-                    dangerously_trust_filesystem: cfg!(target_os = "android"),
-                },
-                progress,
-            )
-            .await
+        // Под `Arc`, потому что поднимать придётся столько раз, сколько
+        // человек передумает: замыкание-фабрика зовётся на каждое включение
+        // и забирать в себя ничего не вправе.
+        let setup = std::sync::Arc::new((layout, onion_key));
+        let onion = Switched::new(move |progress| {
+            let setup = std::sync::Arc::clone(&setup);
+            async move {
+                let (layout, onion_key) = &*setup;
+                OnionRunner::start(
+                    ratatosk_transport::onion::arti::OnionSetup {
+                        state_dir: &layout.state,
+                        cache_dir: &layout.cache,
+                        keystore_dir: &layout.keys,
+                        key: onion_key,
+                        // На Android — и только там. Приложение живёт в своём
+                        // каталоге, чужих пользователей на устройстве нет,
+                        // а предки пути принадлежат системе и устроены не так,
+                        // как ждёт `fs-mistrust`: проверка отвергает заведомо
+                        // безопасный путь. На десктопе она остаётся включённой,
+                        // потому что там она осмысленна.
+                        dangerously_trust_filesystem: cfg!(target_os = "android"),
+                    },
+                    progress,
+                )
+                .await
+            }
         });
         Transports::new(lan, onion, Disabled)
     };
@@ -1784,7 +1865,9 @@ impl AccountRegistry {
         let mut failure = None;
         for (account, weak) in opened.iter() {
             let Some(client) = weak.upgrade() else { continue };
-            if let Err(error) = client.set_lan_enabled(front == Some(*account)) {
+            if let Err(error) =
+                client.set_transport_enabled(FfiTransport::Lan, front == Some(*account))
+            {
                 failure.get_or_insert(error);
             }
         }

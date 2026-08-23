@@ -29,8 +29,8 @@
 //!
 //! # Что кому достаётся
 //!
-//! Команды с явным транспортом (`Send`, `Connect`) уходят по нему. Команды
-//! с именем транспорта в названии (`SetLanEnabled`, `WatchLanPeers`,
+//! Команды с явным транспортом (`Send`, `Connect`, `SetEnabled`) уходят
+//! по нему. Команды с именем транспорта в названии (`WatchLanPeers`,
 //! `RestartLan`) — ему же. А `Disconnect` уходит **всем**: в нём нет `via`,
 //! и кто именно держит соединение с этим контактом, знает только сам раннер.
 
@@ -47,8 +47,14 @@ use crate::runner::{Runner, TransportCommand, TransportError, TransportEvent};
 pub struct Disabled;
 
 impl Runner for Disabled {
-    async fn execute(&mut self, _command: TransportCommand) -> Result<(), TransportError> {
-        Err(TransportError::Unavailable)
+    async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
+        match command {
+            // Сказать несобранному транспорту, что он разрешён, — не ошибка.
+            // Разрешение относится к §5.4, а его здесь всё равно нет; отказ
+            // же выглядел бы в журнале поломкой, которой не случилось.
+            TransportCommand::SetEnabled { .. } => Ok(()),
+            _ => Err(TransportError::Unavailable),
+        }
     }
 
     async fn next_event(&mut self) -> Option<TransportEvent> {
@@ -153,10 +159,15 @@ impl<L: Runner, O: Runner, M: Runner> Runner for Transports<L, O, M> {
                 let via = *via;
                 self.to_one(via, command).await
             }
+            // Транспорт назван полем — как и у отправки.
+            TransportCommand::SetEnabled { transport, .. } => {
+                let transport = *transport;
+                self.to_one(transport, command).await
+            }
             // Имя транспорта в названии команды: адресат очевиден.
-            TransportCommand::SetLanEnabled(_)
-            | TransportCommand::WatchLanPeers(_)
-            | TransportCommand::RestartLan => self.lan.execute(command).await,
+            TransportCommand::WatchLanPeers(_) | TransportCommand::RestartLan => {
+                self.lan.execute(command).await
+            }
             // А тут `via` нет, и знать, кто держит соединение с этим
             // контактом, может только сам раннер.
             TransportCommand::Disconnect { .. } => self.to_all(command).await,
@@ -222,7 +233,7 @@ mod tests {
                 TransportCommand::Send { .. } => "send",
                 TransportCommand::Connect { .. } => "connect",
                 TransportCommand::Disconnect { .. } => "disconnect",
-                TransportCommand::SetLanEnabled(_) => "lan-enabled",
+                TransportCommand::SetEnabled { .. } => "set-enabled",
                 TransportCommand::WatchLanPeers(_) => "watch",
                 TransportCommand::RestartLan => "restart",
             };
@@ -276,7 +287,10 @@ mod tests {
         let (mail, _m) = Recorder::new("mail", &seen);
         let mut transports = Transports::new(lan, onion, mail);
 
-        transports.execute(TransportCommand::SetLanEnabled(true)).await.unwrap();
+        transports
+            .execute(TransportCommand::SetEnabled { transport: Transport::Lan, enabled: true })
+            .await
+            .unwrap();
         transports.execute(TransportCommand::RestartLan).await.unwrap();
 
         let seen = seen.lock().unwrap().clone();

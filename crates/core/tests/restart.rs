@@ -131,6 +131,88 @@ fn identity_contacts_and_history_survive_a_restart() {
 }
 
 #[test]
+fn a_switched_off_transport_stays_switched_off_after_a_restart() {
+    // Выбор человека, а не состояние сети. Выключивший Tor обязан обнаружить
+    // его выключенным и назавтра — иначе выключатель означает «до следующего
+    // запуска», то есть не означает ничего.
+    //
+    // Хранит это ядро, а не клиент, и не из вкуса: §13.3 не пускает
+    // протокольные решения выше границы, а «каким транспортом ехать» — оно
+    // и есть. Второй экземпляр той же правды в настройках приложения однажды
+    // разошёлся бы с тем, по которому ядро принимает решения, и разошёлся бы
+    // молча.
+    let db = TempDb::new("transports");
+    let db_key = Zeroizing::new([5u8; 32]);
+
+    {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().unwrap();
+
+        // Умолчания заданы и разные: локальная сеть выключена (§5.1 — маяк
+        // в эфире выдаёт присутствие устройства), onion включён.
+        assert!(!engine.transports().contains(Transport::Lan), "§5.1: LAN по умолчанию выключен");
+        assert!(engine.transports().contains(Transport::Onion), "onion по умолчанию включён");
+
+        let effects = engine
+            .step(
+                1_000,
+                Input::Command(Command::SetTransportEnabled {
+                    transport: Transport::Onion,
+                    enabled: false,
+                }),
+            )
+            .unwrap();
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                ratatosk_core::Effect::SetTransportEnabled {
+                    transport: Transport::Onion,
+                    enabled: false
+                }
+            )),
+            "транспорту обязаны сказать: гасить себя ему, а не ядру: {effects:?}"
+        );
+
+        // Повтор того же — бесплатно и молча: клиент выставляет переключатели
+        // при каждом старте, и каждый такой старт не должен ничего значить.
+        let again = engine
+            .step(
+                1_100,
+                Input::Command(Command::SetTransportEnabled {
+                    transport: Transport::Onion,
+                    enabled: false,
+                }),
+            )
+            .unwrap();
+        assert!(again.is_empty(), "повтор того же значения ничего не делает: {again:?}");
+    }
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+    assert!(
+        !engine.transports().contains(Transport::Onion),
+        "выключенный транспорт обязан остаться выключенным"
+    );
+
+    // И транспортам об этом говорят при запуске — сами они не догадаются.
+    let startup = engine.startup_effects();
+    assert!(
+        startup.iter().any(|e| matches!(
+            e,
+            ratatosk_core::Effect::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: false
+            }
+        )),
+        "при старте выбор обязан доехать до транспорта: {startup:?}"
+    );
+}
+
+#[test]
 fn a_read_receipt_is_not_re_sent_after_a_restart() {
     // §9.4: квитанцию о прочтении выпускает **вызов клиента**, и ничто иное.
     // Водяной знак жил в памяти, поэтому после перезапуска первое же открытие
@@ -190,7 +272,15 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
         // Это не подгонка под реализацию, а восстановление состояния, которое
         // на устройстве создают клиент и обнаружение: сессия переживает
         // перезапуск, видимость в сети — нет.
-        engine.step(1_900, Input::Command(Command::SetLanEnabled(true))).unwrap();
+        engine
+            .step(
+                1_900,
+                Input::Command(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Lan,
+                    enabled: true,
+                }),
+            )
+            .unwrap();
         engine.step(1_950, Input::SeenOnLan { peer_ik }).unwrap();
 
         let effects =
@@ -213,7 +303,15 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
     engine.restore().unwrap();
     // Канал поднимается заново — иначе тишина ниже ничего не доказывала бы:
     // она означала бы «некуда отправить», а проверяется «нечего отправлять».
-    engine.step(2_900, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine
+        .step(
+            2_900,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
     engine.step(2_950, Input::SeenOnLan { peer_ik }).unwrap();
 
     let effects =
@@ -277,7 +375,15 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
     assert_eq!(engine.session_count(), 1, "сессия поднята");
 
     // LAN включён и контакт «виден» — иначе §5.4 отправлять не станет.
-    engine.step(2_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
     engine.step(2_000, Input::SeenOnLan { peer_ik }).unwrap();
     engine
         .step(2_100, Input::Command(Command::SendText { chat, text: "после смерти".to_owned() }))
@@ -298,7 +404,7 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
 }
 
 #[test]
-fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
+fn a_lan_link_loss_keeps_the_session_and_silence_only_retires_it() {
     // Раньше здесь проверялось обратное: разрыв LAN закрывал сессию. Читалось
     // это как §5.4, но §5.4 запрещает **переносить** сессию в чужое семейство
     // транспортов, а не переживать разрыв сокета. Ошибка стоила дорого: сессия
@@ -306,7 +412,11 @@ fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
     // в никуда и видела «не доставлено» при живой связи. Лечилось только
     // удалением контакта.
     //
-    // Закрывает сессию теперь одно: кадр ушёл, а квитанции в срок нет.
+    // Второй заход по тем же граблям был мягче, но той же природы: молчание
+    // в ответ на ушедший кадр сессию **закрывало**. А молчание —
+    // свидетельство об одном направлении, сессия же двусторонняя (5ю).
+    // Поэтому теперь она уходит на покой: принимать по ней можно, отправлять
+    // нельзя, и отправка идёт через новое рукопожатие.
     let db = TempDb::new("lanloss");
     let db_key = Zeroizing::new([5u8; 32]);
     let (card_bytes, peer_ik) = peer_card();
@@ -339,8 +449,16 @@ fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
     assert_eq!(engine.session_count(), 1, "разрыв сокета не закрывает сессию");
     assert_eq!(engine.store().sessions().unwrap().len(), 1, "и с диска не убирает");
 
-    // А вот молчание в ответ на ушедший кадр — закрывает.
-    engine.step(3_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    // А вот молчание в ответ на ушедший кадр — отправляет её на покой.
+    engine
+        .step(
+            3_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
     engine.step(3_000, Input::SeenOnLan { peer_ik }).unwrap();
     let effects = engine
         .step(3_100, Input::Command(Command::SendText { chat, text: "есть кто?".to_owned() }))
@@ -353,9 +471,23 @@ fn a_lan_link_loss_keeps_the_session_but_silence_closes_it() {
         })
         .expect("прямой канал заводит срок ожидания квитанции");
 
-    engine.step(9_000, Input::Timer { token }).unwrap();
-    assert_eq!(engine.session_count(), 0, "несогласованная сессия закрыта в памяти");
-    assert!(engine.store().sessions().unwrap().is_empty(), "и на диске тоже");
+    let after = engine.step(9_000, Input::Timer { token }).unwrap();
+
+    // Сессия остаётся — и это не недоделка, а разбор живой поломки (5ю).
+    // Собеседник о нашем молчании не знает и продолжает слать по ней;
+    // забыв её, мы отбрасывали бы каждый его кадр как «неизвестную сессию»,
+    // а сказать ему об этом нечем — кадр не расшифрован, кто прислал,
+    // неизвестно. Переписка умирала в одну сторону навсегда.
+    assert_eq!(engine.session_count(), 1, "покойная сессия обязана остаться принимать");
+    assert_eq!(engine.store().sessions().unwrap().len(), 1, "и с диска не убирается");
+
+    // Но отправлять по ней больше нельзя: §5.4 идёт за новой сессией,
+    // то есть за рукопожатием. Молчание обязано привести к нему, а не
+    // к тишине — иначе сообщение просто исчезает (§14).
+    assert!(
+        after.iter().any(|e| matches!(e, ratatosk_core::Effect::Send { via: Transport::Lan, .. })),
+        "покой без нового рукопожатия — это молчание, а не лечение: {after:?}"
+    );
 }
 
 #[test]
@@ -373,7 +505,15 @@ fn a_network_change_forgets_what_it_knew_about_the_local_network() {
     engine
         .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
         .unwrap();
-    engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine
+        .step(
+            1_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
     engine.step(1_000, Input::SeenOnLan { peer_ik }).unwrap();
     assert!(engine.contacts()[&peer_ik].availability.seen_on_lan);
 
@@ -473,7 +613,15 @@ fn a_waiting_message_still_waits_after_a_restart() {
             .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
             .unwrap();
         // LAN включён, но собеседника никто не видел: отправлять некуда.
-        engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Lan,
+                    enabled: true,
+                }),
+            )
+            .unwrap();
 
         let effects = engine
             .step(2_000, Input::Command(Command::SendText { chat, text: "подожду".to_owned() }))
@@ -506,7 +654,15 @@ fn a_waiting_message_still_waits_after_a_restart() {
     engine.restore().unwrap();
     assert_eq!(engine.store().outbox().unwrap().len(), 1, "очередь на месте");
 
-    engine.step(10_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine
+        .step(
+            10_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
     let effects = engine.step(11_000, Input::SeenOnLan { peer_ik }).unwrap();
     assert!(
         effects.iter().any(|e| matches!(e, ratatosk_core::Effect::Send { .. })),
@@ -533,7 +689,15 @@ fn a_waiting_message_for_a_deleted_contact_stops_waiting() {
     engine
         .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
         .unwrap();
-    engine.step(1_000, Input::Command(Command::SetLanEnabled(true))).unwrap();
+    engine
+        .step(
+            1_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .unwrap();
 
     let effects = engine
         .step(2_000, Input::Command(Command::SendText { chat, text: "подожду".to_owned() }))

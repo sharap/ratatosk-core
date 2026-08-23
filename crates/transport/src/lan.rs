@@ -433,7 +433,13 @@ impl Runner for LanRunner {
                 self.links.remove(&peer.ik);
                 Ok(())
             }
-            TransportCommand::SetLanEnabled(on) => self.set_enabled(on),
+            // Чужой транспорт сюда попасть не может — составной раннер
+            // разводит по адресату, — но проверка стоит: молча включиться
+            // по чужой команде хуже, чем отказать.
+            TransportCommand::SetEnabled { transport: Transport::Lan, enabled } => {
+                self.set_enabled(enabled)
+            }
+            TransportCommand::SetEnabled { .. } => Err(TransportError::Unavailable),
             TransportCommand::RestartLan => self.restart().await,
             TransportCommand::WatchLanPeers(peers) => {
                 // Сначала пересматриваем уже услышанное, потом запоминаем

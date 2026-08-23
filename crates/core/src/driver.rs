@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ratatosk_crdt::{Hlc, MsgId};
-use ratatosk_proto::transport_policy::PeerAvailability;
+use ratatosk_proto::transport_policy::{PeerAvailability, Transport};
 use ratatosk_store::{FileId, Store, StoredFile, StoredMessage, StoredReaction};
 use ratatosk_transport::{Runner, TransportCommand, TransportError, TransportEvent};
 use tokio::sync::{mpsc, oneshot};
@@ -159,6 +159,12 @@ enum Query {
     OpenFile { file_id: FileId, reply: oneshot::Sender<Option<FileReader>> },
     /// Порог автоматического приёма файлов.
     AutoAccept { reply: oneshot::Sender<Option<u64>> },
+    /// Какие транспорты сейчас включены (§5.4).
+    ///
+    /// Запросом, а не памятью клиента: выбор переживает перезапуск в `meta`,
+    /// и второй его экземпляр в настройках приложения однажды разошёлся бы
+    /// с тем, по которому ядро принимает решения.
+    Transports { reply: oneshot::Sender<TransportStatus> },
     /// Своя карточка прямо сейчас — ссылка и её версия (§4.1, §4.3).
     ///
     /// Запросом, а не значением, полученным при открытии: адреса появляются
@@ -214,6 +220,20 @@ pub struct OwnCard {
     pub chatmail: String,
 }
 
+/// Состояние транспортов на этом устройстве (§5.4).
+///
+/// Два набора, а не один, и разница видна человеку: «включён» — выбор,
+/// «работает» — состояние. Включённый Tor становится работающим через
+/// десятки секунд, и всё это время §5.4 его не выбирает; клиенту это нужно,
+/// чтобы сказать «поднимается» вместо «не работает».
+#[derive(Debug, Clone, Copy)]
+pub struct TransportStatus {
+    /// Что разрешил человек. Переживает перезапуск.
+    pub enabled: ratatosk_proto::TransportSet,
+    /// Что уже работает. Состояние сеанса, на диск не идёт.
+    pub ready: ratatosk_proto::TransportSet,
+}
+
 /// Что клиент знает о контакте.
 ///
 /// [`PeerAvailability`] здесь не украшение: это ровно те четыре признака,
@@ -252,13 +272,15 @@ enum Wake {
     Chore(Chore),
     Timers,
     Stop,
-    /// Tor опубликовал сервис — пора сказать об этом контактам (§4.3).
+    /// Tor опубликовал сервис: ступень заработала, и у неё есть адрес.
     ///
-    /// Отдельная ветка, а не готовый [`Input`], потому что команда объявления
-    /// несёт карточку целиком: и onion, и почту. Транспорт знает только свою
-    /// половину, вторую надо взять у ядра — а до ядра в ветке `select!`
-    /// не дотянуться.
-    Announce(String),
+    /// Отдельная ветка, а не готовый [`Input`], по двум причинам сразу.
+    /// Во-первых, отсюда рождаются **два** входа, и порядок между ними
+    /// важен: сперва §5.4 узнаёт, что ступень заработала, потом контакты
+    /// узнают адрес. Во-вторых, команда объявления несёт карточку целиком —
+    /// и onion, и почту; транспорт знает только свою половину, вторую надо
+    /// взять у ядра, а до ядра в ветке `select!` не дотянуться.
+    TorReady(String),
     /// Новость для UI, которой ядро не касается вовсе.
     ///
     /// Ход подъёма Tor — не состояние протокола: ни одно решение §5.4
@@ -321,6 +343,21 @@ impl DriverHandle {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::Contacts { reply })).await.ok()?;
         answer.await.ok()
+    }
+
+    /// Какие транспорты включены и какие работают (§5.4).
+    /// `None` — драйвер остановлен.
+    pub async fn transports(&self) -> Option<TransportStatus> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Transports { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// То же, блокируя вызывающий поток.
+    pub fn transports_blocking(&self) -> Option<TransportStatus> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Transports { reply })).ok()?;
+        answer.blocking_recv().ok()
     }
 
     /// Читает свою карточку (§4.1). `None` — драйвер остановлен.
@@ -523,6 +560,23 @@ impl<S: Store, R: Runner> Driver<S, R> {
 
     /// Основной цикл. Возвращается, когда закрылся транспорт или ручка UI.
     pub async fn run(&mut self) -> Result<(), EngineError> {
+        // Первое, что делает драйвер, — доносит до транспортов то, что человек
+        // решил в прошлый раз (§5.4). До этого момента сказать было некому:
+        // `Engine::restore` зовётся раньше драйвера и эффектов не возвращает.
+        //
+        // Клиент, выставляющий переключатели при старте, ничего не портит:
+        // повтор того же значения ядро отбрасывает молча.
+        let now = now_ms();
+        for effect in self.engine.startup_effects() {
+            if let Some(failed) = self.apply(now, effect).await {
+                // Ответить на это некому и нечем: соединений ещё нет,
+                // доставок тоже. Но промолчать нельзя — это первый признак
+                // того, что транспорт не собрался.
+                let _ = failed;
+                tracing::debug!("транспорт отказался включаться при старте");
+            }
+        }
+
         loop {
             let deadline = self.timers.keys().next().copied();
 
@@ -564,7 +618,16 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         tracing::debug!("очередь событий UI переполнена, новость отброшена");
                     }
                 }
-                Wake::Announce(onion) => {
+                Wake::TorReady(onion) => {
+                    // Два действия, и порядок между ними важен.
+                    //
+                    // Сперва §5.4 узнаёт, что ступень заработала: до этого
+                    // момента onion в лестнице не участвовал, и всё, что
+                    // ждало, ждало именно этого. Объяви мы сначала адрес,
+                    // рассылка §4.3 пошла бы по ступени, которую ядро ещё
+                    // считает неготовой, — и легла бы в ожидание.
+                    self.tolerate(Input::TransportReady { transport: Transport::Onion }).await?;
+
                     // Почта берётся из текущей карточки, а не из пустоты:
                     // объявление заявляет оба адреса разом, и подставить
                     // сюда пустую строку значило бы сказать контактам, что
@@ -650,6 +713,12 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::AutoAccept { reply } => {
                 let _ = reply.send(self.engine.auto_accept_bytes());
+            }
+            Query::Transports { reply } => {
+                let _ = reply.send(TransportStatus {
+                    enabled: self.engine.transports(),
+                    ready: self.engine.transports_ready(),
+                });
             }
             Query::OwnCard { reply } => {
                 let card = self.engine.own_card();
@@ -876,7 +945,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Effect::Send { peer_ik, via, .. } | Effect::Connect { peer_ik, via } => {
                 Some((*peer_ik, *via))
             }
-            Effect::SetLanEnabled(_)
+            Effect::SetTransportEnabled { .. }
             | Effect::WatchLanPeers(_)
             | Effect::RestartLan
             | Effect::SetTimer { .. }
@@ -890,7 +959,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Effect::Connect { peer_ik, via } => {
                 Some(TransportCommand::Connect { peer: self.address_of(peer_ik), via })
             }
-            Effect::SetLanEnabled(on) => Some(TransportCommand::SetLanEnabled(on)),
+            Effect::SetTransportEnabled { transport, enabled } => {
+                Some(TransportCommand::SetEnabled { transport, enabled })
+            }
             Effect::WatchLanPeers(peers) => Some(TransportCommand::WatchLanPeers(peers)),
             Effect::RestartLan => Some(TransportCommand::RestartLan),
             Effect::SetTimer { after_ms, token } => {
@@ -988,7 +1059,7 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::Disconnected { peer_ik, via }
         | TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectionLost { peer_ik, via },
         TransportEvent::SeenOnLan { peer_ik } => Input::SeenOnLan { peer_ik },
-        TransportEvent::TorReady { onion } => return Wake::Announce(onion),
+        TransportEvent::TorReady { onion } => return Wake::TorReady(onion),
         TransportEvent::TorProgress { fraction, note, blocked } => {
             return Wake::Notice(Event::TorStatus { fraction, note, blocked })
         }

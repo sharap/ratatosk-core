@@ -90,12 +90,19 @@ impl Node {
                 display_name: name,
             },
         );
-        // Onion объявляется работающим сразу: симуляция проверяет протокол,
-        // а не подъём Tor. На устройстве этот вход приходит от транспорта
-        // после публикации сервиса, десятками секунд позже включения.
-        engine
-            .step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Onion })
-            .expect("готовность транспорта");
+        // Onion и почта объявляются работающими сразу: симуляция проверяет
+        // протокол, а не подъём Tor и не вход на почтовый сервер. На
+        // устройстве оба входа приходят от транспорта — onion после
+        // публикации сервиса, почта после входа с заведённым ящиком (5аа).
+        //
+        // Почту здесь объявлять обязательно: у симулятора для неё свой
+        // профиль связи (`LinkProfile::MAIL`, задержки в минуты), и без
+        // готовности §5.4 её просто не выбрал бы. Последняя ступень лестницы
+        // осталась бы непроверенной — молча, потому что тесты продолжали бы
+        // проходить на onion.
+        for transport in [ratatosk_proto::Transport::Onion, ratatosk_proto::Transport::Mail] {
+            engine.step(0, Input::TransportReady { transport }).expect("готовность транспорта");
+        }
         Node { engine, peers: BTreeMap::new(), events: Vec::new(), arrivals: Vec::new() }
     }
 
@@ -105,13 +112,24 @@ impl Node {
 
     /// Исполняет эффекты ядра: отправки уходят в сеть, уведомления копятся.
     fn apply(&mut self, ctx: &mut Ctx<'_>, effects: Vec<Effect>) {
+        // Подтверждения передачи собираются, а не выполняются на месте:
+        // иначе `apply` вызывал бы сам себя из середины разбора эффектов,
+        // и порядок отправок в сети зависел бы от глубины этого вызова.
+        let mut handed = Vec::new();
         for effect in effects {
             match effect {
-                Effect::Send { peer_ik, via, frame } => {
+                Effect::Send { peer_ik, via, frame, handoff } => {
                     let Some(&to) = self.peers.get(&peer_ik) else {
                         panic!("некуда слать: узел с таким IK не заведён в сценарии");
                     };
                     ctx.send(to, to_sim(via), frame);
+                    // Роль почтового сервера играет симулятор: письмо принято
+                    // сразу, а идёт долго (`LinkProfile::MAIL`). Именно так
+                    // это и устроено в жизни — «принято» и «доставлено»
+                    // разнесены на минуты, и §9.4 говорит только о первом.
+                    if let Some(handoff) = handoff {
+                        handed.push(Input::Handed { peer_ik, via, handoff });
+                    }
                 }
                 Effect::Notify(event) => {
                     if let Event::MessageReceived { msg_id, .. } = &event {
@@ -123,8 +141,14 @@ impl Node {
                 Effect::Connect { .. }
                 | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
+                | Effect::SetMailAccount(_)
+                | Effect::CreateMailAccount { .. }
                 | Effect::RestartLan => {}
             }
+        }
+        for input in handed {
+            let effects = self.engine.step(ctx.now_ms(), input).expect("подтверждение передачи");
+            self.apply(ctx, effects);
         }
     }
 

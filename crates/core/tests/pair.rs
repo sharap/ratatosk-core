@@ -80,10 +80,40 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
     loop {
         while let Some((from_first, effect)) = queue.pop_front() {
             steps += 1;
-            assert!(steps < 100, "обмен не сходится — вероятно, кольцо эффектов");
+            // Предел щедрый, и это не послабление. Он ловит **кольцо**
+            // эффектов, а кольцо не сходится ни при каком пределе. Честная
+            // же передача файла почтой производит эффекты сотнями: окно
+            // в восемь чанков, подтверждение на каждый четвёртый, отметка
+            // прогресса и новый срок молчания на каждый принятый кусок.
+            // Сто шагов такую передачу обрывали бы посередине, и тест
+            // проверял бы предел провода вместо протокола.
+            // Самая частая причина срабатывания — **не** ошибка в ядре,
+            // а срок, который взводит сам себя. У этого провода нет времени:
+            // `now_ms` не движется, и все взведённые сроки спускаются подряд,
+            // как только очередь затихла. Поэтому «получатель просит —
+            // отправителю нечем ответить — срок вышел снова» здесь кольцо,
+            // а в живом времени — повтор через полчаса, потом через час
+            // (`files::stall_backoff_ms`). Такие случаи проверяются шагами
+            // вручную, а не этим проводом.
+            assert!(
+                steps < 400,
+                "обмен не сходится: кольцо эффектов — или срок, взводящий сам себя"
+            );
 
             match effect {
-                Effect::Send { via, frame, .. } => {
+                Effect::Send { peer_ik, via, frame, handoff } => {
+                    // Провод играет заодно и роль почтового сервера: если
+                    // отправитель ждёт подтверждения передачи, он его тут же
+                    // получает. Без этого §5.4 объявил бы почту неудавшейся
+                    // по сроку — не потому, что письмо не ушло, а потому,
+                    // что сказать об этом на мгновенном проводе некому.
+                    if let Some(handoff) = handoff {
+                        let sender = if from_first { &mut *a } else { &mut *b };
+                        let produced = sender
+                            .step(now_ms, Input::Handed { peer_ik, via, handoff })
+                            .expect("подтверждение передачи не должно отказывать");
+                        queue.extend(produced.into_iter().map(|e| (from_first, e)));
+                    }
                     let target = if from_first { &mut *b } else { &mut *a };
                     let produced = target
                         .step(now_ms, Input::Received { via, frame })
@@ -95,6 +125,8 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 Effect::Connect { .. }
                 | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
+                | Effect::SetMailAccount(_)
+                | Effect::CreateMailAccount { .. }
                 | Effect::RestartLan => {}
             }
         }
@@ -322,6 +354,147 @@ fn lan_only_contact(node: &mut Node, seed: u8) -> [u8; 32] {
     )
     .unwrap();
     peer_ik
+}
+
+/// Оставляет узлу единственную ступень §5.4 — почту.
+///
+/// LAN выключен умолчанием (§5.1), onion выключается здесь, а готовность
+/// почты объявляется явно: заготовка узла этого не делает, потому что
+/// на устройстве её объявляет транспорт после входа на сервер (5аа).
+fn mail_only(node: &mut Node) {
+    node.step(
+        0,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Onion,
+            enabled: false,
+        }),
+    )
+    .expect("onion выключается");
+    node.step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Mail })
+        .expect("почта вошла на сервер");
+}
+
+/// Знакомит два узла и доводит начатый обмен до конца.
+///
+/// Обычный [`introduce`] эффекты выбрасывает, и это незаметно ровно до тех
+/// пор, пока добавление контакта ничего не порождает. Но карточка, с которой
+/// сняли адрес, объявляется заново при добавлении (§4.3) — а объявление
+/// по несуществующей сессии начинает рукопожатие. Оно и уходило единственным
+/// письмом, а отправка текста после него возвращала пустоту: `ensure_handshake`
+/// видел рукопожатие уже в пути и правильно не начинал второго.
+///
+/// Тест на этом и споткнулся: искал письмо в эффектах отправки, а письмо
+/// уехало двумя шагами раньше — из `AddContact`.
+fn introduce_and_settle(a: &mut Node, b: &mut Node, now_ms: u64) {
+    let a_card = a.own_card().encode().unwrap();
+    let b_card = b.own_card().encode().unwrap();
+    let from_a = a
+        .step(
+            now_ms,
+            Input::Command(Command::AddContact { card_bytes: b_card, met_in_person: true }),
+        )
+        .expect("контакт добавляется");
+    let from_b = b
+        .step(
+            now_ms,
+            Input::Command(Command::AddContact { card_bytes: a_card, met_in_person: true }),
+        )
+        .expect("контакт добавляется");
+    pump(a, b, now_ms, from_a);
+    pump(b, a, now_ms, from_b);
+}
+
+/// Метка подтверждения из отправки почтой — и сама отправка.
+fn mail_handoff(effects: &[Effect]) -> u64 {
+    effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send { via: Transport::Mail, handoff: Some(token), .. } => Some(*token),
+            _ => None,
+        })
+        .expect("письмо обязано уехать почтой и ждать подтверждения")
+}
+
+fn sent_announced(effects: &[Effect]) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Sent,
+                ..
+            })
+        )
+    })
+}
+
+#[test]
+fn a_letter_is_not_sent_until_the_server_has_taken_it() {
+    // §14 и §9.4. Прежде «отправлено» появлялось в тот же миг, когда кадр
+    // клали в очередь транспорта, — то есть до всякой сети. Письмо после
+    // этого могло не уйти вовсе: вход на сервер отвергнут, кончилось место,
+    // порвалась цепочка Tor. Человек при этом видел «отправлено» и был
+    // уверен, что сообщение у собеседника.
+    // Почта — единственная ступень у обоих, и **до** знакомства: карточки
+    // тогда разъезжаются уже без onion-адресов, и §5.4 не на что откатываться
+    // ни в одну сторону.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    // Письмо с текстом — и оно ждёт подтверждения, а не объявляет успех.
+    let effects = send_text(&mut alice, &bob, 1_000, "письмом");
+    // Проверка внутри: без метки подтверждения отправка почтой не считается
+    // состоявшейся, и `mail_handoff` об этом скажет.
+    let _first = mail_handoff(&effects);
+    assert!(
+        !sent_announced(&effects),
+        "кадр только положили в очередь транспорта — обещать «отправлено» рано"
+    );
+
+    // Провод играет роль сервера: письма принимаются, ответ приходит,
+    // сессия устанавливается, сообщение уезжает — и вот теперь оно
+    // действительно отправлено.
+    let events = pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["письмом".to_owned()], "письмо обязано доехать");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::StatusChanged { status: ratatosk_proto::DeliveryStatus::Sent, .. }
+        )),
+        "принятое сервером письмо — вот теперь «отправлено»: {events:?}"
+    );
+}
+
+#[test]
+fn a_letter_the_server_never_took_is_not_sent_either() {
+    // Обратная сторона той же честности: подтверждения нет, срок вышел —
+    // значит письмо не ушло, и «отправлено» появиться не имеет права.
+    // Прежде этот случай был неотличим от успеха, потому что успех
+    // объявлялся заранее, а почтовое рукопожатие не имело срока вовсе
+    // и молчало навсегда.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    let effects = send_text(&mut alice, &bob, 1_000, "в никуда");
+    let token = mail_handoff(&effects);
+
+    // Пять минут тишины: сервер письма не принял.
+    let expired = alice.step(400_000, Input::Timer { token }).expect("срок передачи");
+    assert!(!sent_announced(&expired), "молчание сервера — не отправка: {expired:?}");
+    let statuses: Vec<_> = expired
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Notify(Event::StatusChanged { status, .. }) => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !statuses.is_empty(),
+        "исход обязан быть объявлен: молча оставленное в очереди сообщение — то же молчание (§14)"
+    );
 }
 
 #[test]
@@ -1823,6 +1996,7 @@ fn a_reply_without_words_is_refused() {
 
 use ratatosk_core::OutgoingFile;
 use ratatosk_proto::files;
+use ratatosk_proto::mail::{MailAccount, Secret};
 // Здесь оно нужно поимённо: проверяется, **каким** транспортом уходит кадр,
 // и `ratatosk_proto::Transport::Lan` внутри `matches!` читается уже плохо.
 use ratatosk_proto::{DeliveryStatus, Transport};
@@ -1850,6 +2024,221 @@ fn assembled(node: &Node, file_id: &[u8; 16]) -> Vec<u8> {
 fn only_file(node: &Node, peer: &Node) -> [u8; 16] {
     let msg_id = *ids_in(node, peer).last().expect("сообщение с вложением");
     node.store().files_of(&msg_id).unwrap()[0].file_id
+}
+
+/// Отправляет один файл и возвращает эффекты.
+fn send_file(node: &mut Node, peer: &Node, now_ms: u64, path: &str) -> Vec<Effect> {
+    node.step(
+        now_ms,
+        Input::Command(Command::SendFiles {
+            chat: Engine::<MemoryStore>::chat_id_for(&peer.own_card().ik),
+            files: vec![OutgoingFile {
+                path: path.into(),
+                preview: Some(vec![0x89, b'P', b'N', b'G']),
+            }],
+            text: "вот отчёт".into(),
+        }),
+    )
+    .expect("отправка файла принята")
+}
+
+#[test]
+fn a_file_travels_over_mail_when_mail_is_the_only_transport() {
+    // Просьба со стенда, и она же **расхождение со спецификацией**: §10.2
+    // требует для чанков прямого канала. У части людей прямого канала нет
+    // вовсе — LAN не годится, Tor в их сети не поднимается, — и буква
+    // спецификации означает для них «файлов нет».
+    //
+    // Прежнее обоснование запрета («оконный протокол поверх почты
+    // не медленный, а неработающий») было не выводом, а нежеланием считать.
+    // Окно и подтверждения не требуют миллисекунд — они требуют, чтобы срок
+    // молчания был длиннее круга. Круг почты — минуты, срок ей отведён
+    // получасовой, и вся разница между транспортами сводится к трём числам
+    // в `files`: окно, частота подтверждений, срок.
+    //
+    // Файл нарочно длиннее почтового окна (девять чанков против восьми):
+    // иначе окно не проверяется вовсе — всё уезжает первой же пачкой,
+    // и подтверждения ни на что не влияют.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    // Разреженный, а не настоящий: правило смотрит на размер, и держать
+    // ради него в памяти девять мебибайт байтов незачем. Читается он честно
+    // — нулями, — так что передача идёт настоящая.
+    let size = files::CHUNK_BYTES as u64 * 9 + 5;
+    alice_blobs.lock().unwrap().seed_sparse("/tmp/otchet.pdf", size);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. }))),
+        "почта теперь возит файлы — обещать ожидание прямого канала нечестно: {effects:?}"
+    );
+
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let file_id = only_file(&bob, &alice);
+    let received = bob.store().file(&file_id).unwrap().unwrap();
+    assert_eq!(received.size_bytes, size);
+    assert!(received.complete, "файл обязан собраться до конца — одной только почтой");
+    let whole = assembled(&bob, &file_id);
+    assert_eq!(whole.len() as u64, size, "собранный файл обязан совпасть по длине");
+    assert!(whole.iter().all(|byte| *byte == 0), "и по содержимому: исходник был из нулей");
+}
+
+#[test]
+fn a_stingy_letter_limit_keeps_files_off_the_mail() {
+    // Свой сервер объявил `SIZE` меньше, чем весит письмо с куском файла.
+    // Отправлять в такой предел значит получать отказ на каждый чанк
+    // и начинать заново вечно; §14 велит сказать, а не пробовать.
+    //
+    // Сообщения при этом обязаны ходить: ограничение только для вложений,
+    // и спутать эти два случая — значит объявить почту сломанной там,
+    // где она работает.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    // Мегабайт: письмо с чанком — около полутора.
+    //
+    // Предел ставится **обеим** сторонам, и это не удобство теста. Так и есть
+    // на живом стенде: оба ящика заводятся на одном chatmail-сервере, значит
+    // и предел у них один. Правило при этом проверяется дважды — у отправителя
+    // при вложении, у получателя при попытке принять.
+    //
+    // Односторонний случай (скупой сервер у отправителя, щедрый у получателя)
+    // законен и ведёт себя иначе: получатель про свой предел ничего плохого
+    // не знает, просит чанки и не получает их, а срок молчания разводит
+    // повторы по отступлению (`stall_backoff_ms`). Проверить это здесь нельзя,
+    // и вот почему — на грабли стоит наступить один раз.
+    //
+    // **У провода в этом тесте нет времени.** `pump` держит `now_ms`
+    // неизменным и спускает все взведённые сроки подряд, как только очередь
+    // затихла. Срок, который взводит сам себя, в такой модели не «повторится
+    // через полчаса», а закрутится в кольцо: получатель просит, отправитель
+    // молча не может, срок выходит снова — и так до предела шагов. Кольцо
+    // при этом ненастоящее: в живом времени между повторами полчаса, потом
+    // час, потом два.
+    for node in [&mut alice, &mut bob] {
+        node.step(500, Input::MailLetterLimit { bytes: Some(1_000_000) }).expect("предел принят");
+    }
+
+    alice_blobs.lock().unwrap().seed_sparse("/tmp/otchet.pdf", files::CHUNK_BYTES as u64 * 2);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. }))),
+        "сказать надо сразу: почта этот файл не увезёт: {effects:?}"
+    );
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let file_id = only_file(&bob, &alice);
+    assert!(
+        !bob.store().file(&file_id).unwrap().unwrap().complete,
+        "в предел, который сервер не примет, ни один чанк уехать не должен"
+    );
+
+    // А сообщение — доезжает. Ограничение письма не делает почту неработающей.
+    let effects = send_text(&mut alice, &bob, 2_000, "а текст идёт");
+    let events = pump(&mut alice, &mut bob, 2_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "предел письма не отменяет переписку: {events:?}"
+    );
+}
+
+#[test]
+fn a_mailbox_with_no_room_stops_asking_for_chunks() {
+    // Просит чанки получатель, и открытое окно ляжет в **его** ящик.
+    // Места меньше, чем на окно, — часть писем сервер не примет,
+    // а отправитель получит отказ, которого не поймёт ни он, ни мы.
+    //
+    // И обратный ход: ящик разгрузился — то, что не спрашивалось,
+    // спрашивается само. Без этого приём, однажды упёршийся в полный
+    // ящик, ждал бы прямого канала до конца времён: срок молчания в этом
+    // случае не заводится нарочно.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    let window = files::mail_window_bytes();
+    let full = Input::MailQuota { used_bytes: window * 2 - 1, limit_bytes: window * 2 };
+    bob.step(500, full).expect("квота принята");
+
+    alice_blobs.lock().unwrap().seed_sparse("/tmp/otchet.pdf", files::CHUNK_BYTES as u64 * 2);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
+    let events = pump(&mut alice, &mut bob, 1_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::FileWaitsForChannel { .. })),
+        "получателю надо сказать, что в его ящике нет места: {events:?}"
+    );
+    let file_id = only_file(&bob, &alice);
+    assert!(!bob.store().file(&file_id).unwrap().unwrap().complete);
+
+    // Ящик разгрузился — приём возобновляется сам, без единого действия
+    // человека и без нового письма от отправителя.
+    let free = Input::MailQuota { used_bytes: 0, limit_bytes: window * 2 };
+    let effects = bob.step(2_000, free).expect("квота принята");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    assert!(
+        bob.store().file(&file_id).unwrap().unwrap().complete,
+        "освободившееся место обязано возобновить приём само"
+    );
+}
+
+#[test]
+fn a_file_too_large_for_mail_says_it_waits_for_a_channel() {
+    // Обратная сторона предыдущего теста. Почтой файлы ходят, но круг у неё
+    // минутный: сто мегабайт — это десятки минут, а гигабайт — сутки.
+    // За пределом честнее сказать «нужен прямой канал» (§14), чем показать
+    // полоску, которая не сдвинется до завтра.
+    //
+    // Сказать надо **сразу**, а не когда человек заметит, что полоска стоит.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    alice_blobs.lock().unwrap().seed_sparse("/tmp/kino.mkv", files::MAIL_FILE_LIMIT_BYTES + 1);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/kino.mkv");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. }))),
+        "сказать надо сразу, а не когда человек заметит, что полоска стоит: {effects:?}"
+    );
+
+    // Предложение при этом уезжает: собеседник увидит имя, размер и превью.
+    // Не увидит содержимого — и это ровно то, о чём его предупредили.
+    let events = pump(&mut alice, &mut bob, 1_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "само предложение обязано доехать почтой: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, Event::FileWaitsForChannel { .. })),
+        "и получателю тоже надо сказать, чего он ждёт: {events:?}"
+    );
+    let file_id = only_file(&bob, &alice);
+    assert!(
+        !bob.store().file(&file_id).unwrap().unwrap().complete,
+        "и ни одного чанка при этом уехать не должно"
+    );
 }
 
 #[test]
@@ -1905,8 +2294,10 @@ fn a_message_waits_for_tor_to_come_up_instead_of_burning_the_step() {
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
 
-    // Почта в этом тесте лишняя: у заготовки узла есть и почтовый адрес,
-    // а §5.4 честно ушёл бы на неё — и проверялась бы не та ступень.
+    // Почта в этом тесте лишняя: у заготовки узла есть почтовый адрес.
+    // Работающей она теперь и так не считается — ящик не заведён, — но
+    // выключается явно, чтобы тест проверял ступень onion, а не зависел
+    // от умолчания соседнего транспорта.
     alice
         .step(
             400,
@@ -1969,7 +2360,23 @@ fn switching_tor_off_takes_the_address_out_of_the_card() {
     // «он выключил Tor».
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let alice_ik = alice.own_card().ik;
+    let (alice_ik, bob_ik) = (alice.own_card().ik, bob.own_card().ik);
+
+    // Обновление карточки — такой же кадр, как любой другой, и ступень §5.4
+    // ему нужна такая же. Onion здесь как раз выключают, а почта без ящика
+    // не работает (5аа) — значит везти обновление обязана локальная сеть,
+    // и её надо включить по-настоящему, а не понадеяться на соседа.
+    //
+    // Раньше тест этого не делал и всё равно проходил: почта считалась
+    // работающей с момента включения, и обновление уезжало «почтой»,
+    // которой нет. Проверялась, выходит, не доставка, а провод теста.
+    let lan_on = || {
+        Input::Command(Command::SetTransportEnabled { transport: Transport::Lan, enabled: true })
+    };
+    alice.step(500, lan_on()).unwrap();
+    bob.step(500, lan_on()).unwrap();
+    alice.step(600, Input::SeenOnLan { peer_ik: bob_ik }).unwrap();
+    bob.step(600, Input::SeenOnLan { peer_ik: alice_ik }).unwrap();
 
     let address = some_onion(9);
     let effects = alice
@@ -2002,6 +2409,130 @@ fn switching_tor_off_takes_the_address_out_of_the_card() {
 }
 
 #[test]
+fn a_mailbox_is_a_promise_and_it_goes_into_the_card() {
+    // Пока собеседник не знает нашего chatmail-адреса, почта не ступень
+    // §5.4 **для него**: `has_chatmail` берётся из карточки, а не из наших
+    // настроек. Поэтому заведённый ящик обязан доехать до карточки — той же
+    // дорогой §4.3, что и onion-адрес.
+    let mut alice = node(1, "alice");
+    let before = alice.own_card().version;
+
+    let account = MailAccount::from_address("a7f3k9@nine.example", "sekret");
+    let effects =
+        alice.step(1_000, Input::Command(Command::SetMailAccount(Some(account)))).unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SetMailAccount(Some(_)))),
+        "настройки обязаны уехать до транспорта: взять их самому ему негде (§13.3)"
+    );
+    assert_eq!(alice.own_card().chatmail, "a7f3k9@nine.example");
+    assert!(alice.own_card().version > before, "смена адреса — это §4.3, версия растёт");
+
+    // А вот работающей почта от этого не стала. «Есть куда входить»
+    // и «вошли» — разные вещи, и разница видна человеку: между ними
+    // столько времени, сколько занимает вход на сервер.
+    assert!(
+        !alice.transports_ready().contains(Transport::Mail),
+        "заведённый ящик — ещё не работающая почта: об этом скажет транспорт"
+    );
+
+    // Ящик убрали — адрес снят. Обещать путь, которого нет, нельзя (§14):
+    // собеседник честно писал бы на него и получал «не доставлено».
+    alice.step(2_000, Input::Command(Command::SetMailAccount(None))).unwrap();
+    assert!(alice.own_card().chatmail.is_empty(), "адрес обязан уйти вместе с ящиком");
+}
+
+#[test]
+fn a_mailbox_that_cannot_work_is_refused_out_loud() {
+    // Молчаливый приём неверного адреса выглядит на сервере как отказ входа,
+    // а отказ входа человек читает как «почта не работает» — и чинит не то.
+    let mut alice = node(1, "alice");
+    let bad = MailAccount::from_address("nine.example", "sekret");
+    assert!(
+        alice.step(1_000, Input::Command(Command::SetMailAccount(Some(bad)))).is_err(),
+        "адрес без @ обязан быть отвергнут здесь, а не на сервере"
+    );
+    assert!(alice.mail_account().is_none(), "отвергнутые настройки не сохраняются");
+}
+
+#[test]
+fn a_mailbox_from_a_link_goes_the_same_road_as_a_typed_one() {
+    // Второй способ обзавестись почтой: человек даёт ссылку на chatmail-
+    // сервер, тот заводит ящик и отвечает готовыми адресом и паролем.
+    // Дальше — ровно тот же путь, что и у введённого руками: откуда взялись
+    // данные, не имеет значения ни для хранения, ни для карточки, ни для §5.4.
+    let mut alice = node(1, "alice");
+
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::CreateMailAccount {
+                url: "https://chatmail.example/new".to_owned(),
+                via_tor: false,
+            }),
+        )
+        .unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::CreateMailAccount { .. })),
+        "в сеть ходит транспорт, а не ядро (§13.3): {effects:?}"
+    );
+
+    // Сервер ответил.
+    let effects = alice
+        .step(
+            2_000,
+            Input::MailAccountCreated {
+                address: "a7f3k9@chatmail.example".to_owned(),
+                password: Secret::new("vydan-serverom"),
+            },
+        )
+        .unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::MailAccountReady { .. }))),
+        "новый адрес человек нигде больше не увидит — сказать обязаны: {effects:?}"
+    );
+    assert_eq!(alice.own_card().chatmail, "a7f3k9@chatmail.example");
+
+    // Выбор пути сделан **до** регистрации и относится к ящику тоже.
+    // Сходить за паролем напрямую, а письма возить через Tor значило бы
+    // один раз показать серверу свой IP — и связать его с адресом навсегда.
+    assert_eq!(
+        alice.mail_account().map(|account| account.via_tor),
+        Some(false),
+        "выбор «через Tor» обязан пережить поход в сеть"
+    );
+}
+
+#[test]
+fn a_registration_link_without_tls_never_reaches_the_network() {
+    // По http пароль приехал бы открытым текстом любому на пути, а этот
+    // пароль открывает переписку. Отказ — до того, как человек нажал и стал
+    // ждать сети, а не после.
+    let mut alice = node(1, "alice");
+    let refused = alice.step(
+        1_000,
+        Input::Command(Command::CreateMailAccount {
+            url: "http://chatmail.example/new".to_owned(),
+            via_tor: true,
+        }),
+    );
+    assert!(refused.is_err(), "ссылка без TLS обязана быть отвергнута ядром");
+}
+
+#[test]
+fn a_failed_registration_is_said_out_loud() {
+    // Человек нажал «завести почту». Молчание он прочтёт как поломку
+    // приложения — и будет прав (§14).
+    let mut alice = node(1, "alice");
+    let effects = alice
+        .step(1_000, Input::MailAccountFailed { reason: "сервер отказал".to_owned() })
+        .unwrap();
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::MailAccountFailed { .. }))),
+        "отказ обязан доехать до человека словами: {effects:?}"
+    );
+}
+
+#[test]
 fn switching_a_transport_off_releases_what_was_riding_it() {
     // Выключатель, который действует только на новые отправки, — половина
     // выключателя. Всё, что уже выбрало этот транспорт, продолжало его
@@ -2030,26 +2561,15 @@ fn switching_a_transport_off_releases_what_was_riding_it() {
             }),
         )
         .unwrap();
-    // Сойти с выключенной ступени — значит оказаться на следующей, а не
-    // сразу в ожидании: §5.4 ведёт дальше по лестнице, и для неё «человек
-    // выключил» и «не сработало» — один исход. Видно это по рукопожатию:
-    // оно уходит почтой, и сообщение ждёт уже её.
+    // Ступеней ниже onion сейчас нет: почта «включена», но не работает —
+    // ящик не заведён, и §5.4 её не выбирает. Значит лестница кончилась,
+    // и сообщению остаётся честное ожидание.
     assert!(
-        released.iter().any(|e| matches!(e, Effect::Send { via: Transport::Mail, .. })),
-        "сообщение обязано сойти с выключенной ступени на следующую: {released:?}"
-    );
-
-    // А почта (§5.3) ещё не написана: на устройстве раннер откажет. Это
-    // не подгонка теста под код — это то, что там сейчас происходит,
-    // и без этого шага лестница не кончится никогда.
-    let refused =
-        alice.step(2_100, Input::ConnectionLost { peer_ik: bob_ik, via: Transport::Mail }).unwrap();
-    assert!(
-        refused.iter().any(|e| matches!(
+        released.iter().any(|e| matches!(
             e,
             Effect::Notify(Event::StatusChanged { status: DeliveryStatus::Waiting, .. })
         )),
-        "ступени кончились — сообщение обязано честно встать в ожидание: {refused:?}"
+        "сообщение обязано сойти с выключенной ступени и честно встать в ожидание: {released:?}"
     );
 
     // Теперь локальная сеть — на обеих машинах.
@@ -2254,6 +2774,150 @@ fn each_rung_of_the_ladder_gets_its_own_handshake() {
          как «неизвестная сессия»: {:?}",
         inbox(&alice, &bob)
     );
+}
+
+/// Сверяет, что обе стороны отправляют по одной и той же сессии.
+///
+/// Это **то самое** свойство, ради которого реестр сессий устроен так, как
+/// устроен. Расхождение здесь означает переписку, умершую при живой связи
+/// с обеих сторон, и по почте его нечем обнаружить: квитанций там нет
+/// (§9.4), отправитель до конца дней видит «отправлено».
+fn assert_sessions_agree(a: &Node, b: &Node, transport: Transport) {
+    let (a_ik, b_ik) = (a.own_card().ik, b.own_card().ik);
+    let (mine, theirs) = (a.session_for(&b_ik, transport), b.session_for(&a_ik, transport));
+    assert!(mine.is_some(), "сессия обязана быть: {transport:?}");
+    assert_eq!(
+        mine, theirs,
+        "стороны разошлись в сессии для {transport:?}: каждая шлёт туда, \
+         где другая её не знает"
+    );
+}
+
+#[test]
+fn both_sides_starting_at_once_still_end_up_in_one_session() {
+    // Одновременное рукопожатие — не ошибка и не редкость: двое пишут друг
+    // другу, сессии нет ни у кого, оба начинают. В одном семействе после
+    // этого оказываются две сессии, а место в реестре — одно.
+    //
+    // Пока вытеснение удаляло прежнюю, каждая сторона выбирала победителем
+    // **свою** и молча отбрасывала всё, что шлёт другая. По onion это
+    // лечилось сроком ожидания квитанции, по почте — ничем: там квитанций
+    // нет, и отправитель до конца дней видит «отправлено».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Оба начинают, и ни один ещё не видел кадра другого.
+    let from_alice = send_text(&mut alice, &bob, 1_000, "от Алисы");
+    let from_bob = send_text(&mut bob, &alice, 1_000, "от Боба");
+
+    // И только теперь провод разносит оба рукопожатия.
+    pump(&mut alice, &mut bob, 1_000, from_alice);
+    pump(&mut bob, &mut alice, 1_000, from_bob);
+
+    assert!(
+        inbox(&bob, &alice).contains(&"от Алисы".to_string()),
+        "первое сообщение обязано доехать: {:?}",
+        inbox(&bob, &alice)
+    );
+    assert!(
+        inbox(&alice, &bob).contains(&"от Боба".to_string()),
+        "и встречное тоже: {:?}",
+        inbox(&alice, &bob)
+    );
+
+    // Главное — что переписка продолжается. Даже если победители у сторон
+    // разные, прежняя сессия осталась принимать, и кадр находит адресата.
+    let next = send_text(&mut alice, &bob, 2_000, "и дальше");
+    pump(&mut alice, &mut bob, 2_000, next);
+    assert!(
+        inbox(&bob, &alice).contains(&"и дальше".to_string()),
+        "после встречных рукопожатий переписка обязана идти дальше: {:?}",
+        inbox(&bob, &alice)
+    );
+
+    let back = send_text(&mut bob, &alice, 3_000, "и обратно");
+    pump(&mut bob, &mut alice, 3_000, back);
+    assert!(
+        inbox(&alice, &bob).contains(&"и обратно".to_string()),
+        "в обе стороны: {:?}",
+        inbox(&alice, &bob)
+    );
+}
+
+#[test]
+fn a_fallback_inside_one_family_keeps_the_same_handshake() {
+    // Вторая поломка со стенда, выглядевшая ровно как первая: «кадр для
+    // неизвестной сессии — отброшен», `via=Mail`.
+    //
+    // Правило «каждой ступени своё рукопожатие» верно по духу и слишком
+    // широко по букве. Ступеней три, а семейств два: onion и почта живут
+    // в одном, и реестр держит **одну сессию на семейство**. Значит,
+    // переход onion → почта заводил в одном слоте две сессии, и дальше
+    // всё решал порядок ответов — а onion отвечает секундами, почта
+    // минутами, и у сторон он разный почти наверняка.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    // Почта — рабочая ступень: без этого §5.4 до неё просто не дойдёт.
+    alice
+        .step(0, Input::TransportReady { transport: Transport::Mail })
+        .expect("почта вошла на сервер");
+
+    // Первая ступень — onion: LAN выключен умолчанием (§5.1), адрес есть.
+    let effects = send_text(&mut alice, &bob, 1_000, "через семью");
+    let onion_frame = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send { via: Transport::Onion, frame, .. } => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("первая ступень при выключенном LAN — onion");
+    let token = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("у рукопожатия прямым каналом есть срок");
+
+    // Onion молчит — §5.4 ведёт на почту. Семейство то же самое.
+    let moved = alice.step(60_000, Input::Timer { token }).expect("срок рукопожатия");
+    let mail_frame = moved
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send { via: Transport::Mail, frame, .. } => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("после молчания onion §5.4 обязан привести на почту");
+
+    assert_eq!(
+        mail_frame, onion_frame,
+        "внутри одного семейства — тот же самый кадр: второе рукопожатие завело бы \
+         вторую сессию в слоте, где помещается одна, и стороны разошлись бы"
+    );
+
+    // И главное: сессия после этого одна на двоих. Боб принимает письмо
+    // и отвечает почтой, Алиса привязывает ту же сессию — в то же семейство.
+    let answer = bob
+        .step(61_000, Input::Received { via: Transport::Mail, frame: mail_frame })
+        .expect("приём рукопожатия");
+    pump(&mut bob, &mut alice, 61_000, answer);
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["через семью".to_string()],
+        "сообщение обязано уехать почтой по той же сессии"
+    );
+
+    let back = send_text(&mut bob, &alice, 70_000, "ответ");
+    pump(&mut bob, &mut alice, 70_000, back);
+    assert!(
+        inbox(&alice, &bob).contains(&"ответ".to_string()),
+        "сессия семейства обязана быть одной на двоих: {:?}",
+        inbox(&alice, &bob)
+    );
+    // И это же — прямо, а не по следствию: рукопожатие было одно,
+    // значит и сессия одна.
+    assert_sessions_agree(&alice, &bob, Transport::Mail);
+    assert_sessions_agree(&alice, &bob, Transport::Onion);
 }
 
 #[test]

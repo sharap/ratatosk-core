@@ -29,7 +29,13 @@ use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 #[cfg(feature = "tor")]
 use ratatosk_transport::{onion::arti::OnionRunner, Switched};
-use ratatosk_transport::{Disabled, LanConfig, LanRunner, Transports};
+// `Disabled` нужен только тем сборкам, где чего-то нет. Собери мост
+// с обоими признаками — все три ступени заняты настоящими раннерами,
+// и безусловный импорт становится предупреждением ровно в той сборке,
+// которая и пойдёт в приложение.
+#[cfg(any(not(feature = "tor"), not(feature = "mail")))]
+use ratatosk_transport::Disabled;
+use ratatosk_transport::{LanConfig, LanRunner, Transports};
 
 uniffi::setup_scaffolding!();
 
@@ -269,6 +275,29 @@ pub enum FfiEvent {
         /// Чат.
         chat_id: Vec<u8>,
     },
+    /// Файлу не на чем ехать (§10.3).
+    ///
+    /// **Состояние, а не происшествие.** Показывать надо на самом файле —
+    /// строкой из [`file_waiting_text`], — а не всплывающей подсказкой:
+    /// подсказка исчезнет, а ждать файл будет столько, сколько собеседник
+    /// вне сети.
+    ///
+    /// Случаев два. Либо канала нет никакого — собеседник не в сети, почты
+    /// у него нет. Либо канал остался только почтовый, а файл для почты
+    /// слишком велик: почтой файлы ходят (по чанку в письме), но круг у неё
+    /// минутный, и сотня мегабайт — предел, за которым честнее сказать
+    /// «нужен прямой канал», чем показывать полоску, которая не сдвинется
+    /// до завтра.
+    ///
+    /// Снимает это состояние следующий [`FfiEvent::FileProgress`]: он
+    /// и означает, что канал появился и передача пошла.
+    ///
+    /// Прежнее имя — `FileWaitsForDirectChannel`; переименовано, когда
+    /// чанки поехали почтой.
+    FileWaitsForChannel {
+        /// Какой файл.
+        file_id: Vec<u8>,
+    },
     /// Ход передачи файла (§10.2).
     ///
     /// Приходит на каждый принятый чанк и на завершение. `total` равен нулю
@@ -287,6 +316,177 @@ pub enum FfiEvent {
         /// Текст.
         text: String,
     },
+    /// Ядро отвергло команду (§14).
+    ///
+    /// Отдельно от [`FfiEvent::HonestNotice`]: там выверенный текст §14,
+    /// здесь — отчёт о конкретном действии человека (опечатка в ссылке,
+    /// файл не того формата). Показать обязательно: молчание после
+    /// нажатия он прочтёт как поломку приложения.
+    CommandRefused {
+        /// Что именно не так — словами, для показа.
+        reason: String,
+    },
+    /// Chatmail-сервер завёл ящик (§5.3).
+    ///
+    /// Показать адрес обязательно, и не из вежливости: это новая почта
+    /// человека, он её больше нигде не увидит, а собеседники будут писать
+    /// именно туда. Пароль в событие не едет — он не нужен ни для показа,
+    /// ни для чего-либо ещё выше границы §13.3.
+    MailAccountReady {
+        /// Адрес, который выдал сервер.
+        address: String,
+    },
+    /// Завести ящик не вышло (§5.3, §14).
+    ///
+    /// Человек нажал «завести почту» и обязан узнать, почему её нет.
+    /// Молчаливый отказ он прочтёт как поломку приложения — и будет прав.
+    MailAccountFailed {
+        /// Что именно не вышло — словами, для показа.
+        reason: String,
+    },
+    /// Вход на почтовый сервер не удался (§5.3, §14).
+    ///
+    /// Отдельно от [`FfiEvent::MailAccountFailed`], потому что беды разные
+    /// и лечатся по-разному: там ящик не завёлся, здесь ящик есть, а войти
+    /// в него не вышло — сменили пароль, лежит сервер, не пускает Tor.
+    ///
+    /// Показывать надо там же, где состояние почты: молча переставшая
+    /// работать почта выглядит поломкой приложения. Ни ошибкой, ни модальным
+    /// окном это не является — сообщения при этом продолжают ходить
+    /// остальными ступенями §5.4.
+    MailLoginFailed {
+        /// Что именно не вышло — словами, для показа.
+        reason: String,
+    },
+    /// Почтовый сервер назвал свои пределы (§5.3).
+    ///
+    /// Приходит при входе на сервер и после каждой разборки ящика. То же
+    /// самое отдаёт [`RatatoskClient::mail_status`] — событие двигает
+    /// показанное, запрос отвечает пришедшему позже.
+    ///
+    /// Само по себе оно не новость и всплывающей подсказки не заслуживает:
+    /// это состояние экрана настроек почты. Новостью становятся два вывода
+    /// внутри — `crowded` и `carries_files`, — и оба означают, что вложения
+    /// сейчас почтой не пойдут, а сообщения пойдут.
+    MailLimits {
+        /// Предел одного письма, байт. `None` — сервер не назвал.
+        letter_bytes: Option<u64>,
+        /// Занято в ящике, байт.
+        mailbox_used: Option<u64>,
+        /// Весь объём ящика, байт.
+        mailbox_limit: Option<u64>,
+        /// Места меньше, чем нужно одной передаче файла.
+        crowded: bool,
+        /// Поедут ли почтой файлы.
+        carries_files: bool,
+    },
+}
+
+/// Что происходит с почтой прямо сейчас (§5.3, §5.4).
+///
+/// Пять состояний, и это ровно те пять ответов, которые человек может
+/// получить на вопрос «почему не отправляется». Каждый лечится по-своему,
+/// и слить их в «работает / не работает» значило бы оставить его наедине
+/// с состоянием, из которого он не знает выхода.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMailState {
+    /// Выключена человеком. Лечится переключателем.
+    Off,
+    /// Включена, но ящика нет. Лечится вводом настроек или регистрацией.
+    NoAccount,
+    /// Ящик есть, входим на сервер. Лечится ожиданием — секунды, через Tor
+    /// десятки секунд.
+    Connecting,
+    /// Вошли: §5.4 выбирает почту для отправки.
+    Ready,
+    /// Сервер не пустил. Причина — в `detail`, и показать её обязательно.
+    Failed,
+}
+
+/// Состояние почты целиком — то, что рисуется на экране настроек.
+///
+/// Запросом, а не только событиями, и это не удобство. События существуют
+/// один раз: клиент, открывший экран через минуту после входа, не увидит
+/// ничего и покажет пустоту вместо правды. А человек, пришедший туда,
+/// спрашивает ровно одно — «почему не идёт», — и ответ обязан быть
+/// на экране, а не в пропущенном уведомлении.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMailStatus {
+    /// Что происходит.
+    pub state: FfiMailState,
+    /// Словами, если есть что сказать: причина отказа сервера.
+    pub detail: Option<String>,
+    /// Адрес ящика, если он заведён, — его показывают рядом с состоянием.
+    pub address: Option<String>,
+    /// Идёт ли почта через Tor.
+    ///
+    /// Здесь же, а не отдельным запросом, потому что показывается рядом:
+    /// «работает» и «работает напрямую» — разные утверждения, и второе
+    /// человек обязан видеть, не открывая настройки ящика (§2.2).
+    pub via_tor: bool,
+    /// Предел одного письма у **своего** сервера, байт.
+    ///
+    /// `None` — сервер не назвал, и это законно. Показывать в этом случае
+    /// нечего: строка «предел: неизвестно» человеку не говорит ничего.
+    pub letter_limit_bytes: Option<u64>,
+    /// Занято в ящике, байт. `None` — сервер не умеет `QUOTA`.
+    pub mailbox_used_bytes: Option<u64>,
+    /// Весь объём ящика, байт. `None` — сервер не умеет `QUOTA`.
+    pub mailbox_limit_bytes: Option<u64>,
+    /// Места в ящике меньше, чем нужно одной передаче файла.
+    ///
+    /// Готовый вывод, а не проценты: считать порог в клиенте значило бы
+    /// вынести протокольное правило выше границы §13.3. Пока это `true`,
+    /// файлы почтой **не принимаются** — и человеку стоит сказать почему,
+    /// иначе он увидит только застывшую полосу.
+    pub mailbox_crowded: bool,
+    /// Поедут ли почтой файлы.
+    ///
+    /// `false` означает, что сервер объявил предел письма меньше, чем
+    /// весит письмо с куском файла. Сообщения при этом ходят как ходили —
+    /// это ограничение только для вложений, и сказать надо именно так.
+    pub carries_files: bool,
+}
+
+/// Что Tor сказал о себе последним (§5.2, §13.1).
+///
+/// Тот же смысл и та же причина, что у [`FfiMailStatus`]: событие двигает
+/// индикатор, запрос отвечает тому, кто пришёл смотреть позже.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTorStatus {
+    /// Доля готовности, от 0 до 1.
+    pub fraction: f32,
+    /// Что происходит сейчас — словами arti.
+    pub note: String,
+    /// Почему подъём стоит, если он стоит.
+    ///
+    /// Пусто — «идёт, просто долго». Непусто — «встал, и вот причина».
+    /// Снаружи эти два случая неотличимы, и §14 не разрешает о них молчать.
+    pub blocked: Option<String>,
+}
+
+/// Настройки почтового ящика в том виде, в каком их показывает UI (§5.3).
+///
+/// Пароль здесь открытой строкой, и по-другому нельзя: его либо ввёл сам
+/// человек, либо выдал сервер — и во втором случае это единственное место,
+/// где он может его увидеть. Прятать его от владельца значило бы запереть
+/// его в собственной почте.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMailAccount {
+    /// Адрес вида `a7f3k9@chatmail.example`. Он же логин.
+    pub address: String,
+    /// Пароль.
+    pub password: String,
+    /// Имя IMAP-сервера.
+    pub imap_host: String,
+    /// Порт IMAP.
+    pub imap_port: u16,
+    /// Имя SMTP-сервера.
+    pub smtp_host: String,
+    /// Порт SMTP.
+    pub smtp_port: u16,
+    /// Идёт ли почта через Tor.
+    pub via_tor: bool,
 }
 
 /// Контакт в том виде, в каком его показывает UI.
@@ -890,6 +1090,107 @@ impl RatatoskClient {
         Ok(self.transport_status()?.enabled.contains(transport.into()))
     }
 
+    /// Записывает настройки существующего почтового ящика (§5.3).
+    ///
+    /// Первый из двух способов обзавестись почтой; второй —
+    /// [`RatatoskClient::create_mail_account`]. Спросить, какой из них,
+    /// клиент обязан при включении почты: у человека либо уже есть ящик,
+    /// либо нет ничего.
+    ///
+    /// `imap_host` и `smtp_host` пустые означают «взять из домена адреса»,
+    /// порты `0` — «стандартные». Chatmail-серверы устроены именно так,
+    /// и заставлять человека вводить четыре строки ради этого незачем.
+    ///
+    /// `via_tor` — выбор пути, и клиент обязан назвать его цену **до**
+    /// переключения: выключив Tor, человек показывает серверу свой IP,
+    /// а вместе с адресом ящика это привязка переписки к линии связи.
+    /// Содержимого писем сервер не видит в любом случае (§5.3).
+    ///
+    /// Настройки **хранит ядро** и переживают перезапуск вместе с паролем:
+    /// база зашифрована ключом §8.6. Клиенту дублировать их у себя не нужно
+    /// и не следует.
+    pub fn set_mail_account(
+        &self,
+        address: String,
+        password: String,
+        imap_host: String,
+        imap_port: u16,
+        smtp_host: String,
+        smtp_port: u16,
+        via_tor: bool,
+    ) -> Result<(), RatatoskError> {
+        let mut account = ratatosk_proto::mail::MailAccount::from_address(&address, &password);
+        if !imap_host.is_empty() {
+            account.imap_host = imap_host;
+        }
+        if !smtp_host.is_empty() {
+            account.smtp_host = smtp_host;
+        }
+        if imap_port != 0 {
+            account.imap_port = imap_port;
+        }
+        if smtp_port != 0 {
+            account.smtp_port = smtp_port;
+        }
+        account.via_tor = via_tor;
+        self.command(Command::SetMailAccount(Some(account)))
+    }
+
+    /// Убирает почтовый ящик (§5.3).
+    ///
+    /// Почта перестаёт быть ступенью §5.4, а chatmail-адрес снимается
+    /// с карточки (§4.3): обещать путь, которого нет, нельзя.
+    pub fn clear_mail_account(&self) -> Result<(), RatatoskError> {
+        self.command(Command::SetMailAccount(None))
+    }
+
+    /// Просит chatmail-сервер завести **новый** ящик (§5.3).
+    ///
+    /// `url` — ссылка вида `https://chatmail.example/new`; такие же в ходу
+    /// у Delta Chat. Сервер отвечает готовыми адресом и паролем,
+    /// персональных данных не спрашивая.
+    ///
+    /// Ссылка обязана быть `https` — иначе отказ, и отказ немедленный:
+    /// по `http` пароль приехал бы открытым текстом любому на пути.
+    ///
+    /// `via_tor` относится **и к самой регистрации, и к заведённому ящику**.
+    /// Разделять их нельзя: сходить за паролем напрямую, а письма возить
+    /// через Tor значит один раз показать серверу IP и связать его
+    /// с адресом навсегда.
+    ///
+    /// Функция возвращается сразу — поход в сеть идёт своим чередом. Исход
+    /// приходит событием: [`FfiEvent::MailAccountReady`] с новым адресом
+    /// либо [`FfiEvent::MailAccountFailed`] с причиной. Второе показать
+    /// обязательно: человек нажал «завести почту» и молчание прочтёт
+    /// как поломку приложения.
+    pub fn create_mail_account(&self, url: String, via_tor: bool) -> Result<(), RatatoskError> {
+        self.command(Command::CreateMailAccount { url, via_tor })
+    }
+
+    /// Настройки почтового ящика, если он заведён (§5.3).
+    ///
+    /// **Вместе с паролем**, и это не оплошность. Пароль мог выдать сервер
+    /// при регистрации, и человек не видел его никогда; не показав, мы
+    /// оставили бы его без единственного способа войти в свою же почту
+    /// с другого устройства или после переустановки. Показывать его в UI
+    /// стоит по нажатию, а не постоянно, — но иметь возможность обязан.
+    pub fn mail_account(&self) -> Result<Option<FfiMailAccount>, RatatoskError> {
+        let account = self
+            .opened
+            .handle
+            .mail_account_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(account.map(|account| FfiMailAccount {
+            address: account.address,
+            password: account.password.as_str().to_owned(),
+            imap_host: account.imap_host,
+            imap_port: account.imap_port,
+            smtp_host: account.smtp_host,
+            smtp_port: account.smtp_port,
+            via_tor: account.via_tor,
+        }))
+    }
+
     /// **Работает** ли транспорт прямо сейчас (§5.4).
     ///
     /// Не то же, что включён, и разницу надо показывать человеку: между
@@ -898,6 +1199,58 @@ impl RatatoskClient {
     /// «Поднимается» — правда, «не работает» — нет.
     pub fn transport_ready(&self, transport: FfiTransport) -> Result<bool, RatatoskError> {
         Ok(self.transport_status()?.ready.contains(transport.into()))
+    }
+
+    /// Что происходит с почтой прямо сейчас (§5.3).
+    ///
+    /// Один запрос вместо четырёх: включена ли, есть ли ящик, вошли ли,
+    /// а если нет — почему. Собирать это из отдельных ответов клиенту
+    /// пришлось бы самому, и первая же сборка разошлась бы с правдой
+    /// в состоянии «включена, ящик есть, но сервер не пустил» — самом
+    /// непонятном из всех.
+    pub fn mail_status(&self) -> Result<FfiMailStatus, RatatoskError> {
+        let status = self.transport_status()?;
+        let account = self.opened.handle.mail_account_blocking().flatten();
+        let via_tor = account.as_ref().is_some_and(|account| account.via_tor);
+        let address = account.as_ref().map(|account| account.address.clone());
+
+        let state = if !status.enabled.contains(ratatosk_proto::Transport::Mail) {
+            FfiMailState::Off
+        } else if account.is_none() {
+            FfiMailState::NoAccount
+        } else if status.ready.contains(ratatosk_proto::Transport::Mail) {
+            FfiMailState::Ready
+        } else if status.mail_failure.is_some() {
+            FfiMailState::Failed
+        } else {
+            FfiMailState::Connecting
+        };
+        let limits = status.mail_limits;
+        Ok(FfiMailStatus {
+            state,
+            detail: status.mail_failure,
+            address,
+            via_tor,
+            letter_limit_bytes: limits.letter_bytes,
+            mailbox_used_bytes: limits.mailbox_used,
+            mailbox_limit_bytes: limits.mailbox_limit,
+            mailbox_crowded: limits.crowded(),
+            carries_files: limits.carries_file_chunks(),
+        })
+    }
+
+    /// Что Tor сказал о себе последним (§5.2).
+    ///
+    /// `None` означает «новостей не было»: транспорт не поднимался — либо
+    /// выключен, либо ещё не начинал. Отличить это от «поднимается» можно
+    /// по [`RatatoskClient::transport_enabled`], и различие стоит показывать:
+    /// выключенный Tor — выбор человека, а молчащий — повод для тревоги.
+    pub fn tor_status(&self) -> Result<Option<FfiTorStatus>, RatatoskError> {
+        Ok(self.transport_status()?.tor.map(|tor| FfiTorStatus {
+            fraction: tor.fraction,
+            note: tor.note,
+            blocked: tor.blocked,
+        }))
     }
 
     /// Объявляет свои адреса контактам (§4.3).
@@ -1525,21 +1878,34 @@ fn to_msg_ids(ids: &[Vec<u8>]) -> Result<Vec<[u8; 16]>, RatatoskError> {
         .collect()
 }
 
+/// Почтовый раннер — или его отсутствие.
+///
+/// Отдельным псевдонимом, чтобы состав транспортов не разветвлялся
+/// на четыре сочетания признаков: `tor` и `mail` независимы друг от друга,
+/// и перечислять их пары значило бы четыре раза написать одно и то же.
+#[cfg(feature = "mail")]
+type MailSide = ratatosk_transport::chatmail::runner::MailRunner;
+
+/// Почты в этой сборке нет: [`ratatosk_transport::Disabled`] честно отказывает.
+#[cfg(not(feature = "mail"))]
+type MailSide = Disabled;
+
 /// Набор транспортов этой сборки.
 ///
 /// Псевдоним, а не тип по месту: состав транспортов виден в сигнатурах,
 /// и меняется он здесь, а не в каждой из них.
 ///
 /// С признаком `tor` в середине стоит настоящий onion — обёрнутый
-/// в [`Deferred`], потому что bootstrap идёт десятки секунд, а открытие
-/// аккаунта обязано быть мгновенным. Без признака там [`Disabled`], и это
-/// не заглушка, а правда о сборке: §5.4 обязан узнать, что ступень
-/// не сработала, и перейти к следующей.
+/// в [`Switched`], потому что bootstrap идёт десятки секунд, а открытие
+/// аккаунта обязано быть мгновенным. Без признака там
+/// [`ratatosk_transport::Disabled`], и это не заглушка, а правда о сборке:
+/// §5.4 обязан узнать, что ступень не сработала, и перейти к следующей.
 #[cfg(feature = "tor")]
-type Runners = Transports<LanRunner, Switched<OnionRunner>, Disabled>;
-/// Набор транспортов сборки без Tor: работает одна локальная сеть.
+type Runners = Transports<LanRunner, Switched<OnionRunner>, MailSide>;
+
+/// Набор транспортов сборки без Tor: локальная сеть и, если собрана, почта.
 #[cfg(not(feature = "tor"))]
-type Runners = Transports<LanRunner, Disabled, Disabled>;
+type Runners = Transports<LanRunner, Disabled, MailSide>;
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
@@ -1589,6 +1955,16 @@ async fn start(
     // включил: `Engine::startup_effects` объявляет включённые транспорты
     // первым делом в `Driver::run`. Выключенный в прошлый раз Tor
     // не поднимается вовсе — ни bootstrap, ни каталога сети, ни цепочек.
+    // Ручка общего Tor-клиента — одна на оба транспорта: второй `TorClient`
+    // означал бы второй bootstrap и ещё десятки мегабайт памяти (§5.2),
+    // что на телефоне заметно.
+    let tor_handle = ratatosk_transport::onion::TorHandle::default();
+
+    #[cfg(feature = "mail")]
+    let mail = ratatosk_transport::chatmail::runner::MailRunner::new(tor_handle.clone());
+    #[cfg(not(feature = "mail"))]
+    let mail = Disabled;
+
     #[cfg(feature = "tor")]
     let runner = {
         let layout = ratatosk_core::TorLayout::beside(&db_path);
@@ -1600,8 +1976,10 @@ async fn start(
         // человек передумает: замыкание-фабрика зовётся на каждое включение
         // и забирать в себя ничего не вправе.
         let setup = std::sync::Arc::new((layout, onion_key));
+        let handle = tor_handle.clone();
         let onion = Switched::new(move |progress| {
             let setup = std::sync::Arc::clone(&setup);
+            let tor = handle.clone();
             async move {
                 let (layout, onion_key) = &*setup;
                 OnionRunner::start(
@@ -1617,17 +1995,22 @@ async fn start(
                         // безопасный путь. На десктопе она остаётся включённой,
                         // потому что там она осмысленна.
                         dangerously_trust_filesystem: cfg!(target_os = "android"),
+                        tor,
                     },
                     progress,
                 )
                 .await
             }
         });
-        Transports::new(lan, onion, Disabled)
+        Transports::new(lan, onion, mail)
     };
-    // Почта (§5.3) ещё не написана, и без признака `tor` — onion тоже.
+    // Без признака `tor` onion честно отказывает, а почта работает: §5.3
+    // по умолчанию идёт через Tor, но умеет и напрямую.
     #[cfg(not(feature = "tor"))]
-    let runner = Transports::new(lan, Disabled, Disabled);
+    let runner = {
+        let _ = &tor_handle;
+        Transports::new(lan, Disabled, mail)
+    };
 
     let (driver, handle, events) = Driver::new(engine, runner);
     let opened = Opened {
@@ -1972,10 +2355,26 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::GroupMembershipChanged { chat } => {
             FfiEvent::GroupMembershipChanged { chat_id: chat.to_vec() }
         }
+        Event::FileWaitsForChannel { file_id } => {
+            FfiEvent::FileWaitsForChannel { file_id: file_id.to_vec() }
+        }
         Event::FileProgress { file_id, received, total } => {
             FfiEvent::FileProgress { file_id: file_id.to_vec(), received, total }
         }
         Event::HonestNotice { text } => FfiEvent::HonestNotice { text: text.to_owned() },
+        Event::CommandRefused { reason } => FfiEvent::CommandRefused { reason },
+        Event::MailAccountReady { address } => FfiEvent::MailAccountReady { address },
+        Event::MailAccountFailed { reason } => FfiEvent::MailAccountFailed { reason },
+        Event::MailLoginFailed { reason } => FfiEvent::MailLoginFailed { reason },
+        Event::MailLimits { letter_bytes, mailbox_used, mailbox_limit, crowded, carries_files } => {
+            FfiEvent::MailLimits {
+                letter_bytes,
+                mailbox_used,
+                mailbox_limit,
+                crowded,
+                carries_files,
+            }
+        }
     })
 }
 
@@ -2045,6 +2444,17 @@ pub fn revocation_notice() -> String {
     ratatosk_core::honest::REVOCATION_NOTICE.to_string()
 }
 
+/// Что показать на файле, которому не на чем ехать (§10.3).
+///
+/// Текст задан спецификацией и переписыванию не подлежит: он обещает ровно
+/// то, что протокол делает, — файл уедет, когда собеседник появится в сети.
+/// «Ошибка отправки» и «загрузка…» здесь одинаково неправда.
+#[uniffi::export]
+#[must_use]
+pub fn file_waiting_text() -> String {
+    ratatosk_proto::files::waiting_for_channel_text().to_string()
+}
+
 /// Предупреждение при включении LAN (§5.1).
 #[uniffi::export]
 #[must_use]
@@ -2096,6 +2506,24 @@ pub fn chunk_bytes() -> u32 {
 #[must_use]
 pub fn max_file_bytes() -> u64 {
     ratatosk_proto::files::MAX_FILE_BYTES
+}
+
+/// Наибольший размер файла, который поедет почтой (§10.3).
+///
+/// Файл крупнее ждёт прямого канала: почтой он поехал бы сутками, и §14
+/// велит сказать это до начала, а не показывать полосу, которая
+/// не сдвинется. Ограничение это про **время**, а не про место — место
+/// защищает окно передачи.
+///
+/// Клиенту нужно, чтобы сказать заранее. Без этого числа он узнаёт
+/// о запрете только событием [`FfiEvent::FileWaitsForChannel`], то есть
+/// уже после того, как человек выбрал файл и нажал «отправить».
+///
+/// Заведомо меньше [`max_file_bytes`]: прямым каналом ходит всё.
+#[uniffi::export]
+#[must_use]
+pub fn mail_file_limit_bytes() -> u64 {
+    ratatosk_proto::files::MAIL_FILE_LIMIT_BYTES
 }
 
 /// Сколько файлов можно приложить к одному сообщению.

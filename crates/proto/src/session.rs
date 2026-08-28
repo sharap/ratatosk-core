@@ -131,13 +131,35 @@ impl SessionRegistry {
     /// Второй, менее заметный итог накопления: ключевой материал старых
     /// сессий продолжал лежать в памяти и на диске без всякой пользы.
     ///
-    /// Вытесняются и сессии «на покое» ([`BoundSession::retired`]): они
-    /// оставались принимать ровно до появления новой, и эта минута прошла.
+    /// # Вытеснение — на покой, а не в небытие
+    ///
+    /// Прежняя сессия семейства **не удаляется**, а отправляется на покой:
+    /// отправлять по ней больше нельзя, принимать — можно. Разница стоила
+    /// разбора живой поломки, и она вот в чём.
+    ///
+    /// Две стороны заводят сессии независимо, и в одном семействе они могут
+    /// разойтись без всякой ошибки — например, если обе одновременно начали
+    /// рукопожатие (каждая ответила на чужое и установила своё). Тогда у нас
+    /// побеждает одна, у собеседника другая, и при удалении прежней каждая
+    /// сторона молча отбрасывает всё, что шлёт вторая: «кадр для неизвестной
+    /// сессии». Переписка умирает при живой связи с обеих сторон, и вылечить
+    /// это нечем — по почте квитанций нет (§9.4), то есть отправитель даже
+    /// не узнает, что его не слышат.
+    ///
+    /// Оставшись принимающей, прежняя сессия закрывает этот случай целиком:
+    /// кто бы какую ни выбрал для отправки, у другой стороны она есть.
+    ///
+    /// Копиться при этом нечему: следующая сессия убирает покойную насовсем.
+    /// В семействе живут самое большее две — одна отправляет, одна дослушивает.
+    ///
+    /// Возвращаются **только удалённые** идентификаторы: ушедшая на покой
+    /// с диска не убирается, иначе после перезапуска она не смогла бы
+    /// дослушать то, ради чего оставлена.
     pub fn insert(&mut self, session: Session, binding: SessionBinding) -> Vec<u64> {
         let id = session.session_id;
         let peer = session.peer_ik;
 
-        let superseded: Vec<u64> = self
+        let same_family: Vec<u64> = self
             .by_peer
             .get(&peer)
             .map(|ids| {
@@ -148,8 +170,19 @@ impl SessionRegistry {
                     .collect()
             })
             .unwrap_or_default();
-        for old in &superseded {
-            self.remove(*old);
+
+        // Действующая уходит на покой, уже покойная — насовсем. Одно
+        // поколение отсрочки, не больше: в семействе живёт одна отправляющая
+        // сессия и одна принимающая, и обе кончаются вместе со следующей.
+        let mut removed = Vec::new();
+        for old in same_family {
+            match self.by_id.get_mut(&old) {
+                Some(bound) if !bound.retired => bound.retired = true,
+                _ => {
+                    self.remove(old);
+                    removed.push(old);
+                }
+            }
         }
 
         self.by_id.insert(id, BoundSession { session, binding, retired: false });
@@ -157,7 +190,7 @@ impl SessionRegistry {
         if !ids.contains(&id) {
             ids.push(id);
         }
-        superseded
+        removed
     }
 
     /// Сессия по идентификатору.
@@ -302,11 +335,45 @@ mod tests {
 
         let fresh = session(1, b"second");
         let new_id = fresh.session_id;
-        let superseded = r.insert(fresh, SessionBinding::of(Transport::Onion));
+        let removed = r.insert(fresh, SessionBinding::of(Transport::Onion));
 
-        assert_eq!(superseded, vec![old_id], "покойную обязаны вытеснить и назвать");
+        assert_eq!(removed, vec![old_id], "покойную обязаны убрать и назвать");
         assert_eq!(r.route(old_id), Route::Unknown);
         assert_eq!(r.for_peer(&[1u8; 32], Transport::Onion), Some(new_id));
+    }
+
+    #[test]
+    fn the_superseded_session_keeps_listening_for_one_more_generation() {
+        // Две стороны заводят сессии независимо, и в одном семействе они
+        // расходятся без всякой ошибки — хватит одновременного рукопожатия
+        // с обеих сторон. Удали мы прежнюю сразу, каждая сторона молча
+        // отбрасывала бы всё, что шлёт вторая, и по почте об этом никто
+        // бы не узнал: квитанций там нет (§9.4).
+        let mut r = SessionRegistry::new();
+        let old = session(1, b"first");
+        let old_id = old.session_id;
+        r.insert(old, SessionBinding::of(Transport::Onion));
+
+        let fresh = session(1, b"second");
+        let new_id = fresh.session_id;
+        let removed = r.insert(fresh, SessionBinding::of(Transport::Onion));
+
+        assert!(removed.is_empty(), "прежняя уходит на покой, а не с диска");
+        assert_eq!(r.route(old_id), Route::Session(old_id), "по ней обязаны принимать");
+        assert_eq!(
+            r.for_peer(&[1u8; 32], Transport::Onion),
+            Some(new_id),
+            "а отправлять — только по новой"
+        );
+
+        // И копиться нечему: третья убирает первую насовсем.
+        let third = session(1, b"third");
+        let third_id = third.session_id;
+        let removed = r.insert(third, SessionBinding::of(Transport::Onion));
+        assert_eq!(removed, vec![old_id], "поколение отсрочки ровно одно");
+        assert_eq!(r.route(old_id), Route::Unknown);
+        assert_eq!(r.route(new_id), Route::Session(new_id), "теперь дослушивает вторая");
+        assert_eq!(r.for_peer(&[1u8; 32], Transport::Onion), Some(third_id));
     }
 
     #[test]
@@ -346,12 +413,13 @@ mod tests {
         assert_ne!(old_id, new_id);
 
         assert!(r.insert(first, SessionBinding::Lan).is_empty(), "вытеснять пока нечего");
-        let superseded = r.insert(second, SessionBinding::Lan);
+        assert!(r.insert(second, SessionBinding::Lan).is_empty(), "прежняя уходит на покой");
 
-        assert_eq!(superseded, vec![old_id], "прежнюю надо не только забыть, но и назвать");
-        assert_eq!(r.len(), 1);
-        assert_eq!(r.route(old_id), Route::Unknown);
+        // Отправка — только по новой; в этом и был смысл вытеснения.
         assert_eq!(r.for_peer(&[1u8; 32], Transport::Lan), Some(new_id));
+        // А приём по прежней остаётся: разбор — в `insert`.
+        assert_eq!(r.route(old_id), Route::Session(old_id));
+        assert_eq!(r.len(), 2);
     }
 
     #[test]

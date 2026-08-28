@@ -390,7 +390,7 @@ impl LanRunner {
 impl Runner for LanRunner {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         match command {
-            TransportCommand::Send { peer, via, frame } => {
+            TransportCommand::Send { peer, via, frame, .. } => {
                 if via != Transport::Lan {
                     return Err(TransportError::Unavailable);
                 }
@@ -450,6 +450,12 @@ impl Runner for LanRunner {
                     *watched = peers;
                 }
                 Ok(())
+            }
+            // Почтовые настройки локальной сети не касаются. Сюда они
+            // не доходят — составной раннер разводит по адресату, — но
+            // молчаливое согласие с чужой командой хуже отказа.
+            TransportCommand::SetMailAccount(_) | TransportCommand::CreateMailAccount { .. } => {
+                Err(TransportError::Unavailable)
             }
         }
     }
@@ -754,6 +760,7 @@ mod tests {
                 peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
+                handoff: None,
             })
             .await;
         assert!(matches!(verdict, Err(TransportError::Unavailable)));
@@ -772,6 +779,7 @@ mod tests {
                 peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
+                handoff: None,
             })
             .await;
         assert!(matches!(verdict, Err(TransportError::NoAddress)));
@@ -801,6 +809,7 @@ mod tests {
                 peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
+                handoff: None,
             })
             .await;
 

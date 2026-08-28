@@ -43,12 +43,47 @@ use ratatosk_codec::ContactCard;
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
 use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
 use ratatosk_crypto::{Identity, OnionKey};
+use ratatosk_proto::mail::MailAccount;
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
 #[cfg(feature = "tor")]
 use ratatosk_transport::Switched;
-use ratatosk_transport::{Disabled, LanConfig, LanDirectory, LanRunner, Transports};
+// `Disabled` нужен только тем сборкам, где чего-то нет. С обоими признаками
+// сразу все три ступени заняты настоящими раннерами, и безусловный импорт
+// становится предупреждением — в сборке, которая как раз и есть рабочая.
+#[cfg(any(not(feature = "tor"), not(feature = "mail")))]
+use ratatosk_transport::Disabled;
+use ratatosk_transport::{LanConfig, LanDirectory, LanRunner, Transports};
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+/// Есть ли в этом двоичном файле живой arti (§5.2).
+///
+/// Не «включён ли Tor», а «собран ли он вовсе», и разница стоила сеанса
+/// разбора. Стенд без `--features tor` держит на месте onion
+/// [`ratatosk_transport::Disabled`], а тот на переключатель отвечает
+/// `Ok(())` — и правильно отвечает:
+/// разрешение относится к §5.4, а не к сборке. Но снаружи это выглядело
+/// так: `/tor on` принят, выбор записан в базу, строк подъёма нет ни одной.
+/// Неотличимо от сломанного Tor — то есть ровно та «чужая неисправность
+/// вместо своей», которую §14 запрещает показывать.
+const TOR_BUILT_IN: bool = cfg!(feature = "tor");
+
+/// Есть ли в этом двоичном файле сокеты почты (§5.3).
+///
+/// Та же история и та же цена: без `--features mail` просьба завести ящик
+/// возвращается словами «транспорт недоступен», а они читаются как отказ
+/// сервера, а не как отсутствие кода.
+const MAIL_BUILT_IN: bool = cfg!(feature = "mail");
+
+/// Чем собран этот стенд — одной строкой в шапку.
+///
+/// Печатается всегда, а не только когда чего-то нет: строка «почта: нет»
+/// полезна ровно тем, что её ищут глазами после первой же непонятной тишины.
+fn build_line() -> String {
+    let tor = if TOR_BUILT_IN { "onion (arti)" } else { "onion НЕТ (--features tor)" };
+    let mail = if MAIL_BUILT_IN { "почта" } else { "почта НЕТ (--features mail)" };
+    format!("LAN, {tor}, {mail}")
+}
 
 struct Args {
     name: String,
@@ -259,6 +294,19 @@ async fn run<S: Store + 'static>(
     let port = lan.port();
     let directory = lan.directory();
 
+    // Ручка общего Tor-клиента — одна на обе ветки и на оба транспорта.
+    // Onion-раннер кладёт в неё клиента, когда поднимется; почта берёт его
+    // оттуда, а своего второго не заводит (§5.2: второй bootstrap — это
+    // ещё десятки мегабайт памяти).
+    let tor_handle = ratatosk_transport::onion::TorHandle::default();
+
+    // Почтовый раннер живёт в обеих ветках: почта от Tor не зависит —
+    // §5.3 по умолчанию идёт через него, но умеет и напрямую.
+    #[cfg(feature = "mail")]
+    let mail = ratatosk_transport::chatmail::runner::MailRunner::new(tor_handle.clone());
+    #[cfg(not(feature = "mail"))]
+    let mail = Disabled;
+
     // С признаком `tor` и дисковым хранилищем стенд поднимает настоящий
     // onion — в фоне, как это делает клиент: bootstrap идёт десятки секунд,
     // а команды со stdin обязаны работать сразу.
@@ -273,8 +321,10 @@ async fn run<S: Store + 'static>(
         // (`/tor on`, `/tor off`), а замыкание-фабрика забирать в себя
         // ничего не вправе.
         let setup = std::sync::Arc::new((layout, onion, args.trust_fs));
+        let handle = tor_handle.clone();
         let onion = Switched::new(move |progress| {
             let setup = std::sync::Arc::clone(&setup);
+            let tor = handle.clone();
             async move {
                 let (layout, key, trust_fs) = &*setup;
                 let Some(layout) = layout.as_ref() else {
@@ -287,26 +337,31 @@ async fn run<S: Store + 'static>(
                         keystore_dir: &layout.keys,
                         key,
                         dangerously_trust_filesystem: *trust_fs,
+                        tor,
                     },
                     progress,
                 )
                 .await
             }
         });
-        Transports::new(lan, onion, Disabled)
+        Transports::new(lan, onion, mail)
     };
     #[cfg(not(feature = "tor"))]
     let runner = {
-        // Без признака onion и почта — [`Disabled`]: честный отказ, а не
+        // Без признака onion и почта — `Disabled`: честный отказ, а не
         // молчаливый успех. Ровно это увидит §5.4 и перейдёт к следующей
         // ступени.
-        let _ = (&layout, &onion);
-        Transports::new(lan, Disabled, Disabled)
+        let _ = (&layout, &onion, &tor_handle);
+        Transports::new(lan, Disabled, mail)
     };
 
     println!("узел     : {}", args.name);
     println!("отпечаток: {fingerprint}");
     println!("порт     : {port}");
+    // Раньше этой строки не было, и стенд без транспорта выглядел точно так
+    // же, как стенд со сломанным транспортом. Разбирать вторую неисправность,
+    // имея первую, можно долго.
+    println!("сборка   : {}", build_line());
     println!(
         "сеть     : {}",
         if args.lan {
@@ -333,7 +388,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -518,6 +573,22 @@ async fn console(
                         .ok();
                     if enabled {
                         println!("< onion включён — §5.4 снова может его выбрать");
+                        // Два разных «ничего не произошло», и различить их
+                        // человек снаружи не может — значит, обязан сказать
+                        // стенд.
+                        if TOR_BUILT_IN {
+                            // Ядро молчит на повтор того же выбора
+                            // (`on_set_transport_enabled`), и это правильно:
+                            // клиент выставляет все переключатели при старте.
+                            // Но человеку, который ждёт строк подъёма, надо
+                            // знать, что их не будет и почему.
+                            println!("  если строк подъёма нет — Tor уже был включён");
+                            println!("  и поднялся при старте; состояние покажет /tor");
+                        } else {
+                            println!("  НО этот стенд собран без arti: поднимать нечего.");
+                            println!("  выбор записан в базу и подействует после сборки");
+                            println!("  с --features tor");
+                        }
                     } else {
                         println!("< onion выключен — §5.4 его больше не выбирает");
                         println!("  выбор запомнен и переживёт перезапуск");
@@ -529,9 +600,18 @@ async fn console(
                     // не ходят — это Tor ещё не готов или уже сломан?»
                     // Порядок строк — порядок причин: сперва наш сервис,
                     // потом адрес собеседника, потом сеть.
+                    if !TOR_BUILT_IN {
+                        // Первой строкой, до всего остального: пока это
+                        // не сказано, любой разбор идёт не туда.
+                        println!("< tor: этот стенд собран БЕЗ arti (--features tor)");
+                        println!("  ключ и адрес ниже считаются и хранятся, но сервиса нет");
+                    }
                     match &tor {
                         Some(note) => println!("< tor: {note}"),
-                        None => println!("< tor: новостей не было — транспорт не поднимался"),
+                        None if TOR_BUILT_IN => {
+                            println!("< tor: новостей не было — транспорт не поднимался");
+                        }
+                        None => {}
                     }
                     // Два адреса, а не один, и это не многословие. Первый
                     // посчитан из нашего ключа, второй — тот, что уехал
@@ -581,6 +661,10 @@ async fn console(
                     } else {
                         println!("< локальная сеть выключена — доставка пойдёт через onion");
                     }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/mail") {
+                    mail_command(&handle, rest.trim()).await;
                     continue;
                 }
                 if line == "/net" {
@@ -680,7 +764,15 @@ async fn console(
                     | Event::FileProgress { .. }
                     // Печатается в `report`, а здесь делать нечего: ход
                     // подъёма Tor ничего не меняет в состоянии стенда.
-                    | Event::HonestNotice { .. } => {}
+                    | Event::HonestNotice { .. }
+                    | Event::CommandRefused { .. }
+                    // Тоже печатается в `report`. Ящик хранит ядро, стенду
+                    // помнить его незачем — он спросит, когда понадобится.
+                    | Event::MailAccountReady { .. }
+                    | Event::MailAccountFailed { .. }
+                    | Event::MailLoginFailed { .. }
+                    | Event::MailLimits { .. }
+                    | Event::FileWaitsForChannel { .. } => {}
                     // Печатается в `report`, а здесь запоминается: `/tor`
                     // обязан отвечать и тогда, когда строка уехала вверх.
                     Event::TorStatus { note, blocked, .. } => {
@@ -893,6 +985,163 @@ fn decode_card(encoded: &str) -> Result<Vec<u8>, String> {
     })
 }
 
+/// Почтовый ящик: показать, завести руками, завести по ссылке, убрать (§5.3).
+///
+/// Одна команда с подкомандами, а не пять команд: у почты одно состояние,
+/// и разводить его по нескольким именам значит заставить человека помнить,
+/// какое из них что меняет.
+async fn mail_command(handle: &DriverHandle, rest: &str) {
+    let (word, tail) = match rest.split_once(char::is_whitespace) {
+        Some((word, tail)) => (word, tail.trim()),
+        None => (rest, ""),
+    };
+
+    match word {
+        // Показать. Пароль печатается: его мог выдать сервер, и человек
+        // не видел его никогда — без показа он не войдёт в свою же почту
+        // с другого устройства. Стенд не телефон, чужих глаз у консоли нет.
+        "" => match handle.mail_account().await {
+            Some(Some(account)) => {
+                println!("< почта: {}", account.address);
+                println!("  пароль    : {}", account.password.as_str());
+                println!("  imap      : {}:{}", account.imap_host, account.imap_port);
+                println!("  smtp      : {}:{}", account.smtp_host, account.smtp_port);
+                println!("  через tor : {}", yes(account.via_tor));
+                if let Some(status) = handle.transports().await {
+                    let mail = ratatosk_proto::Transport::Mail;
+                    println!(
+                        "  ступень   : включена={}  работает={}",
+                        yes(status.enabled.contains(mail)),
+                        yes(status.ready.contains(mail))
+                    );
+                    // Причина — рядом с состоянием, а не только в журнале:
+                    // «включена, ящик есть, а не работает» без объяснения —
+                    // состояние, из которого человек не знает выхода (§14).
+                    if let Some(reason) = status.mail_failure {
+                        println!("  не вышло  : {reason}");
+                    }
+                    // Пределы сервера — здесь же и целиком. Ради них
+                    // и заводился второй `EHLO`: «файлы почтой не идут»
+                    // без числа неотличимо от десятка других бед.
+                    let limits = status.mail_limits;
+                    println!(
+                        "  письмо    : {}",
+                        limits
+                            .letter_bytes
+                            .map_or_else(|| "предел не назван".to_owned(), bytes_text)
+                    );
+                    match (limits.mailbox_used, limits.mailbox_limit) {
+                        (Some(used), Some(limit)) => println!(
+                            "  ящик      : {} из {} (свободно {})",
+                            bytes_text(used),
+                            bytes_text(limit),
+                            limits.free_bytes().map_or_else(String::new, bytes_text)
+                        ),
+                        _ => println!("  ящик      : объём не назван (сервер без QUOTA)"),
+                    }
+                    println!(
+                        "  файлы     : {}",
+                        if !limits.carries_file_chunks() {
+                            "не поедут — письмо с куском файла не влезает в предел"
+                        } else if limits.crowded() {
+                            "не принимаются — в ящике меньше места, чем нужно передаче"
+                        } else {
+                            "поедут"
+                        }
+                    );
+                }
+                println!("  «работает» = вошли на сервер: отправка SMTP, приём IMAP");
+            }
+            Some(None) => {
+                println!("< ящика нет — почта не ступень §5.4");
+                println!("  /mail set <адрес> <пароль>          — существующая почта");
+                println!("  /mail new <https://.../new> [on|off] — новый ящик на сервере");
+                println!("  последнее слово у /mail new — идти ли через Tor (по умолчанию on)");
+                println!("  у заведённого ящика путь меняется командой /mail tor on|off");
+            }
+            None => println!("< ядро остановлено"),
+        },
+        "set" => {
+            let Some((address, password)) = tail.split_once(char::is_whitespace) else {
+                println!("< /mail set <адрес> <пароль>");
+                return;
+            };
+            let account = MailAccount::from_address(address, password.trim());
+            match handle.send(Command::SetMailAccount(Some(account))).await {
+                Ok(()) => println!("< ящик записан; адрес уедет контактам обновлением (§4.3)"),
+                Err(_) => println!("< ядро остановлено"),
+            }
+        }
+        "new" => {
+            // Путь называется здесь же, необязательным словом в конце.
+            // Отдельной командой его не задать: `/mail tor` меняет
+            // **заведённый** ящик, а до регистрации ящика ещё нет —
+            // и человек, желающий регистрироваться напрямую, оказывался
+            // в тупике. Найдено на стенде.
+            let (url, via_tor) = match tail.rsplit_once(char::is_whitespace) {
+                Some((url, word)) if onoff(word).is_some() => {
+                    (url.trim(), onoff(word).unwrap_or(true))
+                }
+                _ => (tail, true),
+            };
+            if url.is_empty() {
+                println!("< /mail new https://chatmail.example/new [on|off]");
+                println!("  последнее слово — идти ли через Tor; по умолчанию on");
+                return;
+            }
+            let command = Command::CreateMailAccount { url: url.to_owned(), via_tor };
+            match handle.send(command).await {
+                // Не «пошли за ящиком»: `send` только кладёт команду
+                // в очередь. Ушла просьба, а не ящик; об исходе скажет
+                // событие, и оно может оказаться отказом.
+                Ok(()) => {
+                    println!("< просьба ушла: {url} (через tor: {})", yes(via_tor));
+                    println!("  ответ придёт отдельной строкой");
+                }
+                Err(_) => println!("< ядро остановлено"),
+            }
+        }
+        "tor" => {
+            let Some(via_tor) = onoff(tail) else {
+                println!("< /mail tor on | /mail tor off");
+                return;
+            };
+            let Some(Some(mut account)) = handle.mail_account().await else {
+                // Переключать нечего, и завести пустой ящик ради галочки
+                // нельзя: выбор относится к ящику, а не к транспорту вообще.
+                println!("< ящика нет — сперва /mail set или /mail new");
+                return;
+            };
+            account.via_tor = via_tor;
+            match handle.send(Command::SetMailAccount(Some(account))).await {
+                Ok(()) if via_tor => println!("< почта пойдёт через Tor"),
+                Ok(()) => {
+                    println!("< почта пойдёт напрямую");
+                    println!("  сервер увидит ваш IP и свяжет его с адресом ящика (§14)");
+                }
+                Err(_) => println!("< ядро остановлено"),
+            }
+        }
+        "off" => match handle.send(Command::SetMailAccount(None)).await {
+            Ok(()) => {
+                println!("< ящик убран");
+                println!("  адрес снят с карточки: обещать путь, которого нет, нельзя");
+            }
+            Err(_) => println!("< ядро остановлено"),
+        },
+        other => println!("< /mail | set | new | tor | off (а не «{other}»)"),
+    }
+}
+
+/// `on`/`off` по-русски и по-английски.
+fn onoff(word: &str) -> Option<bool> {
+    match word.trim() {
+        "on" | "вкл" => Some(true),
+        "off" | "выкл" => Some(false),
+        _ => None,
+    }
+}
+
 /// Варианты перечислены поимённо, без `_`: новое событие должно ронять сборку
 /// стенда, а не молча проваливаться в общую ветку.
 fn report(event: &Event) {
@@ -958,6 +1207,79 @@ fn report(event: &Event) {
             println!("< файл {}: {received}/{total}", short(file_id));
         }
         Event::HonestNotice { text } => println!("< {text}"),
+        Event::CommandRefused { reason } => {
+            // §14: человек что-то сделал и обязан узнать, почему не вышло.
+            // Раньше это была строка в журнале, а на экране — тишина.
+            println!("< отказано: {reason}");
+        }
+        Event::MailAccountReady { address } => {
+            // Адрес человек больше нигде не увидит, а писать ему будут
+            // именно туда. Пароль не печатается: он в событие и не едет.
+            println!("< почта заведена: {address}");
+            println!("    адрес уехал контактам обновлением карточки (§4.3)");
+        }
+        Event::MailAccountFailed { reason } => {
+            // §14: человек попросил завести почту. Молчание он прочтёт
+            // как поломку стенда, а не как отказ сервера.
+            println!("< почту завести не вышло: {reason}");
+            // А «транспорт недоступен» он прочтёт как отказ сервера, хотя
+            // это отсутствие кода. Причина не в тексте отказа: раннер,
+            // которого нет, не может сказать о себе ничего умнее. Сказать
+            // обязан стенд — он один знает, чем собран.
+            if !MAIL_BUILT_IN {
+                println!("    этот стенд собран БЕЗ сокетов почты: --features mail");
+            } else if !TOR_BUILT_IN {
+                println!("    напомню: через Tor нужен и --features tor — общий");
+                println!("    Tor-клиент держит onion-раннер, а без него его нет");
+            }
+        }
+        Event::FileWaitsForChannel { file_id } => {
+            // §10.3 задаёт этот текст, и он показывается дословно: «загрузка»
+            // и «ошибка» здесь одинаково неправда.
+            println!(
+                "< файл {}: {}",
+                short(file_id),
+                ratatosk_proto::files::waiting_for_channel_text()
+            );
+            println!("    канала нет вовсе — либо остался почтовый, а файл для почты велик");
+        }
+        Event::MailLoginFailed { reason } => {
+            // Ящик есть, а войти не вышло. Молча переставшая работать почта
+            // выглядит поломкой приложения; сообщения при этом продолжают
+            // ходить остальными ступенями §5.4, и паниковать тут не о чем.
+            println!("< на почтовый сервер не пустили: {reason}");
+            println!("    почта не ступень §5.4, пока вход не удастся;");
+            println!("    настройки покажет /mail, повторить вход — /mail set");
+        }
+        Event::MailLimits { letter_bytes, mailbox_used, mailbox_limit, crowded, carries_files } => {
+            // Числа печатаются целиком: стенд для того и нужен, чтобы
+            // увидеть, что именно сказал сервер, а не наш вывод из этого.
+            println!(
+                "< пределы почты: письмо {}, ящик {}",
+                letter_bytes.map_or_else(|| "не назван".to_owned(), bytes_text),
+                match (mailbox_used, mailbox_limit) {
+                    (Some(used), Some(limit)) =>
+                        format!("{} из {}", bytes_text(*used), bytes_text(*limit)),
+                    _ => "не назван".to_owned(),
+                }
+            );
+            if !*carries_files {
+                println!("    файлы почтой не поедут: письмо с куском файла не влезает");
+                println!("    сообщения при этом ходят как ходили");
+            }
+            if *crowded {
+                println!("    места меньше, чем нужно одной передаче, — файлы не принимаются");
+            }
+        }
+    }
+}
+
+/// Байты человеку: мегабайты при трёх и более разрядах, иначе как есть.
+fn bytes_text(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} МБ", bytes as f64 / 1_000_000.0)
+    } else {
+        format!("{bytes} Б")
     }
 }
 

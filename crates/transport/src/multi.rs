@@ -52,7 +52,13 @@ impl Runner for Disabled {
             // Сказать несобранному транспорту, что он разрешён, — не ошибка.
             // Разрешение относится к §5.4, а его здесь всё равно нет; отказ
             // же выглядел бы в журнале поломкой, которой не случилось.
-            TransportCommand::SetEnabled { .. } => Ok(()),
+            // То же и про настройки ящика: несобранному почтовому раннеру
+            // они не нужны, но и поломкой это не является.
+            TransportCommand::SetEnabled { .. } | TransportCommand::SetMailAccount(_) => Ok(()),
+            // А вот на это молчаливое согласие было бы обманом: человек
+            // нажал «завести почту» и ждёт ящика, которого несобранный
+            // раннер не заведёт. Отказ доедет до него словами.
+            TransportCommand::CreateMailAccount { .. } => Err(TransportError::Unavailable),
             _ => Err(TransportError::Unavailable),
         }
     }
@@ -168,6 +174,9 @@ impl<L: Runner, O: Runner, M: Runner> Runner for Transports<L, O, M> {
             TransportCommand::WatchLanPeers(_) | TransportCommand::RestartLan => {
                 self.lan.execute(command).await
             }
+            TransportCommand::SetMailAccount(_) | TransportCommand::CreateMailAccount { .. } => {
+                self.mail.execute(command).await
+            }
             // А тут `via` нет, и знать, кто держит соединение с этим
             // контактом, может только сам раннер.
             TransportCommand::Disconnect { .. } => self.to_all(command).await,
@@ -236,6 +245,8 @@ mod tests {
                 TransportCommand::SetEnabled { .. } => "set-enabled",
                 TransportCommand::WatchLanPeers(_) => "watch",
                 TransportCommand::RestartLan => "restart",
+                TransportCommand::SetMailAccount(_) => "mail-account",
+                TransportCommand::CreateMailAccount { .. } => "mail-create",
             };
             self.seen.lock().unwrap().push((self.name, what.to_owned()));
             if self.refuse {
@@ -257,7 +268,7 @@ mod tests {
     }
 
     fn send(via: Transport) -> TransportCommand {
-        TransportCommand::Send { peer: peer(), via, frame: vec![0u8; 4096] }
+        TransportCommand::Send { peer: peer(), via, frame: vec![0u8; 4096], handoff: None }
     }
 
     #[tokio::test]

@@ -72,6 +72,26 @@ enum Request {
     Chore(Chore),
 }
 
+/// Кому сказать, если транспорт откажет прямо здесь, синхронно.
+///
+/// Тип, а не пара опций: у отказа три разных адресата, и путать их нельзя.
+/// Доставке отказ означает следующую ступень §5.4; человеку, попросившему
+/// завести почту, — ответ на его просьбу; всему остальному — ничего.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    /// Сообщение переходит на следующий транспорт (§5.4).
+    Delivery {
+        /// Кому не доехало.
+        peer_ik: [u8; 32],
+        /// Каким транспортом.
+        via: Transport,
+    },
+    /// Человек ждёт ящика, и отказ — это ответ ему (§5.3, §14).
+    Mailbox,
+    /// Сказать некому: эффект ничьей просьбой не был.
+    Silent,
+}
+
 /// Обслуживание хранилища — по кнопке, а не по расписанию.
 enum Chore {
     /// Стереть с диска вложения, которых нет в базе (§12).
@@ -165,6 +185,13 @@ enum Query {
     /// и второй его экземпляр в настройках приложения однажды разошёлся бы
     /// с тем, по которому ядро принимает решения.
     Transports { reply: oneshot::Sender<TransportStatus> },
+    /// Настройки почтового ящика, если он заведён (§5.3).
+    ///
+    /// **Вместе с паролем**, и это не оплошность. Пароль мог выдать сервер
+    /// при регистрации, и человек не видел его никогда; не показав, мы
+    /// оставили бы его без единственного способа войти в свою же почту
+    /// с другого устройства или после переустановки.
+    MailAccount { reply: oneshot::Sender<Option<ratatosk_proto::mail::MailAccount>> },
     /// Своя карточка прямо сейчас — ссылка и её версия (§4.1, §4.3).
     ///
     /// Запросом, а не значением, полученным при открытии: адреса появляются
@@ -226,12 +253,59 @@ pub struct OwnCard {
 /// «работает» — состояние. Включённый Tor становится работающим через
 /// десятки секунд, и всё это время §5.4 его не выбирает; клиенту это нужно,
 /// чтобы сказать «поднимается» вместо «не работает».
-#[derive(Debug, Clone, Copy)]
+/// `Copy` здесь больше нет, и это не потеря. Он стоял, пока в структуре
+/// лежали два набора битов; с появлением строк — последней новости Tor
+/// и причины отказа почты — копировать её молча стало нельзя, а нужды
+/// в этом нет: её берут целиком, один раз, и разбирают на месте.
+#[derive(Debug, Clone)]
 pub struct TransportStatus {
     /// Что разрешил человек. Переживает перезапуск.
     pub enabled: ratatosk_proto::TransportSet,
     /// Что уже работает. Состояние сеанса, на диск не идёт.
     pub ready: ratatosk_proto::TransportSet,
+    /// Последнее, что сказал о себе Tor.
+    ///
+    /// Запросом, а не только событием, и это не удобство. Событие
+    /// существует один раз: клиент, открывший экран настроек через минуту
+    /// после подъёма, не увидит ничего и покажет пустоту вместо «работает».
+    /// А человек, зашедший туда, спрашивает ровно одно — «почему не идёт», —
+    /// и ответ обязан быть на экране, а не в пропущенном уведомлении.
+    pub tor: Option<TorNote>,
+    /// Почему не работает почта, если она не работает.
+    ///
+    /// Та же причина, что и у `tor`, и та же беда без этого поля: «включена,
+    /// ящик заведён, а сообщения не уходят» — состояние, которое человек
+    /// не может ни объяснить, ни исправить, пока ему не сказали, что сервер
+    /// не пустил и почему.
+    ///
+    /// `None` означает «жаловаться не на что»: либо работает, либо ещё
+    /// не пробовали.
+    pub mail_failure: Option<String>,
+    /// Что почтовый сервер сказал о своих пределах.
+    ///
+    /// Запросом, а не только событием, и по той же причине, что у `tor`:
+    /// событие приходит в момент входа, а на экран настроек человек
+    /// заглядывает когда угодно.
+    ///
+    /// Пустые поля означают «не спрашивали или сервер не назвал». Показывать
+    /// такое нечего — и не надо: «предел: неизвестно» человеку не говорит
+    /// ничего, а место на экране занимает.
+    pub mail_limits: ratatosk_proto::mail::MailLimits,
+}
+
+/// Последнее, что Tor сказал о себе (§5.2, §13.1).
+///
+/// То же самое, что уезжает событием `Event::TorStatus`, — но доступное
+/// в любой момент. Оба нужны: событие двигает индикатор, запрос отвечает
+/// тому, кто пришёл смотреть позже.
+#[derive(Debug, Clone)]
+pub struct TorNote {
+    /// Доля готовности, от 0 до 1.
+    pub fraction: f32,
+    /// Что происходит сейчас — словами arti.
+    pub note: String,
+    /// Почему подъём стоит, если он стоит.
+    pub blocked: Option<String>,
 }
 
 /// Что клиент знает о контакте.
@@ -357,6 +431,24 @@ impl DriverHandle {
     pub fn transports_blocking(&self) -> Option<TransportStatus> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::Transports { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Настройки почтового ящика (§5.3). `None` — драйвер остановлен.
+    ///
+    /// Внешний `Option` означает «драйвер остановлен», внутренний — «ящика
+    /// нет». Разница видна вызывающему, и путать их нельзя: первое —
+    /// поломка, второе — обычное состояние из коробки.
+    pub async fn mail_account(&self) -> Option<Option<ratatosk_proto::mail::MailAccount>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::MailAccount { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// То же, блокируя вызывающий поток.
+    pub fn mail_account_blocking(&self) -> Option<Option<ratatosk_proto::mail::MailAccount>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::MailAccount { reply })).ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -530,6 +622,19 @@ pub struct Driver<S: Store, R: Runner> {
     runner: R,
     requests: mpsc::Receiver<Request>,
     notices: mpsc::Sender<Event>,
+    /// Последняя новость от Tor — чтобы её мог спросить и опоздавший.
+    ///
+    /// Живёт в драйвере, а не в ядре, и намеренно: ни одно решение §5.4
+    /// на неё не опирается. Это состояние показа, и место ему там же,
+    /// где очередь уведомлений.
+    tor_note: Option<TorNote>,
+    /// Последнее, что почтовый сервер сказал о своих пределах.
+    ///
+    /// Кэш ровно того же назначения, что `tor_note`: событие двигает
+    /// индикатор, запрос отвечает тому, кто пришёл смотреть позже.
+    mail_limits: ratatosk_proto::mail::MailLimits,
+    /// Последняя жалоба почты, если она не работает.
+    mail_failure: Option<String>,
     /// Срок → метки таймеров, которые в этот срок сработают.
     ///
     /// `BTreeMap` ради одного свойства: ближайший срок — это `keys().next()`,
@@ -547,6 +652,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
             runner,
             requests: requests_rx,
             notices: notices_tx,
+            tor_note: None,
+            mail_limits: ratatosk_proto::mail::MailLimits::default(),
+            mail_failure: None,
             timers: BTreeMap::new(),
         };
         let handle = DriverHandle { requests: requests_tx };
@@ -607,11 +715,47 @@ impl<S: Store, R: Runner> Driver<S, R> {
             };
 
             match wake {
-                Wake::Input(input) => self.tolerate(input).await?,
+                Wake::Input(input) => {
+                    // Почта заработала — прежней жалобе конец. Оставленная,
+                    // она пережила бы починку и объясняла бы человеку беду,
+                    // которой уже нет.
+                    if matches!(input, Input::TransportReady { transport: Transport::Mail }) {
+                        self.mail_failure = None;
+                    }
+                    self.tolerate(input).await?;
+                }
                 Wake::Query(query) => self.answer(query),
                 Wake::Chore(chore) => self.do_chore(chore),
                 Wake::Timers => self.fire_due_timers().await?,
                 Wake::Notice(event) => {
+                    // Новость не только уезжает, но и запоминается: экран,
+                    // открытый позже, спросит `Query::Transports` и получит
+                    // то же самое. Без этого «почему не работает» отвечалось
+                    // бы только тем, кто смотрел в нужную секунду.
+                    match &event {
+                        Event::TorStatus { fraction, note, blocked } => {
+                            self.tor_note = Some(TorNote {
+                                fraction: *fraction,
+                                note: note.clone(),
+                                blocked: blocked.clone(),
+                            });
+                        }
+                        Event::MailLoginFailed { reason } => {
+                            self.mail_failure = Some(reason.clone());
+                        }
+                        Event::MailLimits { letter_bytes, mailbox_used, mailbox_limit, .. } => {
+                            // Выводы (`crowded`, `carries_files`) не хранятся:
+                            // они считаются из этих же трёх чисел правилом
+                            // из `proto::mail`, и вторая их копия однажды
+                            // разошлась бы с первой.
+                            self.mail_limits = ratatosk_proto::mail::MailLimits {
+                                letter_bytes: *letter_bytes,
+                                mailbox_used: *mailbox_used,
+                                mailbox_limit: *mailbox_limit,
+                            };
+                        }
+                        _ => {}
+                    }
                     // Тот же путь, что и у уведомлений ядра: переполненная
                     // очередь UI не вправе останавливать протокол.
                     if self.notices.try_send(event).is_err() {
@@ -718,7 +862,13 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let _ = reply.send(TransportStatus {
                     enabled: self.engine.transports(),
                     ready: self.engine.transports_ready(),
+                    tor: self.tor_note.clone(),
+                    mail_failure: self.mail_failure.clone(),
+                    mail_limits: self.mail_limits,
                 });
+            }
+            Query::MailAccount { reply } => {
+                let _ = reply.send(self.engine.mail_account().cloned());
             }
             Query::OwnCard { reply } => {
                 let card = self.engine.own_card();
@@ -903,12 +1053,33 @@ impl<S: Store, R: Runner> Driver<S, R> {
     /// а его продолжение: без диска ядро не может ни принять сообщение, ни
     /// сохранить сессию, и продолжать работу означало бы делать вид, что всё
     /// в порядке, теряя всё, что придёт дальше (§14).
+    /// Отвергнутая **команда** вдобавок доезжает до человека словами
+    /// ([`Event::CommandRefused`]).
+    ///
+    /// Раньше она оставалась строкой в журнале, и это была настоящая
+    /// поломка честности, найденная на стенде: человек ошибся в ссылке
+    /// на регистрацию почты, ядро внятно отказало — «в ссылке нет имени
+    /// сервера», — а на экране не появилось ничего. Он видел «пошли
+    /// за ящиком» и тишину.
+    ///
+    /// Кадры и таймеры так не сообщаются намеренно: их отказы — чужие
+    /// ошибки и сетевой мусор (§7.3), а не действие человека, и вываливать
+    /// их на экран значило бы приучить не читать.
     async fn tolerate(&mut self, input: Input) -> Result<(), EngineError> {
+        let was_command = matches!(input, Input::Command(_));
         match self.feed(input).await {
             Ok(()) => Ok(()),
             Err(error @ EngineError::Store(_)) => Err(error),
             Err(error) => {
                 tracing::warn!(%error, "вход отвергнут ядром");
+                if was_command
+                    && self
+                        .notices
+                        .try_send(Event::CommandRefused { reason: error.to_string() })
+                        .is_err()
+                {
+                    tracing::debug!("очередь событий UI переполнена, отказ не показан");
+                }
                 Ok(())
             }
         }
@@ -934,33 +1105,43 @@ impl<S: Store, R: Runner> Driver<S, R> {
 
     /// Исполняет один эффект.
     ///
-    /// Возвращает вход, который надо подать ядру следом, — сейчас это ровно
-    /// один случай: транспорт отказал прямо здесь, синхронно. Ядру про такой
-    /// отказ надо сказать тем же входом, каким сказал бы сам транспорт,
-    /// случись отказ позже.
+    /// Возвращает вход, который надо подать ядру следом: транспорт отказал
+    /// прямо здесь, синхронно. Ядру про такой отказ надо сказать тем же
+    /// входом, каким сказал бы сам транспорт, случись отказ позже.
     async fn apply(&mut self, now_ms: u64, effect: Effect) -> Option<Input> {
-        // Кого касается отказ — запоминается до того, как эффект разберут
+        // Как сообщать об отказе — решается до того, как эффект разберут
         // на части: `frame` уезжает в команду, а ключ и транспорт нужны после.
-        let addressee = match &effect {
+        let refusal = match &effect {
             Effect::Send { peer_ik, via, .. } | Effect::Connect { peer_ik, via } => {
-                Some((*peer_ik, *via))
+                Refusal::Delivery { peer_ik: *peer_ik, via: *via }
             }
+            // Человек нажал «завести почту» и ждёт ответа. Отказ транспорта
+            // — это и есть ответ, и он обязан до него доехать: раньше здесь
+            // была только строка в журнале, а на экране не появлялось
+            // ничего. Найдено на стенде, где почтового раннера ещё нет
+            // вовсе и отказ приходит на каждую попытку.
+            Effect::CreateMailAccount { .. } => Refusal::Mailbox,
             Effect::SetTransportEnabled { .. }
+            | Effect::SetMailAccount(_)
             | Effect::WatchLanPeers(_)
             | Effect::RestartLan
             | Effect::SetTimer { .. }
-            | Effect::Notify(_) => None,
+            | Effect::Notify(_) => Refusal::Silent,
         };
 
         let command = match effect {
-            Effect::Send { peer_ik, via, frame } => {
-                Some(TransportCommand::Send { peer: self.address_of(peer_ik), via, frame })
+            Effect::Send { peer_ik, via, frame, handoff } => {
+                Some(TransportCommand::Send { peer: self.address_of(peer_ik), via, frame, handoff })
             }
             Effect::Connect { peer_ik, via } => {
                 Some(TransportCommand::Connect { peer: self.address_of(peer_ik), via })
             }
             Effect::SetTransportEnabled { transport, enabled } => {
                 Some(TransportCommand::SetEnabled { transport, enabled })
+            }
+            Effect::SetMailAccount(account) => Some(TransportCommand::SetMailAccount(account)),
+            Effect::CreateMailAccount { url, via_tor } => {
+                Some(TransportCommand::CreateMailAccount { url, via_tor })
             }
             Effect::WatchLanPeers(peers) => Some(TransportCommand::WatchLanPeers(peers)),
             Effect::RestartLan => Some(TransportCommand::RestartLan),
@@ -1001,12 +1182,16 @@ impl<S: Store, R: Runner> Driver<S, R> {
         }
 
         tracing::debug!(?error, "транспорт отказал, переходим к следующему");
-        let (peer_ik, via) = addressee?;
-        // Повтор безвреден: тот же отказ может приехать ещё раз событием
-        // от самого транспорта (LAN так и делает), но ядро сверяет транспорт
-        // с тем, на котором сообщение сейчас, — а оно к тому моменту уже
-        // на следующей ступени, и второй отказ ничего не сжигает.
-        Some(Input::ConnectionLost { peer_ik, via })
+        match refusal {
+            // Повтор безвреден: тот же отказ может приехать ещё раз событием
+            // от самого транспорта (LAN так и делает), но ядро сверяет
+            // транспорт с тем, на котором сообщение сейчас, — а оно к тому
+            // моменту уже на следующей ступени, и второй отказ ничего
+            // не сжигает.
+            Refusal::Delivery { peer_ik, via } => Some(Input::ConnectionLost { peer_ik, via }),
+            Refusal::Mailbox => Some(Input::MailAccountFailed { reason: error.to_string() }),
+            Refusal::Silent => None,
+        }
     }
 
     /// Адреса контакта для транспорта.
@@ -1062,6 +1247,26 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::TorReady { onion } => return Wake::TorReady(onion),
         TransportEvent::TorProgress { fraction, note, blocked } => {
             return Wake::Notice(Event::TorStatus { fraction, note, blocked })
+        }
+        TransportEvent::MailAccountCreated { address, password } => {
+            Input::MailAccountCreated { address, password }
+        }
+        TransportEvent::MailAccountFailed { reason } => Input::MailAccountFailed { reason },
+        TransportEvent::Handed { peer_ik, via, handoff } => Input::Handed { peer_ik, via, handoff },
+        TransportEvent::Ready { transport } => Input::TransportReady { transport },
+        // Через ядро, а не мимо: от этих чисел зависят два его решения —
+        // пускать ли почту в выбор канала для файла и просить ли чанки
+        // в свой кончающийся ящик. Показ — уже следствие, и приезжает
+        // он одним сведённым событием (`Engine::tell_mail_limits`).
+        TransportEvent::MailLetterLimit { bytes } => Input::MailLetterLimit { bytes },
+        TransportEvent::MailQuota { used_bytes, limit_bytes } => {
+            Input::MailQuota { used_bytes, limit_bytes }
+        }
+        // Мимо ядра: не сумевшая войти почта просто не становится ступенью,
+        // и §5.4 ведёт себя ровно так же, как до заведения ящика. Сказать
+        // об этом надо человеку, а не протоколу.
+        TransportEvent::MailLoginFailed { reason } => {
+            return Wake::Notice(Event::MailLoginFailed { reason })
         }
     };
     Wake::Input(input)

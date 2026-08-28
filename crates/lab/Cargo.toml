@@ -32,6 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # и проверяется отдельной сборкой; пока он не включён, onion честно
 # отказывает, а §5.4 переходит к следующей ступени.
 tor = ["ratatosk-transport/onion-arti"]
+# Живая почта (§5.3): TLS, поход за ящиком. **Не по умолчанию**, как и `tor`:
+# пока чужой API не сошёлся сборкой, остальное дерево обязано быть зелёным.
+mail = ["ratatosk-transport/chatmail-net"]
 
 [lints.rust]
 unsafe_code = "forbid"

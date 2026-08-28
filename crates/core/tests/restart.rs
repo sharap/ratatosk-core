@@ -13,6 +13,7 @@ use ratatosk_core::{vault, Engine, OsEntropy, SelfAddresses};
 use ratatosk_crdt::Hlc;
 use ratatosk_crypto::handshake::Role;
 use ratatosk_crypto::{Identity, Session};
+use ratatosk_proto::mail::MailAccount;
 use ratatosk_proto::Transport;
 use ratatosk_store::{SqliteStore, Store, StoredMessage, StoredSession};
 use zeroize::Zeroizing;
@@ -209,6 +210,112 @@ fn a_switched_off_transport_stays_switched_off_after_a_restart() {
             }
         )),
         "при старте выбор обязан доехать до транспорта: {startup:?}"
+    );
+}
+
+#[test]
+fn a_mailbox_survives_the_restart_together_with_its_password() {
+    // Ящик хранится там же, где переписка, и по той же причине, что и выбор
+    // транспортов: §13.3 не пускает протокольные решения выше границы,
+    // а «куда и чем входить» — часть выбора транспорта. Второй экземпляр
+    // той же правды в настройках приложения однажды разошёлся бы с тем,
+    // по которому ядро принимает решения, и разошёлся бы молча.
+    //
+    // Пароль лежит рядом с перепиской и защищён тем же ключом (§8.6).
+    // Отдельное «более надёжное» место означало бы второй способ потерять
+    // доступ, не убавив первого.
+    let db = TempDb::new("mailbox");
+    let db_key = Zeroizing::new([5u8; 32]);
+
+    let mut account = MailAccount::from_address("a7f3k9@nine.example", "sekret");
+    account.via_tor = false;
+    account.smtp_port = 587;
+
+    {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().unwrap();
+        assert!(engine.mail_account().is_none(), "из коробки ящика нет");
+
+        engine.step(1_000, Input::Command(Command::SetMailAccount(Some(account.clone())))).unwrap();
+    }
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+    assert_eq!(
+        engine.mail_account(),
+        Some(&account),
+        "ящик обязан пережить перезапуск целиком — с портом и с выбором пути"
+    );
+
+    // И раннеру об этом говорят при запуске: сам он настройки взять негде.
+    let startup = engine.startup_effects();
+    assert!(
+        startup.iter().any(|e| matches!(e, ratatosk_core::Effect::SetMailAccount(Some(_)))),
+        "при старте ящик обязан доехать до транспорта: {startup:?}"
+    );
+}
+
+#[test]
+fn the_newest_session_of_a_family_is_the_one_that_sends_after_a_restart() {
+    // Реестр держит в семействе одну отправляющую сессию — ту, что вставлена
+    // последней. Прежняя при этом не исчезает, а остаётся принимать, и обе
+    // лежат на диске.
+    //
+    // Порядок, в котором их отдаёт хранилище, ничем не задан. Без сортировки
+    // по возрасту после перезапуска отправляющей могла бы стать та, что уже
+    // ушла на покой, — и снаружи это выглядело бы как «после перезапуска
+    // сообщения перестали доходить», без всякой видимой причины. По почте
+    // такое не обнаруживается вовсе: квитанций там нет (§9.4).
+    let db = TempDb::new("session-age");
+    let db_key = Zeroizing::new([9u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let newer_id = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .unwrap();
+
+        // Две сессии одного семейства: так и бывает, когда прежняя ушла
+        // на покой, а новая заняла её место.
+        let older = Session::derive(Role::Initiator, peer_ik, b"older-transcript", b"noise", 1_000);
+        let newer = Session::derive(Role::Initiator, peer_ik, b"newer-transcript", b"noise", 9_000);
+        let newer_id = newer.session_id;
+        assert_ne!(older.session_id, newer_id);
+
+        // Кладём **новую первой**: если порядок чтения совпадёт с порядком
+        // записи, тест поймает именно ту ошибку, ради которой написан.
+        for (session, established_ms) in [(newer, 9_000u64), (older, 1_000u64)] {
+            engine
+                .store_mut()
+                .put_session(&StoredSession {
+                    session_id: session.session_id,
+                    peer_ik,
+                    lan: false,
+                    snapshot: session.export().to_vec(),
+                    established_ms,
+                })
+                .unwrap();
+        }
+        newer_id
+    };
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+
+    assert_eq!(
+        engine.session_for(&peer_ik, Transport::Onion),
+        Some(newer_id),
+        "отправлять обязана самая свежая сессия семейства, а не та, \
+         что первой попалась хранилищу"
     );
 }
 

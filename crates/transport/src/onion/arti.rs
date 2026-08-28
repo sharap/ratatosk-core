@@ -116,11 +116,19 @@ pub struct OnionSetup<'a> {
     /// и устроены не так, как ждёт `fs-mistrust`. Там проверка отвергает
     /// заведомо безопасный путь, и её приходится снимать.
     pub dangerously_trust_filesystem: bool,
+    /// Куда положить поднятого клиента, чтобы им пользовалась и почта.
+    ///
+    /// Один `TorClient` на приложение, а не по одному на транспорт: второй
+    /// означал бы второй bootstrap, второй кэш директории и ещё десятки
+    /// мегабайт памяти (§5.2). Разбор — [`crate::onion::TorHandle`].
+    pub tor: crate::onion::TorHandle,
 }
 
 /// Onion-транспорт: свой Tor-клиент, свой сервис, свои соединения.
 pub struct OnionRunner {
     client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    /// Общая ручка: пока раннер жив, в ней лежит его клиент.
+    tor: crate::onion::TorHandle,
     /// Пока жив — сервис опубликован. Уронишь — исчезнет из сети.
     _service: Arc<RunningOnionService>,
     links: BTreeMap<[u8; 32], Link>,
@@ -147,6 +155,10 @@ impl Drop for OnionRunner {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        // Клиент уходит вместе с раннером, и ручка обязана это заметить:
+        // иначе почта продолжала бы считать Tor поднятым и молча ждать
+        // соединений, которых больше не будет.
+        self.tor.withdraw();
     }
 }
 
@@ -265,7 +277,12 @@ impl OnionRunner {
             events_tx.clone(),
         ));
 
+        // Клиент — в общую ручку: с этого мгновения почта (§5.3) может
+        // ходить через Tor тем же клиентом, не поднимая своего.
+        setup.tor.publish(Arc::clone(&client));
+
         Ok(OnionRunner {
+            tor: setup.tor,
             client,
             _service: service,
             links: BTreeMap::new(),
@@ -364,7 +381,7 @@ impl OnionRunner {
 impl Runner for OnionRunner {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         match command {
-            TransportCommand::Send { peer, via: Transport::Onion, frame } => {
+            TransportCommand::Send { peer, via: Transport::Onion, frame, .. } => {
                 let link = self.ensure_link(&peer).await?;
                 link.send(frame).await
             }

@@ -78,6 +78,98 @@ pub const SERVICE_PORT: u16 = 9_001;
 #[cfg(feature = "onion-arti")]
 pub mod arti;
 
+/// Общий Tor-клиент: один на приложение, а не один на транспорт.
+///
+/// # Зачем он вообще
+///
+/// Через Tor ходит не только onion. Почта (§5.3) по умолчанию идёт тем же
+/// путём, и завести ей свой второй `TorClient` было бы проще всего —
+/// но это второй bootstrap (десятки секунд), второй кэш директории на диске
+/// и ещё десятки мегабайт памяти (§5.2). На телефоне это заметно, а выигрыша
+/// нет никакого: один клиент умеет и держать сервис, и открывать исходящие
+/// потоки.
+///
+/// # Почему ручка, а не владение
+///
+/// Владеет клиентом [`arti::OnionRunner`], и по делу: клиент поднимается
+/// вместе с ним и умирает вместе с ним, потому что «выключить Tor» — это
+/// уронить раннера (5э). Отдать владение наружу значило бы разорвать эту
+/// связь: выключенный человеком Tor остался бы жив в чужой ссылке.
+///
+/// Поэтому здесь ручка. Onion-раннер кладёт в неё клиента, когда поднялся,
+/// и забирает, когда гаснет; почтовый раннер заглядывает и, если пусто,
+/// честно отказывает — «Tor ещё не поднялся». Это не обходной путь,
+/// а правда: почты через Tor без работающего Tor не бывает.
+///
+/// # Без признака `onion-arti`
+///
+/// Тип остаётся, но внутри у него ничего нет. Так проводка одинакова
+/// в обеих сборках, а «Tor не собран» и «Tor не поднялся» для почты
+/// означают одно и то же — отказ с внятной причиной.
+#[derive(Clone, Default)]
+pub struct TorHandle {
+    #[cfg(feature = "onion-arti")]
+    client: std::sync::Arc<
+        std::sync::Mutex<
+            Option<std::sync::Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for TorHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Содержимое не печатается: `TorClient` тянет за собой полстека Tor,
+        // и в журнале это была бы стена текста вместо одной строки.
+        f.write_str(if self.is_up() { "TorHandle(поднят)" } else { "TorHandle(пусто)" })
+    }
+}
+
+impl TorHandle {
+    /// Поднят ли Tor прямо сейчас.
+    #[must_use]
+    pub fn is_up(&self) -> bool {
+        #[cfg(feature = "onion-arti")]
+        {
+            self.client.lock().is_ok_and(|client| client.is_some())
+        }
+        #[cfg(not(feature = "onion-arti"))]
+        {
+            false
+        }
+    }
+
+    /// Кладёт поднятого клиента в ручку.
+    #[cfg(feature = "onion-arti")]
+    pub fn publish(
+        &self,
+        client: std::sync::Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
+    ) {
+        if let Ok(mut slot) = self.client.lock() {
+            *slot = Some(client);
+        }
+    }
+
+    /// Забирает клиента: Tor погас.
+    #[cfg(feature = "onion-arti")]
+    pub fn withdraw(&self) {
+        if let Ok(mut slot) = self.client.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Копия клиента для одного соединения, если Tor поднят.
+    ///
+    /// Копия, а не заимствование: замок держать на всё время соединения
+    /// нельзя — оно живёт минутами, а замок нужен другим на микросекунды.
+    #[cfg(feature = "onion-arti")]
+    #[must_use]
+    pub fn client(
+        &self,
+    ) -> Option<std::sync::Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>> {
+        self.client.lock().ok()?.clone()
+    }
+}
+
 /// Onion-сервис устройства.
 ///
 /// TODO(этап 2): поднять `arti_client::TorClient`, опубликовать сервис v3,

@@ -40,7 +40,8 @@ tor-proto = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 # Выбор криптопровайдера rustls — см. пояснение в общем манифесте.
 rustls = { workspace = true, optional = true }
-tokio-socks = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
@@ -66,7 +67,27 @@ onion-arti = [
     "dep:futures",
     "dep:rustls",
 ]
-chatmail = ["dep:async-imap", "dep:async-smtp", "dep:tokio-socks"]
+chatmail = ["dep:async-imap", "dep:async-smtp"]
+# Живые сокеты почты. **Не в `default`**, по той же причине, что и
+# `onion-arti`: пока чужой API не сошёлся сборкой, остальное дерево обязано
+# оставаться зелёным.
+#
+# `tokio-socks` здесь не нужен и убран: через Tor мы ходим потоком arti
+# напрямую, а не через SOCKS-прокси, которого у библиотечного arti и нет.
+#
+# `tokio-util` здесь не перечислен намеренно: он не необязательная
+# зависимость, а обычная (полосы LAN разбираются его кодеком), и `dep:`
+# на неё — ошибка манифеста, а не лишняя строка. Нужный признак `compat`
+# объявлен в общем манифесте.
+chatmail-net = [
+    "chatmail",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+    # Приём читает ответы IMAP потоками futures: `async-imap` отдаёт
+    # выборку, отметки и уборку именно ими, а не итераторами.
+    "dep:futures",
+]
 lan = ["dep:mdns-sd"]
 
 [lints.rust]

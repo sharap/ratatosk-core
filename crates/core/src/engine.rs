@@ -24,6 +24,7 @@ use ratatosk_crypto::handshake::{
 };
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
 use ratatosk_proto::fragment::Reassembler;
+use ratatosk_proto::mail::{AccountUrl, MailAccount, Secret};
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{
     Attempt, Decision, PeerAvailability, SessionBinding, TransportSet,
@@ -66,13 +67,17 @@ const DEFAULT_TRANSPORTS: TransportSet =
 
 /// Транспорты, которым нечего ждать: включили — значит работает.
 ///
-/// Локальная сеть занимает порт при открытии аккаунта, до всякой команды;
-/// почта асинхронна по устройству — у неё нет ни соединения, ни сессии,
-/// которых надо дождаться. Единственный, у кого между «включили»
-/// и «работает» лежат десятки секунд, — Tor, и он говорит о своей
-/// готовности сам ([`Input::TransportReady`]).
-const IMMEDIATE_TRANSPORTS: TransportSet =
-    TransportSet::none().with(Transport::Lan).with(Transport::Mail);
+/// Локальная сеть занимает порт при открытии аккаунта, до всякой команды,
+/// и больше ей ждать нечего. Все остальные говорят о своей готовности сами
+/// ([`Input::TransportReady`]).
+///
+/// Почта была здесь и не должна была: «включена» она с коробки (§5.4),
+/// а работать ей не на чем, пока не заведён ящик и транспорт не вошёл
+/// на сервер. Ядро при этом считало её рабочей ступенью и уводило на неё
+/// сообщения — в никуда, потому что почтового раннера ещё нет вовсе.
+/// Наружу это выглядело как «отправлено» у сообщения, которого никто
+/// не отправлял, — то самое, что §14 запрещает прямо.
+const IMMEDIATE_TRANSPORTS: TransportSet = TransportSet::none().with(Transport::Lan);
 
 /// Класс кадра для рукопожатия (§5.5).
 ///
@@ -88,6 +93,23 @@ const HANDSHAKE_CLASS: SizeClass = SizeClass::S;
 /// что вернула бы политика. Своего числа здесь нет намеренно: два срока
 /// ожидания ответа, живущие в разных файлах, однажды разойдутся.
 const ONION_FALLBACK_TIMEOUT_MS: u64 = ratatosk_proto::transport_policy::ONION_REPLY_TIMEOUT_MS;
+
+/// Сколько ждать от почты подтверждения, что сервер принял письмо.
+///
+/// Это **не** срок ожидания ответа собеседника — по почте его ждут часами,
+/// и §9.4 прямо говорит, что дальше «отправлено» статус не растёт. Это срок
+/// на одно действие: вход на сервер, `MAIL FROM`, тело, ответ на `DATA`.
+///
+/// Пять минут — щедро и намеренно. Через Tor сюда входит построение цепочки
+/// и вход на сервер, а впереди в очереди могут стоять чужие письма: почта
+/// шлёт их по одному, потому что соединение с сервером одно. Занижать
+/// нечего — время идёт не за счёт человека: пока письмо не ушло, сообщение
+/// честно висит «отправляется», а не «отправлено».
+///
+/// Но и не бесконечность. Молчащий сервер обязан однажды стать внятной
+/// неудачей, иначе сообщение навсегда останется в состоянии, из которого
+/// нет выхода, — а это то же молчание, только с крутящимся кружком (§14).
+const MAIL_HANDOFF_TIMEOUT_MS: u64 = 300_000;
 
 /// Сколько ждать, пока обнаружение (§5.1) ответит, есть ли собеседник в сети.
 ///
@@ -161,6 +183,19 @@ pub enum EngineError {
     /// значит сделать не то, что он просил.
     #[error("ответ: {0}")]
     Reply(#[from] ratatosk_proto::reply::ReplyError),
+    /// Настройки почтового ящика не годятся (§5.3).
+    ///
+    /// Отказ вслух, а не «пусть сервер разберётся»: неверный адрес выглядит
+    /// на сервере как отказ входа, а отказ входа человек читает как «почта
+    /// не работает» и чинит не то.
+    #[error("почтовый ящик: {0}")]
+    Mail(#[from] ratatosk_proto::mail::MailAccountError),
+    /// Ссылка на регистрацию ящика не годится (§5.3).
+    ///
+    /// Отдельно от [`EngineError::Mail`]: там не годятся настройки, здесь —
+    /// ссылка, и человек чинит разные поля.
+    #[error("ссылка на регистрацию: {0}")]
+    MailUrl(#[from] ratatosk_proto::mail::AccountUrlError),
 }
 
 // Варианта «нет доступного транспорта» здесь нет сознательно. Раньше он был,
@@ -179,10 +214,15 @@ pub enum EngineError {
 ///
 /// Окно, а не «шлём всё подряд»: без него один шаг ядра выдал бы драйверу весь
 /// файл эффектами, то есть два гигабайта в памяти процесса, который на Android
-/// убивают за меньшее. Отправитель держит окно в [`CHUNK_WINDOW`] чанков
+/// убивают за меньшее. Отправитель держит окно в [`chunk_window`] чанков
 /// впереди подтверждённого получателем.
 ///
-/// [`CHUNK_WINDOW`]: ratatosk_proto::files::CHUNK_WINDOW
+/// Почтой окно значит вдобавок и другое: всё отправленное, но
+/// не подтверждённое, лежит в **ящике получателя**. Открытое окно и есть
+/// верхняя граница того, сколько чужого ящика заняла передача, — сколько бы
+/// файл ни весил.
+///
+/// [`chunk_window`]: ratatosk_proto::files::chunk_window
 #[derive(Debug, Clone, Copy)]
 struct Sending {
     file_id: FileId,
@@ -298,6 +338,13 @@ enum Failure {
     ///
     /// Поэтому сессия закрывается, и следующая попытка идёт через новое
     /// рукопожатие — оно аутентифицировано (§8.2), в отличие от любого намёка.
+    ///
+    /// **У почты этот же исход означает другое** — что письмо не ушло вовсе:
+    /// сервер не подтвердил приём за отведённый срок. Подозревать сессию
+    /// здесь не в чем, и она не закрывается: условие выше требует прямого
+    /// канала. Имя одно на два случая потому, что дальше они ведут себя
+    /// одинаково — ступень §5.4 признана неудавшейся, — а различие
+    /// существенно ровно в одной строке.
     Silent,
 }
 
@@ -373,18 +420,39 @@ enum DeliveryState {
 /// Без собственной попытки по §5.4 получалась бы тупиковая связка: данные
 /// переходят на почту, а рукопожатие, без которого они не поедут, осталось
 /// в упавшем onion.
-/// Готового кадра здесь намеренно нет. Раньше он лежал рядом с состоянием,
-/// и следующая ступень §5.4 пересылала **тот же самый** кадр — «зачем
-/// начинать рукопожатие заново». Разбор поломки на стенде показал, зачем.
-/// Смотри [`Engine::retry_handshake`].
+/// Готовый кадр хранится, но пересылается **не всегда** — только внутри
+/// одного семейства транспортов. Разбор этого правила и обеих поломок,
+/// из которых оно выросло, — в [`Engine::retry_handshake`].
 struct OutgoingHandshake {
     state: PendingHandshake,
     attempt: Attempt,
     peer_ik: [u8; 32],
-    /// Метка таймера текущей попытки, если транспорт прямой.
+    /// Первое сообщение рукопожатия целиком, как оно ушло в сеть.
+    ///
+    /// Нужно ровно для одного: перейдя на ступень **того же семейства**
+    /// (onion → почта), надо повторить тот же самый кадр, а не начать
+    /// рукопожатие заново.
+    frame: Vec<u8>,
+    /// Семейство, в котором это рукопожатие живёт сейчас.
+    ///
+    /// Именно семейство, а не транспорт: одна сессия на семейство — это
+    /// и есть правило, по которому [`SessionRegistry::insert`] вытесняет
+    /// прежнюю.
+    ///
+    /// [`SessionRegistry::insert`]: ratatosk_proto::session::SessionRegistry::insert
+    binding: SessionBinding,
+    /// Метка таймера текущей попытки, пока она чего-то ждёт.
     ///
     /// Без неё молча проглоченное рукопожатие не переходит на следующий
     /// транспорт: об отказе никто не сообщает, а ждать больше нечего.
+    ///
+    /// Ждут разного. Прямой канал — ответа собеседника; почта — того, что
+    /// сервер примет письмо. Второго срока раньше не было вовсе, и письмо
+    /// с рукопожатием, которое сервер не принял, молчало навсегда вместе
+    /// со всеми сообщениями, ждавшими эту сессию.
+    ///
+    /// `None` означает «ждать перестали»: сервер письмо принял, и жечь
+    /// ступень по сроку больше не за что.
     timer: Option<u64>,
 }
 
@@ -452,6 +520,38 @@ pub struct Engine<S: Store> {
     /// а состояние сети в этом запуске. Поднятым Tor не бывает до того,
     /// как поднялся.
     ready: TransportSet,
+    /// Настройки почтового ящика, если он заведён (§5.3).
+    ///
+    /// Переживает перезапуск ([`META_MAIL_ACCOUNT`]) вместе с паролем:
+    /// база зашифрована ключом §8.6, то есть пароль защищён ровно тем же,
+    /// чем переписка.
+    ///
+    /// Наличие ящика — не то же, что работающая почта. Ящик означает
+    /// «есть куда входить»; работает почта с того момента, как транспорт
+    /// вошёл и сказал об этом ([`Input::TransportReady`]).
+    ///
+    /// [`META_MAIL_ACCOUNT`]: ratatosk_store::META_MAIL_ACCOUNT
+    mail: Option<MailAccount>,
+    /// Что свой почтовый сервер сказал о своих пределах (§5.3).
+    ///
+    /// В памяти, а не на диске, и это не забывчивость. Числа приходят
+    /// от сервера при каждом входе, то есть при каждом запуске; поднятые
+    /// с диска, они говорили бы о сервере месячной давности — а квота
+    /// меняется от каждого письма, и предел письма меняется, когда человек
+    /// переезжает на другой сервер.
+    ///
+    /// Пустые поля означают «не спрашивали или сервер не назвал», и это
+    /// **не** «предел ноль»: см. [`MailLimits`].
+    ///
+    /// [`MailLimits`]: ratatosk_proto::mail::MailLimits
+    mail_limits: ratatosk_proto::mail::MailLimits,
+    /// Выбор «через Tor», сделанный до регистрации ящика.
+    ///
+    /// Живёт от команды до ответа сервера и только там: `via_tor` относится
+    /// и к регистрации, и к заведённому ящику, а между ними лежит поход
+    /// в сеть. На диске ему делать нечего — после ответа он переезжает
+    /// в сами настройки.
+    mail_via_tor: Option<bool>,
     /// Кого заметили в LAN раньше, чем добавили в контакты.
     seen_on_lan: BTreeSet<[u8; 32]>,
     /// Сообщения, которым некуда было ехать. Ждут случая (§5.4).
@@ -490,6 +590,17 @@ pub struct Engine<S: Store> {
     /// мебибайтами. Теперь у файла ровно один живой срок; сработавшая метка,
     /// которой здесь больше нет, — опоздавшая, и её игнорируют.
     file_timers: BTreeMap<FileId, u64>,
+    /// Сколько сроков молчания подряд вышло впустую по каждому файлу.
+    ///
+    /// Отсюда растёт отступление (`files::stall_backoff_ms`). В памяти,
+    /// а не на диске, и намеренно: перезапуск — сам по себе повод спросить
+    /// заново без отступления, потому что после него меняется всё, что
+    /// могло мешать, — сеть, транспорт, сессия.
+    ///
+    /// Обнуляет счётчик приход чанка, а не удачно ушедшая просьба: удача
+    /// здесь — движение файла. Просьба, которая исправно уезжает в пустоту,
+    /// удачей не является, и ровно её отступление и должно разредить.
+    file_attempts: BTreeMap<FileId, u32>,
     /// Сколько сообщений легло в историю с прошлой уборки (§12).
     ///
     /// В памяти, а не на диске, и это не забывчивость: счётчик — способ
@@ -550,6 +661,9 @@ impl<S: Store> Engine<S> {
             next_timer_token: 1,
             enabled: DEFAULT_TRANSPORTS,
             ready: IMMEDIATE_TRANSPORTS,
+            mail: None,
+            mail_limits: ratatosk_proto::mail::MailLimits::default(),
+            mail_via_tor: None,
             seen_on_lan: BTreeSet::new(),
             deferred: Vec::new(),
             awaited_discovery: BTreeSet::new(),
@@ -558,6 +672,7 @@ impl<S: Store> Engine<S> {
             auto_accept: Some(ratatosk_proto::files::DEFAULT_AUTO_ACCEPT_BYTES),
             sending: Vec::new(),
             file_timers: BTreeMap::new(),
+            file_attempts: BTreeMap::new(),
             messages_since_compaction: 0,
             schedule: Schedule::default(),
             announced: None,
@@ -601,6 +716,22 @@ impl<S: Store> Engine<S> {
         &self.contacts
     }
 
+    /// По какой сессии сейчас пошла бы отправка этому контакту (§5.4).
+    ///
+    /// Наружу выдаётся ради **проверяемости**, а не ради клиента: строить
+    /// на этом числе что-либо выше границы §13.3 нечего, а вот сверить две
+    /// стороны — можно, и без этого нельзя написать тест на единственное
+    /// свойство, ради которого реестр сессий вообще устроен так, как устроен:
+    /// у обеих сторон в одном семействе транспортов одна и та же сессия.
+    ///
+    /// Расхождение здесь — это молча умирающая переписка при живой связи,
+    /// и по почте оно даже не обнаруживается: квитанций там нет (§9.4).
+    /// Поэтому свойство проверяется тестом, а не наблюдением на стенде.
+    #[must_use]
+    pub fn session_for(&self, peer_ik: &[u8; 32], transport: Transport) -> Option<u64> {
+        self.sessions.for_peer(peer_ik, transport)
+    }
+
     /// Хранилище — для миграций, чтения и обслуживания.
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
@@ -633,7 +764,34 @@ impl<S: Store> Engine<S> {
         match input {
             Input::Command(command) => self.on_command(now_ms, command),
             Input::Received { via, frame } => self.on_frame(now_ms, via, &frame),
-            Input::TransportReady { transport } => self.on_transport_ready(transport),
+            Input::TransportReady { transport } => self.on_transport_ready(now_ms, transport),
+            Input::MailAccountCreated { address, password } => {
+                self.on_mail_account_created(now_ms, &address, &password)
+            }
+            Input::MailLetterLimit { bytes } => {
+                self.mail_limits.letter_bytes = bytes;
+                Ok(self.tell_mail_limits())
+            }
+            Input::MailQuota { used_bytes, limit_bytes } => {
+                let was_crowded = self.mail_limits.crowded();
+                self.mail_limits.mailbox_used = Some(used_bytes);
+                self.mail_limits.mailbox_limit = Some(limit_bytes);
+                let mut effects = self.tell_mail_limits();
+                // Ящик разгрузился — то, что из-за тесноты не спрашивалось,
+                // спрашивается сейчас. Без этого приём файла, однажды
+                // упёршийся в полный ящик, ждал бы прямого канала до конца
+                // времён: срок молчания в этом случае не заводится нарочно
+                // (`ask_for_file`), и позвать нас больше нечему.
+                if was_crowded && !self.mail_limits.crowded() {
+                    effects.extend(self.resume_all_files(now_ms)?);
+                }
+                Ok(effects)
+            }
+            Input::MailAccountFailed { reason } => {
+                // Человек нажал «завести почту» — он обязан узнать, почему
+                // её нет. Молчание он прочтёт как «приложение сломалось».
+                Ok(vec![Effect::Notify(Event::MailAccountFailed { reason })])
+            }
             Input::SeenOnLan { peer_ik } => {
                 // mDNS повторяет объявления, поэтому важен именно **переход**
                 // «не видели → видим»: на каждом повторе перебирать очередь
@@ -688,6 +846,7 @@ impl<S: Store> Engine<S> {
             Input::ConnectionLost { peer_ik, via } => {
                 self.on_delivery_failed(peer_ik, via, Failure::Reported)
             }
+            Input::Handed { peer_ik, via, handoff } => self.on_handed(peer_ik, via, handoff),
             // TODO(этап 1): перерукопожатие (§8.5) и расписание уборки (§12)
             // тоже придут таймерами — пока их ставит только доставка.
             Input::Timer { token } => self.on_timer(now_ms, token),
@@ -777,6 +936,10 @@ impl<S: Store> Engine<S> {
             Command::SetTransportEnabled { transport, enabled } => {
                 self.on_set_transport_enabled(now_ms, transport, enabled)
             }
+            Command::SetMailAccount(account) => self.on_set_mail_account(now_ms, account),
+            Command::CreateMailAccount { url, via_tor } => {
+                self.on_create_mail_account(&url, via_tor)
+            }
             Command::NetworkChanged => self.on_network_changed(),
             Command::SendFiles { chat, files, text } => {
                 self.on_send_files(now_ms, chat, &files, &text)
@@ -834,6 +997,25 @@ impl<S: Store> Engine<S> {
                 [bits] => TransportSet::from_bits(*bits),
                 _ => DEFAULT_TRANSPORTS,
             };
+        }
+
+        // Ящик — рядом с транспортами и по той же причине: без него почта
+        // не ступень, и знать об этом §5.4 обязан до первого сообщения.
+        //
+        // Испорченная запись означает «ящика нет», а не отказ открыть базу:
+        // переписка от почтовых настроек не зависит, и потерять доступ ко
+        // всему из-за одной строки было бы несоразмерно. Человек увидит
+        // пустые поля и введёт их заново.
+        if let Some(raw) = self.store.meta(ratatosk_store::META_MAIL_ACCOUNT)? {
+            // Пустая запись — это «ящик убрали», и она молчалива: у хранилища
+            // нет «забыть ключ», убирая ящик мы пишем пустоту, и жаловаться
+            // на неё при каждом старте значило бы ругать себя.
+            if !raw.is_empty() {
+                self.mail = MailAccount::decode(&raw).ok();
+                if self.mail.is_none() {
+                    tracing::warn!("настройки почты не разобрались — ящик считается не заведённым");
+                }
+            }
         }
 
         let stored = self.store.contacts()?;
@@ -934,7 +1116,16 @@ impl<S: Store> Engine<S> {
 
         // Сессии поднимаются после контактов: внешний ключ в схеме связывает
         // их с `contacts`, и порядок здесь тот же, что и на записи.
-        for stored in self.store.sessions()? {
+        // По возрасту, от старых к новым, и это не косметика. Реестр держит
+        // в семействе одну отправляющую сессию — ту, что вставлена последней.
+        // Порядок, в котором их отдаёт хранилище, ничем не задан, и без
+        // сортировки после перезапуска отправляющей могла стать прежняя,
+        // уже отправленная на покой. Снаружи это выглядело бы как «после
+        // перезапуска сообщения перестали доходить» — то есть как поломка
+        // без причины.
+        let mut stored_sessions = self.store.sessions()?;
+        stored_sessions.sort_by_key(|stored| stored.established_ms);
+        for stored in stored_sessions {
             let session = Session::restore(&stored.snapshot)?;
             let binding = if stored.lan { SessionBinding::Lan } else { SessionBinding::Tor };
             // Вытесненные с диска тоже уходят: база могла накопить их прежней
@@ -946,11 +1137,13 @@ impl<S: Store> Engine<S> {
         Ok(restored)
     }
 
-    /// Регистрирует новую сессию и убирает ту, которую она заменила.
+    /// Регистрирует новую сессию и убирает то, что она вытеснила насовсем.
     ///
-    /// Прежняя уходит и из реестра, и с диска. Оставленная, она вернулась бы
-    /// после перезапуска и снова начала бы участвовать в выборе `for_peer` —
-    /// то есть ровно та поломка, от которой вытеснение и заведено.
+    /// «Насовсем» — потому что прежняя сессия семейства уходит **на покой**,
+    /// а не в небытие: отправлять по ней нельзя, принимать можно, и с диска
+    /// она не убирается (разбор — в [`SessionRegistry::insert`]). Убирается
+    /// поколением позже, и вот тогда её надо стереть и с диска: оставленная,
+    /// она вернулась бы после перезапуска и снова участвовала бы в выборе.
     fn supersede(&mut self, session: Session, binding: SessionBinding) -> Result<(), EngineError> {
         for stale in self.sessions.insert(session, binding) {
             self.store.delete_session(stale)?;
@@ -1144,6 +1337,125 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Заводит почтовый ящик или убирает его (§5.3).
+    ///
+    /// Три вещи разом, и все три обязательны.
+    ///
+    /// **Настройки на диск.** Иначе ящик пришлось бы вводить при каждом
+    /// запуске, а хранить его у клиента §13.3 не разрешает.
+    ///
+    /// **Адрес — в карточку** (§4.3). Пока собеседник не знает нашего
+    /// chatmail-адреса, почта не ступень §5.4 **для него**: `has_chatmail`
+    /// берётся из карточки, а не из наших настроек. Убрали ящик — адрес
+    /// снимается той же дорогой, что и onion при выключении Tor: обещать
+    /// путь, которого нет, нельзя.
+    ///
+    /// **Готовность — снять.** Заведение ящика не делает почту работающей:
+    /// работает она с того момента, как транспорт вошёл на сервер и сказал
+    /// об этом ([`Input::TransportReady`]). А вот убранный ящик означает
+    /// «не работает» немедленно и наверняка — тут ждать нечего, и всё,
+    /// что ехало почтой, снимается с неё сразу.
+    fn on_set_mail_account(
+        &mut self,
+        now_ms: u64,
+        account: Option<MailAccount>,
+    ) -> Result<Vec<Effect>, EngineError> {
+        if let Some(account) = &account {
+            account.check()?;
+        }
+        if self.mail == account {
+            // Повтор того же — обычное дело: клиент выставляет настройки
+            // при старте. Молча и бесплатно.
+            return Ok(Vec::new());
+        }
+
+        match &account {
+            Some(account) => {
+                self.store.put_meta(ratatosk_store::META_MAIL_ACCOUNT, &account.encode()?)?
+            }
+            // Пустая запись, а не удаление строки: у хранилища нет
+            // «забыть ключ», и заводить его ради одного случая незачем.
+            // Разобрать пустоту нельзя — значит «ящика нет» (см. `restore`).
+            None => self.store.put_meta(ratatosk_store::META_MAIL_ACCOUNT, &[])?,
+        }
+
+        let address = account.as_ref().map(|a| a.address.clone()).unwrap_or_default();
+        self.mail = account.clone();
+        // Пределы принадлежат серверу, а не нам: сменился ящик — сменился
+        // и сервер, и прежние числа стали чужими. Оставь их, и переезд
+        // со скупого сервера на щедрый оставил бы файлы запрещёнными
+        // до перезапуска.
+        self.mail_limits = ratatosk_proto::mail::MailLimits::default();
+
+        let mut effects = vec![Effect::SetMailAccount(account)];
+        // И сказать об этом: у клиента на экране остались бы числа прежнего
+        // сервера рядом с адресом нового.
+        effects.extend(self.tell_mail_limits());
+        if address.is_empty() {
+            // Ящика больше нет: почта перестала работать в тот же миг.
+            self.ready.set(Transport::Mail, false);
+            for contact in self.contacts.values_mut() {
+                contact.availability.ready = self.ready;
+            }
+            effects.extend(self.release_from(Transport::Mail)?);
+        }
+        let onion = self.addresses.onion.clone();
+        effects.extend(self.on_announce_addresses(now_ms, onion, address)?);
+        Ok(effects)
+    }
+
+    /// Просит транспорт завести новый ящик на chatmail-сервере (§5.3).
+    ///
+    /// Ссылка разбирается **здесь**, до всякой сети, и по двум причинам.
+    /// Отказать надо до того, как человек нажал и стал ждать. И «только
+    /// `https`» — решение протокольного уровня, а не сетевого: по `http`
+    /// пароль приехал бы открытым текстом любому на пути, а этот пароль
+    /// открывает переписку.
+    ///
+    /// Выбор пути (`via_tor`) запоминается до ответа: он относится и
+    /// к самой регистрации, и к заведённому ящику. Сходить за паролем
+    /// напрямую, а потом ходить за письмами через Tor значило бы один раз
+    /// показать серверу свой IP — и связать его с адресом навсегда.
+    fn on_create_mail_account(
+        &mut self,
+        url: &str,
+        via_tor: bool,
+    ) -> Result<Vec<Effect>, EngineError> {
+        AccountUrl::parse(url)?;
+        self.mail_via_tor = Some(via_tor);
+        Ok(vec![Effect::CreateMailAccount { url: url.to_owned(), via_tor }])
+    }
+
+    /// Сервер завёл ящик — складываем его в настройки (§5.3).
+    ///
+    /// Дальше всё то же самое, что и при вводе руками: откуда взялись адрес
+    /// и пароль, не имеет значения ни для хранения, ни для карточки (§4.3),
+    /// ни для §5.4. Поэтому здесь нет своей ветки — только сборка настроек
+    /// и общий путь.
+    fn on_mail_account_created(
+        &mut self,
+        now_ms: u64,
+        address: &str,
+        password: &Secret,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let mut account = MailAccount::from_address(address, password.as_str());
+        // Выбор человека, а не умолчание типа: он мог отказаться от Tor
+        // ещё до регистрации, и регистрация уже прошла его дорогой.
+        account.via_tor = self.mail_via_tor.take().unwrap_or(true);
+
+        let mut effects = self.on_set_mail_account(now_ms, Some(account))?;
+        effects.push(Effect::Notify(Event::MailAccountReady { address: address.to_owned() }));
+        Ok(effects)
+    }
+
+    /// Настройки почтового ящика, если он заведён (§5.3).
+    ///
+    /// Пароль внутри печатать нельзя — за этим следит его тип.
+    #[must_use]
+    pub fn mail_account(&self) -> Option<&MailAccount> {
+        self.mail.as_ref()
+    }
+
     /// Снимает с карточки адрес выключенного транспорта (§4.3, §14).
     ///
     /// Выключенный Tor означает, что по нашему onion-адресу больше никого
@@ -1232,7 +1544,11 @@ impl<S: Store> Engine<S> {
     ///
     /// Здесь же — второй шанс всему, что ждало: ступень появилась, и это
     /// ровно то событие, ради которого очередь отложенных и существует.
-    fn on_transport_ready(&mut self, transport: Transport) -> Result<Vec<Effect>, EngineError> {
+    fn on_transport_ready(
+        &mut self,
+        now_ms: u64,
+        transport: Transport,
+    ) -> Result<Vec<Effect>, EngineError> {
         // Готовым может быть только разрешённый. Иначе выключенный
         // человеком транспорт, чей подъём успел договорить своё последнее
         // слово, тихо вернулся бы в лестницу.
@@ -1243,7 +1559,30 @@ impl<S: Store> Engine<S> {
         for contact in self.contacts.values_mut() {
             contact.availability.ready = self.ready;
         }
-        self.retry_deferred(None)
+        let mut effects = self.retry_deferred(None)?;
+        // И недокачанные файлы. Для почты это единственный повод спросить
+        // после перезапуска: рукопожатия там не будет — сессия поднимается
+        // с диска целой (`resume_all_files`).
+        effects.extend(self.resume_all_files(now_ms)?);
+        Ok(effects)
+    }
+
+    /// Сводит два разговора с сервером в одну новость для человека.
+    ///
+    /// Предел письма сообщает SMTP, объём ящика — IMAP, и приходят они
+    /// в разные моменты. Клиенту эта география не нужна: он показывает
+    /// состояние почты, а не устройство протокола (§13.3). Поэтому наружу
+    /// уезжает картина целиком, а вместе с ней — два готовых вывода,
+    /// потому что правила, по которым они делаются, обязаны быть одни
+    /// (`proto::mail`), а не пересчитываться в каждом клиенте.
+    fn tell_mail_limits(&self) -> Vec<Effect> {
+        vec![Effect::Notify(Event::MailLimits {
+            letter_bytes: self.mail_limits.letter_bytes,
+            mailbox_used: self.mail_limits.mailbox_used,
+            mailbox_limit: self.mail_limits.mailbox_limit,
+            crowded: self.mail_limits.crowded(),
+            carries_files: self.mail_limits.carries_file_chunks(),
+        })]
     }
 
     /// Что надо сделать один раз при запуске, до первой команды клиента.
@@ -1265,6 +1604,9 @@ impl<S: Store> Engine<S> {
                 enabled: self.enabled.contains(transport),
             });
         }
+        // Ящик — вместе с транспортами: почтовому раннеру он нужен до первой
+        // отправки, а взять его самому неоткуда (§13.3).
+        effects.push(Effect::SetMailAccount(self.mail.clone()));
         if self.enabled.contains(Transport::Lan) {
             effects.push(self.watch_lan_peers());
         }
@@ -1470,6 +1812,7 @@ impl<S: Store> Engine<S> {
     fn forget_file(&mut self, file_id: &FileId) {
         self.sending.retain(|s| s.file_id != *file_id);
         self.file_timers.remove(file_id);
+        self.file_attempts.remove(file_id);
         let _ = self.blobs.remove(file_id);
         let _ = self.store.delete_file(file_id);
     }
@@ -1691,7 +2034,7 @@ impl<S: Store> Engine<S> {
 
         let envelope =
             Envelope::new(msg_id, hlc, PayloadType::FileOffer, files::offer_payload(text, &offers));
-        self.enqueue(Delivery {
+        let mut effects = self.enqueue(Delivery {
             msg_id,
             peer_ik,
             envelope: envelope.encode()?,
@@ -1699,7 +2042,29 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
-        })
+        })?;
+
+        // Само предложение уедет любой ступенью §5.4, а чанки — той, которую
+        // выберет `file_channel`. Совпадают они не всегда: почтой едет и то
+        // и другое, но большой файл почтой не поедет (§10.3), и собеседник
+        // получит письмо с описанием файла, а самого файла не получит, пока
+        // не появится в сети.
+        //
+        // Сказать об этом надо здесь и сразу, а не когда человек заметит,
+        // что полоска стоит: §10.3 задаёт для этого случая свой текст,
+        // и он существовал в коде с самого начала, ни разу никому
+        // не показанный.
+        //
+        // Спрашивается **про каждый файл отдельно**: предел почты — про
+        // размер, и в одном сообщении может уехать и фотография, которая
+        // поедет почтой, и видео, которое будет ждать.
+        for record in &records {
+            if self.file_channel(&peer_ik, record.size_bytes).is_none() {
+                effects
+                    .push(Effect::Notify(Event::FileWaitsForChannel { file_id: record.file_id }));
+            }
+        }
+        Ok(effects)
     }
 
     /// Поделиться контактом: отправить в чат карточку известного человека.
@@ -2050,9 +2415,24 @@ impl<S: Store> Engine<S> {
 
     /// Просит собеседника продолжить (или начать) передачу файла.
     ///
-    /// Просьба уходит **прямым каналом и только им**: файл — это тысячи кадров,
-    /// и почтой (§5.3) они не поедут. Нет канала — нет и просьбы: собеседник
-    /// появится, сессия установится, и мы спросим снова.
+    /// Просьба уходит тем же каналом, каким поедут чанки, — его выбирает
+    /// [`Engine::file_channel`], и почта оттуда больше не исключена. Нет
+    /// канала — нет и просьбы: собеседник появится, сессия установится,
+    /// и мы спросим снова.
+    ///
+    /// # Тесный свой ящик останавливает приём почтой
+    ///
+    /// Просит — получатель, и открытое окно ляжет в **его** ящик. Места
+    /// меньше, чем на окно (`MailLimits::crowded`), — значит часть писем
+    /// сервер не примет, а отправитель получит отказ, которого не поймёт
+    /// ни он, ни мы. Честнее не просить и сказать человеку, что файл ждёт
+    /// (§14).
+    ///
+    /// Проверка стоит **здесь**, а не в [`Engine::file_channel`], и это
+    /// не мелочь. Свой полный ящик мешает принимать и не мешает отправлять:
+    /// исходящие письма в нашем ящике не лежат. Поставь её в общий выбор
+    /// канала — и человек с забитым ящиком перестал бы отправлять файлы
+    /// по причине, которая к отправке отношения не имеет.
     fn ask_for_file(
         &mut self,
         now_ms: u64,
@@ -2069,7 +2449,25 @@ impl<S: Store> Engine<S> {
             // и у передачи, которая закончилась ровно перед перезапуском.
             return self.finish_file(file);
         };
-        let Some(via) = self.direct_channel(&peer_ik) else { return Ok(Vec::new()) };
+        let Some(via) = self.file_channel(&peer_ik, file.size_bytes) else {
+            // Просить некого: канала нет вовсе, либо остался один почтовый,
+            // а файл для почты слишком велик (§10.3). Молчать здесь и значило
+            // «вечную загрузку»: срок молчания не заводится (ниже), спросить
+            // снова нечем, и файл остаётся на нуле процентов без единого
+            // слова.
+            //
+            // Возобновит передачу появление канала — `resume_files`.
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
+        };
+        if via == Transport::Mail && self.mail_limits.crowded() {
+            // Свой ящик кончается. Просить чанки некуда — они в него
+            // и лягут. Срок молчания при этом не заводится: спрашивать
+            // заново каждые полчаса в полный ящик бессмысленно, а
+            // возобновит передачу либо освободившееся место (квота
+            // приезжает после каждой разборки ящика), либо появление
+            // прямого канала.
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
+        }
 
         let mut effects = self.send_file_frame(
             now_ms,
@@ -2087,13 +2485,22 @@ impl<S: Store> Engine<S> {
     /// Без него оборванная передача не возобновится никогда: отправитель ждёт
     /// подтверждения, получатель ждёт чанков, и оба правы. Срок сторожит
     /// получатель — у него есть всё, чтобы спросить заново.
+    ///
+    /// Срок растёт с каждой безответной попыткой подряд
+    /// (`files::stall_backoff_ms`), и нужно это почте. Без отступления
+    /// брошенная почтовая передача спрашивала бы письмом каждые полчаса
+    /// вечно: сорок восемь писем в сутки, каждое со своим следом
+    /// у chatmail-сервера и своим куском чужой квоты. Счётчик обнуляет
+    /// приход любого чанка — движение файла, а не удачно ушедшая просьба.
     fn watch_for_stall(&mut self, file_id: FileId, via: Transport) -> Vec<Effect> {
         let token = self.allocate_timer();
         // Прежняя метка забывается, а не снимается: отменить уже поставленный
         // таймер драйверу нечем, но сработавшая метка, которой здесь больше
         // нет, ничего не делает. Живой срок у файла всегда один.
         self.file_timers.insert(file_id, token);
-        vec![Effect::SetTimer { after_ms: ratatosk_proto::files::stall_ms(via), token }]
+        let attempt = self.file_attempts.get(&file_id).copied().unwrap_or(0);
+        let after_ms = ratatosk_proto::files::stall_backoff_ms(via, attempt);
+        vec![Effect::SetTimer { after_ms, token }]
     }
 
     /// Отправляет служебный кадр файла — просьбу или чанк.
@@ -2117,7 +2524,7 @@ impl<S: Store> Engine<S> {
         let envelope =
             Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
         let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame }])
+        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
     }
 
     /// Пришло предложение файлов.
@@ -2243,17 +2650,25 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         };
         let sending = self.sending[index];
-        let Some(via) = self.direct_channel(&sending.peer_ik) else {
-            // Прямого канала нет — чанкам ехать не на чем. Получатель спросит
+        let Some(via) = self.file_channel(&sending.peer_ik, file.size_bytes) else {
+            // Канала нет — чанкам ехать не на чем. Получатель спросит
             // снова, когда канал появится; своего расписания у отправителя нет.
-            return Ok(Vec::new());
+            //
+            // Но сказать об этом надо: иначе у отправителя файл висит
+            // «отправляется» ровно столько, сколько собеседник вне сети,
+            // и объяснения этому нет ни на экране, ни в журнале.
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
         };
         let Some(source) = file.source_path.clone() else { return Ok(Vec::new()) };
         let Some(session_id) = self.sessions.for_peer(&sending.peer_ik, via) else {
             return Ok(Vec::new());
         };
 
-        let limit = sending.chunk_total.min(sending.acked_upto.saturating_add(files::CHUNK_WINDOW));
+        // Окно берётся у транспорта, которым сейчас едем: у почты оно шире
+        // (круг минутный, узким окном сто мегабайт не увезти) и означает
+        // вдобавок «столько чужого ящика мы заняли».
+        let limit =
+            sending.chunk_total.min(sending.acked_upto.saturating_add(files::chunk_window(via)));
         let mut effects = Vec::new();
         let mut next = sending.sent_upto;
         while next < limit {
@@ -2283,7 +2698,7 @@ impl<S: Store> Engine<S> {
                 files::chunk_payload(file.file_id, next, &sealed),
             );
             let frame = self.seal_for(session_id, &envelope.encode()?)?;
-            effects.push(Effect::Send { peer_ik: sending.peer_ik, via, frame });
+            effects.push(Effect::Send { peer_ik: sending.peer_ik, via, frame, handoff: None });
             next += 1;
         }
         if let Some(slot) = self.sending.iter_mut().find(|s| s.file_id == file.file_id) {
@@ -2341,6 +2756,10 @@ impl<S: Store> Engine<S> {
         // чанк — нет.
         self.blobs.put_chunk(&file_id, index, &sealed)?;
         self.store.note_chunk(&file_id, index)?;
+        // Файл сдвинулся — отступление сроков начинается заново. Обнуляет
+        // счётчик именно приход чанка: удача здесь это движение файла,
+        // а не то, что наша просьба ушла.
+        self.file_attempts.remove(&file_id);
 
         let received = self.store.received_chunks(&file_id)?;
         let mut effects = vec![Effect::Notify(Event::FileProgress {
@@ -2358,7 +2777,7 @@ impl<S: Store> Engine<S> {
         // Подтверждение — «принял, шлите дальше», а не «начните заново»:
         // у отправителя в полёте ещё несколько чанков, и пересылать их
         // не нужно. Различие едет флагом, а не угадывается на той стороне.
-        if received % files::ACK_EVERY == 0 {
+        if received % files::ack_every(via) == 0 {
             effects.extend(self.ask_for_file(now_ms, &file, false)?);
         } else {
             effects.extend(self.watch_for_stall(file_id, via));
@@ -2370,6 +2789,7 @@ impl<S: Store> Engine<S> {
     fn finish_file(&mut self, file: &StoredFile) -> Result<Vec<Effect>, EngineError> {
         self.store.complete_file(&file.file_id)?;
         self.file_timers.remove(&file.file_id);
+        self.file_attempts.remove(&file.file_id);
         Ok(vec![Effect::Notify(Event::FileProgress {
             file_id: file.file_id,
             received: file.chunk_total,
@@ -2383,14 +2803,40 @@ impl<S: Store> Engine<S> {
         if file.complete || !file.incoming || !file.accepted {
             return Ok(Vec::new());
         }
+        // Срок вышел впустую — следующий будет длиннее (`watch_for_stall`).
+        // Счётчик растёт здесь, до просьбы: просьба его и прочитает.
+        let attempt = self.file_attempts.entry(file_id).or_insert(0);
+        *attempt = attempt.saturating_add(1);
         // Срок вышел — значит за всё это время не пришло ничего. Вот теперь
         // отправителю и правда надо начать с названного номера.
         self.ask_for_file(now_ms, &file, true)
     }
 
+    /// Возобновляет незаконченные приёмы **у всех** собеседников.
+    ///
+    /// Зовётся, когда заработала ступень (`on_transport_ready`), и нужно это
+    /// почте. У прямых каналов возобновление держится на рукопожатии: сессия
+    /// после перезапуска новая, рукопожатие проходит, `resume_files` спрашивает
+    /// про недокачанное. У почты рукопожатия при старте нет — сессия поднимается
+    /// с диска целой, — и без этого вызова приём файла почтой после перезапуска
+    /// не возобновлялся бы **никогда**: срок молчания живёт в памяти и
+    /// перезапуска не переживает, спросить некому, файл стоит навсегда.
+    ///
+    /// Найдено рассуждением, а не на стенде, и это тот случай, когда так
+    /// и надо: поломка проявляется только если перезапустить приложение
+    /// посреди почтовой передачи, то есть через час после её начала.
+    fn resume_all_files(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
+        let peers: Vec<[u8; 32]> = self.contacts.keys().copied().collect();
+        let mut effects = Vec::new();
+        for peer_ik in peers {
+            effects.extend(self.resume_files(now_ms, peer_ik)?);
+        }
+        Ok(effects)
+    }
+
     /// Возобновляет незаконченные приёмы у этого собеседника.
     ///
-    /// Зовётся, когда появляется прямой канал: после рукопожатия и когда
+    /// Зовётся, когда появляется канал: после рукопожатия и когда
     /// собеседник объявился в эфире. Это и есть возобновление после
     /// перезапуска — своего состояния передачи у получателя нет, всё нужное
     /// лежит в базе.
@@ -2933,11 +3379,62 @@ impl<S: Store> Engine<S> {
     // Дополнение к спецификации: v0.1 аватарок не описывает. Правила и пределы
     // собраны в `ratatosk_proto::avatar`, здесь — только их применение.
 
+    /// Канал, которым можно везти чанки этого файла (§10.2, §10.3).
+    ///
+    /// От [`Engine::direct_channel`] отличается одним: почта отсюда
+    /// не исключена. Это **расхождение со спецификацией**, сделанное
+    /// сознательно, и вот его причина.
+    ///
+    /// §10.2 требует для чанков прямого канала, а §10.3 разрешает почте
+    /// только файлы до 20 МБ — то есть «файл одним письмом». Правило верное
+    /// для случая, когда прямой канал бывает. Но у части людей почта —
+    /// **единственный** транспорт: LAN не годится, а Tor в их сети
+    /// не поднимается. Для них буква спецификации означает «файлов нет»,
+    /// и это хуже, чем расхождение.
+    ///
+    /// Поэтому чанки едут и почтой — тем же оконным протоколом, просто
+    /// каждый чанк отдельным письмом. Почему это работает, хотя раньше было
+    /// записано, что не может: окно и подтверждения не требуют миллисекунд,
+    /// они требуют, чтобы **срок молчания был длиннее круга**
+    /// (`files::stall_ms`). Круг у почты — минуты, и срок ей отведён
+    /// получасовой. Прежнее «почтой чанки не ходят» было не выводом,
+    /// а нежеланием считать.
+    ///
+    /// Единственное, что здесь по-прежнему отсекается, — файлы, для которых
+    /// почтовый круг означает сутки ([`may_send_over`]). Такие честно ждут
+    /// прямого канала.
+    ///
+    /// [`may_send_over`]: ratatosk_proto::files::may_send_over
+    fn file_channel(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<Transport> {
+        let availability = self.availability_of(peer_ik).ok()?;
+        let mut attempt = Attempt::new();
+        while let Some(Decision::Use(transport)) = attempt.next(availability) {
+            if !ratatosk_proto::files::may_send_over(size_bytes, transport) {
+                continue;
+            }
+            // Второе, что отсекает почту, — предел письма у **своего**
+            // сервера. Чанк едет письмом на полтора мебибайта; сервер,
+            // объявивший `SIZE` меньше, отверг бы каждый, и передача
+            // начиналась бы заново вечно. Пока предел неизвестен, почта
+            // проходит: молчащий сервер не должен быть хуже скупого.
+            if transport == Transport::Mail && !self.mail_limits.carries_file_chunks() {
+                continue;
+            }
+            if self.sessions.for_peer(peer_ik, transport).is_some() {
+                return Some(transport);
+            }
+        }
+        None
+    }
+
     /// Прямой канал к контакту, если сессия по нему есть (§5.4).
     ///
     /// Аватарка, как и квитанция (§9.4), почтой не ходит: тридцать килобайт
     /// в письме — это удвоение трафика и метаданных у сервера ради картинки
     /// в профиле. И рукопожатия ради неё тоже не начинаем.
+    ///
+    /// Файлы этим больше не пользуются — у них свой выбор,
+    /// [`Engine::file_channel`], и он шире на почту.
     fn direct_channel(&self, peer_ik: &[u8; 32]) -> Option<Transport> {
         // Спрашивается §5.4, а не перебирается список руками, и это
         // исправление ошибки, которая выглядела так: сообщения через onion
@@ -3051,7 +3548,7 @@ impl<S: Store> Engine<S> {
             Value::Bytes(bytes.to_vec()),
         );
         let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame }])
+        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
     }
 
     /// Пришла аватарка контакта.
@@ -3185,7 +3682,7 @@ impl<S: Store> Engine<S> {
             receipt.payload(msg_ids),
         );
         let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame }])
+        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
     }
 
     /// Выставляет статус доставки и сообщает о нём UI (§9.4).
@@ -3410,24 +3907,82 @@ impl<S: Store> Engine<S> {
         };
 
         let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let mut effects = vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame }];
+        let (handoff, timer) = self.arm_send(delivery, transport);
+        Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
+    }
 
-        if transport.is_direct() {
-            // Срок ожидания квитанции (§9.4), а не страховка от молчания
-            // транспорта. Успешная запись в сокет ничего не доказывает:
-            // полуоткрытое соединение принимает байты молча. Не пришла
-            // квитанция за отведённое время — попытка не удалась, и §5.4
-            // ведёт дальше.
-            let timer = self.allocate_timer();
-            let after_ms = delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
-            delivery.state = DeliveryState::InFlight { via: transport, timer };
-            effects.push(Effect::SetTimer { after_ms, token: timer });
+    /// Ставит отправке срок и решает, ждать ли подтверждения передачи.
+    ///
+    /// Одна функция на оба вида ожидания, потому что состояние у них общее
+    /// (`InFlight` с меткой таймера) и разъезжаться ему нельзя. Различие —
+    /// в том, чего именно ждём, и оно ровно одно:
+    ///
+    /// * прямой канал ждёт **квитанции собеседника** (§9.4). Успешная запись
+    ///   в сокет не доказывает ничего: полуоткрытое соединение принимает
+    ///   байты молча. Не пришла квитанция за срок — попытка не удалась,
+    ///   и §5.4 ведёт дальше;
+    /// * почта ждёт **ответа сервера на письмо**. Квитанций у неё нет
+    ///   по построению, зато есть настоящее событие: сервер принял письмо
+    ///   в свою очередь. До него кадр не отправлен, и говорить «отправлено»
+    ///   нельзя.
+    ///
+    /// Раньше почта не ждала ничего: статус объявлялся в тот же миг, когда
+    /// кадр клали в очередь транспорта, — то есть до всякой сети. Письмо
+    /// после этого могло не уйти вовсе, а человек уже видел «отправлено».
+    fn arm_send(&mut self, delivery: &mut Delivery, transport: Transport) -> (Option<u64>, Effect) {
+        let timer = self.allocate_timer();
+        let (after_ms, handoff) = if transport.is_direct() {
+            (delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS), None)
         } else {
+            (MAIL_HANDOFF_TIMEOUT_MS, Some(timer))
+        };
+        delivery.state = DeliveryState::InFlight { via: transport, timer };
+        (handoff, Effect::SetTimer { after_ms, token: timer })
+    }
+
+    /// Транспорт подтвердил: кадр ушёл (§5.3).
+    ///
+    /// Отсюда — и только отсюда — берётся «отправлено» у почты. Метка
+    /// сверяется точно, а не по порядку: по одной ступени к одному
+    /// собеседнику едут и рукопожатие, и сообщения, и подтверждение письма
+    /// с рукопожатием засчиталось бы сообщению, которого сервер ещё не видел.
+    ///
+    /// Неизвестная метка — не ошибка. Подтверждение могло опоздать: срок
+    /// вышел, попытка объявлена неудавшейся, а письмо всё-таки уехало.
+    /// Ронять из-за этого нечего — сообщение к тому моменту уже получило
+    /// свой честный исход, а второе письмо съест дедупликация (§9.2).
+    fn on_handed(
+        &mut self,
+        peer_ik: [u8; 32],
+        via: Transport,
+        handoff: u64,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Рукопожатие: подтверждать человеку нечего, но срок снять обязаны.
+        // Иначе он сработает на кадре, который сервер уже принял, и §5.4
+        // объявит ступень неудавшейся — при том что она сработала.
+        if let Some(handshake) =
+            self.pending.iter_mut().find(|p| p.peer_ik == peer_ik && p.timer == Some(handoff))
+        {
+            handshake.timer = None;
+            return Ok(Vec::new());
+        }
+
+        let mut queue = std::mem::take(&mut self.outbox);
+        let mut effects = Vec::new();
+        for delivery in &mut queue {
+            if delivery.peer_ik != peer_ik
+                || !matches!(delivery.state, DeliveryState::InFlight { via: v, timer }
+                    if v == via && timer == handoff)
+            {
+                continue;
+            }
             // §9.4: по почте статус дальше «отправлено» не растёт, ждать
-            // нечего, и запись из очереди уходит.
+            // больше нечего, и запись уходит из очереди.
             delivery.attempt.succeed();
             effects.extend(self.note_status(delivery.msg_id, DeliveryStatus::Sent)?);
         }
+        queue.retain(|d| !d.attempt.is_finished());
+        self.outbox = queue;
         Ok(effects)
     }
 
@@ -3476,16 +4031,44 @@ impl<S: Store> Engine<S> {
         let availability = self.availability_of(&peer_ik)?;
         walk_attempt_to(&mut attempt, availability, transport);
 
-        let mut effects = vec![Effect::Send { peer_ik, via: transport, frame }];
-        let mut timer = None;
-        if transport.is_direct() {
-            let token = self.allocate_timer();
-            let after_ms = attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
-            effects.push(Effect::SetTimer { after_ms, token });
-            timer = Some(token);
-        }
-        self.pending.push(OutgoingHandshake { state, attempt, peer_ik, timer });
+        let (handoff, token, set_timer) = self.arm_handshake(&attempt, transport);
+        let effects = vec![
+            Effect::Send { peer_ik, via: transport, frame: frame.clone(), handoff },
+            set_timer,
+        ];
+        self.pending.push(OutgoingHandshake {
+            state,
+            attempt,
+            peer_ik,
+            frame,
+            binding: SessionBinding::of(transport),
+            timer: Some(token),
+        });
         Ok(effects)
+    }
+
+    /// То же, что [`Engine::arm_send`], но для рукопожатия.
+    ///
+    /// Возвращает метку подтверждения, метку таймера и сам таймер.
+    ///
+    /// Почтовое рукопожатие раньше не получало срока вовсе: ждать ответа
+    /// собеседника по почте бессмысленно, а другого ожидания не было.
+    /// Итог был хуже, чем кажется: письмо с рукопожатием, которое сервер
+    /// не принял, никого ни о чём не извещало, и сообщения, ждавшие эту
+    /// сессию, оставались в очереди навсегда. Теперь срок есть и здесь —
+    /// но отмеряет он не ответ, а передачу.
+    fn arm_handshake(
+        &mut self,
+        attempt: &Attempt,
+        transport: Transport,
+    ) -> (Option<u64>, u64, Effect) {
+        let token = self.allocate_timer();
+        let (after_ms, handoff) = if transport.is_direct() {
+            (attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS), None)
+        } else {
+            (MAIL_HANDOFF_TIMEOUT_MS, Some(token))
+        };
+        (handoff, token, Effect::SetTimer { after_ms, token })
     }
 
     /// Начинает рукопожатие заново на следующей ступени §5.4.
@@ -3527,10 +4110,36 @@ impl<S: Store> Engine<S> {
     /// смешиваются в одной сессии никогда») оказывается нарушен не выбором
     /// транспорта, а бухгалтерией сессий.
     ///
-    /// Поэтому каждая ступень получает своё рукопожатие: новый кадр — новая
-    /// сессия, и обе стороны привязывают её к одному и тому же семейству,
-    /// потому что видели её на одном и том же пути. Цена — ещё одна операция
-    /// Noise на ступень; она несравнима с молча умершей перепиской (§14).
+    /// Отсюда первая половина правила: **переходя в другое семейство, надо
+    /// начинать рукопожатие заново.** Новый кадр — новая сессия, и обе
+    /// стороны привяжут её к одному и тому же семейству, потому что видели
+    /// её на одном и том же пути. Цена — ещё одна операция Noise; она
+    /// несравнима с молча умершей перепиской (§14).
+    ///
+    /// # А внутри одного семейства — наоборот
+    ///
+    /// Сперва правило звучало короче: «каждая ступень получает своё
+    /// рукопожатие». Оно было верным по духу и слишком широким по букве,
+    /// и вторая поломка со стенда выглядела ровно так же, как первая:
+    /// «кадр для неизвестной сессии — отброшен», `via=Mail`.
+    ///
+    /// Ступеней три, а семейств два: onion и почта живут в одном
+    /// ([`SessionBinding::of`]), и реестр держит **одну сессию на семейство**
+    /// — новая вытесняет прежнюю. Значит, переход onion → почта по прежнему
+    /// правилу заводил в одном семействе два рукопожатия, то есть две
+    /// сессии на один слот. Дальше всё решал порядок: у каждой стороны
+    /// побеждала та, чей ответ пришёл вторым, — а onion отвечает секундами,
+    /// почта минутами, и порядок у сторон разный почти наверняка.
+    ///
+    /// Внутри семейства повтор безопасен ровно потому, почему он был опасен
+    /// между семействами: собеседник, получив точный повтор, оставляет
+    /// сессию привязанной к тому семейству, где увидел её впервые, — и это
+    /// **то же самое** семейство. Обе стороны остаются при одной сессии.
+    ///
+    /// Поэтому кадр первого сообщения хранится, и правило целиком такое:
+    ///
+    /// * другое семейство (LAN ↔ Tor) — новое рукопожатие;
+    /// * то же семейство (onion → почта) — тот же самый кадр.
     fn retry_handshake(
         &mut self,
         peer_ik: [u8; 32],
@@ -3550,26 +4159,30 @@ impl<S: Store> Engine<S> {
             }
             match handshake.attempt.next(availability) {
                 Some(Decision::Use(next)) => {
-                    // Новая ступень — новое рукопожатие; разбор см. выше.
-                    // Прежнее состояние `snow` здесь и умирает: запоздалый
-                    // ответ на него больше никого не найдёт, и это правильно —
-                    // та ступень признана неудавшейся.
-                    let card = self.own_card().encode()?;
-                    let (message, state) = Initiator::start(&self.identity, &peer_ik, &card)?;
-                    let frame = self.handshake_frame(HANDSHAKE_STEP_FIRST, &message)?;
-                    handshake.state = state;
-                    effects.push(Effect::Send { peer_ik, via: next, frame });
+                    let next_binding = SessionBinding::of(next);
+                    let frame = if next_binding == handshake.binding {
+                        // Та же семья — тот же самый кадр. Разбор см. выше.
+                        handshake.frame.clone()
+                    } else {
+                        // Другая семья — новое рукопожатие; разбор см. выше.
+                        // Прежнее состояние `snow` здесь и умирает: запоздалый
+                        // ответ на него больше никого не найдёт, и это
+                        // правильно — та ступень признана неудавшейся.
+                        let card = self.own_card().encode()?;
+                        let (message, state) = Initiator::start(&self.identity, &peer_ik, &card)?;
+                        let frame = self.handshake_frame(HANDSHAKE_STEP_FIRST, &message)?;
+                        handshake.state = state;
+                        handshake.frame = frame.clone();
+                        handshake.binding = next_binding;
+                        frame
+                    };
                     // Новой попытке — новый срок. Без него молчание второго
                     // транспорта не приводит к третьему, и откат §5.4
                     // обрывается на середине.
-                    handshake.timer = None;
-                    if next.is_direct() {
-                        let token = self.allocate_timer();
-                        let after_ms =
-                            handshake.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
-                        effects.push(Effect::SetTimer { after_ms, token });
-                        handshake.timer = Some(token);
-                    }
+                    let (handoff, token, set_timer) = self.arm_handshake(&handshake.attempt, next);
+                    effects.push(Effect::Send { peer_ik, via: next, frame, handoff });
+                    effects.push(set_timer);
+                    handshake.timer = Some(token);
                     step = HandshakeStep::Moved(next);
                 }
                 Some(Decision::Undeliverable) | None => step = HandshakeStep::Exhausted,
@@ -3713,7 +4326,7 @@ impl<S: Store> Engine<S> {
             HandshakeOutcome::Established(accepted) => accepted,
             HandshakeOutcome::Repeat { response, peer_ik } => {
                 let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
-                return Ok(vec![Effect::Send { peer_ik, via, frame }]);
+                return Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }]);
             }
         };
         let Accepted { payload, response, session } = accepted;
@@ -3732,7 +4345,7 @@ impl<S: Store> Engine<S> {
         self.persist_session(session_id)?;
 
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
-        effects.push(Effect::Send { peer_ik, via, frame });
+        effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
         // После ответа, а не до: пока сессия не подтверждена нашим кадром,
         // отправлять по ней нечего. Сверенному контакту уедет лицо, всем
         // остальным — ничего (§4.2).
@@ -3821,18 +4434,8 @@ impl<S: Store> Engine<S> {
         };
 
         let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let mut effects = vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame }];
-
-        if transport.is_direct() {
-            let timer = self.allocate_timer();
-            let after_ms = delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS);
-            delivery.state = DeliveryState::InFlight { via: transport, timer };
-            effects.push(Effect::SetTimer { after_ms, token: timer });
-        } else {
-            delivery.attempt.succeed();
-            effects.extend(self.note_status(delivery.msg_id, DeliveryStatus::Sent)?);
-        }
-        Ok(effects)
+        let (handoff, timer) = self.arm_send(delivery, transport);
+        Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
     }
 
     /// Откладывает попытку до ответа обнаружения — или не откладывает.

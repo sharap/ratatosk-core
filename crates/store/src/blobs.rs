@@ -320,6 +320,7 @@ fn file_id_from_hex(name: &str) -> Option<FileId> {
 pub struct MemoryBlobs {
     chunks: BTreeMap<(FileId, u64), Vec<u8>>,
     files: BTreeMap<PathBuf, Vec<u8>>,
+    sparse: BTreeMap<PathBuf, u64>,
 }
 
 impl MemoryBlobs {
@@ -334,9 +335,25 @@ impl MemoryBlobs {
         self.files.insert(path.into(), bytes);
     }
 
+    /// Кладёт «файл на диске» заданного размера, чьи байты — нули.
+    ///
+    /// Нужен одному случаю: проверить правило, которое смотрит на **размер**
+    /// и содержимого не читает, — например почтовый предел §10.3, за которым
+    /// файл ждёт прямого канала. Держать ради такой проверки в памяти сто
+    /// мегабайт нулей значило бы платить памятью за арифметику.
+    ///
+    /// Читается он при этом честно: `read_at` отдаёт нули в пределах
+    /// размера. Так что «разреженный» файл можно и передать целиком, если
+    /// тесту это понадобится.
+    pub fn seed_sparse(&mut self, path: impl Into<PathBuf>, size_bytes: u64) {
+        self.sparse.insert(path.into(), size_bytes);
+    }
+
     /// Убирает «файл с диска» — так проверяется исчезнувший исходник.
     pub fn forget(&mut self, path: impl AsRef<Path>) {
-        self.files.remove(path.as_ref());
+        let path = path.as_ref();
+        self.files.remove(path);
+        self.sparse.remove(path);
     }
 
     /// Содержимое собранного файла по пути.
@@ -354,6 +371,11 @@ impl MemoryBlobs {
 
 impl ChunkSource for MemoryBlobs {
     fn read_at(&self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+        if let Some(size) = self.sparse.get(path) {
+            let left = size.saturating_sub(offset);
+            let take = usize::try_from(left).unwrap_or(usize::MAX).min(len);
+            return Ok(vec![0u8; take]);
+        }
         let bytes = self
             .files
             .get(path)
@@ -373,6 +395,7 @@ impl Blobs for MemoryBlobs {
         self.files
             .get(path)
             .map(|bytes| bytes.len() as u64)
+            .or_else(|| self.sparse.get(path).copied())
             .ok_or_else(|| StoreError::Backend(format!("нет файла {}", path.display())))
     }
 

@@ -59,6 +59,34 @@ fn node_with_blobs(seed: u8, name: &str) -> (Node, Blobs) {
     (engine, blobs)
 }
 
+/// Узел без единого адреса в карточке.
+///
+/// Так выглядит устройство, которое ещё не подняло Tor и не завело ящик:
+/// карточка у него есть, а достучаться по ней нельзя. Случай не выдуманный —
+/// именно в нём двое обмениваются ссылками «на будущее», и он же вскрывает
+/// разницу между «рассказали» и «попытались рассказать».
+fn bare_node(seed: u8, name: &str) -> Node {
+    let identity = Identity::from_seed([seed; 32]);
+    let mut store = MemoryStore::new();
+    store.migrate().expect("миграция in-memory хранилища");
+    let blobs: Blobs = Arc::new(Mutex::new(MemoryBlobs::new()));
+    let mut engine = Engine::new(
+        identity,
+        store,
+        Box::new(blobs),
+        Box::new(SeededEntropy::new(u64::from(seed))),
+        SelfAddresses {
+            onion: String::new(),
+            chatmail: String::new(),
+            display_name: name.to_owned(),
+        },
+    );
+    engine
+        .step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Onion })
+        .expect("объявление готовности транспорта");
+    engine
+}
+
 /// Провод между двумя ядрами.
 ///
 /// Возвращает все события для UI, накопившиеся с обеих сторон, — по ним
@@ -3653,6 +3681,71 @@ fn announcing_one_address_does_not_wipe_the_other() {
     assert!(
         bob.contacts()[&alice_ik].availability.has_chatmail,
         "иначе следующее обновление ехать будет уже не по чему"
+    );
+}
+
+#[test]
+fn a_card_push_that_never_left_does_not_count_as_told() {
+    // Отметка «этому уже рассказали» ставилась по факту **постановки
+    // в очередь**, а не по факту того, что кадр куда-то уехал. Пометив
+    // собеседника, до которого рассылка не доехала, ядро разоружало
+    // страховку `push_own_card` до конца запуска: набор живёт в памяти,
+    // и чинил это только перезапуск приложения.
+    //
+    // Случай, в котором это видно, — двое, обменявшиеся ссылками раньше,
+    // чем у них появились адреса. У Боба в карточке пусто, ехать к нему
+    // некуда, рассылка ложится в никуда. Потом Боб заводит ящик и говорит
+    // об этом — и вот тут Алиса обязана рассказать о себе, а не молчать,
+    // считая, что уже рассказала.
+    let mut alice = node(1, "alice");
+    let mut bob = bare_node(2, "bob");
+    let (alice_ik, bob_ik) = (alice.own_card().ik, bob.own_card().ik);
+    mail_ready(&mut alice);
+    introduce(&mut alice, &mut bob);
+    assert!(
+        !alice.contacts()[&bob_ik].availability.has_chatmail,
+        "у Боба в карточке пусто — ехать к нему пока некуда"
+    );
+
+    // Алиса меняет свой onion-адрес. Ехать некуда: LAN выключен, адресов
+    // у Боба нет — рассылка честно объявляется недоставимой и забывается.
+    let fresh = some_onion(9);
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: Some(fresh.clone()),
+                chatmail: None,
+            }),
+        )
+        .expect("объявление принято");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "ехать было некуда — кадр уйти не мог: {effects:?}"
+    );
+
+    // Боб заводит ящик и говорит об этом. Вот теперь до него есть путь.
+    let effects = bob
+        .step(
+            2_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: None,
+                chatmail: Some("bob@nine.example".to_owned()),
+            }),
+        )
+        .expect("объявление принято");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    assert!(
+        alice.contacts()[&bob_ik].availability.has_chatmail,
+        "адрес Боба обязан доехать до Алисы"
+    );
+
+    // И в ответ Алиса рассказывает о себе — потому что на самом деле
+    // не рассказывала.
+    assert_eq!(
+        bob.contacts()[&alice_ik].card.onion,
+        fresh,
+        "рассылка, не уехавшая никуда, не должна была считаться состоявшейся"
     );
 }
 

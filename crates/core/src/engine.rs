@@ -1906,12 +1906,13 @@ impl<S: Store> Engine<S> {
             return Ok(effects);
         }
 
-        effects.extend(self.enqueue_request(
+        let (_, produced) = self.enqueue_request(
             now_ms,
             peer_ik,
             PayloadType::Retract,
             ratatosk_proto::retract::payload(&ours),
-        )?);
+        )?;
+        effects.extend(produced);
         Ok(effects)
     }
 
@@ -2265,13 +2266,23 @@ impl<S: Store> Engine<S> {
         self.card_pushed.clear();
         let mut effects = Vec::new();
         for peer_ik in recipients {
-            self.card_pushed.insert(peer_ik);
-            effects.extend(self.enqueue_request(
-                now_ms,
-                peer_ik,
-                PayloadType::CardUpdate,
-                payload.clone(),
-            )?);
+            let (msg_id, produced) =
+                self.enqueue_request(now_ms, peer_ik, PayloadType::CardUpdate, payload.clone())?;
+            effects.extend(produced);
+            // Отметка — **после** постановки и только если доставка выжила.
+            //
+            // Раньше она ставилась до неё, то есть по факту намерения.
+            // Отметка означает «этому уже рассказали», и на ней стоит
+            // страховка `push_own_card`: она досылает карточку, когда
+            // появляется сессия. Пометив контакт, до которого рассылка
+            // не доехала (адресов в его карточке нет, LAN выключен —
+            // `remember_undelivered` честно отвечает «ждать нечего»),
+            // мы разоружали страховку до конца запуска: набор живёт
+            // в памяти. Собеседник дозванивался к нам сам, рукопожатие
+            // проходило, а наши адреса он так и не узнавал.
+            if self.delivery_alive(&msg_id) {
+                self.card_pushed.insert(peer_ik);
+            }
         }
         Ok(effects)
     }
@@ -2310,8 +2321,11 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         // Второй раз одному и тому же в одном запуске — впустую: `Stale`
-        // на той стороне (§4.3) и лишний кадр на этой.
-        if !self.card_pushed.insert(peer_ik) {
+        // на той стороне (§4.3) и лишний кадр на этой. Но отметка ставится
+        // ниже и по тому же правилу, что в рассылке: только если доставка
+        // выжила. Иначе первая же неудачная досылка запирала бы все
+        // следующие.
+        if self.card_pushed.contains(&peer_ik) {
             return Ok(Vec::new());
         }
 
@@ -2320,7 +2334,12 @@ impl<S: Store> Engine<S> {
         let bytes = card.encode()?;
         let signature = self.identity.sign(&bytes);
         let payload = ratatosk_proto::card_update::payload(&bytes, &signature);
-        self.enqueue_request(now_ms, peer_ik, PayloadType::CardUpdate, payload)
+        let (msg_id, effects) =
+            self.enqueue_request(now_ms, peer_ik, PayloadType::CardUpdate, payload)?;
+        if self.delivery_alive(&msg_id) {
+            self.card_pushed.insert(peer_ik);
+        }
+        Ok(effects)
     }
 
     /// Собеседник сменил адреса (§4.3).
@@ -2340,6 +2359,7 @@ impl<S: Store> Engine<S> {
     /// отношении, и обновление с той стороны её не касается.
     fn on_card_update(
         &mut self,
+        now_ms: u64,
         peer_ik: [u8; 32],
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -2367,6 +2387,15 @@ impl<S: Store> Engine<S> {
         // некуда было ехать, ждали именно этого (§5.4).
         let mut effects = vec![Effect::Notify(Event::ContactChanged { peer_ik })];
         effects.extend(self.retry_deferred(Some(peer_ik))?);
+        // И наша карточка — туда же, если ещё не рассказывали. Собеседник
+        // только что сообщил, где он; это самый ранний момент, когда наше
+        // обновление до него вообще может доехать.
+        //
+        // Случай не выдуманный: двое, добавившие друг друга ссылкой раньше,
+        // чем у них появились адреса, иначе не находят друг друга вовсе.
+        // Рассылка в обе стороны легла в никуда (адресов не было), а `Stale`
+        // на той стороне отсеет лишнее, если рассказать нам было нечего.
+        effects.extend(self.push_own_card(now_ms, peer_ik)?);
         Ok(effects)
     }
 
@@ -3141,12 +3170,13 @@ impl<S: Store> Engine<S> {
         if self.store.edit_message(&msg_id, trimmed.as_bytes(), now_ms)? {
             effects.push(Effect::Notify(Event::MessageEdited { chat, msg_id }));
         }
-        effects.extend(self.enqueue_request(
+        let (_, produced) = self.enqueue_request(
             now_ms,
             peer_ik,
             PayloadType::Edit,
             ratatosk_proto::edit::payload(msg_id, trimmed),
-        )?);
+        )?;
+        effects.extend(produced);
         Ok(effects)
     }
 
@@ -3228,12 +3258,13 @@ impl<S: Store> Engine<S> {
 
         let mut effects =
             vec![Effect::Notify(Event::ReactionChanged { chat, msg_id, author_ik: own_ik })];
-        effects.extend(self.enqueue_request(
+        let (_, produced) = self.enqueue_request(
             now_ms,
             peer_ik,
             PayloadType::Reaction,
             ratatosk_proto::reaction::payload(msg_id, emoji),
-        )?);
+        )?;
+        effects.extend(produced);
         Ok(effects)
     }
 
@@ -3889,18 +3920,36 @@ impl<S: Store> Engine<S> {
         peer_ik: [u8; 32],
         payload_type: PayloadType,
         payload: Value,
-    ) -> Result<Vec<Effect>, EngineError> {
+    ) -> Result<(MsgId, Vec<Effect>), EngineError> {
         let envelope =
             Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
-        self.enqueue(Delivery {
-            msg_id: envelope.msg_id,
+        let msg_id = envelope.msg_id;
+        let effects = self.enqueue(Delivery {
+            msg_id,
             peer_ik,
             envelope: envelope.encode()?,
             attempt: Attempt::new(),
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
-        })
+        })?;
+        Ok((msg_id, effects))
+    }
+
+    /// Осталась ли доставка на попечении ядра.
+    ///
+    /// Три исхода у постановки в очередь, и различить надо два от одного:
+    /// доставка либо ждёт своего часа (в очереди или в отложенных), либо
+    /// уже объявлена недоставимой и забыта. Первые два — «мы ещё должны»,
+    /// третий — «должны не будем».
+    ///
+    /// Нужно это одному вопросу: рассказали ли мы собеседнику свою карточку.
+    /// Отметку об этом раньше ставили по факту **постановки в очередь**,
+    /// то есть до того, как выяснится, уехало ли хоть что-то, — и страховка
+    /// [`Engine::push_own_card`] после неудачной рассылки отказывалась
+    /// работать до конца запуска.
+    fn delivery_alive(&self, msg_id: &MsgId) -> bool {
+        self.outbox.iter().chain(self.deferred.iter()).any(|d| d.msg_id == *msg_id)
     }
 
     /// Ставит сообщение в очередь доставки и делает первую попытку.
@@ -5078,7 +5127,7 @@ impl<S: Store> Engine<S> {
             PayloadType::GroupMembership | PayloadType::SenderKey => {
                 todo!("этап 5: группы (§11)")
             }
-            PayloadType::CardUpdate => self.on_card_update(peer_ik, &envelope),
+            PayloadType::CardUpdate => self.on_card_update(now_ms, peer_ik, &envelope),
         }
     }
 }

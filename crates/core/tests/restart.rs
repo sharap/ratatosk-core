@@ -907,8 +907,8 @@ fn the_announced_card_survives_a_restart() {
             .step(
                 1_000,
                 Input::Command(Command::AnnounceAddresses {
-                    onion: address.clone(),
-                    chatmail: String::new(),
+                    onion: Some(address.clone()),
+                    chatmail: Some(String::new()),
                 }),
             )
             .expect("объявление адресов");
@@ -935,8 +935,8 @@ fn the_announced_card_survives_a_restart() {
         .step(
             2_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .expect("повторное объявление");
@@ -948,8 +948,8 @@ fn the_announced_card_survives_a_restart() {
         .step(
             3_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: ratatosk_crypto::OnionKey::from_seed([10u8; 32]).address(),
-                chatmail: String::new(),
+                onion: Some(ratatosk_crypto::OnionKey::from_seed([10u8; 32]).address()),
+                chatmail: Some(String::new()),
             }),
         )
         .expect("смена адреса");

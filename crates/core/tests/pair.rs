@@ -2383,8 +2383,8 @@ fn switching_tor_off_takes_the_address_out_of_the_card() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3582,8 +3582,8 @@ fn an_address_update_reaches_the_contact() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3593,6 +3593,97 @@ fn an_address_update_reaches_the_contact() {
     assert_eq!(after.onion, address, "адрес обязан доехать");
     assert!(after.version > before.version, "версия карточки обязана вырасти");
     assert!(bob.contacts()[&alice_ik].availability.has_onion, "§5.4 обязан узнать про путь");
+}
+
+/// Объявляет почту рабочей, не трогая остальные ступени.
+///
+/// Отличается от [`mail_only`] ровно тем, ради чего заведён: onion остаётся
+/// включённым. Нужно там, где проверяется **появление** onion-адреса
+/// у стороны, до которой добираются почтой.
+fn mail_ready(node: &mut Node) {
+    node.step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Mail })
+        .expect("почта вошла на сервер");
+}
+
+#[test]
+fn announcing_one_address_does_not_wipe_the_other() {
+    // Настоящая поломка со стенда, и в отчёте она звучала так: «если почта —
+    // единственный транспорт, обновления карточки не доходят до получателя».
+    //
+    // Доходили они прекрасно. Терялся **адрес**. Команда объявления требовала
+    // обе половины карточки сразу, а зовут её всегда с одной: подъём Tor знает
+    // onion, заведение ящика — почтовый адрес. Стенд подставлял во вторую
+    // пустую строку — и та означала не «не знаю», а «адреса больше нет».
+    //
+    // Дальше самозапирание: собеседник получает карточку без почтового
+    // адреса, а другого пути к нам нет. Он не может ни ответить, ни получить
+    // следующее обновление — сказать ему новый адрес больше не по чему.
+    // Снаружи это и выглядит как «обновления не доходят».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let alice_ik = alice.own_card().ik;
+    // У Боба только почта, значит и добираться до него можно только ею.
+    mail_only(&mut bob);
+    mail_ready(&mut alice);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+
+    let mailbox = alice.own_card().chatmail;
+    assert!(!mailbox.is_empty(), "у заготовки узла почтовый адрес есть");
+
+    // Объявляется **только** onion — ровно так, как это делает подъём Tor.
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::AnnounceAddresses {
+                onion: Some(some_onion(9)),
+                chatmail: None,
+            }),
+        )
+        .expect("объявление принято");
+    assert_eq!(alice.own_card().chatmail, mailbox, "своя почта не тронута");
+
+    let events = pump(&mut alice, &mut bob, 1_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::ContactChanged { .. })),
+        "обновление обязано доехать почтой: {events:?}"
+    );
+
+    let card = &bob.contacts()[&alice_ik].card;
+    assert_eq!(card.onion, some_onion(9), "новый адрес доехал");
+    assert_eq!(card.chatmail, mailbox, "а старый — на месте");
+    assert!(
+        bob.contacts()[&alice_ik].availability.has_chatmail,
+        "иначе следующее обновление ехать будет уже не по чему"
+    );
+}
+
+#[test]
+fn withdrawing_one_address_leaves_the_other_alone() {
+    // Обратная сторона: «снять адрес» обязано снимать **свой** адрес и
+    // не трогать соседний. §14 требует убирать onion при выключении Tor —
+    // обещать путь, за которым никого нет, нельзя; но заодно потерять почту
+    // означало бы выключателем Tor выключить и почтовую доставку.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let alice_ik = alice.own_card().ik;
+    mail_only(&mut bob);
+    mail_ready(&mut alice);
+    introduce_and_settle(&mut alice, &mut bob, 0);
+    let mailbox = alice.own_card().chatmail;
+    assert!(!alice.own_card().onion.is_empty(), "у заготовки узла onion-адрес есть");
+
+    let effects = alice
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Onion,
+                enabled: false,
+            }),
+        )
+        .expect("Tor выключается");
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    let card = &bob.contacts()[&alice_ik].card;
+    assert!(card.onion.is_empty(), "§14: за выключенным Tor никого нет");
+    assert_eq!(card.chatmail, mailbox, "а почта выключением Tor не выключается");
 }
 
 #[test]
@@ -3618,8 +3709,8 @@ fn an_address_update_does_not_undo_the_fingerprint_check() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: some_onion(9),
-                chatmail: "a7f3k9@nine.example".into(),
+                onion: Some(some_onion(9)),
+                chatmail: Some("a7f3k9@nine.example".into()),
             }),
         )
         .unwrap();
@@ -3646,8 +3737,8 @@ fn announcing_the_same_addresses_costs_nothing() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3658,7 +3749,10 @@ fn announcing_the_same_addresses_costs_nothing() {
     let again = alice
         .step(
             2_000,
-            Input::Command(Command::AnnounceAddresses { onion: address, chatmail: String::new() }),
+            Input::Command(Command::AnnounceAddresses {
+                onion: Some(address),
+                chatmail: Some(String::new()),
+            }),
         )
         .unwrap();
     assert!(again.is_empty(), "повтор с теми же адресами не рассылается");
@@ -3680,8 +3774,8 @@ fn an_update_about_a_third_person_changes_nothing() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: some_onion(9),
-                chatmail: String::new(),
+                onion: Some(some_onion(9)),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3719,8 +3813,8 @@ fn a_contact_added_after_the_announcement_still_learns_the_address() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3759,8 +3853,8 @@ fn establishing_a_session_delivers_the_address_to_whoever_missed_it() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: address.clone(),
-                chatmail: String::new(),
+                onion: Some(address.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3791,8 +3885,8 @@ fn the_same_card_is_not_pushed_to_the_same_contact_twice() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: some_onion(9),
-                chatmail: String::new(),
+                onion: Some(some_onion(9)),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3835,8 +3929,8 @@ fn a_new_announcement_is_pushed_again() {
         .step(
             1_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: some_onion(9),
-                chatmail: String::new(),
+                onion: Some(some_onion(9)),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();
@@ -3857,8 +3951,8 @@ fn a_new_announcement_is_pushed_again() {
         .step(
             5_000,
             Input::Command(Command::AnnounceAddresses {
-                onion: second.clone(),
-                chatmail: String::new(),
+                onion: Some(second.clone()),
+                chatmail: Some(String::new()),
             }),
         )
         .unwrap();

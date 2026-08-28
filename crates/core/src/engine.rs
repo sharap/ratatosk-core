@@ -1446,8 +1446,8 @@ impl<S: Store> Engine<S> {
             }
             effects.extend(self.release_from(Transport::Mail)?);
         }
-        let onion = self.addresses.onion.clone();
-        effects.extend(self.on_announce_addresses(now_ms, onion, address)?);
+        // Названа только почта: onion этой команды не касается.
+        effects.extend(self.on_announce_addresses(now_ms, None, Some(address))?);
         Ok(effects)
     }
 
@@ -1527,15 +1527,23 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         // Локальная сеть в карточке не живёт: её адрес меняется при каждом
         // подключении, и в §4.1 его нет.
+        // Снимается **только своя** половина, вторая не называется вовсе.
+        // Прежняя запись перечисляла обе — и была верной ровно потому, что
+        // вторую бережно копировала из текущего состояния. Такая верность
+        // держится на внимательности, а `None` держится сам.
         let (onion, chatmail) = match transport {
             Transport::Lan => return Ok(Vec::new()),
-            Transport::Onion => (String::new(), self.addresses.chatmail.clone()),
-            Transport::Mail => (self.addresses.onion.clone(), String::new()),
+            Transport::Onion => (Some(String::new()), None),
+            Transport::Mail => (None, Some(String::new())),
         };
         // Снимать нечего — и объявлять нечего: §4.3 не рассылает то, что
         // не изменилось, но проверить дешевле здесь, чем разбираться потом,
         // почему версия выросла на ровном месте.
-        if onion == self.addresses.onion && chatmail == self.addresses.chatmail {
+        let already_gone = match transport {
+            Transport::Onion => self.addresses.onion.is_empty(),
+            _ => self.addresses.chatmail.is_empty(),
+        };
+        if already_gone {
             return Ok(Vec::new());
         }
         self.on_announce_addresses(now_ms, onion, chatmail)
@@ -2200,9 +2208,21 @@ impl<S: Store> Engine<S> {
     fn on_announce_addresses(
         &mut self,
         now_ms: u64,
-        onion: String,
-        chatmail: String,
+        onion: Option<String>,
+        chatmail: Option<String>,
     ) -> Result<Vec<Effect>, EngineError> {
+        // `None` — «не трогать». Разворачивается в текущее значение первым
+        // делом, до всякого сравнения: дальше по функции обе половины
+        // карточки уже равноправны.
+        //
+        // Раньше `None` не существовало, и вызывающий, знающий только одну
+        // половину, подставлял во вторую пустую строку — то есть **стирал**
+        // работающий адрес. Так стенд терял почтовый ящик по команде `/onion`,
+        // а на устройстве с одной только почтой это означало «до меня больше
+        // не достучаться»: собеседник терял адрес, а сказать ему новый было
+        // уже не по чему.
+        let onion = onion.unwrap_or_else(|| self.addresses.onion.clone());
+        let chatmail = chatmail.unwrap_or_else(|| self.addresses.chatmail.clone());
         // Сравнивается с **объявленным**, а не с текущим состоянием в памяти:
         // после перезапуска адреса подняты с диска именно оттуда, и повтор
         // того же объявления обязан остаться бесплатным.

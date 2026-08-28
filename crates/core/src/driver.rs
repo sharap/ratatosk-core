@@ -815,12 +815,11 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     // считает неготовой, — и легла бы в ожидание.
                     self.tolerate(Input::TransportReady { transport: Transport::Onion }).await?;
 
-                    // Почта берётся из текущей карточки, а не из пустоты:
-                    // объявление заявляет оба адреса разом, и подставить
-                    // сюда пустую строку значило бы сказать контактам, что
-                    // почтового ящика больше нет.
-                    let chatmail = self.engine.own_card().chatmail;
-                    let command = Command::AnnounceAddresses { onion, chatmail };
+                    // Почта здесь не называется вовсе. Раньше её приходилось
+                    // доставать из текущей карточки, потому что команда
+                    // требовала обе половины и пустая строка означала «нет»;
+                    // теперь «не трогать» выразимо, и обход не нужен.
+                    let command = Command::AnnounceAddresses { onion: Some(onion), chatmail: None };
                     self.tolerate(Input::Command(command)).await?;
                 }
                 Wake::Stop => return Ok(()),

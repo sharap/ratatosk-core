@@ -533,14 +533,21 @@ async fn console(
                     // затирала бы работающий адрес, который назвал сервис,
                     // посчитанным — а они, как выяснилось на стенде, совпадают
                     // не всегда.
+                    //
+                    // Почта здесь **не называется**, и раньше называлась —
+                    // пустой строкой. Это и был баг со стенда: `/onion`
+                    // бережно сохранял onion и молча стирал почтовый адрес.
+                    // Там, где почта единственный транспорт, после этого
+                    // до узла нельзя было достучаться вовсе — и следующее
+                    // обновление карточки до собеседника уже не доезжало.
                     let current =
                         handle.own_card().await.map(|c| c.onion).unwrap_or_default();
                     let announce =
                         if current.is_empty() { onion_address.clone() } else { current };
                     handle
                         .send(Command::AnnounceAddresses {
-                            onion: announce.clone(),
-                            chatmail: String::new(),
+                            onion: Some(announce.clone()),
+                            chatmail: None,
                         })
                         .await
                         .ok();

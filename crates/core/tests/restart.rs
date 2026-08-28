@@ -132,6 +132,59 @@ fn identity_contacts_and_history_survive_a_restart() {
 }
 
 #[test]
+fn added_when_survives_a_restart_and_means_added() {
+    // Настоящий баг, найденный при выносе поля на границу §13.3, и увидеть
+    // его можно **только** после перезапуска: в памяти момент добавления
+    // лежал верный, а на диск при каждой записи контакта уезжало текущее
+    // время. Записывается же контакт не только при добавлении — ещё при
+    // сверке и при обновлении карточки (§4.3).
+    //
+    // Не замечал этого никто ровно потому, что поле никуда не отдавалось.
+    // Первый же клиент, показавший «в контактах с …», показал бы «сегодня»
+    // у человека, добавленного год назад.
+    let db = TempDb::new("added");
+    let db_key = Zeroizing::new([9u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность заведена");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём с чистой базы");
+
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::AddContact {
+                    card_bytes: card_bytes.clone(),
+                    met_in_person: false,
+                }),
+            )
+            .expect("контакт добавлен");
+        assert_eq!(engine.contacts()[&peer_ik].added_ms, 1_000);
+
+        // Сверка голосом — второе действие, и оно переписывает контакт
+        // на диск. Ровно здесь «добавлен» и превращался в «сегодня».
+        engine
+            .step(500_000, Input::Command(Command::MarkVerified { peer_ik }))
+            .expect("сверка принята");
+        assert_eq!(engine.contacts()[&peer_ik].added_ms, 1_000, "в памяти было верно и раньше");
+    }
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность поднята");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    assert_eq!(engine.restore().expect("контакты подняты"), 1);
+
+    let contact = &engine.contacts()[&peer_ik];
+    assert!(contact.verified, "сверка пережила перезапуск");
+    assert_eq!(
+        contact.added_ms, 1_000,
+        "«добавлен» — про первую встречу, а не про последнюю запись на диск"
+    );
+}
+
+#[test]
 fn a_switched_off_transport_stays_switched_off_after_a_restart() {
     // Выбор человека, а не состояние сети. Выключивший Tor обязан обнаружить
     // его выключенным и назавтра — иначе выключатель означает «до следующего

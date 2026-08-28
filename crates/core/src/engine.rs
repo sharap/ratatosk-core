@@ -315,6 +315,14 @@ pub struct Contact {
     /// хранится, но наружу не отдаётся (§4.2). Решает это
     /// [`Engine::avatar_of`], и только оно.
     pub has_avatar: bool,
+    /// Когда контакт добавили, мс.
+    ///
+    /// Переживает и обновление карточки (§4.3), и сверку, и снятие сверки:
+    /// «добавлен» — это про первую встречу, а не про последнюю запись
+    /// на диск. Раньше на диск уезжало `now_ms` при каждом сохранении,
+    /// и столбец `created_ms` означал на деле «когда контакт трогали».
+    /// Никто этого не замечал ровно потому, что наружу поле не отдавалось.
+    pub added_ms: u64,
 }
 
 /// Почему попытка доставки не удалась.
@@ -732,6 +740,21 @@ impl<S: Store> Engine<S> {
         self.sessions.for_peer(peer_ik, transport)
     }
 
+    /// Отброшенные кадры от этого источника (§7.3, шаг 4).
+    ///
+    /// Считались с самого начала и не показывались никому. А это
+    /// единственный сигнал о том, что кто-то шлёт на устройство мусор
+    /// от имени этого контакта: неизвестные `session_id`, кадры с негодным
+    /// тегом, повторы рукопожатия. Ни один из них не виден в переписке —
+    /// они отбрасываются до неё.
+    ///
+    /// Счётчики живут в памяти и обнуляются перезапуском: это наблюдение
+    /// за происходящим сейчас, а не улика.
+    #[must_use]
+    pub fn anomalies(&self, peer_ik: &[u8; 32]) -> ratatosk_proto::session::AnomalyCounters {
+        self.sessions.anomalies(peer_ik)
+    }
+
     /// Хранилище — для миграций, чтения и обслуживания.
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
@@ -882,7 +905,7 @@ impl<S: Store> Engine<S> {
                 // Сверка голосом (§4.2) — разовое действие пользователя.
                 // Не пережив перезапуск, она обесценивается: просить сверять
                 // отпечаток заново при каждом старте никто не станет.
-                self.persist_contact(&peer_ik, now_ms)?;
+                self.persist_contact(&peer_ik)?;
                 // До сверки аватарку ему не отправляли — теперь можно.
                 // Два события у пользователя сливаются в одно: сверили —
                 // и лица появились с обеих сторон.
@@ -896,7 +919,7 @@ impl<S: Store> Engine<S> {
             Command::RevokeVerification { peer_ik } => {
                 let contact = self.contacts.get_mut(&peer_ik).ok_or(EngineError::UnknownPeer)?;
                 contact.verified = false;
-                self.persist_contact(&peer_ik, now_ms)?;
+                self.persist_contact(&peer_ik)?;
                 // Собеседнику не уходит ничего. Отзыв — решение пользователя
                 // о том, кому он доверяет, а не сообщение о человеке; уведомив
                 // о нём, мы завели бы сигнал, которого он не просил подавать.
@@ -907,9 +930,7 @@ impl<S: Store> Engine<S> {
                 // остаются лежать: сверят заново — покажется снова.
                 Ok(vec![Effect::Notify(Event::ContactChanged { peer_ik })])
             }
-            Command::SetLocalName { peer_ik, name } => {
-                self.on_set_local_name(now_ms, peer_ik, name)
-            }
+            Command::SetLocalName { peer_ik, name } => self.on_set_local_name(peer_ik, name),
             Command::DeleteContact { peer_ik, purge_history } => {
                 self.on_delete_contact(peer_ik, purge_history)
             }
@@ -1042,6 +1063,7 @@ impl<S: Store> Engine<S> {
                     availability,
                     local_name: contact.local_name,
                     has_avatar: self.store.has_avatar(&peer_ik)?,
+                    added_ms: contact.created_ms,
                 },
             );
             self.by_chat.insert(chat, peer_ik);
@@ -1178,7 +1200,17 @@ impl<S: Store> Engine<S> {
     }
 
     /// Складывает контакт на диск (§4, §12).
-    fn persist_contact(&mut self, peer_ik: &[u8; 32], now_ms: u64) -> Result<(), EngineError> {
+    ///
+    /// Времени не берёт, и это не мелочь. Раньше брало — и подставляло
+    /// в `created_ms`, отчего столбец «когда добавлен» означал на деле
+    /// «когда последний раз трогали»: контакт пишется и при сверке,
+    /// и при каждом обновлении карточки (§4.3). Момент добавления теперь
+    /// живёт в `Contact::added_ms` и не зависит от того, когда мы решили
+    /// сохраниться.
+    ///
+    /// Параметр убран, а не подчёркнут: неиспользуемый аргумент — это
+    /// приглашение вернуть в него `now_ms` и починить «ошибку», которой нет.
+    fn persist_contact(&mut self, peer_ik: &[u8; 32]) -> Result<(), EngineError> {
         let Some(contact) = self.contacts.get(peer_ik) else {
             return Ok(());
         };
@@ -1194,7 +1226,10 @@ impl<S: Store> Engine<S> {
             card_version: contact.card.version,
             card_bytes,
             verified: contact.verified,
-            created_ms: now_ms,
+            // Момент добавления, а не момент записи. Раньше здесь стояло
+            // `now_ms`, и первое же обновление карточки (§4.3) или снятие
+            // сверки переписывало «добавлен» на «сегодня».
+            created_ms: contact.added_ms,
             local_name: contact.local_name.clone(),
         };
         self.store.put_contact(&stored)?;
@@ -1238,12 +1273,24 @@ impl<S: Store> Engine<S> {
         // может приехать заново (§4.3), а подпись пользователя — его, и
         // затирать её обновлением с той стороны нельзя.
         let local_name = self.contacts.get(&peer_ik).and_then(|c| c.local_name.clone());
+        // Та же причина, что у локального имени: `add_contact` зовётся
+        // не только при первом добавлении, но и когда карточка приехала
+        // заново (§4.3) или пришла третьим человеком. Момент добавления
+        // при этом не меняется.
+        let added_ms = self.contacts.get(&peer_ik).map_or(now_ms, |c| c.added_ms);
         self.contacts.insert(
             peer_ik,
-            Contact { card, verified: met_in_person, availability, local_name, has_avatar },
+            Contact {
+                card,
+                verified: met_in_person,
+                availability,
+                local_name,
+                has_avatar,
+                added_ms,
+            },
         );
         self.by_chat.insert(Self::chat_id_for(&peer_ik), peer_ik);
-        self.persist_contact(&peer_ik, now_ms)?;
+        self.persist_contact(&peer_ik)?;
 
         let mut effects = vec![Effect::Notify(Event::ContactAdded {
             peer_ik,
@@ -2273,7 +2320,6 @@ impl<S: Store> Engine<S> {
     /// отношении, и обновление с той стороны её не касается.
     fn on_card_update(
         &mut self,
-        now_ms: u64,
         peer_ik: [u8; 32],
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -2295,7 +2341,7 @@ impl<S: Store> Engine<S> {
         contact.availability.has_onion = !card.onion.is_empty();
         contact.availability.has_chatmail = !card.chatmail.is_empty();
         contact.card = card;
-        self.persist_contact(&peer_ik, now_ms)?;
+        self.persist_contact(&peer_ik)?;
 
         // Появившийся адрес — это появившийся путь. Сообщения, которым
         // некуда было ехать, ждали именно этого (§5.4).
@@ -3274,7 +3320,6 @@ impl<S: Store> Engine<S> {
     /// и заставлять клиент отличать `Some("")` от `None` незачем.
     fn on_set_local_name(
         &mut self,
-        now_ms: u64,
         peer_ik: [u8; 32],
         name: Option<String>,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -3287,7 +3332,7 @@ impl<S: Store> Engine<S> {
 
         let contact = self.contacts.get_mut(&peer_ik).ok_or(EngineError::UnknownPeer)?;
         contact.local_name = trimmed;
-        self.persist_contact(&peer_ik, now_ms)?;
+        self.persist_contact(&peer_ik)?;
         Ok(vec![Effect::Notify(Event::ContactChanged { peer_ik })])
     }
 
@@ -5013,7 +5058,7 @@ impl<S: Store> Engine<S> {
             PayloadType::GroupMembership | PayloadType::SenderKey => {
                 todo!("этап 5: группы (§11)")
             }
-            PayloadType::CardUpdate => self.on_card_update(now_ms, peer_ik, &envelope),
+            PayloadType::CardUpdate => self.on_card_update(peer_ik, &envelope),
         }
     }
 }

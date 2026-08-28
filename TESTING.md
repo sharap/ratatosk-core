@@ -815,6 +815,10 @@ cargo test -p ratatosk-transport
 | `crowded_asks_about_the_window_not_about_percents` | порог — окно, а не проценты: гигабайт на 95 % просторен, двадцать мегабайт наполовину — нет |
 | `the_numbers_a_real_stingy_server_gave` | числа `tarpit.fun` целиком, вместе с множителем килобайтов RFC 2087 |
 | `the_answer_a_real_stingy_server_gave` | разбор `SIZE` на настоящем ответе `EHLO` (только с `--features chatmail-net`) |
+| `the_verdict_agrees_with_the_ladder_on_every_combination` | показанный вердикт §5.4 и настоящая отправка — один список; перебор всех 32 сочетаний |
+| `a_rising_rung_is_not_the_same_as_no_way_out` | «Tor поднимается» и «отправлять некуда» — разные ответы, и путать их нельзя |
+| `a_rung_says_which_of_the_three_troubles_it_is` | переключатель, время и адрес — три беды с тремя лечениями |
+| `added_when_survives_a_restart_and_means_added` | «добавлен» — про первую встречу; проверяется **только** перезапуском |
 | `a_direct_channel_is_never_a_switched_off_lan` | сессия переживает выключение сети, канал — нет: иначе файлы стоят там, где сообщения ходят |
 | `a_switched_off_transport_does_not_rise_at_all` | выключенный в прошлый раз Tor не поднимается вовсе — ни bootstrap, ни цепочек |
 | `switching_on_rises_and_switching_off_drops_it` | погасить — уронить раннера; включить заново — поднять заново |

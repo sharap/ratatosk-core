@@ -52,4 +52,6 @@ pub use receipts::{DeliveryStatus, Receipt};
 pub use reply::ReplyError;
 pub use retract::MAX_RETRACT_IDS;
 pub use session::{Route, SessionRegistry};
-pub use transport_policy::{Attempt, Decision, PeerAvailability, Transport, TransportSet};
+pub use transport_policy::{
+    Attempt, Decision, PeerAvailability, Reachability, Rung, Transport, TransportSet,
+};

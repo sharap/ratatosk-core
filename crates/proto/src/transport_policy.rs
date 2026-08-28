@@ -210,6 +210,123 @@ impl TransportSet {
     }
 }
 
+/// Одна ступень лестницы §5.4 глазами конкретного контакта.
+///
+/// Три признака, а не один «доступен», и они разного рода — потому что
+/// и лечатся по-разному: [`Rung::enabled`] чинится переключателем в UI,
+/// [`Rung::ready`] — временем (bootstrap Tor идёт десятки секунд),
+/// [`Rung::addressable`] — обменом карточками (§4.3) или появлением в эфире
+/// (§5.1). Слитые в одно слово, они отвечали бы на вопрос «почему не идёт»
+/// одинаково для трёх разных бед.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    /// Какая ступень.
+    pub transport: Transport,
+    /// Разрешена человеком.
+    pub enabled: bool,
+    /// Уже работает.
+    pub ready: bool,
+    /// Есть куда ехать: адрес в карточке или маяк в эфире.
+    pub addressable: bool,
+}
+
+impl Rung {
+    /// Годится ли ступень прямо сейчас.
+    #[must_use]
+    pub const fn usable(self) -> bool {
+        self.enabled && self.ready && self.addressable
+    }
+
+    /// Заберёт ли эта ступень отправку, когда поднимется.
+    ///
+    /// Разрешена и адресуема, но ещё не работает — то есть ждать её имеет
+    /// смысл. Ровно этот случай отличает «Tor поднимается, сообщение уйдёт
+    /// через полминуты» от «отправлять некуда»; смешав их, UI пугает
+    /// человека тем, что вот-вот пройдёт само.
+    #[must_use]
+    pub const fn rising(self) -> bool {
+        self.enabled && self.addressable && !self.ready
+    }
+}
+
+/// Куда поедет следующее сообщение этому контакту — и почему не дальше.
+///
+/// **Существует затем, чтобы вердикт был один.** Раньше его считал каждый,
+/// кому он нужен: `Attempt::next` — для отправки, стенд — для `/who`,
+/// и клиент завёл бы третью копию. Три копии одной лестницы расходятся
+/// не «когда-нибудь», а при первом же добавлении ступени, и расхождение
+/// это молчаливое: UI показывает «пойдёт почтой», а уходит оно через onion.
+///
+/// Поэтому лестница живёт здесь одним списком, а [`Attempt::next`] ходит
+/// по нему же. Правило, которое можно забыть, заменено кодом, который
+/// забыть нельзя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reachability {
+    /// Ступени по порядку §5.4: LAN, onion, почта.
+    pub rungs: [Rung; 3],
+}
+
+impl Reachability {
+    /// Раскладывает доступность контакта по ступеням.
+    #[must_use]
+    pub const fn of(peer: PeerAvailability) -> Reachability {
+        // Порядок здесь **и есть** §5.4, и читаться он должен сверху вниз
+        // одним взглядом. Добавить транспорт значит дописать строку.
+        Reachability {
+            rungs: [
+                Rung {
+                    transport: Transport::Lan,
+                    enabled: peer.enabled.contains(Transport::Lan),
+                    ready: peer.ready.contains(Transport::Lan),
+                    addressable: peer.seen_on_lan,
+                },
+                Rung {
+                    transport: Transport::Onion,
+                    enabled: peer.enabled.contains(Transport::Onion),
+                    ready: peer.ready.contains(Transport::Onion),
+                    addressable: peer.has_onion,
+                },
+                Rung {
+                    transport: Transport::Mail,
+                    enabled: peer.enabled.contains(Transport::Mail),
+                    ready: peer.ready.contains(Transport::Mail),
+                    addressable: peer.has_chatmail,
+                },
+            ],
+        }
+    }
+
+    /// Состояние одной ступени.
+    #[must_use]
+    pub fn rung(&self, transport: Transport) -> Rung {
+        self.rungs.into_iter().find(|rung| rung.transport == transport).unwrap_or(Rung {
+            transport,
+            enabled: false,
+            ready: false,
+            addressable: false,
+        })
+    }
+
+    /// Ступень, которой уйдёт следующее сообщение.
+    ///
+    /// `None` — отправлять некуда прямо сейчас. Это **не** «не уйдёт
+    /// никогда»: см. [`Reachability::rising`].
+    #[must_use]
+    pub fn route(&self) -> Option<Transport> {
+        self.rungs.into_iter().find(|rung| rung.usable()).map(|rung| rung.transport)
+    }
+
+    /// Ступень, которая заберёт отправку, когда поднимется.
+    ///
+    /// Отвечает на «сообщение висит — оно уйдёт или нет». Непустой ответ
+    /// означает «уйдёт, надо подождать»; пустой вместе с пустым
+    /// [`Reachability::route`] — «ждать нечего, нужен адрес или переключатель».
+    #[must_use]
+    pub fn rising(&self) -> Option<Transport> {
+        self.rungs.into_iter().find(|rung| rung.rising()).map(|rung| rung.transport)
+    }
+}
+
 /// Решение о том, куда отправлять.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -269,28 +386,17 @@ impl Attempt {
             return None;
         }
 
-        // Лестница списком, а не цепочкой `if`: порядок ступеней — это и есть
-        // §5.4, и он должен читаться сверху вниз одним взглядом. Добавить
-        // транспорт значит дописать строку, а не разобраться в развилке.
-        //
-        // У каждой ступени три условия, и они разного рода: **разрешён** ли
-        // транспорт человеком, **работает** ли он уже и **есть ли куда** им
-        // ехать. Раздельно, потому что и лечится это разным: первое —
-        // переключателем в UI, второе — временем (bootstrap идёт десятки
-        // секунд), третье — обменом карточками (§4.3) или появлением
-        // в эфире (§5.1).
-        let ladder = [
-            (Transport::Lan, peer.seen_on_lan),
-            (Transport::Onion, peer.has_onion),
-            (Transport::Mail, peer.has_chatmail),
-        ];
-        let candidate = ladder.into_iter().find_map(|(transport, addressable)| {
-            let usable = peer.enabled.contains(transport)
-                && peer.ready.contains(transport)
-                && addressable
-                && !self.tried.contains(&transport);
-            usable.then_some(transport)
-        });
+        // Лестница берётся у [`Reachability`], а не выписывается здесь.
+        // Раньше она была списком в этой функции, и копия её жила в стенде
+        // (`/who` печатал свой вердикт). Две копии одной лестницы расходятся
+        // при первом же добавлении ступени, и расхождение молчаливое: экран
+        // говорит «пойдёт почтой», а уходит через onion. Теперь список один,
+        // а вопросов к нему два — «куда отправлять» и «что показать».
+        let candidate = Reachability::of(peer)
+            .rungs
+            .into_iter()
+            .find(|rung| rung.usable() && !self.tried.contains(&rung.transport))
+            .map(|rung| rung.transport);
 
         match candidate {
             Some(t) => {
@@ -560,5 +666,95 @@ mod tests {
         assert!(Transport::Lan.is_direct());
         assert!(Transport::Onion.is_direct());
         assert!(!Transport::Mail.is_direct());
+    }
+
+    #[test]
+    fn the_verdict_agrees_with_the_ladder_on_every_combination() {
+        // Главная проверка этой пары типов. `Reachability::route` существует
+        // ради показа, `Attempt::next` — ради отправки, и разойдись они,
+        // человек читал бы на экране одно, а уезжало бы другое. Молча.
+        //
+        // Проверяется полным перебором: пять независимых признаков — это
+        // 2^5 = 32 сочетания, и перебрать их дешевле, чем выбирать
+        // интересные и однажды выбрать не то.
+        for bits in 0u8..32 {
+            let mut enabled = TransportSet::none();
+            let mut ready = TransportSet::none();
+            let lan = bits & 1 != 0;
+            let onion_on = bits & 2 != 0;
+            let mail_on = bits & 4 != 0;
+            if lan {
+                enabled.set(Transport::Lan, true);
+                ready.set(Transport::Lan, true);
+            }
+            if onion_on {
+                enabled.set(Transport::Onion, true);
+                ready.set(Transport::Onion, true);
+            }
+            if mail_on {
+                enabled.set(Transport::Mail, true);
+                ready.set(Transport::Mail, true);
+            }
+            let peer = PeerAvailability {
+                seen_on_lan: bits & 8 != 0,
+                enabled,
+                ready,
+                has_onion: bits & 16 != 0,
+                has_chatmail: true,
+            };
+
+            let mut attempt = Attempt::new();
+            let taken = match attempt.next(peer) {
+                Some(Decision::Use(transport)) => Some(transport),
+                _ => None,
+            };
+            assert_eq!(
+                Reachability::of(peer).route(),
+                taken,
+                "вердикт разошёлся с отправкой на сочетании {bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rising_rung_is_not_the_same_as_no_way_out() {
+        // «Tor поднимается, сообщение уйдёт через полминуты» и «отправлять
+        // некуда» — разные вещи, и UI обязан их различать: первое проходит
+        // само, второе требует адреса или переключателя.
+        let mut enabled = TransportSet::none();
+        enabled.set(Transport::Onion, true);
+        let rising = PeerAvailability {
+            seen_on_lan: false,
+            enabled,
+            ready: TransportSet::none(),
+            has_onion: true,
+            has_chatmail: false,
+        };
+        let view = Reachability::of(rising);
+        assert_eq!(view.route(), None, "ступень ещё не работает — ехать сейчас некуда");
+        assert_eq!(view.rising(), Some(Transport::Onion), "но она поднимется и заберёт отправку");
+
+        // А вот здесь ждать действительно нечего: транспорт разрешён
+        // и работает, но адреса нет.
+        let mut ready = TransportSet::none();
+        ready.set(Transport::Onion, true);
+        let hopeless = PeerAvailability { ready, has_onion: false, ..rising };
+        let view = Reachability::of(hopeless);
+        assert_eq!(view.route(), None);
+        assert_eq!(view.rising(), None, "без адреса ждать нечего — это не «вот-вот»");
+    }
+
+    #[test]
+    fn a_rung_says_which_of_the_three_troubles_it_is() {
+        // Три признака ступени лечатся тремя разными действиями, и слить
+        // их в одно «недоступен» значит ответить одинаково на три вопроса.
+        let view = Reachability::of(without(Transport::Lan));
+        let lan = view.rung(Transport::Lan);
+        assert!(!lan.enabled, "выключен человеком — чинится переключателем");
+        assert!(lan.addressable, "и при этом виден: беда не в адресе");
+        assert!(!lan.usable());
+
+        let onion = view.rung(Transport::Onion);
+        assert!(onion.usable(), "остальные ступени выключение LAN не трогает");
     }
 }

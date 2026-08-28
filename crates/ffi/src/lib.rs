@@ -175,6 +175,16 @@ impl From<FfiTransport> for ratatosk_proto::Transport {
     }
 }
 
+impl From<ratatosk_proto::Transport> for FfiTransport {
+    fn from(value: ratatosk_proto::Transport) -> FfiTransport {
+        match value {
+            ratatosk_proto::Transport::Lan => FfiTransport::Lan,
+            ratatosk_proto::Transport::Onion => FfiTransport::Onion,
+            ratatosk_proto::Transport::Mail => FfiTransport::Mail,
+        }
+    }
+}
+
 /// Событие для UI.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiEvent {
@@ -489,6 +499,81 @@ pub struct FfiMailAccount {
     pub via_tor: bool,
 }
 
+/// Одна ступень лестницы §5.4 глазами конкретного контакта.
+///
+/// Три признака, а не один «доступен», и это не подробность ради
+/// подробности: они лечатся тремя разными действиями. `enabled` чинится
+/// переключателем в приложении, `ready` — временем (Tor поднимается
+/// десятки секунд), `addressable` — обменом карточками (§4.3) или тем,
+/// что собеседник появится в общей сети (§5.1).
+///
+/// Слив их в одно слово, экран отвечал бы одинаково на три разных вопроса,
+/// и человек чинил бы не то. Именно так и выглядит «сообщение не уходит,
+/// а почему — непонятно».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRung {
+    /// Какая ступень.
+    pub transport: FfiTransport,
+    /// Разрешена человеком.
+    pub enabled: bool,
+    /// Уже работает.
+    pub ready: bool,
+    /// Есть куда ехать: адрес в карточке или маяк в эфире.
+    pub addressable: bool,
+    /// Годится прямо сейчас — все три признака сразу.
+    pub usable: bool,
+}
+
+/// Куда поедет следующее сообщение этому контакту — и почему не дальше.
+///
+/// **Вердикт считает ядро, и пересчитывать его в клиенте нельзя** (§13.3).
+/// Лестница §5.4 живёт одним списком в `proto::transport_policy`, и по нему
+/// же ходит настоящая отправка. Копия в Kotlin разойдётся с ней при первом
+/// же изменении правил — молча: экран скажет «пойдёт почтой», а уедет
+/// через onion.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiReachability {
+    /// Ступени по порядку §5.4: LAN, onion, почта.
+    pub rungs: Vec<FfiRung>,
+    /// Ступень, которой уйдёт следующее сообщение. `None` — сейчас некуда.
+    pub route: Option<FfiTransport>,
+    /// Ступень, которая заберёт отправку, когда поднимется.
+    ///
+    /// Отвечает на «сообщение висит — оно уйдёт или нет». Непустое значение
+    /// вместе с пустым `route` означает «уйдёт, надо подождать» — и показывать
+    /// это надо спокойно. Оба пустые — ждать нечего: нужен адрес или
+    /// переключатель, и человек может это сделать сам.
+    pub rising: Option<FfiTransport>,
+}
+
+/// Сколько кадров от этого источника отброшено (§7.3).
+///
+/// Не показатель для списка контактов, а строка на экране «почему
+/// не доходит». Считалось это с самого начала и не показывалось никому,
+/// а между тем это **единственный** признак того, что кто-то шлёт
+/// на устройство мусор от имени контакта: в переписке такие кадры
+/// не появляются — они отбрасываются до неё.
+///
+/// Счётчики живут в памяти и обнуляются перезапуском: это наблюдение
+/// за происходящим сейчас, а не улика. Ноль — обычное состояние; всплеск
+/// стоит показать, но не как ошибку приложения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiAnomalies {
+    /// Кадры с неизвестным `session_id`.
+    ///
+    /// Самая безобидная строка: так выглядит собеседник, переустановивший
+    /// клиент, — его кадры зашифрованы сессией, которой у нас больше нет.
+    pub unknown_session: u64,
+    /// Кадры, не прошедшие проверку тега.
+    pub bad_tag: u64,
+    /// Кадры с непонятным содержимым.
+    pub malformed: u64,
+    /// Повторно предъявленные рукопожатия.
+    pub handshake_replay: u64,
+    /// Всего.
+    pub total: u64,
+}
+
 /// Контакт в том виде, в каком его показывает UI.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiContact {
@@ -510,6 +595,14 @@ pub struct FfiContact {
     /// Сверен ли отпечаток голосом (§4.2).
     pub verified: bool,
     /// Виден ли контакт в локальной сети прямо сейчас (§5.1).
+    ///
+    /// То же самое, что `addressable` у ступени LAN в `reachability`, —
+    /// и оставлено намеренно: это самый частый вопрос списка контактов
+    /// («кто рядом»), и заставлять его искать нужную ступень в массиве
+    /// значило бы менять удобство на стройность.
+    ///
+    /// **Не то же, что «есть связь».** Маяк говорит «устройство в эфире»;
+    /// установлена ли сессия, отвечает `direct_channel`.
     pub seen_on_lan: bool,
     /// Есть ли аватарка, которую **можно показать**.
     ///
@@ -518,6 +611,38 @@ pub struct FfiContact {
     /// [`RatatoskClient::avatar_of`]; здесь только признак, чтобы список
     /// чатов не тянул по тридцать килобайт на строку.
     pub has_avatar: bool,
+    /// Onion-адрес из карточки (§5.2). `None` — адреса нет.
+    ///
+    /// Показывать его в списке контактов незачем — это пятьдесят шесть
+    /// знаков, — а на карточке человека есть зачем: по нему видно, чем
+    /// до него вообще можно достучаться.
+    pub onion: Option<String>,
+    /// Chatmail-адрес из карточки (§5.3). `None` — адреса нет.
+    ///
+    /// Отвечает на вопрос, который иначе не задать: дойдёт ли до человека
+    /// сообщение, пока он не в сети. Без почтового адреса — **нет**, и это
+    /// стоит сказать до того, как человек напишет и станет ждать.
+    pub chatmail: Option<String>,
+    /// Версия карточки, монотонная (§4.3).
+    ///
+    /// Диагностика: по ней видно, доехало ли до нас обновление адресов.
+    /// В списке контактов ей делать нечего.
+    pub card_version: u64,
+    /// Когда контакт добавили, мс от эпохи.
+    pub added_ms: u64,
+    /// Куда сейчас уйдёт сообщение этому человеку и почему не дальше.
+    pub reachability: FfiReachability,
+    /// Живой прямой канал, если он есть (§5.4).
+    ///
+    /// **Не то же, что `seen_on_lan`.** Маяк говорит «устройство в эфире»,
+    /// а это — «сессия установлена, кадры пойдут сейчас». Между ними
+    /// рукопожатие, и на медленном канале это заметные секунды.
+    ///
+    /// Пусто при работающей почте — обычное дело, а не беда: почта прямым
+    /// каналом не бывает по устройству, и квитанций (§9.4) по ней нет.
+    pub direct_channel: Option<FfiTransport>,
+    /// Отброшенные кадры от этого источника (§7.3).
+    pub anomalies: FfiAnomalies,
 }
 
 /// Сообщение в том виде, в каком его показывает UI.
@@ -1662,6 +1787,21 @@ impl RatatoskClient {
                 verified: c.verified,
                 seen_on_lan: c.availability.seen_on_lan,
                 has_avatar: c.has_avatar,
+                onion: c.onion,
+                chatmail: c.chatmail,
+                card_version: c.card_version,
+                added_ms: c.added_ms,
+                reachability: reachability(c.reachability),
+                direct_channel: c.direct_channel.map(FfiTransport::from),
+                anomalies: FfiAnomalies {
+                    unknown_session: c.anomalies.unknown_session,
+                    bad_tag: c.anomalies.bad_tag,
+                    malformed: c.anomalies.malformed,
+                    handshake_replay: c.anomalies.handshake_replay,
+                    // Считается ядром, а не клиентом: сумма из четырёх слагаемых
+                    // выглядит безобидно ровно до появления пятого.
+                    total: c.anomalies.total(),
+                },
             })
             .collect())
     }
@@ -1858,6 +1998,31 @@ fn to_ik(bytes: &[u8]) -> Result<[u8; 32], RatatoskError> {
 
 fn to_msg_id(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
     bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))
+}
+
+/// Переводит вердикт §5.4 через границу.
+///
+/// Ни одного решения здесь не принимается — и это главное свойство функции.
+/// `usable`, `route` и `rising` считает `proto::transport_policy` тем же
+/// кодом, по которому идёт настоящая отправка; здесь только перекладывание
+/// полей. Появись тут хоть одно `&&`, правило §5.4 оказалось бы записано
+/// в двух местах (§13.3).
+fn reachability(view: ratatosk_proto::transport_policy::Reachability) -> FfiReachability {
+    FfiReachability {
+        rungs: view
+            .rungs
+            .into_iter()
+            .map(|rung| FfiRung {
+                transport: rung.transport.into(),
+                enabled: rung.enabled,
+                ready: rung.ready,
+                addressable: rung.addressable,
+                usable: rung.usable(),
+            })
+            .collect(),
+        route: view.route().map(FfiTransport::from),
+        rising: view.rising().map(FfiTransport::from),
+    }
 }
 
 fn to_chat(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {

@@ -826,7 +826,14 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         // «не сверен» остаётся упрёком без способа его снять.
         println!("    отпечаток: {}", contact.fingerprint);
 
-        let a = contact.availability;
+        println!("    добавлен: {} мс, карточка версии {}", contact.added_ms, contact.card_version);
+        if let Some(onion) = &contact.onion {
+            println!("    onion-адрес: {onion}");
+        }
+        if let Some(chatmail) = &contact.chatmail {
+            println!("    почта: {chatmail}");
+        }
+
         let addr = directory
             .get(&contact.peer_ik)
             .map_or_else(|| "неизвестен".to_owned(), |addr| addr.to_string());
@@ -835,46 +842,67 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         // десятки секунд), «адрес» — обменом карточками. Слив их в одно
         // слово, стенд отвечал бы на вопрос «почему не идёт» одинаково
         // для трёх разных бед.
-        let step = |t| (a.enabled.contains(t), a.ready.contains(t));
-        let (lan_on, lan_up) = step(ratatosk_proto::Transport::Lan);
-        let (onion_on, onion_up) = step(ratatosk_proto::Transport::Onion);
-        let (mail_on, mail_up) = step(ratatosk_proto::Transport::Mail);
-        println!(
-            "    LAN:   включён={}  работает={}  виден={}  адрес: {addr}",
-            yes(lan_on),
-            yes(lan_up),
-            yes(a.seen_on_lan)
-        );
-        println!(
-            "    onion: включён={}  работает={}  адрес={}",
-            yes(onion_on),
-            yes(onion_up),
-            yes(a.has_onion)
-        );
-        println!(
-            "    почта: включена={}  работает={}  адрес={}",
-            yes(mail_on),
-            yes(mail_up),
-            yes(a.has_chatmail)
-        );
+        //
+        // Раскладку и вердикт считает **ядро** (`Reachability`). Раньше
+        // здесь стояла своя копия цепочки условий из `Attempt::next` —
+        // две копии одной лестницы, расходящиеся при первом же изменении
+        // правил, причём молча: стенд говорит «пойдёт почтой», а уезжает
+        // через onion.
+        for rung in &contact.reachability.rungs {
+            let name = match rung.transport {
+                ratatosk_proto::Transport::Lan => "LAN  ",
+                ratatosk_proto::Transport::Onion => "onion",
+                ratatosk_proto::Transport::Mail => "почта",
+            };
+            let tail = if rung.transport == ratatosk_proto::Transport::Lan {
+                format!("  адрес: {addr}")
+            } else {
+                String::new()
+            };
+            println!(
+                "    {name}: включён={}  работает={}  адрес/виден={}{tail}",
+                yes(rung.enabled),
+                yes(rung.ready),
+                yes(rung.addressable)
+            );
+        }
 
-        // Ровно та цепочка условий, что в `transport_policy::Attempt::next`.
-        let verdict = if lan_on && lan_up && a.seen_on_lan {
-            "пойдёт по LAN"
-        } else if onion_on && onion_up && a.has_onion {
-            "пойдёт через onion"
-        } else if onion_on && a.has_onion {
-            "onion ещё поднимается — уйдёт, как только сервис опубликуется"
-        } else if mail_on && mail_up && a.has_chatmail {
-            "пойдёт почтой"
-        } else if !lan_on {
-            "отправлять некуда: LAN выключен, других путей нет — \
-             проверьте /tor и адреса в карточке"
-        } else {
-            "отправлять некуда: контакт не виден в LAN. \
-             Допишите адрес: /add <карточка> <ip:порт> — на обеих машинах"
-        };
-        println!("    → §5.4: {verdict}");
+        match (contact.reachability.route(), contact.reachability.rising()) {
+            (Some(via), _) => println!("    → §5.4: пойдёт {}", via_name(via)),
+            (None, Some(via)) => println!(
+                "    → §5.4: {} ещё поднимается — уйдёт, как только заработает",
+                via_name(via)
+            ),
+            (None, None) => {
+                println!("    → §5.4: отправлять некуда");
+                println!("      проверьте /tor, /mail и адреса в карточке;");
+                println!("      для LAN: /add <карточка> <ip:порт> — на обеих машинах");
+            }
+        }
+
+        // Отброшенные кадры (§7.3). Ноль — обычное дело и не печатается:
+        // строка «аномалий: 0» у каждого контакта прячет ту единственную,
+        // где не ноль.
+        let anomalies = contact.anomalies;
+        if anomalies.total() > 0 {
+            println!(
+                "    отброшено кадров: {} (чужая сессия {}, тег {}, формат {}, повтор {})",
+                anomalies.total(),
+                anomalies.unknown_session,
+                anomalies.bad_tag,
+                anomalies.malformed,
+                anomalies.handshake_replay
+            );
+        }
+    }
+}
+
+/// Имя транспорта для строки человеку.
+fn via_name(via: ratatosk_proto::Transport) -> &'static str {
+    match via {
+        ratatosk_proto::Transport::Lan => "по LAN",
+        ratatosk_proto::Transport::Onion => "через onion",
+        ratatosk_proto::Transport::Mail => "почтой",
     }
 }
 

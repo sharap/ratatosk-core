@@ -270,6 +270,17 @@ pub enum FfiEvent {
         /// Чья.
         peer_ik: Vec<u8>,
     },
+    /// **Своя** аватарка поставлена или снята.
+    ///
+    /// Отдельное событие, а не [`FfiEvent::AvatarChanged`] с собственным
+    /// `IK`: по тому клиент идёт за контактом и со своим ключом не нашёл бы
+    /// там ничего, а перерисовать ему надо профиль.
+    ///
+    /// **Приходит и тогда, когда сменил не этот экран.** Своё лицо теперь
+    /// вправе поменять сопряжённый десктоп (§13.4); без этого события
+    /// телефон показывал бы прежнюю картинку до перезапуска. Байты —
+    /// через [`RatatoskClient::my_avatar`], как и у чужой.
+    OwnAvatarChanged,
     /// Как идёт подъём Tor (§5.2).
     ///
     /// Показывать это человеку **надо**, и не из любви к прогресс-барам:
@@ -635,6 +646,15 @@ pub struct FfiPairedDevice {
     pub connected: bool,
     /// Пора ли десктопу стереть кэш — тридцать суток без связи (§13.4).
     pub cache_expired: bool,
+    /// Дотянется ли до этого устройства телефон вне общей сети (§13.4).
+    ///
+    /// **Признак, а не адрес.** Ложь значит «только дома» — законное
+    /// и самое частое состояние, и показывать его надо как состояние,
+    /// а не как поломку: «работает, когда телефон и ноутбук в одной сети».
+    ///
+    /// Иначе человек, открывший ноутбук в другом городе, видит вечное
+    /// «подключаемся» и не знает, ждать ему или нет (§14).
+    pub reachable_anywhere: bool,
 }
 
 /// Контакт в том виде, в каком его показывает UI.
@@ -879,6 +899,65 @@ pub struct FfiSwept {
     /// Сколько отдельных чанков убрано.
     pub chunks: u64,
     /// Сколько байт освободилось.
+    pub bytes: u64,
+}
+
+/// Что именно вывозить (§12).
+///
+/// Три области, и выбор между ними — не настройка «поменьше», а разные
+/// задачи. Полный архив переносит переписку целиком и весит как она.
+/// Без вложений — то же, но на порядок легче: уезжает почтой, а файлы
+/// остаются на прежнем устройстве. Граф — только знакомства: с ним человек,
+/// сменивший телефон, не теряет **связей**, даже если готов расстаться
+/// с историей.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiExportScope {
+    /// Переписка со вложениями.
+    Everything,
+    /// Переписка без вложений.
+    WithoutAttachments,
+    /// Только контакты с их адресами и своя идентичность.
+    SocialGraph,
+}
+
+impl From<FfiExportScope> for ratatosk_core::ExportScope {
+    fn from(scope: FfiExportScope) -> ratatosk_core::ExportScope {
+        match scope {
+            FfiExportScope::Everything => ratatosk_core::ExportScope::Everything,
+            FfiExportScope::WithoutAttachments => ratatosk_core::ExportScope::WithoutAttachments,
+            FfiExportScope::SocialGraph => ratatosk_core::ExportScope::SocialGraph,
+        }
+    }
+}
+
+/// Что уехало в вывезенный архив переписки (§12).
+///
+/// **Ключ показать обязательно и обязательно сразу.** Он здесь не для
+/// журнала: без него архив не открывается нигде, а второй раз этот же
+/// архив не спросишь. Клиент, который положит его в лог и не покажет
+/// человеку, отдаст ему файл, который никогда не откроется.
+///
+/// Строкой, а не байтами: ключ выходит наружу ровно затем, чтобы его
+/// переписали с экрана, и вид этой строки — часть решения §12.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiExported {
+    /// Куда лёг архив.
+    pub path: String,
+    /// Ключ для показа человеку: base32 группами по четыре.
+    ///
+    /// Отдаётся **всегда**, в том числе когда архив заперт фразой: это
+    /// второй вход, и место ему — в менеджере паролей.
+    pub key_text: String,
+    /// Заперт ли архив фразой.
+    ///
+    /// От этого зависит, **что** показывать. С фразой ключ — запасной вход
+    /// «на всякий случай», и человек вправе его не записывать. Без фразы
+    /// ключ единственный: потерять его значит потерять архив, и строка
+    /// на экране обязана звучать иначе.
+    pub locked_by_phrase: bool,
+    /// Сколько вложений уехало вместе с базой.
+    pub files: u64,
+    /// Сколько байт в архиве.
     pub bytes: u64,
 }
 
@@ -1660,6 +1739,100 @@ impl RatatoskClient {
         Ok(FfiSwept { files: swept.files, chunks: swept.chunks, bytes: swept.bytes })
     }
 
+    /// Добавляет к своим знакомствам те, что лежат в архиве (§12).
+    ///
+    /// **Не восстановление, и путать их нельзя.** `import_archive` делает
+    /// архив аккаунтом целиком и требует чистого места; здесь личность
+    /// остаётся своя, переписка своя, а из архива берутся только контакты.
+    /// Поэтому это метод открытого клиента, а не свободная функция.
+    ///
+    /// Что человеку стоит сказать про исход:
+    ///
+    /// * `own_graph = false` — список чужой, и **никто в нём не сверен**
+    ///   (§4.2: поручительство друга сверкой голосом не является).
+    ///   Локальные имена из чужого списка тоже не переносятся.
+    /// * `known` — сколько уже было. Эти не тронуты ни в одном поле:
+    ///   ни адреса, ни версия карточки, ни сверка. Без этой строки слияние
+    ///   ста контактов, из которых девяносто известны, выглядит поломкой.
+    /// * `refused` — сколько записей оказались негодными. Ноль — обычное
+    ///   дело; не ноль — повод посмотреть, откуда взялся архив.
+    ///
+    /// `scratch_dir` — каталог для черновика, приватный каталог приложения.
+    /// Общий временный не годится: черновик — расшифрованная копия чужой базы.
+    ///
+    /// # Errors
+    ///
+    /// Файла нет, это не архив, он оборван, ключ или фраза не те.
+    pub fn merge_contacts(
+        &self,
+        archive: String,
+        unlock: FfiArchiveUnlock,
+        scratch_dir: String,
+    ) -> Result<FfiMerged, RatatoskError> {
+        let unlock = match unlock {
+            FfiArchiveUnlock::Passphrase { phrase } => {
+                ratatosk_core::ArchiveKey::Passphrase(phrase)
+            }
+            FfiArchiveUnlock::Key { key_text } => ratatosk_core::ArchiveKey::Key(
+                ratatosk_crypto::storage_key::key_from_text(&key_text).map_err(|_| {
+                    RatatoskError::internal("ключ не разобрался: перепишите его целиком")
+                })?,
+            ),
+        };
+        let merged = self
+            .opened
+            .handle
+            .merge_contacts_blocking(
+                std::path::PathBuf::from(archive),
+                unlock,
+                std::path::PathBuf::from(scratch_dir),
+            )
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?
+            .map_err(RatatoskError::internal)?;
+        Ok(FfiMerged {
+            own_graph: merged.own_graph,
+            added: merged.added,
+            known: merged.known,
+            refused: merged.refused,
+        })
+    }
+
+    /// Вывозит переписку в зашифрованный архив (§12).
+    ///
+    /// **Единственный путь переноса истории на другое устройство в v1.**
+    /// Ни синхронизации, ни облака нет; без архива переписка человека живёт
+    /// ровно столько, сколько его телефон.
+    ///
+    /// `path` — куда положить файл. Существующий файл **не** перезаписывается:
+    /// под ним может лежать единственная копия чьей-то переписки, и молчаливая
+    /// перезапись стоила бы её.
+    ///
+    /// Ключ возвращается в [`FfiExported::key_text`], и показать его надо
+    /// сразу: без него архив не открыть, а спросить его второй раз нельзя.
+    ///
+    /// Дорогая: переписывает базу и все вложения. Вызывать не из UI-потока
+    /// и показывать человеку ожидание.
+    pub fn export_history(
+        &self,
+        path: String,
+        scope: FfiExportScope,
+        phrase: Option<String>,
+    ) -> Result<FfiExported, RatatoskError> {
+        let done = self
+            .opened
+            .handle
+            .export_history_blocking(std::path::PathBuf::from(path), scope.into(), phrase)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?
+            .map_err(RatatoskError::internal)?;
+        Ok(FfiExported {
+            path: done.path.to_string_lossy().into_owned(),
+            key_text: done.key_text,
+            locked_by_phrase: done.locked_by_phrase,
+            files: done.files,
+            bytes: done.bytes,
+        })
+    }
+
     /// Открывает вложение на чтение (§10.2).
     ///
     /// **Один вызов на файл, а не на кусок.** Дальше куски берутся
@@ -1910,6 +2083,7 @@ impl RatatoskClient {
                 last_seen_ms: d.last_seen_ms,
                 connected: d.connected,
                 cache_expired: d.cache_expired,
+                reachable_anywhere: d.reachable_anywhere,
             })
             .collect())
     }
@@ -2662,6 +2836,7 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::ContactChanged { peer_ik } => FfiEvent::ContactChanged { peer_ik: peer_ik.to_vec() },
         Event::ContactRemoved { peer_ik } => FfiEvent::ContactRemoved { peer_ik: peer_ik.to_vec() },
         Event::AvatarChanged { peer_ik } => FfiEvent::AvatarChanged { peer_ik: peer_ik.to_vec() },
+        Event::OwnAvatarChanged => FfiEvent::OwnAvatarChanged,
         Event::TorStatus { fraction, note, blocked } => {
             FfiEvent::TorStatus { fraction, note, blocked }
         }
@@ -2843,6 +3018,171 @@ pub fn max_file_bytes() -> u64 {
 /// уже после того, как человек выбрал файл и нажал «отправить».
 ///
 /// Заведомо меньше [`max_file_bytes`]: прямым каналом ходит всё.
+/// Чем открывают архив (§12).
+///
+/// Два входа в один и тот же архив. Фразу человек придумал сам и держит
+/// в голове; сырой ключ он положил в менеджер паролей и не смотрит на него
+/// никогда. Спрашивать надо **тот, который подойдёт**, — что подойдёт,
+/// говорит [`peek_archive`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiArchiveUnlock {
+    /// Фраза, придуманная при вывозе.
+    Passphrase {
+        /// Она самая.
+        phrase: String,
+    },
+    /// Сырой ключ — та строка, что показывалась при вывозе.
+    Key {
+        /// Разделители и регистр не важны.
+        key_text: String,
+    },
+}
+
+/// Что за архив лежит по этому пути (§12).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiArchivePeek {
+    /// Что вывезено.
+    pub scope: FfiExportScope,
+    /// Открывается ли фразой. `false` — спрашивать надо ключ.
+    pub takes_passphrase: bool,
+}
+
+/// Заглядывает в архив, ничего не открывая (§12).
+///
+/// **Звать до того, как что-то спрашивать у человека.** Экран, требующий
+/// фразу от архива, в котором её нет, — тупик: человек будет вспоминать
+/// то, чего никогда не было. Ни ключа, ни фразы для этого не нужно: область
+/// вывоза и наличие завёрнутого ключа лежат в архиве открыто и о переписке
+/// ничего не говорят.
+///
+/// # Errors
+///
+/// Файла нет, это не архив, он новее этой сборки или оборван.
+#[uniffi::export]
+pub fn peek_archive(archive: String) -> Result<FfiArchivePeek, RatatoskError> {
+    let peek = ratatosk_store::peek_archive(std::path::Path::new(&archive))
+        .map_err(RatatoskError::internal)?;
+    Ok(FfiArchivePeek {
+        scope: match peek.scope {
+            ratatosk_core::ExportScope::Everything => FfiExportScope::Everything,
+            ratatosk_core::ExportScope::WithoutAttachments => FfiExportScope::WithoutAttachments,
+            ratatosk_core::ExportScope::SocialGraph => FfiExportScope::SocialGraph,
+        },
+        takes_passphrase: peek.takes_passphrase,
+    })
+}
+
+/// Что дало слияние знакомств (§12).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMerged {
+    /// Вывезен ли архив этой же личностью.
+    ///
+    /// `false` — список чужой, и никто в нём не сверен.
+    pub own_graph: bool,
+    /// Сколько знакомств добавлено.
+    pub added: u64,
+    /// Сколько уже было — **не тронуты** ни в одном поле.
+    pub known: u64,
+    /// Сколько записей отвергнуто как негодные.
+    pub refused: u64,
+}
+
+/// Что приехало из архива — для показа человеку (§12).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiImported {
+    /// Что было вывезено: `Everything`, `WithoutAttachments`, `SocialGraph`.
+    pub scope: FfiExportScope,
+    /// Сколько знакомств приехало.
+    pub contacts: u64,
+    /// Сколько сообщений.
+    pub messages: u64,
+    /// Сколько записей о вложениях.
+    pub files: u64,
+    /// Сколько вложений доехало **целиком** — байтами, а не записью.
+    ///
+    /// Разница с `files` — это то, о чём человеку стоит сказать: вложения,
+    /// чьи байты остались на прежнем устройстве, показываются неполученными.
+    pub whole_files: u64,
+    /// Сколько байт вложений легло на диск.
+    pub bytes: u64,
+}
+
+/// Восстанавливает аккаунт из архива (§12).
+///
+/// **Это восстановление, а не слияние.** Архив становится аккаунтом целиком;
+/// база по пути `destination` не должна существовать — иначе отказ. Слияния
+/// с живущим аккаунтом в v1 нет и не будет: у него нет ответа на вопрос,
+/// чьей остаётся личность.
+///
+/// `key_text` — та строка, которую человек переписал с экрана при вывозе.
+/// Разделители и регистр не важны.
+///
+/// Три вещи, которые UI обязан сказать человеку **после** успеха:
+///
+/// 1. **Прежним устройством пользоваться больше нельзя.** Восстановленный
+///    аккаунт — та же личность; два устройства с одним `IK` разойдутся
+///    сессиями и запутают собеседников. Для второго экрана есть режим
+///    компаньона (§13.4).
+/// 2. **База открывается прежним PIN.** Соль уехала в архиве вместе
+///    с базой, поэтому `open` после ввоза ждёт тот PIN, что был на старом
+///    телефоне, а не новый.
+/// 3. Если `whole_files` меньше `files` — часть вложений осталась дома.
+///
+/// # Errors
+///
+/// Файла нет, это не архив, он оборван, ключ не тот, архив сделан сборкой
+/// новее или база на месте назначения уже есть.
+#[uniffi::export]
+pub fn import_archive(
+    archive: String,
+    unlock: FfiArchiveUnlock,
+    destination: String,
+    files_dir: String,
+) -> Result<FfiImported, RatatoskError> {
+    // Ключ разбирается **до** всего остального: строка длинная, ошибиться
+    // в ней легко, и «ключ не разобрался» человек обязан услышать раньше,
+    // чем что-либо начнёт создаваться.
+    let key = match &unlock {
+        FfiArchiveUnlock::Key { key_text } => {
+            Some(ratatosk_crypto::storage_key::key_from_text(key_text).map_err(|_| {
+                RatatoskError::internal("ключ не разобрался: перепишите его целиком")
+            })?)
+        }
+        FfiArchiveUnlock::Passphrase { .. } => None,
+    };
+    let unlock = match (&unlock, &key) {
+        (FfiArchiveUnlock::Passphrase { phrase }, _) => {
+            ratatosk_store::ArchiveUnlock::Passphrase(phrase)
+        }
+        (_, Some(key)) => ratatosk_store::ArchiveUnlock::Key(key),
+        (FfiArchiveUnlock::Key { .. }, None) => unreachable!("ключ разобран выше"),
+    };
+    let mut blobs = ratatosk_store::FsBlobs::new(std::path::PathBuf::from(files_dir));
+    let done = ratatosk_store::import_archive(
+        std::path::Path::new(&archive),
+        unlock,
+        std::path::Path::new(&destination),
+        &mut blobs,
+    )
+    .map_err(RatatoskError::internal)?;
+    Ok(FfiImported {
+        scope: match done.scope {
+            ratatosk_core::ExportScope::Everything => FfiExportScope::Everything,
+            ratatosk_core::ExportScope::WithoutAttachments => FfiExportScope::WithoutAttachments,
+            ratatosk_core::ExportScope::SocialGraph => FfiExportScope::SocialGraph,
+        },
+        contacts: done.contacts,
+        messages: done.messages,
+        files: done.files,
+        whole_files: done.whole_files,
+        bytes: done.bytes,
+    })
+}
+
+/// Насколько большой файл ещё уедет почтой.
+///
+/// Через сеть предел другой и выше: почта — самый узкий из транспортов,
+/// и UI показывает именно этот предел, когда сети нет.
 #[uniffi::export]
 #[must_use]
 pub fn mail_file_limit_bytes() -> u64 {

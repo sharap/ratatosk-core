@@ -362,6 +362,206 @@ fn a_revoked_terminal_stops_being_answered() {
 }
 
 #[test]
+fn a_terminal_tells_the_phone_where_to_call_it_back() {
+    // Соединения односторонние: телефон отвечает не в принятое соединение,
+    // а в своё, набранное по адресу (5ц). Вне общей сети адрес брать
+    // неоткуда, кроме как от самого терминала, — и приехать он обязан
+    // раньше первого ответа, то есть в рукопожатии.
+    const ADDRESS: &str = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+
+    let mut phone = phone(1, "телефон");
+    let invite = invited(&mut phone, 1_000);
+    let mut desktop = CompanionClient::from_invite(&invite, Box::new(SeededEntropy::new(5)));
+
+    // Сервис поднялся до первого рукопожатия — как оно и бывает, когда
+    // терминал открывают уже вне дома.
+    assert!(
+        desktop.step(1_050, ClientInput::OnionReady(ADDRESS.to_owned())).is_empty(),
+        "объявление адреса само по себе ничего не отправляет: оно уедет рукопожатием"
+    );
+
+    let pairing_public = phone.paired_devices()[0].pairing_public;
+    assert_eq!(phone.device_onion(&pairing_public), None, "до рукопожатия сказать было нечему");
+
+    let first = desktop.step(1_100, ClientInput::Reach);
+    let shown = pump(&mut phone, &mut desktop, 1_100, first);
+    assert!(shown.contains(&ClientEvent::Linked), "рукопожатие с нагрузкой обязано сойтись");
+    assert_eq!(
+        phone.device_onion(&pairing_public),
+        Some(ADDRESS),
+        "телефон обязан запомнить, чем перезвонить"
+    );
+    assert_eq!(phone.paired_devices()[0].onion, ADDRESS, "и пережить перезапуск вместе с базой");
+}
+
+#[test]
+fn a_service_raised_later_reaches_the_phone_with_the_next_handshake() {
+    // Пустой адрес — самое частое значение: дома телефон находит терминал
+    // маяком §5.1, и onion ему не нужен вовсе. Рукопожатие обязано сходиться
+    // ровно так же — иначе тринадцатая версия сломала бы обычный случай.
+    const ADDRESS: &str = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+    let (mut phone, mut desktop, shown) = linked(1_000);
+    assert!(shown.contains(&ClientEvent::Linked));
+
+    let pairing_public = phone.paired_devices()[0].pairing_public;
+    assert_eq!(phone.device_onion(&pairing_public), None, "адреса нет — и звонить некуда");
+    assert_eq!(phone.paired_devices()[0].onion, "", "пустая строка, а не выдуманный адрес");
+
+    // Сервис поднялся уже после подключения. Живой связи он не нужен,
+    // и по ней ничего не едет.
+    assert!(desktop.step(1_200, ClientInput::OnionReady(ADDRESS.to_owned())).is_empty());
+    assert_eq!(phone.device_onion(&pairing_public), None, "по живой связи адрес не досылается");
+
+    // Разрыв — и следующее рукопожатие везёт его само. Это и есть весь
+    // ответ на «а если сервис поднялся позже»: адрес нужен телефону ровно
+    // тогда, когда терминал не в общей сети, а такой разговор всегда
+    // начинается новым рукопожатием.
+    let _ = desktop.step(1_300, ClientInput::Lost);
+    let again = desktop.step(1_400, ClientInput::Reach);
+    let shown = pump(&mut phone, &mut desktop, 1_400, again);
+    assert!(shown.contains(&ClientEvent::Linked), "второе рукопожатие сходится");
+    assert_eq!(phone.device_onion(&pairing_public), Some(ADDRESS));
+}
+
+#[test]
+fn a_revoked_terminal_is_told_and_forgets_what_it_was_shown() {
+    // До этого прощания у терминала не было **ни одного** способа отличить
+    // отзыв от «телефон не в сети»: и то и другое выглядело тишиной,
+    // и окно вечно писало «подключаемся» (§14).
+    let (mut phone, mut desktop, _) = linked(1_000);
+    with_contact(&mut phone, 1_050, "сосед", 9);
+    let device_id = phone.paired_devices()[0].device_id;
+
+    // Терминалу есть что помнить: список чатов он уже видел.
+    let asked = desktop.step(1_100, ClientInput::Ask(Request::Chats));
+    let shown = pump(&mut phone, &mut desktop, 1_100, asked);
+    assert!(shown.iter().any(|e| matches!(e, ClientEvent::Chats { .. })));
+    assert!(!desktop.cache().chats().is_empty(), "кэш наполнился");
+
+    // Отзыв. Кадр прощания уезжает **в том же шаге**, до сноса ключей:
+    // после него запечатать было бы нечем.
+    let effects = phone
+        .step(1_200, Input::Command(Command::RevokePairing { device_id }))
+        .expect("отзыв сопряжения");
+    let desktop_ik = desktop.ik();
+    let mut shown = Vec::new();
+    for effect in effects {
+        let Effect::Send { peer_ik, frame, .. } = effect else { continue };
+        if peer_ik != desktop_ik {
+            continue;
+        }
+        for out in desktop.step(1_200, ClientInput::Received(frame)) {
+            if let ClientEffect::Show(event) = out {
+                shown.push(event);
+            }
+        }
+    }
+    assert!(
+        shown.contains(&ClientEvent::Revoked),
+        "прощание обязано доехать до включённого десктопа: {shown:?}"
+    );
+
+    assert!(desktop.revoked());
+    assert!(!desktop.linked());
+    assert!(
+        desktop.cache().chats().is_empty(),
+        "переписки на машине, которой в ней отказано, остаться не должно"
+    );
+
+    // Дальше он не стучится и не притворяется. Оба конца важны: молчащий
+    // терминал выглядел бы сломанным, а стучащийся — работающим.
+    assert!(
+        desktop.step(1_300, ClientInput::Reach).is_empty(),
+        "стучаться некуда: ключа сопряжения у телефона больше нет"
+    );
+    let asked = desktop.step(1_400, ClientInput::Ask(Request::Chats));
+    assert!(
+        matches!(asked.as_slice(), [ClientEffect::Show(ClientEvent::Refused(_))]),
+        "на просьбу человека отвечаем словами, а не тишиной: {asked:?}"
+    );
+}
+
+#[test]
+fn a_revoked_terminal_knocking_again_does_not_fell_the_phone() {
+    // Разбор дефекта. Рукопожатие терминала возит **пустую** нагрузку:
+    // карточки у него нет и быть не может. Пока он числится устройством,
+    // до разбора карточки дело не доходит; отозванный числиться перестаёт —
+    // и `ContactCard::decode` спотыкался о пустые байты, роняя весь шаг
+    // ядра. Ноутбук, повторяющий рукопожатие раз в пятнадцать секунд,
+    // делал это отказом ядра раз в пятнадцать секунд.
+    let (mut phone, mut desktop, _) = linked(1_000);
+    let device_id = phone.paired_devices()[0].device_id;
+    phone.step(1_100, Input::Command(Command::RevokePairing { device_id })).expect("отзыв");
+
+    // Терминал прощания не получил — так выглядит ноутбук, который в этот
+    // момент был выключен. Связь он потерял вместе с питанием и, включившись,
+    // стучится заново.
+    let _ = desktop.step(1_150, ClientInput::Lost);
+    let again = desktop.step(1_200, ClientInput::Reach);
+    let mut frames = Vec::new();
+    for effect in again {
+        if let ClientEffect::Send(frame) = effect {
+            frames.push(frame);
+        }
+    }
+    assert!(!frames.is_empty(), "терминал обязан был попробовать");
+
+    // Телефон отвечает **надгробием**, а не тишиной и не сессией: он помнит
+    // снесённый ключ сопряжения ровно для этого случая.
+    let desktop_ik = desktop.ik();
+    let mut shown = Vec::new();
+    for frame in frames {
+        let effects = phone
+            .step(1_200, Input::Received { via: Transport::Lan, frame })
+            .expect("рукопожатие без карточки роняться не должно");
+        for effect in effects {
+            let Effect::Send { peer_ik, frame, .. } = effect else {
+                panic!("отозванному отвечают одним кадром и ничем больше");
+            };
+            assert_eq!(peer_ik, desktop_ik);
+            for out in desktop.step(1_200, ClientInput::Received(frame)) {
+                if let ClientEffect::Show(event) = out {
+                    shown.push(event);
+                }
+            }
+        }
+    }
+    assert!(
+        shown.contains(&ClientEvent::Revoked),
+        "выключенный в момент отзыва обязан узнать причину, вернувшись: {shown:?}"
+    );
+    assert!(desktop.revoked());
+
+    // Сессии ему при этом не завели: надгробие — не рукопожатие.
+    assert!(!desktop.linked(), "ответ отзыва связи не даёт");
+
+    // И контактом он не стал: иначе отозванный десктоп появился бы
+    // у человека в списке чатов как собеседник.
+    assert!(phone.contacts().is_empty(), "рукопожатие без карточки контакта не заводит");
+    assert!(phone.paired_devices().is_empty());
+}
+
+#[test]
+fn a_tombstone_older_than_the_cache_answers_with_silence() {
+    // Срок у надгробия тот же, что у кэша десктопа: тридцать суток (§13.4).
+    // К его концу десктоп стирает кэш сам, и сказать ему уже нечего —
+    // а держать ответ вечно значило бы помнить снесённые ключи вечно.
+    let (mut phone, mut desktop, _) = linked(1_000);
+    let device_id = phone.paired_devices()[0].device_id;
+    phone.step(1_100, Input::Command(Command::RevokePairing { device_id })).expect("отзыв");
+
+    let _ = desktop.step(1_150, ClientInput::Lost);
+    let late = 1_100 + ratatosk_core::companion::DESKTOP_CACHE_TTL_MS;
+    let again = desktop.step(late, ClientInput::Reach);
+    for effect in again {
+        let ClientEffect::Send(frame) = effect else { continue };
+        let effects =
+            phone.step(late, Input::Received { via: Transport::Lan, frame }).expect("шаг");
+        assert!(effects.is_empty(), "просроченному надгробию отвечать нечем: {effects:?}");
+    }
+}
+
+#[test]
 fn an_answer_that_outlived_the_link_is_not_shown() {
     // Ответ, переживший разрыв, показывать нельзя: список чатов из прошлой
     // жизни затёр бы нынешний. Здесь его отсекает отсутствие сессии; внутри

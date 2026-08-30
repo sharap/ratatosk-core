@@ -1014,6 +1014,586 @@ fn an_old_staged_upload_is_found_by_the_time_it_was_started() {
     assert_eq!(store.staged_older_than(9_000).unwrap().len(), 2);
 }
 
+/// Собирает архив в память и отдаёт его байтами.
+fn archived(
+    store: &SqliteStore,
+    archive_id: [u8; 16],
+    scope: ratatosk_store::archive::ExportScope,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let head = ratatosk_store::archive::Header { archive_id, scope };
+        let mut writer = ratatosk_store::archive::ArchiveWriter::start(&mut out, head).unwrap();
+        store.export_into(scope, &mut writer).expect("экспорт");
+        writer.finish().expect("конец архива");
+    }
+    out
+}
+
+/// Достаёт из архива снимок базы, расшифровывая куски.
+fn snapshot_from(archive: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    use ratatosk_store::archive::{self, EntryKind};
+
+    let archive_id = archive::parse_header(archive).expect("заголовок").archive_id;
+    let mut at = archive::HEADER_LEN;
+    let mut snapshot = Vec::new();
+    while let Some(entry) = archive::parse_entry(&archive[at..]).expect("рамка") {
+        at += archive::ENTRY_HEADER_LEN;
+        let body = &archive[at..at + entry.len];
+        at += entry.len;
+        if entry.kind != EntryKind::Database {
+            continue;
+        }
+        let aad = archive::db_chunk_aad(&archive_id, entry.index);
+        let open = ratatosk_crypto::storage_key::open_field(key, &aad, body)
+            .expect("кусок базы открывается своим ключом");
+        snapshot.extend_from_slice(&open);
+    }
+    snapshot
+}
+
+#[test]
+fn an_exported_archive_opens_back_into_a_working_database() {
+    // §12: «единственный путь переноса истории на другое устройство».
+    // Проверяется поэтому целиком, до открытой базы на том конце: архив,
+    // который нельзя открыть обратно, — не архив, а иллюзия сохранности.
+    let db = TempDb::new("export");
+    let restored = TempDb::new("export-back");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    for n in 1..=3u8 {
+        store.put_message(&message(n, u64::from(n) * 100)).unwrap();
+    }
+    store.put_contact(&contact(5)).unwrap();
+
+    let archive = archived(&store, [3u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let db_key = store.export_key().expect("ключ архива");
+    assert_eq!(*db_key, *key(1), "архив открывается ключом базы, а не новым (§12)");
+
+    // Снимок обязан лежать в архиве **запечатанным**: файл уезжает
+    // на флешке, и открытая копия базы в нём свела бы §12 к переносу
+    // папки.
+    assert!(
+        !archive.windows(15).any(|w| w == b"SQLite format 3"),
+        "заголовок SQLite виден в архиве открытым текстом"
+    );
+
+    std::fs::write(&restored.0, snapshot_from(&archive, &db_key)).expect("снимок на диск");
+    let back = SqliteStore::open(&restored.0, key(1)).unwrap();
+    let found = back.messages(&[9u8; 16], 10, None).expect("история из архива");
+    assert_eq!(found.len(), 3, "переписка доехала целиком");
+    assert_eq!(found[0].body, "сообщение 1".as_bytes(), "и читается тем же ключом");
+    assert_eq!(back.contacts().expect("контакты").len(), 1, "контакты тоже");
+}
+
+#[test]
+fn the_social_graph_carries_the_contacts_and_leaves_the_correspondence() {
+    // Человек меняет телефон и готов расстаться с историей, но не со
+    // **связями**: без контактов с их адресами он никому не может написать
+    // первым, а собеседники не узнают его нового ключа.
+    //
+    // Проверяется обеими половинами: что доехало и — важнее — что не доехало.
+    let db = TempDb::new("export-graph");
+    let restored = TempDb::new("export-graph-back");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_contact(&contact(2)).unwrap();
+    store.put_contact(&contact(3)).unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_message(&message(2, 200)).unwrap();
+    store.put_meta(ratatosk_store::META_IDENTITY_SEED, b"zerno").unwrap();
+    store.put_meta(ratatosk_store::META_SELF_CARD, b"kartochka").unwrap();
+    store.put_meta(&ratatosk_store::read_upto_key(&[9u8; 16]), b"do-sjuda").unwrap();
+
+    let archive = archived(&store, [8u8; 16], ratatosk_store::archive::ExportScope::SocialGraph);
+    let head = ratatosk_store::archive::parse_header(&archive).unwrap();
+    assert_eq!(
+        head.scope,
+        ratatosk_store::archive::ExportScope::SocialGraph,
+        "область записана в архиве, а не выводится из содержимого"
+    );
+
+    let db_key = store.export_key().unwrap();
+    std::fs::write(&restored.0, snapshot_from(&archive, &db_key)).expect("снимок на диск");
+    let back = SqliteStore::open(&restored.0, key(1)).unwrap();
+
+    // Доехало: контакты с адресами и своя личность.
+    let contacts = back.contacts().expect("контакты");
+    assert_eq!(contacts.len(), 2, "оба знакомства на месте");
+    assert_eq!(contacts[0].card_bytes, vec![2u8; 64], "карточка — та же, байт в байт (§6)");
+    assert_eq!(
+        back.meta(ratatosk_store::META_IDENTITY_SEED).unwrap().as_deref(),
+        Some(&b"zerno"[..]),
+        "без своего зерна это чужой граф, а не свой"
+    );
+    assert_eq!(
+        back.meta(ratatosk_store::META_SELF_CARD).unwrap().as_deref(),
+        Some(&b"kartochka"[..])
+    );
+
+    // Не доехало: переписка и отметки о ней.
+    assert!(
+        back.messages(&[9u8; 16], 10, None).expect("история").is_empty(),
+        "сообщений в графе быть не должно"
+    );
+    assert_eq!(
+        back.meta(&ratatosk_store::read_upto_key(&[9u8; 16])).unwrap(),
+        None,
+        "`meta` уезжает не целиком: отметки прочтения — про переписку"
+    );
+}
+
+#[test]
+fn an_export_without_attachments_still_says_what_it_is() {
+    // Архив без вложений и полный архив у человека без единого вложения
+    // выглядят одинаково. Отличить их можно только по записанной области —
+    // и ввоз обязан прочесть её, а не догадываться.
+    let db = TempDb::new("export-nofiles");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+
+    let archive =
+        archived(&store, [6u8; 16], ratatosk_store::archive::ExportScope::WithoutAttachments);
+    let head = ratatosk_store::archive::parse_header(&archive).unwrap();
+    assert_eq!(head.scope, ratatosk_store::archive::ExportScope::WithoutAttachments);
+
+    // Переписка при этом на месте: без вложений — не значит без слов.
+    let restored = TempDb::new("export-nofiles-back");
+    let db_key = store.export_key().unwrap();
+    std::fs::write(&restored.0, snapshot_from(&archive, &db_key)).expect("снимок на диск");
+    let back = SqliteStore::open(&restored.0, key(1)).unwrap();
+    assert_eq!(back.messages(&[9u8; 16], 10, None).expect("история").len(), 1);
+}
+
+#[test]
+fn an_archive_does_not_open_with_the_wrong_key() {
+    // Иначе «зашифрованный архив» — слово, а не свойство.
+    let db = TempDb::new("export-wrong");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+
+    let archive = archived(&store, [4u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let archive_id = ratatosk_store::archive::parse_header(&archive).unwrap().archive_id;
+    let first =
+        ratatosk_store::archive::parse_entry(&archive[ratatosk_store::archive::HEADER_LEN..])
+            .unwrap()
+            .expect("первая запись");
+    let at = ratatosk_store::archive::HEADER_LEN + ratatosk_store::archive::ENTRY_HEADER_LEN;
+    let body = &archive[at..at + first.len];
+    let aad = ratatosk_store::archive::db_chunk_aad(&archive_id, 0);
+    assert!(
+        ratatosk_crypto::storage_key::open_field(&[2u8; 32], &aad, body).is_err(),
+        "чужой ключ не должен открывать архив"
+    );
+}
+
+#[test]
+fn a_chunk_cannot_be_moved_between_two_archives_of_one_account() {
+    // Два архива одного аккаунта шифруются **одним** ключом, и без
+    // идентификатора архива в associated data кусок вчерашнего архива
+    // подставился бы в сегодняшний незаметно.
+    let db = TempDb::new("export-splice");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+
+    let first = archived(&store, [1u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let db_key = store.export_key().unwrap();
+    let head = ratatosk_store::archive::HEADER_LEN + ratatosk_store::archive::ENTRY_HEADER_LEN;
+    let entry = ratatosk_store::archive::parse_entry(&first[ratatosk_store::archive::HEADER_LEN..])
+        .unwrap()
+        .expect("запись");
+    let body = &first[head..head + entry.len];
+
+    // Тот же кусок, но выдаём его за кусок другого архива.
+    let alien = ratatosk_store::archive::db_chunk_aad(&[2u8; 16], 0);
+    assert!(
+        ratatosk_crypto::storage_key::open_field(&db_key, &alien, body).is_err(),
+        "кусок обязан быть привязан к своему архиву"
+    );
+    let own = ratatosk_store::archive::db_chunk_aad(&[1u8; 16], 0);
+    assert!(ratatosk_crypto::storage_key::open_field(&db_key, &own, body).is_ok());
+}
+
+/// Кладёт байты архива в файл и отдаёт путь.
+fn archive_file(tag: &str, bytes: &[u8]) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "ratatosk-arch-{tag}-{}-{:?}.rtsk",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, bytes).expect("архив на диск");
+    path
+}
+
+/// База с перепиской, контактом и одним вложением из трёх кусков.
+fn account_with_everything(db: &TempDb) -> SqliteStore {
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_contact(&contact(5)).unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_message(&message(2, 200)).unwrap();
+    store.put_file(&file(2, 1, true)).unwrap();
+    store
+}
+
+#[test]
+fn an_archive_goes_out_and_comes_back_as_a_working_account() {
+    // Ради этого весь §12 и написан: переписка обязана пережить телефон.
+    // Проверяется кругом целиком — вывоз, ключ, ввоз, открытая база, —
+    // потому что вывоз, который нечем ввезти, ничего не сохраняет.
+    let db = TempDb::new("round-out");
+    let landing = TempDb::new("round-in");
+    let store = account_with_everything(&db);
+    let db_key = store.export_key().unwrap();
+
+    // Архив: база от хранилища плюс куски вложения — как их кладёт ядро.
+    let mut bytes = Vec::new();
+    {
+        let head = ratatosk_store::archive::Header {
+            archive_id: [11u8; 16],
+            scope: ratatosk_store::archive::ExportScope::Everything,
+        };
+        let mut writer = ratatosk_store::archive::ArchiveWriter::start(&mut bytes, head).unwrap();
+        store.export_into(ratatosk_store::archive::ExportScope::Everything, &mut writer).unwrap();
+        for index in 0..3u64 {
+            ratatosk_store::archive::ArchiveSink::put(
+                &mut writer,
+                ratatosk_store::archive::EntryKind::Attachment,
+                &[2u8; 16],
+                index,
+                &[index as u8; 64],
+            )
+            .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let archive = archive_file("round", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let done = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&db_key),
+        &landing.0,
+        &mut blobs,
+    )
+    .expect("ввоз");
+    assert_eq!(done.scope, ratatosk_store::archive::ExportScope::Everything);
+    assert_eq!(done.contacts, 1);
+    assert_eq!(done.messages, 2);
+    assert_eq!(done.files, 1);
+    assert_eq!(done.whole_files, 1, "все три куска доехали — вложение целое");
+    assert_eq!(done.bytes, 192);
+
+    // И база на месте назначения — рабочая, тем же ключом.
+    let back = SqliteStore::open(&landing.0, key(1)).unwrap();
+    let history = back.messages(&[9u8; 16], 10, None).expect("история");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].body, "сообщение 1".as_bytes());
+    assert_eq!(back.contacts().expect("контакты").len(), 1);
+    let files = back.files_of(&[1u8; 16]).expect("вложения");
+    assert_eq!(files.len(), 1);
+    assert!(files[0].complete, "вложение, чьи байты доехали, — целое");
+    assert_eq!(back.received_chunks(&[2u8; 16]).expect("куски"), 3);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_file_whose_bytes_did_not_travel_stops_calling_itself_whole() {
+    // Архив без вложений несёт **записи** о них и не несёт байтов. Оставить
+    // такую запись «целой» значит показать человеку файл, который
+    // не открывается, — ровно то, что §14 запрещает.
+    let db = TempDb::new("nofiles-out");
+    let landing = TempDb::new("nofiles-in");
+    let mut store = account_with_everything(&db);
+    store.note_chunk(&[2u8; 16], 0).unwrap();
+    store.note_chunk(&[2u8; 16], 1).unwrap();
+    store.note_chunk(&[2u8; 16], 2).unwrap();
+    store.complete_file(&[2u8; 16]).unwrap();
+    store.set_accepted(&[2u8; 16], true).unwrap();
+    assert!(store.file(&[2u8; 16]).unwrap().unwrap().complete, "до вывоза — целое");
+
+    let db_key = store.export_key().unwrap();
+    let bytes =
+        archived(&store, [12u8; 16], ratatosk_store::archive::ExportScope::WithoutAttachments);
+    let archive = archive_file("nofiles", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let done = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&db_key),
+        &landing.0,
+        &mut blobs,
+    )
+    .expect("ввоз");
+    assert_eq!(done.files, 1, "запись о вложении доехала");
+    assert_eq!(done.whole_files, 0, "а байты — нет, и запись это признаёт");
+
+    let back = SqliteStore::open(&landing.0, key(1)).unwrap();
+    let stored = back.file(&[2u8; 16]).expect("файл").expect("запись на месте");
+    assert_eq!(stored.name, "файл 2.pdf", "имя вложения при этом никуда не делось");
+    assert!(!stored.complete, "целым его называть больше нельзя");
+    assert!(
+        !stored.accepted,
+        "и согласие снято: иначе первое подключение потянуло бы с собеседников всё, \
+         от чего человек только что отказался"
+    );
+    assert_eq!(back.received_chunks(&[2u8; 16]).expect("куски"), 0, "отметки о кусках — чужие");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn an_import_over_a_living_account_is_refused() {
+    // Ввоз поверх живого аккаунта — это стереть человеку переписку
+    // по нажатию кнопки «восстановить». И решить за него, чьей остаётся
+    // личность, тоже нельзя: человек не бывает двумя людьми.
+    let db = TempDb::new("over-out");
+    let occupied = TempDb::new("over-in");
+    let store = account_with_everything(&db);
+    let db_key = store.export_key().unwrap();
+    let bytes = archived(&store, [13u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let archive = archive_file("over", &bytes);
+
+    // На месте назначения уже есть база — та, что завёл `TempDb`... точнее,
+    // заведём её нарочно.
+    {
+        let mut living = SqliteStore::open(&occupied.0, key(2)).unwrap();
+        living.migrate().unwrap();
+        living.put_message(&message(7, 700)).unwrap();
+    }
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let refused = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&db_key),
+        &occupied.0,
+        &mut blobs,
+    );
+    assert!(refused.is_err(), "поверх живого аккаунта ввоза нет");
+
+    // И живое не тронуто.
+    let living = SqliteStore::open(&occupied.0, key(2)).unwrap();
+    assert_eq!(living.messages(&[9u8; 16], 10, None).unwrap().len(), 1, "чужая база цела");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_wrong_key_leaves_no_half_made_account_behind() {
+    // Человек ошибся ключом — самое обычное дело, ключ длинный. После
+    // отказа не должно остаться ни базы, ни обрывка под её именем:
+    // вторая попытка иначе упёрлась бы в «здесь уже есть база».
+    let db = TempDb::new("badkey-out");
+    let landing = TempDb::new("badkey-in");
+    let store = account_with_everything(&db);
+    let bytes = archived(&store, [14u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let archive = archive_file("badkey", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let wrong = Zeroizing::new([2u8; 32]);
+    let refused = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&wrong),
+        &landing.0,
+        &mut blobs,
+    );
+    assert!(refused.is_err(), "чужой ключ не должен открывать архив");
+    assert!(!landing.0.exists(), "база не появилась");
+    assert!(
+        !landing.0.with_extension("import-tmp").exists(),
+        "и обрывок не остался: вторая попытка обязана быть возможной"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_truncated_archive_creates_nothing_at_all() {
+    // Оборванный архив, принятый за законченный, дал бы половину переписки,
+    // выглядящую целой. Здесь — обрыв внутри записи.
+    let db = TempDb::new("cut-out");
+    let landing = TempDb::new("cut-in");
+    let store = account_with_everything(&db);
+    let db_key = store.export_key().unwrap();
+    let bytes = archived(&store, [15u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let archive = archive_file("cut", &bytes[..bytes.len() - 10]);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let refused = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&db_key),
+        &landing.0,
+        &mut blobs,
+    );
+    assert!(refused.is_err(), "обрыв обязан быть отказом, а не половиной аккаунта");
+    assert!(!landing.0.exists());
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+/// Заворачивает ключ базы во фразу — так, как это делает ядро при вывозе.
+fn wrapped(db_key: &Zeroizing<[u8; 32]>, archive_id: [u8; 16], phrase: &str) -> Vec<u8> {
+    let salt = [0x5Au8; ratatosk_store::archive::WRAP_SALT_LEN];
+    let params = ratatosk_crypto::storage_key::KdfParams::default();
+    let from_phrase = ratatosk_crypto::storage_key::derive_from_pin(phrase, &salt, params).unwrap();
+    let sealed = ratatosk_crypto::storage_key::seal_field(
+        &from_phrase,
+        &ratatosk_store::archive::wrapped_key_aad(&archive_id),
+        &db_key[..],
+    )
+    .unwrap();
+    ratatosk_store::archive::KeyWrap {
+        salt,
+        memory_kib: params.memory_kib,
+        iterations: params.iterations,
+        parallelism: params.parallelism,
+        sealed,
+    }
+    .to_bytes()
+}
+
+/// Архив, запертый фразой: завёрнутый ключ первой записью, дальше база.
+fn phrase_locked_archive(store: &SqliteStore, archive_id: [u8; 16], phrase: &str) -> Vec<u8> {
+    let db_key = store.export_key().unwrap();
+    let mut out = Vec::new();
+    let head = ratatosk_store::archive::Header {
+        archive_id,
+        scope: ratatosk_store::archive::ExportScope::Everything,
+    };
+    let mut writer = ratatosk_store::archive::ArchiveWriter::start(&mut out, head).unwrap();
+    ratatosk_store::archive::ArchiveSink::put(
+        &mut writer,
+        ratatosk_store::archive::EntryKind::WrappedKey,
+        &[0u8; 16],
+        0,
+        &wrapped(&db_key, archive_id, phrase),
+    )
+    .unwrap();
+    store.export_into(ratatosk_store::archive::ExportScope::Everything, &mut writer).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn an_archive_locked_with_a_phrase_opens_with_that_phrase() {
+    // Ради этого заворачивание и делалось: пятьдесят два знака человек
+    // не запомнит, а фразу, которую он придумал сам, — запомнит.
+    let db = TempDb::new("phrase-out");
+    let landing = TempDb::new("phrase-in");
+    let store = account_with_everything(&db);
+    let bytes = phrase_locked_archive(&store, [21u8; 16], "четыре весёлых кота");
+    let archive = archive_file("phrase", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    // Сперва архив спрашивают, чего он хочет: экран, требующий фразу там,
+    // где её нет, — тупик.
+    let peek = ratatosk_store::peek_archive(&archive).expect("заглянуть");
+    assert!(peek.takes_passphrase, "архив с завёрнутым ключом открывается фразой");
+    assert_eq!(peek.scope, ratatosk_store::archive::ExportScope::Everything);
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let done = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Passphrase("четыре весёлых кота"),
+        &landing.0,
+        &mut blobs,
+    )
+    .expect("ввоз по фразе");
+    assert_eq!(done.messages, 2);
+    assert_eq!(done.contacts, 1);
+
+    let back = SqliteStore::open(&landing.0, key(1)).unwrap();
+    assert_eq!(back.messages(&[9u8; 16], 10, None).unwrap().len(), 2);
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn the_raw_key_still_opens_an_archive_locked_with_a_phrase() {
+    // Второй вход, и он не запасной по важности: фразу пятилетней давности
+    // человек забудет, а строка в менеджере паролей переживёт и его память,
+    // и телефон.
+    let db = TempDb::new("both-out");
+    let landing = TempDb::new("both-in");
+    let store = account_with_everything(&db);
+    let db_key = store.export_key().unwrap();
+    let bytes = phrase_locked_archive(&store, [22u8; 16], "фраза");
+    let archive = archive_file("both", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let done = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Key(&db_key),
+        &landing.0,
+        &mut blobs,
+    )
+    .expect("ввоз тем же ключом");
+    assert_eq!(done.messages, 2, "завёрнутый ключ не мешает войти сырым");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_wrong_phrase_is_refused_and_leaves_nothing() {
+    let db = TempDb::new("badphrase-out");
+    let landing = TempDb::new("badphrase-in");
+    let store = account_with_everything(&db);
+    let bytes = phrase_locked_archive(&store, [23u8; 16], "правильная");
+    let archive = archive_file("badphrase", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let refused = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Passphrase("неправильная"),
+        &landing.0,
+        &mut blobs,
+    );
+    assert!(refused.is_err(), "чужая фраза не открывает архив");
+    assert!(!landing.0.exists(), "и ничего не остаётся");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_phrase_offered_to_an_archive_without_one_says_so() {
+    // Архив постарше фразой не запирался. Отказ обязан назвать причину:
+    // иначе человек будет вспоминать фразу, которой никогда не было.
+    let db = TempDb::new("nophrase-out");
+    let landing = TempDb::new("nophrase-in");
+    let store = account_with_everything(&db);
+    let bytes = archived(&store, [24u8; 16], ratatosk_store::archive::ExportScope::Everything);
+    let archive = archive_file("nophrase", &bytes);
+    std::fs::remove_file(&landing.0).ok();
+
+    assert!(
+        !ratatosk_store::peek_archive(&archive).unwrap().takes_passphrase,
+        "у старого архива фразы нет, и спрашивать её нельзя"
+    );
+
+    let mut blobs = ratatosk_store::MemoryBlobs::new();
+    let refused = ratatosk_store::import_archive(
+        &archive,
+        ratatosk_store::ArchiveUnlock::Passphrase("любая"),
+        &landing.0,
+        &mut blobs,
+    );
+    let why = refused.expect_err("отказ").to_string();
+    assert!(why.contains("фразой не открывается"), "причина обязана быть названа: {why}");
+
+    let _ = std::fs::remove_file(&archive);
+}
+
 /// Сообщение с заданным текстом — для тестов поиска.
 fn said(n: u8, wall: u64, text: &str) -> StoredMessage {
     StoredMessage { body: text.as_bytes().to_vec(), ..message(n, wall) }

@@ -117,7 +117,27 @@ pub const MAX_GONE_IDS: usize = 256;
 ///
 /// Девятка — продолжение прерванной выгрузки: [`Request::Staged`]
 /// и ответ [`Response::Staged`].
-pub const WIRE_VERSION: u32 = 9;
+///
+/// Десятка — аватарки: поле [`ChatSummary::avatar_ms`], просьба
+/// [`Request::Avatar`], ответ [`Response::Avatar`] и новость
+/// [`Notice::AvatarChanged`]. Поле в списке чатов **появилось**, а не сменило
+/// форму: сборка версии 9 разберёт список как прежде, просто не увидит меток.
+///
+/// Одиннадцать — смена своей аватарки с десктопа: [`Request::SetMyAvatar`].
+/// Только просьба: ответ у неё общий (`Done` или `Refused`), а новость
+/// о смене — та же [`Notice::AvatarChanged`], что была в десятке.
+///
+/// Двенадцать — прощание при отзыве: [`Notice::Revoked`]. Константы
+/// «с какой версии» у неё нет и не нужно: десктоп её не спрашивает, а телефон
+/// постарше просто не пришлёт — то есть будет вести себя ровно так, как
+/// вёл себя до неё.
+///
+/// Тринадцать — адрес десктопа в **рукопожатии** ([`DeviceAddress`]).
+/// Ни просьбы, ни ответа, ни новости: нагрузка первого сообщения Noise,
+/// которая до этого была пуста. Телефон постарше её не читает вовсе,
+/// десктоп постарше не шлёт — обе стороны остаются при локальной сети,
+/// как и были.
+pub const WIRE_VERSION: u32 = 13;
 
 /// Наибольшее число сообщений в одной просьбе десктопа.
 ///
@@ -167,6 +187,31 @@ pub const STAGED_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// разрешения продолжить. Версия приезжает `Hello` раньше всех прочих
 /// ответов, и по ней видно, стоит ли вообще спрашивать.
 pub const STAGED_SINCE_WIRE: u32 = 9;
+
+/// С какой версии провода телефон знает про аватарки.
+///
+/// Отдельная константа от [`STAGED_SINCE_WIRE`] по той же причине, по какой
+/// та отдельна от версии провода: числа совпадать не обязаны, а сведённые
+/// в одно разъедутся на первой же новой возможности.
+///
+/// Нужна не ради ответа, а ради **молчания в кэше**. Телефон постарше просьбу
+/// [`Request::Avatar`] отбросит, десктоп ответа не дождётся и покажет пустой
+/// кружок — что само по себе не беда. Беда в том, что пустой кружок
+/// неотличим от «аватарки нет», и десктоп спрашивал бы заново на каждом
+/// подключении. Зная версию, он не спрашивает вовсе.
+pub const AVATARS_SINCE_WIRE: u32 = 10;
+
+/// С какой версии провода телефон принимает свою аватарку от десктопа.
+///
+/// Отдельно от [`AVATARS_SINCE_WIRE`], хотя разница в одну версию: показ
+/// и смена приехали разными поставками, и телефон, умеющий первое, вправе
+/// не уметь второго. Сведи их в одно число — и десктоп, поговорив с таким
+/// телефоном, отправил бы картинку в тишину.
+///
+/// Здесь молчание дороже, чем при чтении: человек **нажал кнопку**. Не
+/// сказав ему ничего, десктоп оставил бы его смотреть на прежнее лицо
+/// и гадать, дошло ли, — а §14 запрещает ровно это.
+pub const SET_AVATAR_SINCE_WIRE: u32 = 11;
 
 /// Наибольшее число реакций на одном сообщении в кадре.
 ///
@@ -229,6 +274,7 @@ const KEY_BYTES: u64 = 28;
 const KEY_ACCEPTED: u64 = 29;
 const KEY_WIRE: u64 = 30;
 const KEY_PREVIEW: u64 = 31;
+const KEY_AVATAR_MS: u64 = 32;
 
 // Виды запроса, ответа и новости нумеруются **каждый в своей области**,
 // и имена это называют вслух. Сперва все три набора звались `KIND_*`,
@@ -263,6 +309,8 @@ const REQUEST_FILE_SEND: u64 = 19;
 const REQUEST_FILE_ABORT: u64 = 20;
 const REQUEST_FILE_PREVIEW: u64 = 21;
 const REQUEST_STAGED: u64 = 22;
+const REQUEST_AVATAR: u64 = 23;
+const REQUEST_SET_AVATAR: u64 = 24;
 
 /// Коды видов ответа — своя нумерация, не общая с запросами.
 const RESPONSE_CHATS: u64 = 1;
@@ -274,6 +322,7 @@ const RESPONSE_HELLO: u64 = 6;
 const RESPONSE_FILE_OFFER: u64 = 7;
 const RESPONSE_FILE_PREVIEW: u64 = 8;
 const RESPONSE_STAGED: u64 = 9;
+const RESPONSE_AVATAR: u64 = 10;
 
 /// Коды видов новости — тоже своя.
 const NOTICE_MESSAGE: u64 = 1;
@@ -284,6 +333,8 @@ const NOTICE_EDITED: u64 = 5;
 const NOTICE_REACTED: u64 = 6;
 const NOTICE_FILE_PROGRESS: u64 = 7;
 const NOTICE_FILE_GONE: u64 = 8;
+const NOTICE_AVATAR_CHANGED: u64 = 9;
+const NOTICE_REVOKED: u64 = 10;
 
 /// Почему сопряжение не принято.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -775,6 +826,107 @@ pub enum Request {
     /// Отсюда правило порядка: `Hello` спрашивается **до** списка чатов,
     /// иначе ловить нечем.
     Hello,
+    /// Аватарка — контакта или своя.
+    ///
+    /// `None` означает **свою**, и это единственное место, где `Option`
+    /// в этом протоколе значит не «есть или нет», а «чужая или своя».
+    /// Такая же форма у [`Notice::AvatarChanged`], и намеренно: два разных
+    /// способа сказать «своя» разошлись бы при первой же правке.
+    ///
+    /// Своя спрашивается на каждом подключении без метки для сравнения —
+    /// себя в списке чатов нет, а держать ради одного числа отдельный ответ
+    /// дороже, чем раз за сеанс привезти 32 КиБ по локальной сети. Чужие —
+    /// только те, у кого [`ChatSummary::avatar_ms`] разошёлся с запомненным.
+    ///
+    /// Ответ на несверенного и на «нет аватарки» одинаков и пуст
+    /// (`Response::Avatar { bytes: None }`) — см. [`ChatSummary::avatar_ms`].
+    Avatar {
+        /// Чей чат, или `None` — своя.
+        chat: Option<ChatId>,
+    },
+    /// Поставить или снять **свою** аватарку (§4.2).
+    ///
+    /// Пустые байты — «снять», и это законное значение, а не пустая просьба:
+    /// так же устроена команда телефона (`Command::SetAvatar`). Поэтому ключ
+    /// здесь едет всегда, в отличие от [`Response::Avatar`], где отсутствие
+    /// ключа и есть «показывать нечего».
+    ///
+    /// **Только своя.** Чужую поменять нельзя ни отсюда, ни откуда-либо ещё:
+    /// лицо контакта приходит от него самого по установленной сессии, и своей
+    /// рукой оно не ставится даже на телефоне.
+    ///
+    /// Разошлёт её сверенным контактам телефон — тем же обработчиком, что
+    /// и команду с телефона. Десктоп в рассылке не участвует и участвовать
+    /// не может: сессии с контактами есть только у телефона (§13.4).
+    SetMyAvatar {
+        /// Байты картинки; пусто — снять.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Что десктоп говорит о себе в первом сообщении рукопожатия (§13.4).
+///
+/// **Место выбрано не из удобства, а из порядка.** Соединения односторонние
+/// (`ARCHITECTURE.md`, 5ц): телефон отвечает не в то соединение, которое
+/// принял, а в своё, набранное по адресу. Значит адрес нужен ему **до**
+/// первого ответа — то есть раньше, чем десктоп успел бы попросить о чём
+/// угодно. Нагрузка рукопожатия — единственное место, которое приходит
+/// раньше ответа.
+///
+/// У контактов там едет карточка (§8.2); у десктопа карточки нет и быть
+/// не может — он не человек в чьём-то списке. До версии 13 нагрузка была
+/// пуста; теперь в ней ровно то, чем десктопу можно перезвонить.
+///
+/// # Почему одного объявления довольно
+///
+/// Сервис Tor мог подняться уже после сопряжения — и тогда в этом
+/// рукопожатии адреса нет. Второго пути объявления заводить не пришлось:
+/// адрес нужен телефону только тогда, когда десктоп **не** в общей сети,
+/// а такой разговор всегда начинается с нового рукопожатия — сессия
+/// у терминала одноразовая и разрыв её не переживает. То есть адрес всегда
+/// приезжает тем же кадром, что и просьба о связи.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceAddress {
+    /// Onion-адрес десктопа. Пустая строка — «набрать меня можно только
+    /// в общей сети».
+    pub onion: String,
+}
+
+/// Наибольшая длина onion-адреса на этом проводе.
+///
+/// Адрес третьей версии — ровно 56 знаков плюс `.onion`, и другого размера
+/// у него не бывает. Предел нужен не ради вкуса: длину называет другая
+/// сторона, и «адрес на мегабайт» — это запрос памяти телефона.
+pub const MAX_ONION_LEN: usize = 56 + ".onion".len();
+
+/// Кодирует то, что десктоп говорит о себе в рукопожатии.
+#[must_use]
+pub fn device_address_value(address: &DeviceAddress) -> Value {
+    Value::Map(vec![(Value::Integer(KEY_ONION.into()), Value::Text(address.onion.clone()))])
+}
+
+/// Разбирает нагрузку рукопожатия от десктопа.
+///
+/// **Пустая нагрузка — законный вход**, а не ошибка: так выглядит десктоп
+/// сборки до тринадцатой, и рукопожатие с ним обязано сойтись. Ответ на неё —
+/// адрес пустой строкой, то есть «только общая сеть».
+///
+/// Негодная нагрузка — тоже не ошибка, и по той же причине: рукопожатие
+/// не должно разваливаться из-за поля, без которого всё остальное работает.
+/// Непонятое здесь означает «адреса нет».
+#[must_use]
+pub fn device_address_from_payload(payload: &[u8]) -> DeviceAddress {
+    if payload.is_empty() {
+        return DeviceAddress::default();
+    }
+    let Ok(value) = canonical::decode(payload) else { return DeviceAddress::default() };
+    let Ok(map) = canonical::as_map(&value) else { return DeviceAddress::default() };
+    let Some(onion) = canonical::get(map, KEY_ONION) else { return DeviceAddress::default() };
+    let Ok(onion) = canonical::as_text(onion) else { return DeviceAddress::default() };
+    if onion.len() > MAX_ONION_LEN {
+        return DeviceAddress::default();
+    }
+    DeviceAddress { onion: onion.to_owned() }
 }
 
 /// Чат в списке на десктопе.
@@ -811,6 +963,27 @@ pub struct ChatSummary {
     pub last_text: String,
     /// Когда оно было, мс.
     pub last_ms: u64,
+    /// Метка аватарки контакта; `0` — показывать нечего.
+    ///
+    /// **Метка, а не байты.** Аватарка — до 32 КиБ, а список чатов приезжает
+    /// целиком и при каждом обновлении; сотня контактов везла бы три
+    /// мегабайта картинок в кадре, куда они не влезут (§5.5). Поэтому здесь
+    /// едет только число, по которому десктоп понимает, совпадает ли его
+    /// копия с телефонной, и спрашивает [`Request::Avatar`] лишь про
+    /// разошедшиеся.
+    ///
+    /// **Ноль значит «показывать нечего», а не «аватарки нет»**, и разница
+    /// тут не словесная. Ноль ставится в двух случаях: у контакта аватарки
+    /// правда нет — и контакт не сверен (§4.2). Второй случай телефон
+    /// не выдаёт ничем: сказать «аватарка есть, но не покажу» значило бы
+    /// сообщить десктопу то, чего человеку всё равно не увидеть, а заодно
+    /// объявить факт отправки лица тем, кому его показывать нельзя.
+    ///
+    /// Само правило §4.2 живёт на телефоне (`Engine::avatar_of`) и здесь
+    /// не повторяется: §13.3 не пускает протокольные решения выше границы,
+    /// а «показывать лицо только сверенному» — ровно оно. Десктоп, решивший
+    /// иначе, байтов всё равно не получит.
+    pub avatar_ms: u64,
 }
 
 /// Реакция на сообщение в том виде, в каком её видит десктоп.
@@ -1060,6 +1233,26 @@ pub enum Response {
         /// Байты превью, если они есть.
         bytes: Option<Vec<u8>>,
     },
+    /// Аватарка — или её отсутствие.
+    ///
+    /// `None` — **ответ, а не отказ**, ровно как у [`Response::FilePreview`]:
+    /// «аватарки нет» и «контакт не сверен» приезжают одинаково, и оба —
+    /// обычное дело, а не то, о чём говорят человеку словами (§14).
+    ///
+    /// Чья она — знает сам десктоп: ответ приходит на свою просьбу, а та
+    /// лежит у него в неотвеченных вместе с номером.
+    ///
+    /// **Метка едет вместе с байтами, а не берётся из списка чатов.**
+    /// Взять её оттуда было бы можно для чужого лица, но не для своего:
+    /// себя в списке чатов нет. Две дороги за одним числом — это два числа,
+    /// которые обязаны совпадать и однажды не совпадут; здесь дорога одна,
+    /// и ведёт она к той же строке, из которой список чатов метку и берёт.
+    Avatar {
+        /// Байты аватарки, если она есть.
+        bytes: Option<Vec<u8>>,
+        /// Метка этой аватарки; `0` — показывать нечего.
+        avatar_ms: u64,
+    },
 }
 
 /// Что телефон говорит десктопу без запроса.
@@ -1165,6 +1358,48 @@ pub enum Notice {
         /// Какого вложения.
         file_id: crate::files::FileId,
     },
+    /// Аватарка сменилась — контакта или своя.
+    ///
+    /// **Своя новость, а не [`Notice::ChatsChanged`]**, хотя список чатов
+    /// метку и везёт. `ChatsChanged` заставляет перечитать весь список ради
+    /// одного изменившегося лица, и на сотне контактов это кадр в мегабайт
+    /// на каждую смену картинки. Здесь же названо ровно то, что сменилось.
+    ///
+    /// Байтов не везёт по той же причине, по какой их нет в списке чатов:
+    /// 32 КиБ в новости, которая приезжает без спроса, — это трафик, за
+    /// который десктоп не просил. Спросит сам, если ему есть куда показать.
+    ///
+    /// Метка едет, хотя десктоп её и так узнает следующим списком чатов:
+    /// новость самодостаточна, и получивший её кладёт в свой кэш и байты,
+    /// и число, которым потом сверится.
+    AvatarChanged {
+        /// Чей чат, или `None` — своя. Та же форма, что у [`Request::Avatar`].
+        chat: Option<ChatId>,
+        /// Новая метка; `0` — показывать нечего (см. [`ChatSummary::avatar_ms`]).
+        avatar_ms: u64,
+    },
+    /// Сопряжение отозвано — этот компьютер больше не второй экран (§13.4).
+    ///
+    /// **Последний кадр этой сессии.** Уходит он до того, как телефон снесёт
+    /// ключи, и другого пути у него нет: после отзыва запечатать нечем.
+    ///
+    /// # Почему это прощание, а не гарантия
+    ///
+    /// Доедет оно только до включённого десктопа, который телефону сейчас
+    /// достижим. Отзывают же чаще всего **потерянный** ноутбук — то есть
+    /// выключенный, и до него не доедет ничего. Обещать по этой новости
+    /// «отозвал — значит кэш стёрт» нельзя, и §13.4 этого и не обещает:
+    /// там гарантия одна — тридцать суток без подключения.
+    ///
+    /// Ценность её не в этом, а в том, что до неё у десктопа **не было
+    /// ни одного** способа отличить отзыв от «телефон не в сети»: и то
+    /// и другое выглядело тишиной, и окно вечно показывало
+    /// «подключаемся» (§14).
+    ///
+    /// Полей нет намеренно. Причина не в экономии: любое поле здесь
+    /// пришлось бы объяснять человеку, а объяснять нечего — сказать ему
+    /// надо одно, и это одно в самом факте новости.
+    Revoked,
 }
 
 /// Собирает нагрузку запроса вместе с его номером.
@@ -1306,6 +1541,23 @@ pub fn request_payload(id: u64, request: &Request) -> Value {
         }
         Request::Hello => {
             fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_HELLO.into())));
+        }
+        Request::SetMyAvatar { bytes } => {
+            fields
+                .push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_SET_AVATAR.into())));
+            // Ключ едет всегда, включая пустые байты: здесь пусто — это
+            // «снять», а не «поля нет».
+            fields.push((Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())));
+        }
+        Request::Avatar { chat } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_AVATAR.into())));
+            // Ключ едет только для чужой: его отсутствие и есть «своя».
+            // Пустой массив значил бы чат с нулевым идентификатором, а такой
+            // чат разобрался бы в `as_array::<16>` отказом — то есть просьба
+            // о своей аватарке превратилась бы в мусорный кадр.
+            if let Some(chat) = chat {
+                fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            }
         }
     }
     Value::Map(fields)
@@ -1483,6 +1735,27 @@ pub fn request_from_payload(value: &Value) -> Result<(u64, Request), CodecError>
         },
         REQUEST_STAGED => Request::Staged,
         REQUEST_HELLO => Request::Hello,
+        REQUEST_SET_AVATAR => {
+            let Value::Bytes(bytes) = canonical::require(map, KEY_BYTES)? else {
+                return Err(CodecError::TypeMismatch);
+            };
+            // Предел — здесь же, а не только в `avatar::check` на телефоне.
+            // Длину называет та сторона провода, и «картинка на мегабайт» —
+            // это запрос памяти телефона, а не ошибка человека за ноутбуком.
+            // Формат при этом не проверяется: `check` на телефоне сделает
+            // это перед записью, и второе такое же условие рядом однажды
+            // разошлось бы с первым.
+            if bytes.len() > crate::avatar::MAX_AVATAR_BYTES {
+                return Err(CodecError::TypeMismatch);
+            }
+            Request::SetMyAvatar { bytes: bytes.clone() }
+        }
+        REQUEST_AVATAR => Request::Avatar {
+            chat: match canonical::get(map, KEY_CHAT) {
+                Some(value) => Some(canonical::as_array::<16>(value)?),
+                None => None,
+            },
+        },
         _ => return Err(CodecError::TypeMismatch),
     };
     Ok((id, request))
@@ -1581,6 +1854,17 @@ pub fn response_payload(id: u64, response: &Response) -> Value {
                 fields.push((Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())));
             }
         }
+        Response::Avatar { bytes, avatar_ms } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_AVATAR.into())));
+            // Ключ едет только когда аватарка есть — как и у превью:
+            // отсутствие ключа и есть «показывать нечего», а пустые байты
+            // значили бы картинку нулевой длины.
+            if let Some(bytes) = bytes {
+                fields.push((Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())));
+            }
+            fields
+                .push((Value::Integer(KEY_AVATAR_MS.into()), Value::Integer((*avatar_ms).into())));
+        }
         Response::FileChunk { index, bytes } => {
             fields.push((
                 Value::Integer(KEY_KIND.into()),
@@ -1663,6 +1947,37 @@ pub fn response_from_payload(value: &Value) -> Result<(u64, Response), CodecErro
             };
             Response::FilePreview { bytes }
         }
+        RESPONSE_AVATAR => {
+            let bytes = match canonical::get(map, KEY_BYTES) {
+                // Предел проверяется и здесь, и по той же причине, что
+                // у превью: длину называет та сторона провода, а картинка
+                // больше `MAX_AVATAR_BYTES` — это не «большая аватарка»,
+                // это не аватарка. Отдать её системному декодеру значило бы
+                // отдать ему то, чего протокол не обещал.
+                //
+                // Формат здесь **не** проверяется, и это не забывчивость:
+                // `avatar::check` смотрит сигнатуру, а телефон её уже
+                // посмотрел — и при отправке своей, и при приёме чужой.
+                // Третья проверка на том же байте не добавляет знания,
+                // а вот разойтись со второй однажды сможет.
+                Some(Value::Bytes(bytes))
+                    if bytes.len() <= crate::avatar::MAX_AVATAR_BYTES && !bytes.is_empty() =>
+                {
+                    Some(bytes.clone())
+                }
+                Some(_) => return Err(CodecError::TypeMismatch),
+                None => None,
+            };
+            let avatar_ms = canonical::as_u64(canonical::require(map, KEY_AVATAR_MS)?)?;
+            // Байты без метки и метка без байтов — не наш ответ. Первое
+            // означало бы лицо, которое не с чем сверить, и десктоп просил
+            // бы его заново при каждом списке чатов; второе — метку,
+            // которой нечего пометить.
+            if bytes.is_some() != (avatar_ms != 0) {
+                return Err(CodecError::TypeMismatch);
+            }
+            Response::Avatar { bytes, avatar_ms }
+        }
         RESPONSE_FILE_CHUNK => {
             let Value::Bytes(bytes) = canonical::require(map, KEY_BYTES)? else {
                 return Err(CodecError::TypeMismatch);
@@ -1738,6 +2053,22 @@ pub fn notice_payload(notice: &Notice) -> Value {
             fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(NOTICE_FILE_GONE.into())));
             fields.push((Value::Integer(KEY_FILE_ID.into()), Value::Bytes(file_id.to_vec())));
         }
+        Notice::Revoked => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(NOTICE_REVOKED.into())));
+        }
+        Notice::AvatarChanged { chat, avatar_ms } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(NOTICE_AVATAR_CHANGED.into()),
+            ));
+            // Ключ едет только для чужой — как и в просьбе, и это одна форма
+            // на оба вида, а не два способа сказать «своя».
+            if let Some(chat) = chat {
+                fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            }
+            fields
+                .push((Value::Integer(KEY_AVATAR_MS.into()), Value::Integer((*avatar_ms).into())));
+        }
     }
     Value::Map(fields)
 }
@@ -1784,6 +2115,14 @@ pub fn notice_from_payload(value: &Value) -> Result<Notice, CodecError> {
         NOTICE_FILE_GONE => Ok(Notice::FileGone {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
         }),
+        NOTICE_REVOKED => Ok(Notice::Revoked),
+        NOTICE_AVATAR_CHANGED => Ok(Notice::AvatarChanged {
+            chat: match canonical::get(map, KEY_CHAT) {
+                Some(value) => Some(canonical::as_array::<16>(value)?),
+                None => None,
+            },
+            avatar_ms: canonical::as_u64(canonical::require(map, KEY_AVATAR_MS)?)?,
+        }),
         NOTICE_FILE_PROGRESS => Ok(Notice::FileProgress {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
             have_chunks: canonical::as_u64(canonical::require(map, KEY_HAVE)?)?,
@@ -1826,6 +2165,7 @@ pub fn chat_value(chat: &ChatSummary) -> Value {
         (Value::Integer(KEY_VERIFIED.into()), Value::Bool(chat.verified)),
         (Value::Integer(KEY_TEXT.into()), Value::Text(chat.last_text.clone())),
         (Value::Integer(KEY_WALL_MS.into()), Value::Integer(chat.last_ms.into())),
+        (Value::Integer(KEY_AVATAR_MS.into()), Value::Integer(chat.avatar_ms.into())),
     ])
 }
 
@@ -1845,6 +2185,15 @@ pub fn chat_from_value(value: &Value) -> Result<ChatSummary, CodecError> {
         verified: *verified,
         last_text: canonical::as_text(canonical::require(map, KEY_TEXT)?)?.to_owned(),
         last_ms: canonical::as_u64(canonical::require(map, KEY_WALL_MS)?)?,
+        // Необязательное на **чтении**, хотя на записи едет всегда: список
+        // чатов от телефона версии 9 этого ключа не несёт, и требовать его
+        // значило бы не разобрать весь список из-за поля, без которого
+        // всё остальное работает. Ноль здесь — «показывать нечего»,
+        // то же самое, что говорит телефон без аватарки.
+        avatar_ms: match canonical::get(map, KEY_AVATAR_MS) {
+            Some(value) => canonical::as_u64(value)?,
+            None => 0,
+        },
     })
 }
 
@@ -2094,6 +2443,446 @@ mod tests {
         canonical::decode(&bytes).expect("и разбираться обратно")
     }
 
+    // --- сторож формы провода ----------------------------------------------
+    //
+    // Версия провода растёт **вручную**, и забыть её легко: за одну сессию
+    // она выросла трижды, и каждый раз число правила рука. Забытая версия —
+    // это не мелочь: сборка постарше молча не разберёт чужой ответ, и человек
+    // увидит пустой список чатов вместо объяснения. Один раз это уже
+    // случилось (5бч, версия 5).
+    //
+    // Сторожат три вещи вместе, и порознь ни одна не работает:
+    //
+    // 1. Список кодов видов берётся **из исходника этого файла**, а не пишется
+    //    руками рядом. Руками написанный список — это второе место, которое
+    //    надо не забыть, то есть та же забывчивость на новом витке.
+    // 2. Каждому объявленному коду обязан найтись образец. Новый вид просьбы
+    //    без образца — молчаливая дыра в проверке, и о ней говорится вслух.
+    // 3. Форма всех образцов сворачивается в число, замороженное **по версии
+    //    провода**. Поменял форму, не подняв версию, — число разошлось
+    //    с таблицей, и тест называет обе стороны.
+    //
+    // Чего это не ловит: изменение, которое не меняет ни одного ключа, ни
+    // одного кода и ни одной длины, — например, другой смысл у того же поля.
+    // Такое не поймает ничто, кроме чтения.
+
+    /// Форма провода по версиям. Растёт только вниз, задним числом не правится.
+    ///
+    /// Прежние строки проверить нечем — старого кода в дереве нет, — и лежат
+    /// они ради истории и ради того, чтобы правка последней строки на месте
+    /// бросалась в глаза. Проверяется последняя: она обязана назвать
+    /// [`WIRE_VERSION`] и сойтись с тем, что кодировщики строят сейчас.
+    const WIRE_SHAPES: [(u32, u64); 2] = [(12, 0x1ef3_4b21_4945_d1f1), (13, 0x9bba_1505_7b0f_b8ed)];
+
+    /// FNV-1a — та же, что сторожит замороженные миграции.
+    ///
+    /// Не криптография: подделывать здесь нечего, задача одна — заметить
+    /// изменение. Своя реализация в три строки надёжнее зависимости,
+    /// которая однажды сменит алгоритм.
+    fn fnv(text: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Сворачивает значение в строку, описывающую **форму**, а не содержимое.
+    ///
+    /// Числа берутся как есть — это коды видов и номера ключей, то самое,
+    /// что обязано быть замечено. От байтов и текста остаётся длина: их
+    /// содержимое в образцах придумано мной и к проводу отношения не имеет,
+    /// а длина ловит подмену поля соседним.
+    ///
+    /// **Ключи карты сортируются**, и это не мелочь: по проводу нагрузка
+    /// едет канонической (§6), то есть отсортированной, а строится она
+    /// в порядке кода. Не отсортируй мы здесь — перестановка двух строк
+    /// в кодировщике выглядела бы изменением провода, каким она не является.
+    fn shape_of(value: &Value) -> String {
+        match value {
+            Value::Integer(_) => {
+                format!("i{}", canonical::as_u64(value).unwrap_or(u64::MAX))
+            }
+            Value::Bytes(bytes) => format!("b{}", bytes.len()),
+            Value::Text(text) => format!("t{}", text.len()),
+            Value::Bool(flag) => format!("f{}", u8::from(*flag)),
+            Value::Array(items) => {
+                let inner: Vec<String> = items.iter().map(shape_of).collect();
+                format!("[{}]", inner.join(","))
+            }
+            Value::Map(pairs) => {
+                let mut inner: Vec<String> =
+                    pairs.iter().map(|(k, v)| format!("{}={}", shape_of(k), shape_of(v))).collect();
+                inner.sort_unstable();
+                format!("{{{}}}", inner.join(","))
+            }
+            other => format!("?{other:?}"),
+        }
+    }
+
+    /// Имя вида просьбы.
+    ///
+    /// **Исчерпывающая нарочно.** Новый вариант не даст этому файлу
+    /// собраться, и это единственное место, где компилятор способен
+    /// потребовать внимания к сторожу. Дописав сюда имя, добавьте образец
+    /// в [`request_samples`] — иначе следующий же тест скажет, что код
+    /// объявлен, а форму его никто не меряет.
+    fn request_name(request: &Request) -> &'static str {
+        match request {
+            Request::Chats => "Chats",
+            Request::History { .. } => "History",
+            Request::SendText { .. } => "SendText",
+            Request::MarkRead { .. } => "MarkRead",
+            Request::SetReaction { .. } => "SetReaction",
+            Request::SendReply { .. } => "SendReply",
+            Request::EditMessage { .. } => "EditMessage",
+            Request::DeleteMessages { .. } => "DeleteMessages",
+            Request::RetractMessages { .. } => "RetractMessages",
+            Request::ForwardMessages { .. } => "ForwardMessages",
+            Request::ClearChat { .. } => "ClearChat",
+            Request::FileChunk { .. } => "FileChunk",
+            Request::AcceptFile { .. } => "AcceptFile",
+            Request::DeclineFile { .. } => "DeclineFile",
+            Request::PauseFile { .. } => "PauseFile",
+            Request::FileOffer { .. } => "FileOffer",
+            Request::FilePut { .. } => "FilePut",
+            Request::FileSend { .. } => "FileSend",
+            Request::FileAbort { .. } => "FileAbort",
+            Request::FilePreview { .. } => "FilePreview",
+            Request::Staged => "Staged",
+            Request::Hello => "Hello",
+            Request::Avatar { .. } => "Avatar",
+            Request::SetMyAvatar { .. } => "SetMyAvatar",
+        }
+    }
+
+    /// Имя вида ответа. Исчерпывающая по той же причине, что и у просьб.
+    fn response_name(response: &Response) -> &'static str {
+        match response {
+            Response::Chats(_) => "Chats",
+            Response::History(_) => "History",
+            Response::Done => "Done",
+            Response::Refused(_) => "Refused",
+            Response::Hello { .. } => "Hello",
+            Response::FileOffer { .. } => "FileOffer",
+            Response::FileChunk { .. } => "FileChunk",
+            Response::Staged { .. } => "Staged",
+            Response::FilePreview { .. } => "FilePreview",
+            Response::Avatar { .. } => "Avatar",
+        }
+    }
+
+    /// Имя вида новости. Исчерпывающая по той же причине.
+    fn notice_name(notice: &Notice) -> &'static str {
+        match notice {
+            Notice::Message(_) => "Message",
+            Notice::Status { .. } => "Status",
+            Notice::ChatsChanged => "ChatsChanged",
+            Notice::Gone { .. } => "Gone",
+            Notice::Edited(_) => "Edited",
+            Notice::Reacted { .. } => "Reacted",
+            Notice::FileProgress { .. } => "FileProgress",
+            Notice::FileGone { .. } => "FileGone",
+            Notice::AvatarChanged { .. } => "AvatarChanged",
+            Notice::Revoked => "Revoked",
+        }
+    }
+
+    /// Сообщение со **всеми** полями, какие оно умеет нести.
+    ///
+    /// Максимальное нарочно: необязательное поле, оставленное пустым,
+    /// в нагрузку не попадает — а значит и в форму. Образец с `None`
+    /// сторожил бы всё, кроме того самого поля.
+    fn full_message() -> Message {
+        Message {
+            msg_id: [1u8; 16],
+            chat: [2u8; 16],
+            mine: true,
+            text: "текст".into(),
+            wall_ms: 1_700_000_000_000,
+            status: Some(3),
+            reactions: vec![Reaction { mine: true, emoji: "👍".into() }],
+            edited_ms: Some(1_700_000_001_000),
+            forwarded: true,
+            reply_to: Some([3u8; 16]),
+            // Два вложения, а не одно: `accepted` едет только когда «нет»,
+            // `has_preview` — только когда «да». Одним образцом половину
+            // ключей было бы не увидеть.
+            files: vec![
+                Attachment {
+                    file_id: [4u8; 16],
+                    name: "кот.jpg".into(),
+                    size_bytes: 3_000_000,
+                    chunk_total: 3,
+                    have_chunks: 1,
+                    accepted: false,
+                    has_preview: true,
+                },
+                Attachment {
+                    file_id: [5u8; 16],
+                    name: "otchet.pdf".into(),
+                    size_bytes: 900,
+                    chunk_total: 1,
+                    have_chunks: 1,
+                    accepted: true,
+                    has_preview: false,
+                },
+            ],
+        }
+    }
+
+    fn request_samples() -> Vec<Request> {
+        let chat = [1u8; 16];
+        let msg_id = [2u8; 16];
+        let file_id = [3u8; 16];
+        vec![
+            Request::Chats,
+            // Оба вида листания: `before` необязателен, и без второго
+            // образца его ключ в форму не попадёт.
+            Request::History { chat, limit: 50, before: None },
+            Request::History { chat, limit: 50, before: Some(msg_id) },
+            Request::SendText { chat, text: "привет".into() },
+            Request::MarkRead { chat, up_to: msg_id },
+            Request::SetReaction { chat, msg_id, emoji: "👍".into() },
+            Request::SendReply { chat, reply_to: msg_id, text: "ответ".into() },
+            Request::EditMessage { chat, msg_id, text: "правка".into() },
+            Request::DeleteMessages { chat, msg_ids: vec![msg_id] },
+            Request::RetractMessages { chat, msg_ids: vec![msg_id] },
+            Request::ForwardMessages { chat, msg_ids: vec![msg_id] },
+            Request::ClearChat { chat },
+            Request::FileChunk { file_id, index: 7 },
+            Request::AcceptFile { file_id },
+            Request::DeclineFile { file_id },
+            Request::PauseFile { file_id },
+            Request::FileOffer {
+                chat,
+                name: "кот.jpg".into(),
+                size_bytes: 3_000_000,
+                preview: Some(vec![0x89, b'P', b'N', b'G']),
+            },
+            Request::FileOffer { chat, name: "кот.jpg".into(), size_bytes: 0, preview: None },
+            Request::FilePut { file_id, index: 2, bytes: vec![5u8; 100] },
+            Request::FileSend { file_ids: vec![file_id], text: "вот файлы".into() },
+            Request::FileAbort { file_id },
+            Request::FilePreview { file_id },
+            Request::Staged,
+            Request::Hello,
+            Request::Avatar { chat: None },
+            Request::Avatar { chat: Some(chat) },
+            Request::SetMyAvatar { bytes: vec![0x89, b'P', b'N', b'G'] },
+        ]
+    }
+
+    fn response_samples() -> Vec<Response> {
+        vec![
+            Response::Chats(vec![ChatSummary {
+                chat: [1u8; 16],
+                title: "Алиса".into(),
+                verified: true,
+                last_text: "до встречи".into(),
+                last_ms: 1_700_000_000_000,
+                avatar_ms: 1_700_000_000_001,
+            }]),
+            Response::History(vec![full_message()]),
+            Response::Done,
+            Response::Refused("контакта больше нет".into()),
+            Response::Hello { wire: WIRE_VERSION },
+            Response::FileOffer { file_id: [4u8; 16], chunk_total: 3 },
+            Response::FileChunk { index: 1, bytes: vec![7u8; 100] },
+            Response::Staged {
+                files: vec![StagedFile {
+                    file_id: [5u8; 16],
+                    name: "otchet.pdf".into(),
+                    size_bytes: 3_000_000,
+                    chunk_total: 3,
+                    missing: vec![1, 2],
+                }],
+            },
+            Response::FilePreview { bytes: Some(vec![0x89, b'P', b'N', b'G']) },
+            Response::FilePreview { bytes: None },
+            Response::Avatar { bytes: Some(vec![0x89, b'P', b'N', b'G']), avatar_ms: 42 },
+            Response::Avatar { bytes: None, avatar_ms: 0 },
+        ]
+    }
+
+    fn notice_samples() -> Vec<Notice> {
+        vec![
+            Notice::Message(full_message()),
+            Notice::Status { msg_id: [1u8; 16], status: 2 },
+            Notice::ChatsChanged,
+            Notice::Gone { chat: [2u8; 16], msg_ids: vec![[1u8; 16]] },
+            Notice::Edited(full_message()),
+            Notice::Reacted {
+                chat: [2u8; 16],
+                msg_id: [1u8; 16],
+                reactions: vec![Reaction { mine: false, emoji: "🔥".into() }],
+            },
+            Notice::FileProgress {
+                file_id: [3u8; 16],
+                have_chunks: 4,
+                chunk_total: 9,
+                accepted: true,
+            },
+            Notice::FileGone { file_id: [3u8; 16] },
+            Notice::AvatarChanged { chat: Some([2u8; 16]), avatar_ms: 1_700_000_000_000 },
+            Notice::AvatarChanged { chat: None, avatar_ms: 0 },
+            Notice::Revoked,
+        ]
+    }
+
+    /// Коды видов, объявленные **в исходнике этого файла**.
+    ///
+    /// Читается текст, а не пишется список рядом: список рядом — это второе
+    /// место, которое надо не забыть, то есть та же забывчивость, от которой
+    /// сторож и заведён.
+    fn declared_kinds(prefix: &str) -> Vec<(String, u64)> {
+        let source = include_str!("companion.rs");
+        let mut out = Vec::new();
+        for line in source.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("const ") else { continue };
+            let Some(rest) = rest.strip_prefix(prefix) else { continue };
+            let Some((name, value)) = rest.split_once(": u64 = ") else { continue };
+            let Some(value) = value.strip_suffix(';') else { continue };
+            let Ok(code) = value.parse::<u64>() else { continue };
+            out.push((format!("{prefix}{name}"), code));
+        }
+        out
+    }
+
+    /// Код вида из построенной нагрузки.
+    fn kind_of(value: &Value) -> u64 {
+        let map = canonical::as_map(value).expect("нагрузка — карта");
+        canonical::as_u64(canonical::require(map, KEY_KIND).expect("у нагрузки есть вид"))
+            .expect("вид — число")
+    }
+
+    #[test]
+    fn every_declared_kind_carries_a_sample() {
+        // Новый вид без образца — молчаливая дыра: форма его никто не меряет,
+        // и провод меняется незамеченным. Список видов берётся из исходника,
+        // поэтому забыть можно только образец, и вот об этом говорится вслух.
+        let mut seen: Vec<(&str, u64)> = Vec::new();
+        for request in request_samples() {
+            seen.push(("REQUEST_", kind_of(&request_payload(1, &request))));
+        }
+        for response in response_samples() {
+            seen.push(("RESPONSE_", kind_of(&response_payload(1, &response))));
+        }
+        for notice in notice_samples() {
+            seen.push(("NOTICE_", kind_of(&notice_payload(&notice))));
+        }
+
+        for prefix in ["REQUEST_", "RESPONSE_", "NOTICE_"] {
+            let declared = declared_kinds(prefix);
+            assert!(
+                !declared.is_empty(),
+                "в исходнике не нашлось ни одного {prefix}* — \
+                 сторож ослеп, и это хуже, чем его отсутствие"
+            );
+            for (name, code) in declared {
+                assert!(
+                    seen.contains(&(prefix, code)),
+                    "{name} = {code} объявлен, но ни один образец его не везёт: \
+                     форму этого вида не сторожит ничто"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_sample_names_its_variant() {
+        // Проверка самого сторожа: имена обязаны быть различны, иначе два
+        // вида слились бы в один и пропажа одного из них осталась незамечена.
+        let names: Vec<&str> = request_samples().iter().map(request_name).collect();
+        let mut unique: Vec<&str> = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            declared_kinds("REQUEST_").len(),
+            "виды просьб и образцы разошлись"
+        );
+
+        let names: Vec<&str> = response_samples().iter().map(response_name).collect();
+        let mut unique: Vec<&str> = names;
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            declared_kinds("RESPONSE_").len(),
+            "виды ответов и образцы разошлись"
+        );
+
+        let names: Vec<&str> = notice_samples().iter().map(notice_name).collect();
+        let mut unique: Vec<&str> = names;
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            declared_kinds("NOTICE_").len(),
+            "виды новостей и образцы разошлись"
+        );
+    }
+
+    #[test]
+    fn the_wire_shape_matches_the_version_it_claims() {
+        let mut shapes: Vec<String> = Vec::new();
+        for request in request_samples() {
+            shapes.push(format!(
+                "q{}:{}",
+                request_name(&request),
+                shape_of(&request_payload(0, &request))
+            ));
+        }
+        for response in response_samples() {
+            shapes.push(format!(
+                "a{}:{}",
+                response_name(&response),
+                shape_of(&response_payload(0, &response))
+            ));
+        }
+        for notice in notice_samples() {
+            shapes.push(format!(
+                "n{}:{}",
+                notice_name(&notice),
+                shape_of(&notice_payload(&notice))
+            ));
+        }
+        // Нагрузка рукопожатия — тоже провод, хотя и не просьба. Без неё
+        // тринадцатая версия прошла бы мимо сторожа целиком: он смотрит
+        // на виды, а видов она не заводит.
+        shapes.push(format!(
+            "h:{}",
+            shape_of(&device_address_value(&DeviceAddress {
+                onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+            }))
+        ));
+        shapes.sort();
+        let got = fnv(&shapes.join("\n"));
+
+        let (version, frozen) = *WIRE_SHAPES.last().expect("таблица форм не бывает пустой");
+        assert_eq!(
+            version, WIRE_VERSION,
+            "последняя строка таблицы форм называет версию {version}, а провод — {WIRE_VERSION}. \
+             Подняли версию — допишите строку, а не правьте прежнюю"
+        );
+        assert_eq!(
+            got,
+            frozen,
+            "форма провода изменилась, а версия осталась {WIRE_VERSION}. Сборка постарше молча \
+             не разберёт эту нагрузку, и человек увидит пустой экран вместо объяснения. \
+             Поднимите WIRE_VERSION и допишите в WIRE_SHAPES строку ({}, {got:#018x})",
+            WIRE_VERSION + 1
+        );
+
+        // Версии в таблице растут: строка задним числом — это переписанная
+        // история, а не новая запись.
+        for pair in WIRE_SHAPES.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "версии в таблице форм обязаны расти");
+        }
+    }
+
     fn invite() -> PairingInvite {
         PairingInvite {
             ik: [7u8; 32],
@@ -2214,6 +3003,14 @@ mod tests {
             Request::FileAbort { file_id: [9u8; 16] },
             Request::FilePreview { file_id: [9u8; 16] },
             Request::Staged,
+            // Оба вида: `None` — своя, и это единственное место, где
+            // отсутствие ключа значит не «нет поля», а «про себя».
+            Request::Avatar { chat: None },
+            Request::Avatar { chat: Some([12u8; 16]) },
+            Request::SetMyAvatar { bytes: vec![0x89, b'P', b'N', b'G'] },
+            // Пусто — «снять», и это законное значение: ключ обязан уехать
+            // и вернуться, а не превратиться в отсутствие поля.
+            Request::SetMyAvatar { bytes: Vec::new() },
         ];
         for (id, request) in cases.iter().enumerate() {
             let id = id as u64;
@@ -2298,6 +3095,8 @@ mod tests {
             (kind(&Request::FileAbort { file_id: [3u8; 16] }), REQUEST_FILE_ABORT),
             (kind(&Request::FilePreview { file_id: [3u8; 16] }), REQUEST_FILE_PREVIEW),
             (kind(&Request::Staged), REQUEST_STAGED),
+            (kind(&Request::Avatar { chat: None }), REQUEST_AVATAR),
+            (kind(&Request::SetMyAvatar { bytes: Vec::new() }), REQUEST_SET_AVATAR),
         ];
         let mut seen: Vec<u64> = Vec::new();
         for (got, expected) in cases {
@@ -2767,6 +3566,7 @@ mod tests {
             verified: true,
             last_text: "до встречи".into(),
             last_ms: 7,
+            avatar_ms: 0,
         };
         let Value::Map(map) = chat_value(&chat) else {
             panic!("чат кодируется картой");
@@ -2793,6 +3593,7 @@ mod tests {
             verified: true,
             last_text: "до встречи".into(),
             last_ms: 1_700_000_000_000,
+            avatar_ms: 1_700_000_000_001,
         }];
         let history = vec![
             Message {
@@ -2849,6 +3650,10 @@ mod tests {
                     missing: vec![1, 2],
                 }],
             },
+            Response::Avatar { bytes: Some(vec![0x89, b'P', b'N', b'G', 13]), avatar_ms: 42 },
+            // «Показывать нечего» — байтов нет и метки нет. Одно без другого
+            // разбор отвергает, и это проверяется отдельным тестом.
+            Response::Avatar { bytes: None, avatar_ms: 0 },
         ];
         for (id, response) in cases.iter().enumerate() {
             let id = id as u64;
@@ -3103,6 +3908,12 @@ mod tests {
                 accepted: false,
             },
             Notice::FileGone { file_id: [3u8; 16] },
+            Notice::AvatarChanged { chat: Some([2u8; 16]), avatar_ms: 1_700_000_000_000 },
+            // Своя — без ключа чата; и «сняли» — с нулевой меткой.
+            Notice::AvatarChanged { chat: None, avatar_ms: 1_700_000_000_000 },
+            Notice::AvatarChanged { chat: Some([2u8; 16]), avatar_ms: 0 },
+            Notice::AvatarChanged { chat: None, avatar_ms: 0 },
+            Notice::Revoked,
         ];
         for notice in &cases {
             assert_eq!(
@@ -3172,6 +3983,11 @@ mod tests {
             NOTICE_FILE_PROGRESS
         );
         assert_eq!(kinds(&Notice::FileGone { file_id: [3u8; 16] }), NOTICE_FILE_GONE);
+        assert_eq!(
+            kinds(&Notice::AvatarChanged { chat: None, avatar_ms: 0 }),
+            NOTICE_AVATAR_CHANGED
+        );
+        assert_eq!(kinds(&Notice::Revoked), NOTICE_REVOKED);
 
         let all = [
             NOTICE_MESSAGE,
@@ -3182,6 +3998,8 @@ mod tests {
             NOTICE_REACTED,
             NOTICE_FILE_PROGRESS,
             NOTICE_FILE_GONE,
+            NOTICE_AVATAR_CHANGED,
+            NOTICE_REVOKED,
         ];
         for (at, code) in all.iter().enumerate() {
             assert!(
@@ -3250,6 +4068,7 @@ mod tests {
         );
         assert_eq!(kinds(&Response::FilePreview { bytes: None }), RESPONSE_FILE_PREVIEW);
         assert_eq!(kinds(&Response::Staged { files: Vec::new() }), RESPONSE_STAGED);
+        assert_eq!(kinds(&Response::Avatar { bytes: None, avatar_ms: 0 }), RESPONSE_AVATAR);
 
         let all = [
             RESPONSE_CHATS,
@@ -3261,6 +4080,7 @@ mod tests {
             RESPONSE_FILE_OFFER,
             RESPONSE_FILE_PREVIEW,
             RESPONSE_STAGED,
+            RESPONSE_AVATAR,
         ];
         for (at, code) in all.iter().enumerate() {
             assert!(
@@ -3268,6 +4088,115 @@ mod tests {
                 "два вида ответа делят код {code} — разбор возьмёт первый"
             );
         }
+    }
+
+    #[test]
+    fn an_avatar_without_a_stamp_is_not_an_answer() {
+        // Байты без метки — лицо, которое не с чем сверить: десктоп положил
+        // бы его в кэш с нулём и просил заново при каждом списке чатов,
+        // потому что ноль в списке значит «показывать нечего». Метка без
+        // байтов — обратная беда: пометить нечего, а десктоп счёл бы, что
+        // лицо у него теперь есть, и спрашивать перестал.
+        let with_bytes_no_stamp = Value::Map(vec![
+            (Value::Integer(KEY_ID.into()), Value::Integer(1.into())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_AVATAR.into())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(vec![0x89, b'P', b'N', b'G'])),
+            (Value::Integer(KEY_AVATAR_MS.into()), Value::Integer(0.into())),
+        ]);
+        assert!(response_from_payload(&through_cbor(&with_bytes_no_stamp)).is_err());
+
+        let with_stamp_no_bytes = Value::Map(vec![
+            (Value::Integer(KEY_ID.into()), Value::Integer(1.into())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_AVATAR.into())),
+            (Value::Integer(KEY_AVATAR_MS.into()), Value::Integer(7.into())),
+        ]);
+        assert!(response_from_payload(&through_cbor(&with_stamp_no_bytes)).is_err());
+    }
+
+    #[test]
+    fn an_avatar_sent_up_bigger_than_the_limit_is_refused_on_arrival() {
+        // Длину называет десктоп. Картинка на мегабайт — это запрос памяти
+        // телефона, а не ошибка человека за ноутбуком, и отвергать её
+        // обязан приём, а не `avatar::check` после того, как байты уже легли
+        // в память шага.
+        let huge = Value::Map(vec![
+            (Value::Integer(KEY_ID.into()), Value::Integer(1.into())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_SET_AVATAR.into())),
+            (
+                Value::Integer(KEY_BYTES.into()),
+                Value::Bytes(vec![7u8; crate::avatar::MAX_AVATAR_BYTES + 1]),
+            ),
+        ]);
+        assert!(request_from_payload(&through_cbor(&huge)).is_err());
+
+        // А ровно предел — проходит: наибольшее законное и есть худший
+        // случай, и он обязан работать.
+        let largest = request_payload(
+            u64::MAX,
+            &Request::SetMyAvatar { bytes: vec![7u8; crate::avatar::MAX_AVATAR_BYTES] },
+        );
+        assert!(request_from_payload(&through_cbor(&largest)).is_ok());
+        let encoded = canonical::encode(&largest).expect("просьба кодируется");
+        assert!(
+            encoded.len() <= ratatosk_wire::SizeClass::L.max_payload(),
+            "аватарка наверх в предел кадра не влезла: {} байт при {}",
+            encoded.len(),
+            ratatosk_wire::SizeClass::L.max_payload()
+        );
+    }
+
+    #[test]
+    fn an_avatar_bigger_than_the_limit_never_reaches_the_decoder() {
+        // Длину называет та сторона провода. Картинка больше предела — это
+        // не «большая аватарка», это не аватарка: отдать её системному
+        // декодеру значило бы отдать ему то, чего протокол не обещал,
+        // а декодер изображений — большая поверхность атаки.
+        let huge = Value::Map(vec![
+            (Value::Integer(KEY_ID.into()), Value::Integer(1.into())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_AVATAR.into())),
+            (
+                Value::Integer(KEY_BYTES.into()),
+                Value::Bytes(vec![7u8; crate::avatar::MAX_AVATAR_BYTES + 1]),
+            ),
+            (Value::Integer(KEY_AVATAR_MS.into()), Value::Integer(7.into())),
+        ]);
+        assert!(response_from_payload(&through_cbor(&huge)).is_err());
+    }
+
+    #[test]
+    fn the_largest_avatar_fits_a_single_frame() {
+        // Аватарка едет ответом целиком, без фрагментации (§9.3): её мера
+        // выбрана так, чтобы этого хватало. Проверяется **законным** худшим
+        // случаем — ровно предел, ни байтом больше: байт сверху разбор
+        // отвергает, и замер на нём мерил бы то, чего на проводе не бывает.
+        let response = Response::Avatar {
+            bytes: Some(vec![0xFFu8; crate::avatar::MAX_AVATAR_BYTES]),
+            avatar_ms: u64::MAX,
+        };
+        let encoded =
+            canonical::encode(&response_payload(u64::MAX, &response)).expect("ответ кодируется");
+        assert!(
+            encoded.len() <= ratatosk_wire::SizeClass::L.max_payload(),
+            "аватарка в предел кадра не влезла: {} байт при {}",
+            encoded.len(),
+            ratatosk_wire::SizeClass::L.max_payload()
+        );
+    }
+
+    #[test]
+    fn a_chat_list_from_an_older_phone_still_parses() {
+        // Метка появилась в версии 10, и телефон версии 9 её не шлёт.
+        // Потребовав ключ, мы не разобрали бы **весь список чатов**
+        // из-за поля, без которого всё остальное работает.
+        let older = Value::Map(vec![
+            (Value::Integer(KEY_CHAT.into()), Value::Bytes(vec![1u8; 16])),
+            (Value::Integer(KEY_TITLE.into()), Value::Text("Алиса".into())),
+            (Value::Integer(KEY_VERIFIED.into()), Value::Bool(true)),
+            (Value::Integer(KEY_TEXT.into()), Value::Text("привет".into())),
+            (Value::Integer(KEY_WALL_MS.into()), Value::Integer(5.into())),
+        ]);
+        let chat = chat_from_value(&older).expect("список чатов версии 9 обязан разобраться");
+        assert_eq!(chat.avatar_ms, 0, "нет метки — значит показывать нечего");
     }
 
     #[test]

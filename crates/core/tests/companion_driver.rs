@@ -48,11 +48,20 @@ type Phone = Engine<MemoryStore>;
 struct FakeRunner {
     events: tokio::sync::mpsc::Receiver<TransportEvent>,
     sent: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Куда и чем звонили — для проверки выбора транспорта.
+    ///
+    /// Отдельным списком, а не третьим полем в канале кадров: кадры читают
+    /// шесть тестов, а адресацию — один, и менять форму ради него значило бы
+    /// править шесть мест из-за седьмого.
+    addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>>,
 }
 
 impl Runner for FakeRunner {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
-        if let TransportCommand::Send { frame, .. } = command {
+        if let TransportCommand::Send { peer, via, frame, .. } = command {
+            if let Ok(mut seen) = self.addressed.lock() {
+                seen.push((via, peer.onion.clone()));
+            }
             // Некому принять — значит тест кончился, и это не ошибка сети.
             let _ = self.sent.send(frame).await;
         }
@@ -77,6 +86,8 @@ struct Pair {
     desktop_ik: [u8; 32],
     /// Ключ телефона: им адресованы события транспорта о разрыве и маяке.
     phone_ik: [u8; 32],
+    /// Куда и чем драйвер звонил — общий список с поддельным раннером.
+    addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>>,
 }
 
 impl Pair {
@@ -196,6 +207,15 @@ impl Pair {
 
 /// Телефон, драйвер и провод между ними — но драйвер ещё не запущен.
 fn paired(now_ms: u64) -> (CompanionDriver<FakeRunner>, Pair) {
+    paired_with_onion(now_ms, String::new())
+}
+
+/// То же, но у телефона есть onion-адрес — он уезжает в приглашение.
+///
+/// Отдельным входом, а не полем в `Pair`: адрес попадает в ссылку сопряжения
+/// в момент её выдачи, и подставить его потом было бы враньём — терминал
+/// берёт его именно оттуда.
+fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeRunner>, Pair) {
     let identity = Identity::from_seed([1u8; 32]);
     let mut store = MemoryStore::new();
     store.migrate().expect("миграция");
@@ -207,7 +227,7 @@ fn paired(now_ms: u64) -> (CompanionDriver<FakeRunner>, Pair) {
         Box::new(blobs),
         Box::new(SeededEntropy::new(1)),
         SelfAddresses {
-            onion: String::new(),
+            onion: phone_onion,
             chatmail: "phone@nine.example".to_owned(),
             display_name: "телефон".to_owned(),
         },
@@ -241,12 +261,23 @@ fn paired(now_ms: u64) -> (CompanionDriver<FakeRunner>, Pair) {
 
     let (to_desktop, events_rx) = tokio::sync::mpsc::channel(64);
     let (sent_tx, from_desktop) = tokio::sync::mpsc::channel(64);
-    let runner = FakeRunner { events: events_rx, sent: sent_tx };
+    let addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>> = Arc::default();
+    let runner = FakeRunner { events: events_rx, sent: sent_tx, addressed: Arc::clone(&addressed) };
 
     let (driver, handle, events) = CompanionDriver::new(client, runner);
     (
         driver,
-        Pair { phone, blobs: kept, handle, events, from_desktop, to_desktop, desktop_ik, phone_ik },
+        Pair {
+            phone,
+            blobs: kept,
+            handle,
+            events,
+            from_desktop,
+            to_desktop,
+            desktop_ik,
+            phone_ik,
+            addressed,
+        },
     )
 }
 
@@ -304,6 +335,96 @@ async fn the_driver_links_up_and_hands_the_chat_list_to_the_window() {
             }).await;
             assert_eq!(chats.len(), 1, "контакт обязан приехать чатом");
             assert_eq!(chats[0].title, "сосед");
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn the_terminal_falls_back_to_onion_and_comes_back_to_the_shared_network() {
+    // Вне общей сети терминал до этой поставки звонил в никуда: адрес
+    // телефона лежал у него в приглашении с самого сопряжения, а в команду
+    // транспорта уезжал `None`.
+    const PHONE: &str = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+    let (mut driver, mut pair) = paired_with_onion(1_000, PHONE.to_owned());
+    let phone_ik = pair.phone_ik;
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_100).await;
+            {
+                let seen = pair.addressed.lock().expect("список адресов");
+                assert!(!seen.is_empty(), "терминал обязан был позвонить");
+                assert!(
+                    seen.iter().all(|(via, _)| *via == Transport::Lan),
+                    "начинаем с общей сети: onion до первого разочарования — \
+                     цепочка Tor в соседнюю комнату"
+                );
+                assert!(
+                    seen.iter().all(|(_, onion)| onion.as_deref() == Some(PHONE)),
+                    "адрес телефона едет всегда: он известен с сопряжения, \
+                     и решает по нему транспорт, а не мы"
+                );
+            }
+
+            // Локальная сеть замолчала.
+            pair.to_desktop
+                .send(TransportEvent::ConnectFailed { peer_ik: phone_ik, via: Transport::Lan })
+                .await
+                .expect("событие транспорта");
+            pair.settle(1_200).await;
+            assert!(
+                pair.addressed
+                    .lock()
+                    .expect("список адресов")
+                    .iter()
+                    .any(|(via, _)| *via == Transport::Onion),
+                "не отозвалась общая сеть — пробуем через Tor"
+            );
+
+            // Телефон снова в эфире. Возврат нужен не меньше отката: иначе
+            // терминал остался бы на onion навсегда — цепочка Tor в соседнюю
+            // комнату.
+            pair.to_desktop
+                .send(TransportEvent::SeenOnLan { peer_ik: phone_ik })
+                .await
+                .expect("событие транспорта");
+            pair.settle(1_300).await;
+
+            // Спрашиваем что-нибудь: связь после onion-рукопожатия жива,
+            // и само по себе `Reach` кадра не породит — а проверить надо,
+            // каким транспортом уедет **следующий** разговор.
+            pair.handle.send(CompanionCommand::Chats).await.expect("просьба принята");
+            pair.settle(1_400).await;
+            let seen = pair.addressed.lock().expect("список адресов");
+            let (via, _) = seen.last().expect("после маяка звонок обязан быть");
+            assert_eq!(*via, Transport::Lan, "маяк возвращает в общую сеть");
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_without_the_phones_address_stays_where_it_is() {
+    // Переключаться некуда: адреса нет. «Звоню туда, где никого нет»
+    // честнее, чем «звоню в никуда», — и заодно это тот самый случай,
+    // когда телефон просто выключили.
+    let (mut driver, mut pair) = paired(1_000);
+    let phone_ik = pair.phone_ik;
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_100).await;
+            pair.to_desktop
+                .send(TransportEvent::ConnectFailed { peer_ik: phone_ik, via: Transport::Lan })
+                .await
+                .expect("событие транспорта");
+            pair.settle(1_200).await;
+            let seen = pair.addressed.lock().expect("список адресов");
+            assert!(
+                seen.iter().all(|(via, onion)| *via == Transport::Lan && onion.is_none()),
+                "без адреса транспорт не меняется: {seen:?}"
+            );
         } => {}
     }
 }

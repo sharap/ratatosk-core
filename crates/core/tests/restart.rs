@@ -72,6 +72,227 @@ fn peer_card() -> (Vec<u8>, [u8; 32]) {
     (card.encode().expect("карточка кодируется"), card.ik)
 }
 
+/// Вывозит граф аккаунта в архив и отдаёт путь к нему.
+fn graph_archive<S: Store>(engine: &mut Engine<S>, tag: &str, phrase: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "ratatosk-graph-{tag}-{}-{:?}.rtsk",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    engine
+        .export_history(&path, ratatosk_core::ExportScope::SocialGraph, Some(phrase))
+        .expect("граф вывезен");
+    path
+}
+
+#[test]
+fn a_foreign_graph_never_brings_the_verification_along() {
+    // Половина ради которой слияние и делалось: человек уехал на новый
+    // телефон с чистого листа и хочет вернуть **знакомства**, не возвращая
+    // историю.
+    //
+    // И половина, ради которой оно так осторожно: личность у него новая,
+    // значит прежний граф ей **чужой**, а из чужого списка сверка (§4.2)
+    // не переносится никогда — поручительство не является сверкой голосом.
+    let old = TempDb::new("graph-own-old");
+    let new = TempDb::new("graph-own-new");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    // Старый телефон: контакт, сверенный голосом, и локальное имя к нему.
+    let archive = {
+        let mut store = old.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::AddContact {
+                    card_bytes: card_bytes.clone(),
+                    met_in_person: true,
+                }),
+            )
+            .expect("контакт");
+        engine
+            .step(
+                1_100,
+                Input::Command(Command::SetLocalName {
+                    peer_ik,
+                    name: Some("Оля с работы".to_owned()),
+                }),
+            )
+            .expect("локальное имя");
+        graph_archive(&mut engine, "own", "четыре весёлых кота")
+    };
+
+    // Новый телефон: **та же** личность (то же зерно), пустая переписка.
+    let mut store = new.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    // Зерно у новой базы своё, поэтому «свой граф» здесь не сойдётся —
+    // и это правильный, самый частый случай: человек завёл новый аккаунт.
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+    assert!(engine.contacts().is_empty(), "начинали с чистого листа");
+
+    let scratch = std::env::temp_dir().join("ratatosk-merge-scratch");
+    let (merged, effects) = engine
+        .merge_contacts_from(
+            2_000,
+            &archive,
+            ratatosk_store::ArchiveUnlock::Passphrase("четыре весёлых кота"),
+            &scratch,
+        )
+        .expect("слияние");
+
+    assert_eq!(merged.added, 1, "знакомство доехало");
+    assert_eq!(merged.known, 0);
+    assert_eq!(merged.refused, 0);
+    assert!(!merged.own_graph, "личность новая — граф для неё чужой");
+
+    let contact = engine.contacts().get(&peer_ik).expect("контакт на месте");
+    assert_eq!(contact.card.display_name, "собеседник");
+    assert!(
+        !contact.verified,
+        "§4.2: сверка не переносится из чужого списка, а для новой личности \
+         прежний граф — чужой"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            ratatosk_core::Effect::Notify(ratatosk_core::Event::ContactAdded { .. })
+        )),
+        "о добавленном контакте обязано быть сказано событием"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn ones_own_graph_brings_the_verification_and_the_local_name() {
+    // Другая половина того же правила. Архив, вывезенный **этой же**
+    // личностью, — своя собственная запись: и сверка, и подпись к человеку
+    // сделаны своей рукой. Терять их при переезде незачем.
+    //
+    // Личность здесь одна на две базы: так бывает после восстановления
+    // из полного архива, когда граф вывозили отдельно и позже.
+    let old = TempDb::new("graph-mine-old");
+    let new = TempDb::new("graph-mine-new");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let (archive, seed) = {
+        let mut store = old.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let seed = store
+            .meta(ratatosk_store::META_IDENTITY_SEED)
+            .expect("зерно читается")
+            .expect("зерно на месте");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .expect("контакт");
+        engine
+            .step(
+                1_100,
+                Input::Command(Command::SetLocalName {
+                    peer_ik,
+                    name: Some("Оля с работы".to_owned()),
+                }),
+            )
+            .expect("локальное имя");
+        (graph_archive(&mut engine, "mine", "фраза"), seed)
+    };
+
+    let mut store = new.open(&db_key);
+    // Та же личность: зерно перенесено, как его переносит полный ввоз.
+    store.put_meta(ratatosk_store::META_IDENTITY_SEED, &seed).expect("зерно на место");
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    let scratch = std::env::temp_dir().join("ratatosk-merge-scratch");
+    let (merged, _) = engine
+        .merge_contacts_from(
+            2_000,
+            &archive,
+            ratatosk_store::ArchiveUnlock::Passphrase("фраза"),
+            &scratch,
+        )
+        .expect("слияние");
+
+    assert!(merged.own_graph, "зерно то же — граф свой");
+    assert_eq!(merged.added, 1);
+    let contact = engine.contacts().get(&peer_ik).expect("контакт");
+    assert!(contact.verified, "своя же сверка не теряется при переезде (§4.2)");
+    assert_eq!(
+        contact.local_name.as_deref(),
+        Some("Оля с работы"),
+        "и своя подпись к человеку — тоже"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
+fn a_known_contact_is_not_touched_by_a_merge() {
+    // Правило то же, что у присланного контакта (§4.1): карточка в архиве
+    // **не подписана**, и разреши мы обновление — граф, полученный от кого
+    // угодно, переписал бы onion-адрес моего собеседника на чужой.
+    let old = TempDb::new("graph-known-old");
+    let new = TempDb::new("graph-known-new");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let archive = {
+        let mut store = old.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(
+                1_000,
+                Input::Command(Command::AddContact {
+                    card_bytes: card_bytes.clone(),
+                    met_in_person: false,
+                }),
+            )
+            .expect("контакт");
+        graph_archive(&mut engine, "known", "фраза")
+    };
+
+    let mut store = new.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+    // Тот же человек уже знаком, и **сверен голосом**.
+    engine
+        .step(1_500, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+        .expect("контакт");
+
+    let scratch = std::env::temp_dir().join("ratatosk-merge-scratch");
+    let (merged, _) = engine
+        .merge_contacts_from(
+            2_000,
+            &archive,
+            ratatosk_store::ArchiveUnlock::Passphrase("фраза"),
+            &scratch,
+        )
+        .expect("слияние");
+
+    assert_eq!(merged.added, 0);
+    assert_eq!(merged.known, 1, "уже знаком — и об этом надо сказать числом");
+    assert!(
+        engine.contacts().get(&peer_ik).expect("контакт").verified,
+        "сверка обязана уцелеть: архив её не знает, но трогать известного нельзя"
+    );
+
+    let _ = std::fs::remove_file(&archive);
+}
+
 #[test]
 fn identity_contacts_and_history_survive_a_restart() {
     let db = TempDb::new("full");

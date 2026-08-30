@@ -53,6 +53,23 @@ pub const DESKTOP_CACHE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// перечитается при следующем открытии.
 pub const DESKTOP_CACHE_CHATS: usize = 64;
 
+/// Скольких лиц терминал держит в кэше.
+///
+/// **Дополнение к §13.4, как и [`DESKTOP_CACHE_CHATS`].** Спецификация про
+/// аватарки не говорит вовсе, а число тут нужнее, чем для истории: сообщение
+/// весит десятки байт, аватарка — до тридцати двух килобайт, и список чатов
+/// длину имеет ту, какую назовёт телефон.
+///
+/// Двести пятьдесят шесть — это восемь мебибайт потолка, и выбраны они
+/// не из красоты числа: держать лица имеет смысл ровно у тех, кого видно
+/// в списке, а список за первой парой сотен уже листают, а не смотрят.
+/// Вытесняются те, с кем дольше не говорили: список чатов приходит
+/// отсортированным по свежести, и хвост его — это и есть вытесняемое.
+///
+/// Больше [`DESKTOP_CACHE_CHATS`] намеренно: историю держат у открытых
+/// чатов, лицо — у **видимых**, а видно в списке куда больше, чем открыто.
+pub const DESKTOP_CACHE_AVATARS: usize = 256;
+
 /// Что разрешено пересекать границу устройства (§13.4).
 ///
 /// «Ключевой материал контактов, `IK`, `SK` и `db_key` границу устройства
@@ -97,6 +114,13 @@ pub struct PairedDevice {
     pub paired_ms: u64,
     /// Когда последний раз подключалось, мс.
     pub last_seen_ms: u64,
+    /// Onion-адрес устройства; пустая строка — только общая сеть.
+    ///
+    /// Называет его сам десктоп, в нагрузке рукопожатия (§13.4). Показывать
+    /// адрес человеку незачем — техническая деталь, — но **признак** «до
+    /// этого устройства можно дозвониться из другого города» ему виден
+    /// и понятен, и берётся он отсюда.
+    pub onion: String,
 }
 
 impl PairedDevice {
@@ -158,6 +182,28 @@ pub struct Cache {
     /// поле обретает с дисковым: там оно отвечает на вопрос «показанное —
     /// это то, что есть сейчас, или то, что было, когда ноутбук выключали».
     fresh: bool,
+    /// Лица контактов: байты вместе с меткой, по которой сверяются
+    /// со списком чатов.
+    ///
+    /// **Отсутствие записи означает «не знаем», а не «аватарки нет».**
+    /// Второе говорит список чатов нулём в `avatar_ms`, и держать это
+    /// же знание здесь вторым способом значило бы завести два ответа
+    /// на один вопрос.
+    avatars: BTreeMap<[u8; 16], CachedAvatar>,
+    /// Своё лицо. Отдельным полем, а не записью с особым ключом:
+    /// шестнадцать нулевых байт — законный идентификатор чата, и заняв
+    /// его под себя, мы однажды затёрли бы чужое лицо своим.
+    mine: Option<CachedAvatar>,
+}
+
+/// Лицо в кэше терминала — байты вместе с меткой телефона.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedAvatar {
+    /// Байты изображения. Пусто не бывает: «нет аватарки» — это отсутствие
+    /// записи, а не запись нулевой длины.
+    bytes: Vec<u8>,
+    /// Метка телефона, с которой сверяется `ChatSummary::avatar_ms`.
+    stamp: u64,
 }
 
 impl Cache {
@@ -191,6 +237,48 @@ impl Cache {
         self.history.get(chat).map_or(&[], Vec::as_slice)
     }
 
+    /// Лицо, которое помним. `chat = None` — своё.
+    ///
+    /// `None` в ответе — «не знаем», а не «аватарки нет»: второе видно
+    /// по нулевой метке в списке чатов, и путать их нельзя. Показывать,
+    /// впрочем, в обоих случаях нечего — разница в том, спрашивать ли.
+    #[must_use]
+    pub fn avatar(&self, chat: Option<&[u8; 16]>) -> Option<&[u8]> {
+        self.entry_for(chat).map(|cached| cached.bytes.as_slice())
+    }
+
+    /// Метка лица, которое помним, — то, чем сверяются со списком чатов.
+    #[must_use]
+    pub fn avatar_stamp(&self, chat: Option<&[u8; 16]>) -> Option<u64> {
+        self.entry_for(chat).map(|cached| cached.stamp)
+    }
+
+    fn entry_for(&self, chat: Option<&[u8; 16]>) -> Option<&CachedAvatar> {
+        match chat {
+            Some(chat) => self.avatars.get(chat),
+            None => self.mine.as_ref(),
+        }
+    }
+
+    /// Чьи лица разошлись со списком чатов — то есть о чём спрашивать.
+    ///
+    /// Считается **здесь**, а не слоем выше, и это то же правило §13.3,
+    /// по которому заголовок чата считает телефон: «спрашивать, когда метка
+    /// разошлась» — знание о протоколе, и повторённое в драйвере оно однажды
+    /// разошлось бы с тем, как кэш эти метки кладёт.
+    ///
+    /// Своё лицо сюда не попадает: метки для сравнения у него нет (себя
+    /// в списке чатов не бывает), и спрашивается оно на каждом подключении.
+    #[must_use]
+    pub fn stale_avatars(&self) -> Vec<[u8; 16]> {
+        self.chats
+            .iter()
+            .filter(|chat| chat.avatar_ms != 0)
+            .filter(|chat| self.avatars.get(&chat.chat).map(|c| c.stamp) != Some(chat.avatar_ms))
+            .map(|chat| chat.chat)
+            .collect()
+    }
+
     /// Связь пропала: показанное больше не подтверждено.
     ///
     /// Само содержимое остаётся — оно всё ещё лучшее, что у нас есть, —
@@ -208,6 +296,22 @@ impl Cache {
         self.history.retain(|chat, _| alive.contains(chat));
         self.touched.retain(|chat| alive.contains(chat));
         self.chats = chats;
+        // Лицо уносится не только с удалённым контактом, но и со **снятой
+        // сверкой**: §4.2 симметричен, и телефон, отозвавший сверку, шлёт
+        // в списке ноль. Не убрав запись здесь, окно показывало бы лицо
+        // того, кого больше не считает проверенным, — то самое бесплатное
+        // доверие, против которого правило и написано.
+        //
+        // **Разошедшаяся метка — не повод стирать.** Ноль означает
+        // «показывать нечего», а другое число — «есть, но другое»: выбросив
+        // байты, окно погасило бы кружок до приезда новых, то есть моргнуло
+        // бы на каждой смене картинки. Прежнее лицо остаётся, пока не придёт
+        // следующее, а разошедшиеся метки собирает `stale_avatars`.
+        let chats = &self.chats;
+        self.avatars.retain(|chat, _| {
+            chats.iter().any(|known| known.chat == *chat && known.avatar_ms != 0)
+        });
+        self.trim_avatars();
         self.fresh = true;
         self.dirty = true;
     }
@@ -240,6 +344,47 @@ impl Cache {
         known.sort_by_key(|m| (m.wall_ms, m.msg_id));
         Self::trim(known);
         self.touch(chat);
+    }
+
+    /// Телефон прислал лицо — или сказал, что показывать нечего.
+    ///
+    /// `stamp = 0` или пустые байты означают «нечего», и запись уносится:
+    /// оставив её, окно показывало бы снятую аватарку до перезапуска.
+    fn remember_avatar(&mut self, chat: Option<[u8; 16]>, bytes: Option<Vec<u8>>, stamp: u64) {
+        self.fresh = true;
+        self.dirty = true;
+        let cached = match bytes {
+            Some(bytes) if !bytes.is_empty() && stamp != 0 => Some(CachedAvatar { bytes, stamp }),
+            _ => None,
+        };
+        match chat {
+            Some(chat) => match cached {
+                Some(cached) => {
+                    self.avatars.insert(chat, cached);
+                    self.trim_avatars();
+                }
+                None => {
+                    self.avatars.remove(&chat);
+                }
+            },
+            None => self.mine = cached,
+        }
+    }
+
+    /// Оставляет лица тех, с кем говорили недавно, — не больше
+    /// [`DESKTOP_CACHE_AVATARS`].
+    ///
+    /// Порядок берётся из списка чатов: телефон присылает его свежими
+    /// вверх, и хвост — это ровно те, кого не видно. Лица чатов, которых
+    /// в списке нет вовсе, уносятся первыми: про них мы не знаем даже,
+    /// живы ли они.
+    fn trim_avatars(&mut self) {
+        if self.avatars.len() <= DESKTOP_CACHE_AVATARS {
+            return;
+        }
+        let keep: Vec<[u8; 16]> =
+            self.chats.iter().map(|chat| chat.chat).take(DESKTOP_CACHE_AVATARS).collect();
+        self.avatars.retain(|chat, _| keep.contains(chat));
     }
 
     /// Пришло новое сообщение.
@@ -361,14 +506,44 @@ impl Cache {
                 ])
             })
             .collect();
-        Value::Map(vec![
+        let avatars = self
+            .avatars
+            .iter()
+            .map(|(chat, cached)| {
+                Value::Map(vec![
+                    (Value::Integer(SNAP_KEY_CHAT.into()), Value::Bytes(chat.to_vec())),
+                    Self::avatar_field(cached),
+                    (Value::Integer(SNAP_KEY_STAMP.into()), Value::Integer(cached.stamp.into())),
+                ])
+            })
+            .collect();
+        let mut fields = vec![
             (Value::Integer(SNAP_KEY_VERSION.into()), Value::Integer(SNAP_VERSION.into())),
             (
                 Value::Integer(SNAP_KEY_CHATS.into()),
                 Value::Array(self.chats.iter().map(companion::chat_value).collect()),
             ),
             (Value::Integer(SNAP_KEY_HISTORY.into()), Value::Array(history)),
-        ])
+            (Value::Integer(SNAP_KEY_AVATARS.into()), Value::Array(avatars)),
+        ];
+        // Своё лицо кладётся ключом, которого при его отсутствии просто нет:
+        // так же, как «нет превью» на проводе. Пустая запись значила бы
+        // картинку нулевой длины, а такой не бывает.
+        if let Some(cached) = &self.mine {
+            fields.push((
+                Value::Integer(SNAP_KEY_MINE.into()),
+                Value::Map(vec![
+                    Self::avatar_field(cached),
+                    (Value::Integer(SNAP_KEY_STAMP.into()), Value::Integer(cached.stamp.into())),
+                ]),
+            ));
+        }
+        Value::Map(fields)
+    }
+
+    /// Байты лица под своим ключом — одинаково для чужого и своего.
+    fn avatar_field(cached: &CachedAvatar) -> (Value, Value) {
+        (Value::Integer(SNAP_KEY_AVATAR.into()), Value::Bytes(cached.bytes.clone()))
     }
 
     /// Поднимает содержимое из значения.
@@ -411,7 +586,41 @@ impl Cache {
             cache.history.insert(chat, messages);
             cache.touch(chat);
         }
+
+        if let Some(Value::Array(avatars)) = canonical::get(map, SNAP_KEY_AVATARS) {
+            // Предел применяется и на чтении — как и к истории, и по той же
+            // причине: файл мог быть записан сборкой с другими числами,
+            // а верить чужому файлу в вопросе «сколько держать в памяти»
+            // нельзя. Здесь цена ошибки выше: запись — это тридцать два
+            // килобайта, а не сообщение.
+            for entry in avatars.iter().take(DESKTOP_CACHE_AVATARS) {
+                let entry = canonical::as_map(entry)?;
+                let chat = canonical::as_array::<16>(canonical::require(entry, SNAP_KEY_CHAT)?)?;
+                cache.avatars.insert(chat, Self::avatar_from_value(entry)?);
+            }
+        }
+        if let Some(mine) = canonical::get(map, SNAP_KEY_MINE) {
+            cache.mine = Some(Self::avatar_from_value(canonical::as_map(mine)?)?);
+        }
         Ok(cache)
+    }
+
+    /// Разбирает лицо из снимка.
+    ///
+    /// Пустые байты и нулевая метка отвергаются, а не превращаются
+    /// в «аватарки нет»: в снимок такая запись не пишется вовсе, и встретив
+    /// её, мы читаем не свой файл. Предел длины — тот же, что на проводе.
+    fn avatar_from_value(
+        entry: &[(Value, Value)],
+    ) -> Result<CachedAvatar, ratatosk_codec::CodecError> {
+        let Value::Bytes(bytes) = canonical::require(entry, SNAP_KEY_AVATAR)? else {
+            return Err(ratatosk_codec::CodecError::TypeMismatch);
+        };
+        let stamp = canonical::as_u64(canonical::require(entry, SNAP_KEY_STAMP)?)?;
+        if bytes.is_empty() || stamp == 0 || bytes.len() > ratatosk_proto::MAX_AVATAR_BYTES {
+            return Err(ratatosk_codec::CodecError::TypeMismatch);
+        }
+        Ok(CachedAvatar { bytes: bytes.clone(), stamp })
     }
 
     /// Оставляет не больше [`DESKTOP_CACHE_PER_CHAT`] последних сообщений.
@@ -423,12 +632,16 @@ impl Cache {
 }
 
 /// Ключи полей снимка. Едут на диск — менять нельзя.
-const SNAP_VERSION: u64 = 1;
+const SNAP_VERSION: u64 = 2;
 const SNAP_KEY_VERSION: u64 = 1;
 const SNAP_KEY_CHATS: u64 = 2;
 const SNAP_KEY_HISTORY: u64 = 3;
 const SNAP_KEY_CHAT: u64 = 4;
 const SNAP_KEY_PAGE: u64 = 5;
+const SNAP_KEY_AVATARS: u64 = 6;
+const SNAP_KEY_MINE: u64 = 7;
+const SNAP_KEY_AVATAR: u64 = 8;
+const SNAP_KEY_STAMP: u64 = 9;
 
 /// Почему снимок кэша не сложился.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -677,6 +890,48 @@ pub enum ClientEvent {
         /// Байты превью, если они есть.
         bytes: Option<Vec<u8>>,
     },
+    /// Аватарка — или её отсутствие.
+    ///
+    /// `bytes: None` означает «показывать нечего», и причин у этого две,
+    /// неразличимых снаружи намеренно: аватарки нет или контакт не сверен
+    /// (§4.2). Окну обе говорят одно и то же — рисовать заглушку.
+    ///
+    /// `fresh` — то же, что у [`ClientEvent::Chats`]: `false` означает лицо
+    /// из кэша, не подтверждённое телефоном в этой связи.
+    Avatar {
+        /// Чей чат, или `None` — своя.
+        chat: Option<[u8; 16]>,
+        /// Байты аватарки, если они есть.
+        bytes: Option<Vec<u8>>,
+        /// Подтверждено ли телефоном сейчас.
+        fresh: bool,
+    },
+    /// Сопряжение отозвано — этот компьютер больше не второй экран (§13.4).
+    ///
+    /// Кэш к этому моменту уже пуст: держать чужую переписку на машине,
+    /// которой в ней отказано, незачем, и решение это не человека —
+    /// человек его уже принял, на телефоне.
+    ///
+    /// Показать **обязательно и словами**: до этой новости отзыв выглядел
+    /// тишиной, неотличимой от «телефон не в сети», и окно вечно писало
+    /// «подключаемся» (§14). Дальше терминал не подключается: сказать ему
+    /// «попробуйте ещё» нечего, а новый второй экран заводится новым QR.
+    Revoked,
+    /// Лицо сменилось — прежнее показывать больше нельзя.
+    ///
+    /// **Без байтов**, и это не экономия ради экономии: новость приезжает
+    /// без спроса, а тридцать два килобайта без спроса — трафик, за который
+    /// окно не просило. Спросит само, если ему есть куда рисовать.
+    ///
+    /// Прежнее лицо к этому моменту из кэша уже убрано: показывать картинку,
+    /// про которую известно, что она не та, — та же неправда, что и показ
+    /// стёртого сообщения (§14).
+    AvatarChanged {
+        /// Чей чат, или `None` — своя.
+        chat: Option<[u8; 16]>,
+        /// Новая метка; `0` — показывать нечего.
+        avatar_ms: u64,
+    },
     /// Выгрузка на этот компьютер прекращена — по просьбе человека.
     ///
     /// Отдельно от [`ClientEvent::Refused`], потому что это не отказ телефона
@@ -741,6 +996,18 @@ pub enum ClientInput {
     Received(Vec<u8>),
     /// Канал пропал.
     Lost,
+    /// Свой onion-сервис поднялся — вот его адрес (§13.4).
+    ///
+    /// Пустая строка — «сервис погас»: без неё телефон продолжал бы звонить
+    /// по адресу, которого больше нет, и молчание выглядело бы как
+    /// «терминал не отвечает».
+    ///
+    /// **Живой связи это не касается.** Адрес объявляется рукопожатием,
+    /// а рукопожатие уже позади; поднявшийся сервис доедет со следующим —
+    /// и это не пробел: адрес нужен телефону ровно тогда, когда терминал
+    /// не в общей сети, а такой разговор всегда начинается новым
+    /// рукопожатием.
+    OnionReady(String),
     /// Человек за десктопом чего-то хочет.
     Ask(Request),
     /// Забрать вложение целиком.
@@ -850,6 +1117,32 @@ pub struct CompanionClient {
     /// уходит первым, и ответ с бо́льшим номером означает, что до него
     /// очередь дошла, а до нашего не дойдёт никогда.
     hello: Option<u64>,
+    /// Сопряжение отозвано: телефон сказал об этом сам (§13.4).
+    ///
+    /// **Дорога в один конец.** Обратно из этого состояния терминал
+    /// не выходит: ключ сопряжения телефон снёс, и никакое рукопожатие
+    /// на нём больше не сложится. Человеку нужен новый QR, то есть новый
+    /// объект, — а этому остаётся не притворяться, что он ещё второй экран.
+    revoked: bool,
+    /// Свой onion-адрес, если сервис поднят. Пустая строка — только
+    /// общая сеть.
+    ///
+    /// Живёт здесь, а не берётся у транспорта в момент рукопожатия, потому
+    /// что ядро sans-io: транспорта оно не видит. Кладёт сюда адрес слой
+    /// выше — [`ClientInput::OnionReady`], — и делает это, когда сервис
+    /// поднялся, а не когда понадобился.
+    own_onion: String,
+    /// Версия провода телефона, когда она уже известна.
+    ///
+    /// **Ноль означает «телефон древний»**, а не «неизвестно»: так
+    /// записывается ответ молчанием на `Hello` (см. [`ClientEvent::Wire`]
+    /// с `theirs: None`). Неизвестность — это `None`, и в ней спрашивать
+    /// можно всё: `Hello` уходит первым, ответ на него приходит первым.
+    ///
+    /// Нужно затем, чтобы не оставлять в неотвеченных просьбу, на которую
+    /// никогда не ответят: их число ограничено `MAX_OUTSTANDING`, и десяток
+    /// повисших аватарок закрыл бы очередь для всего остального.
+    phone_wire: Option<u32>,
     /// Отправка файла на телефон, если она идёт. Одна за раз — как и приём.
     ///
     /// Обратное направление той же дороги, и состояние такое же: чей файл,
@@ -999,6 +1292,9 @@ impl CompanionClient {
             outstanding: BTreeMap::new(),
             cache: Cache::new(),
             hello: None,
+            own_onion: String::new(),
+            revoked: false,
+            phone_wire: None,
             download: None,
             upload: None,
             entropy,
@@ -1117,6 +1413,33 @@ impl CompanionClient {
         aad
     }
 
+    /// Ключ своего onion-сервиса (§13.4).
+    ///
+    /// **Выводится, а не хранится** — из того же зерна сопряжения, что
+    /// и ключ кэша (`ratatosk_crypto::companion::onion_seed`, и там же
+    /// рассуждение). Адрес получается устойчивым: переживает перезапуск
+    /// и стирание кэша, не требуя ничего, кроме той же ссылки, по которой
+    /// терминал и так подключается.
+    ///
+    /// Живёт здесь, а не у слоя выше, по правилу §13.3: «из чего берётся
+    /// ключ» — решение протокольное, и повторённое в десктопном коде оно
+    /// однажды разошлось бы с этим. Слой выше получает готовый ключ и несёт
+    /// его транспорту.
+    #[must_use]
+    pub fn onion_key(&self) -> ratatosk_crypto::onion::OnionKey {
+        let seed = ratatosk_crypto::companion::onion_seed(&self.identity);
+        ratatosk_crypto::onion::OnionKey::from_seed(*seed)
+    }
+
+    /// Отозвано ли сопряжение (§13.4).
+    ///
+    /// Спрашивается слоем выше ради одного: перестать предлагать человеку
+    /// то, чего больше не будет. Обратно это поле не переводится ничем.
+    #[must_use]
+    pub fn revoked(&self) -> bool {
+        self.revoked
+    }
+
     /// Есть ли сейчас живая сессия.
     #[must_use]
     pub fn linked(&self) -> bool {
@@ -1130,6 +1453,10 @@ impl CompanionClient {
             ClientInput::Reach => self.reach(),
             ClientInput::Received(frame) => self.on_frame(now_ms, &frame),
             ClientInput::Lost => self.on_lost(),
+            ClientInput::OnionReady(onion) => {
+                self.own_onion = onion;
+                Vec::new()
+            }
             ClientInput::Ask(request) => self.on_ask(&request),
             ClientInput::Fetch { file_id, chunk_total } => self.on_fetch(file_id, chunk_total),
             ClientInput::CancelFetch => self.on_cancel_fetch(),
@@ -1317,19 +1644,34 @@ impl CompanionClient {
 
     /// Здоровается, если ещё не здоровался.
     fn reach(&mut self) -> Vec<ClientEffect> {
-        if self.linked() {
+        // Отозванному стучаться некуда: ключа сопряжения у телефона больше
+        // нет, и рукопожатие на нём не сложится никогда. Молча, а не словами:
+        // сказано уже было — новостью, один раз; повторять это на каждый тик
+        // таймера значит превратить объяснение в шум.
+        if self.revoked || self.linked() {
             return Vec::new();
         }
-        let Ok((message, pending)) = Initiator::start(&self.identity, &self.phone_ik, &[]) else {
+        // **В нагрузке — свой адрес, и другого места у него нет.** §8.2 возит
+        // здесь карточку отправителя; у терминала карточки нет и быть
+        // не может — он не человек в чьём-то списке контактов. Зато телефону
+        // нужно то, чем ему перезвонить: соединения односторонние (5ц),
+        // и отвечает он не в принятое соединение, а в своё, набранное
+        // по адресу. Значит адрес обязан приехать **раньше** первого ответа,
+        // а раньше ответа приходит только рукопожатие.
+        //
+        // Пустой адрес — законное значение и самое частое: в общей сети
+        // телефон находит терминал маяком, и onion ему не нужен вовсе.
+        let payload = companion::device_address_value(&companion::DeviceAddress {
+            onion: self.own_onion.clone(),
+        });
+        let payload = canonical::encode(&payload).unwrap_or_default();
+        let Ok((message, pending)) = Initiator::start(&self.identity, &self.phone_ik, &payload)
+        else {
             return vec![ClientEffect::Show(ClientEvent::Refused(
                 "рукопожатие не собралось: ключ сопряжения не годится".to_owned(),
             ))];
         };
 
-        // Нагрузка пустая, и это не упущение. §8.2 возит в ней карточку
-        // отправителя; у терминала карточки нет и быть не может — он не
-        // человек в чьём-то списке контактов. Телефон её и не читает: узнав
-        // своё устройство по статическому ключу, он идёт другой веткой.
         self.pending = Some(pending);
         let mut nonce = [0u8; ratatosk_wire::NONCE_LEN];
         self.entropy.fill(&mut nonce);
@@ -1350,6 +1692,28 @@ impl CompanionClient {
     /// значит однажды отправить просьбу в сессию, которой у телефона больше
     /// нет (переустановили, потеряли базу), и получить в ответ тишину,
     /// неотличимую от «телефон занят». Тишина дороже лишнего рукопожатия.
+    /// Телефон отозвал сопряжение (§13.4).
+    ///
+    /// **Кэш выбрасывается здесь, а не слоем выше**, и это то же правило
+    /// §13.3, по которому §4.2 живёт в ядре: «отозвали — переписки здесь
+    /// больше нет» есть решение протокола, а не оформления. Файл сотрёт
+    /// слой выше, но того, что уже поднято в память, ему не достать.
+    ///
+    /// Всё незаконченное уходит вместе с ключами: продолжать выгрузку,
+    /// которую некому принять, и ждать ответов, которых не будет, — значит
+    /// показывать движение там, где его нет.
+    fn on_revoked(&mut self) {
+        self.revoked = true;
+        self.session = None;
+        self.pending = None;
+        self.connected = false;
+        self.outstanding.clear();
+        self.hello = None;
+        self.upload = None;
+        self.download = None;
+        self.cache = Cache::new();
+    }
+
     fn on_lost(&mut self) -> Vec<ClientEffect> {
         self.pending = None;
         self.outstanding.clear();
@@ -1359,6 +1723,10 @@ impl CompanionClient {
         self.connected = false;
 
         self.hello = None;
+        // Версия забывается вместе со связью: телефон между подключениями
+        // мог обновиться, и помнить старое число значило бы не спрашивать
+        // о том, что он уже умеет.
+        self.phone_wire = None;
         // **Отправка каналу не принадлежит и вместе с ним не умирает.**
         // Выгруженные куски лежат в хранилище телефона и переживают даже его
         // перезапуск (`ARCHITECTURE.md`, 5вб); что именно у него осталось,
@@ -1412,7 +1780,54 @@ impl CompanionClient {
                 )))];
             }
         }
+        // Отозванному отвечаем сами и на всё: кэш пуст, телефона нет,
+        // а просьба человека, оставшаяся без ответа, — это то самое
+        // молчание, ради которого прощание и заведено (§14).
+        if self.revoked {
+            return vec![ClientEffect::Show(ClientEvent::Refused(
+                "сопряжение отозвано с телефона — этот компьютер больше не второй экран; \
+                 чтобы связать заново, нужен новый QR"
+                    .to_owned(),
+            ))];
+        }
+
         let mut effects = self.from_cache(request);
+
+        // Телефон постарше про аватарки не знает и просьбу отбросит молча
+        // (5бр). Ответ ему — тишина, а тишина здесь дороже, чем кажется:
+        // просьба осталась бы в неотвеченных навсегда, а их число
+        // ограничено. Показываем «нечего» — что для такого телефона правда
+        // и есть: лица от него не будет никогда.
+        // Телефон постарше своей аватарки от нас не примет: просьбу
+        // он молча отбросит. Здесь молчание дороже, чем при чтении, —
+        // человек **нажал кнопку**, и оставить его смотреть на прежнее лицо
+        // и гадать, дошло ли, §14 запрещает. Поэтому словами, а не пустым
+        // событием: показывать тут нечего, объяснять — есть что.
+        if matches!(request, Request::SetMyAvatar { .. })
+            && self.phone_wire.is_some_and(|wire| wire < companion::SET_AVATAR_SINCE_WIRE)
+        {
+            effects.push(ClientEffect::Show(ClientEvent::Refused(
+                "телефон постарше и менять аватарку отсюда не умеет —                  поставьте её на телефоне"
+                    .to_owned(),
+            )));
+            return effects;
+        }
+
+        if let Request::Avatar { chat } = request {
+            if self.phone_wire.is_some_and(|wire| wire < companion::AVATARS_SINCE_WIRE) {
+                // Кроме случая, когда лицо уже показано из кэша: там ответ
+                // человеку дан, и добавить к нему «показывать нечего»
+                // значило бы погасить кружок, который только что зажгли.
+                if effects.is_empty() {
+                    effects.push(ClientEffect::Show(ClientEvent::Avatar {
+                        chat: *chat,
+                        bytes: None,
+                        fresh: true,
+                    }));
+                }
+                return effects;
+            }
+        }
 
         if !self.linked() {
             effects.push(ClientEffect::Show(ClientEvent::NotLinked));
@@ -1465,6 +1880,18 @@ impl CompanionClient {
                     fresh: self.cache.fresh(),
                 })]
             }
+            // Лицо из кэша показывается сразу, а просьба всё равно уходит:
+            // ответ телефона либо подтвердит его (`fresh: true`), либо
+            // привезёт другое. Так же устроен список чатов — с той разницей,
+            // что здесь картинка стоит на экране без мигания.
+            Request::Avatar { chat } => match self.cache.avatar(chat.as_ref()) {
+                Some(bytes) => vec![ClientEffect::Show(ClientEvent::Avatar {
+                    chat: *chat,
+                    bytes: Some(bytes.to_vec()),
+                    fresh: self.cache.fresh(),
+                })],
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -1522,6 +1949,24 @@ impl CompanionClient {
     }
 
     fn on_handshake(&mut self, now_ms: u64, step: u64, frame: &[u8]) -> Vec<ClientEffect> {
+        // Кадр отзыва приезжает **вместо** ответа рукопожатия: телефон снёс
+        // ключ сопряжения, и рукопожатия не будет. Ключ к нему выводится
+        // статическим DH и не требует ни сессии, ни единого прежнего кадра —
+        // в том и дело, что у отозванного их больше нет.
+        //
+        // Не открылся — молчим. Собрать такой кадр может только владелец
+        // одного из двух статических секретов; всё прочее под этим номером
+        // шага — чужой шум, и рассказывать о нём человеку нечего.
+        if step == crate::frames::REVOKED_STEP {
+            let key = ratatosk_crypto::companion::revocation_key(&self.identity, &self.phone_ik);
+            return match crate::frames::open_revoked(&key, frame) {
+                Ok(()) => {
+                    self.on_revoked();
+                    vec![ClientEffect::Show(ClientEvent::Revoked)]
+                }
+                Err(_) => vec![ClientEffect::Show(ClientEvent::Ignored("кадр отзыва не наш"))],
+            };
+        }
         if step != HANDSHAKE_STEP_RESPONSE {
             // Первое сообщение рукопожатия терминалу не адресуют: он всегда
             // звонит сам. Пришедшее — не наш разговор.
@@ -1748,6 +2193,9 @@ impl CompanionClient {
             if id > hello {
                 self.hello = None;
                 self.outstanding.remove(&hello);
+                // Ноль, а не `None`: «телефон древний» — это знание,
+                // а не его отсутствие, и спрашивать его о новом незачем.
+                self.phone_wire = Some(0);
                 earlier.push(ClientEffect::Show(ClientEvent::Wire {
                     theirs: None,
                     ours: companion::WIRE_VERSION,
@@ -1759,6 +2207,7 @@ impl CompanionClient {
         let shown = match response {
             Response::Hello { wire } => {
                 self.hello = None;
+                self.phone_wire = Some(wire);
                 earlier.extend(self.give_up_stalled(Some(wire)));
                 ClientEvent::Wire { theirs: Some(wire), ours: companion::WIRE_VERSION }
             }
@@ -1877,6 +2326,17 @@ impl CompanionClient {
                 }
                 _ => ClientEvent::Ignored("превью в ответ на другую просьбу"),
             },
+            // Чьё лицо — знает вопрос. Метка берётся из списка чатов:
+            // телефон собрал ответ по той же строке, из которой список
+            // и считался, и второе число в ответе разошлось бы с первым
+            // ровно тогда, когда они и должны совпадать.
+            Response::Avatar { bytes, avatar_ms } => match &asked {
+                Request::Avatar { chat } => {
+                    self.cache.remember_avatar(*chat, bytes.clone(), avatar_ms);
+                    ClientEvent::Avatar { chat: *chat, bytes, fresh: true }
+                }
+                _ => ClientEvent::Ignored("аватарка в ответ на другую просьбу"),
+            },
         };
         earlier.push(ClientEffect::Show(shown));
         earlier
@@ -1976,6 +2436,20 @@ impl CompanionClient {
                 }
                 ClientEvent::FileGone { file_id }
             }
+            // Новость несёт метку, но не байты. Кэш поэтому только **теряет**
+            // прежнее лицо: показывать старое, зная, что оно другое, значило
+            // бы показывать неправду (§14), а нового у нас ещё нет. Спросит
+            // слой выше — у него есть, куда рисовать; здесь же событие
+            // с `bytes: None` и есть «сотри и спроси заново».
+            Notice::AvatarChanged { chat, avatar_ms } => {
+                self.cache.remember_avatar(chat, None, avatar_ms);
+                ClientEvent::AvatarChanged { chat, avatar_ms }
+            }
+            // Последний кадр этой сессии: телефон снёс ключи сразу за ним.
+            Notice::Revoked => {
+                self.on_revoked();
+                ClientEvent::Revoked
+            }
         })]
     }
 }
@@ -1991,7 +2465,13 @@ mod tests {
             verified: true,
             last_text: "было".into(),
             last_ms: u64::from(chat),
+            avatar_ms: 0,
         }
+    }
+
+    /// Тот же чат, но с лицом: метка отлична от нуля.
+    fn summary_with_avatar(chat: u8, avatar_ms: u64) -> ChatSummary {
+        ChatSummary { avatar_ms, ..summary(chat) }
     }
 
     fn message(chat: u8, id: u8, at: u64, text: &str) -> Message {
@@ -2344,6 +2824,7 @@ mod tests {
             label: "ноутбук".into(),
             paired_ms: 0,
             last_seen_ms: 0,
+            onion: String::new(),
         };
         assert!(!d.cache_expired(DESKTOP_CACHE_TTL_MS - 1));
         assert!(d.cache_expired(DESKTOP_CACHE_TTL_MS));
@@ -2352,5 +2833,197 @@ mod tests {
     #[test]
     fn cache_limit_matches_spec() {
         assert_eq!(DESKTOP_CACHE_PER_CHAT, 1_000);
+    }
+
+    /// Терминал без связи — ровно то, что нужно проверке воротец.
+    fn bare_client() -> CompanionClient {
+        let invite = companion::PairingInvite {
+            ik: [3u8; 32],
+            secret: companion::PairingSecret::new([4u8; 32]),
+            onion: String::new(),
+            display_name: "телефон".into(),
+        };
+        CompanionClient::from_invite(&invite, Box::new(crate::entropy::SeededEntropy::new(1)))
+    }
+
+    #[test]
+    fn a_face_asked_of_an_older_phone_is_answered_here_and_now() {
+        // Такой телефон просьбу не понимает и молча её отбрасывает (5бр).
+        // Уйди она на провод — осталась бы в неотвеченных навсегда, а их
+        // число ограничено: десяток аватарок закрыл бы очередь для всего
+        // остального, и переписка встала бы из-за кружков.
+        let mut client = bare_client();
+        client.phone_wire = Some(companion::AVATARS_SINCE_WIRE - 1);
+
+        let shown = client.step(1_000, ClientInput::Ask(Request::Avatar { chat: None }));
+        assert!(
+            matches!(
+                shown.as_slice(),
+                [ClientEffect::Show(ClientEvent::Avatar { chat: None, bytes: None, .. })]
+            ),
+            "ответ обязан быть один и здесь же, без похода на провод: {shown:?}"
+        );
+
+        // А телефону, который знает, — просьба уходит как обычно. Связи нет,
+        // поэтому дальше `NotLinked`, но воротца уже не срабатывают.
+        client.phone_wire = Some(companion::AVATARS_SINCE_WIRE);
+        let shown = client.step(1_100, ClientInput::Ask(Request::Avatar { chat: None }));
+        assert!(
+            shown
+                .iter()
+                .all(|effect| !matches!(effect, ClientEffect::Show(ClientEvent::Avatar { .. }))),
+            "за живое лицо отвечает телефон, а не мы за него: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn setting_a_face_on_an_older_phone_is_refused_in_words() {
+        // Показ такому телефону отвечается пустым событием — рисовать нечего,
+        // и говорить не о чем. Смена — **словами**: человек нажал кнопку,
+        // и оставить его гадать, дошло ли, §14 запрещает.
+        let mut client = bare_client();
+        client.phone_wire = Some(companion::SET_AVATAR_SINCE_WIRE - 1);
+
+        let shown =
+            client.step(1_000, ClientInput::Ask(Request::SetMyAvatar { bytes: vec![1, 2, 3] }));
+        assert!(
+            matches!(shown.as_slice(), [ClientEffect::Show(ClientEvent::Refused(_))]),
+            "отказ обязан быть один и со словами: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_face_is_asked_for_only_when_its_stamp_moved() {
+        // Иначе окно возит тридцать два килобайта на контакт при каждом
+        // обновлении списка чатов — а список приезжает на каждую новость
+        // `ChatsChanged`.
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(1, 100), summary_with_avatar(2, 200)]);
+        assert_eq!(cache.stale_avatars(), vec![[1u8; 16], [2u8; 16]], "не знаем ни одного");
+
+        cache.remember_avatar(Some([1u8; 16]), Some(vec![0x89, b'P', b'N', b'G']), 100);
+        assert_eq!(cache.stale_avatars(), vec![[2u8; 16]], "первое лицо уже знаем");
+
+        // Тот же список — спрашивать нечего.
+        cache.remember_avatar(Some([2u8; 16]), Some(vec![0xFF, 0xD8, 0xFF]), 200);
+        assert!(cache.stale_avatars().is_empty(), "метки совпали — просить нечего");
+
+        // Телефон сменил картинку: метка другая, спросить надо снова.
+        cache.remember_chats(vec![summary_with_avatar(1, 101), summary_with_avatar(2, 200)]);
+        assert_eq!(cache.stale_avatars(), vec![[1u8; 16]]);
+    }
+
+    #[test]
+    fn a_changed_face_stays_on_screen_until_the_new_one_arrives() {
+        // Разошедшаяся метка — это «есть, но другое», а не «нечего
+        // показывать». Выбросив байты, окно гасило бы кружок на каждой
+        // смене картинки, то есть моргало бы там, где менялось лицо.
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(1, 100)]);
+        cache.remember_avatar(Some([1u8; 16]), Some(vec![1, 2, 3]), 100);
+
+        cache.remember_chats(vec![summary_with_avatar(1, 101)]);
+        assert_eq!(cache.avatar(Some(&[1u8; 16])), Some(&[1, 2, 3][..]), "прежнее ещё показываем");
+        assert_eq!(cache.stale_avatars(), vec![[1u8; 16]], "и уже знаем, что оно не то");
+    }
+
+    #[test]
+    fn revoking_verification_takes_the_face_off_the_screen() {
+        // §4.2 симметричен: телефон, отозвавший сверку, шлёт в списке ноль.
+        // Не убрав лицо здесь, окно показывало бы его тому, кого телефон
+        // больше не считает проверенным, — то самое бесплатное доверие,
+        // против которого правило и написано.
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(1, 100)]);
+        cache.remember_avatar(Some([1u8; 16]), Some(vec![1, 2, 3]), 100);
+        assert!(cache.avatar(Some(&[1u8; 16])).is_some());
+
+        cache.remember_chats(vec![summary(1)]);
+        assert_eq!(cache.avatar(Some(&[1u8; 16])), None, "ноль в списке — лица нет");
+        assert!(cache.stale_avatars().is_empty(), "и просить его тоже незачем");
+    }
+
+    #[test]
+    fn a_notice_takes_the_old_face_away_without_bringing_a_new_one() {
+        // Новость байтов не везёт: она приезжает без спроса, а тридцать два
+        // килобайта без спроса — трафик, за который окно не просило.
+        // Показывать же прежнее, зная, что оно другое, нельзя (§14).
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(1, 100)]);
+        cache.remember_avatar(Some([1u8; 16]), Some(vec![1, 2, 3]), 100);
+
+        cache.remember_avatar(Some([1u8; 16]), None, 101);
+        assert_eq!(cache.avatar(Some(&[1u8; 16])), None);
+    }
+
+    #[test]
+    fn ones_own_face_lives_beside_the_others_and_not_among_them() {
+        // Шестнадцать нулевых байт — законный идентификатор чата, и заняв
+        // его под себя, мы затёрли бы чужое лицо своим.
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(0, 7)]);
+        cache.remember_avatar(Some([0u8; 16]), Some(vec![1, 1, 1]), 7);
+        cache.remember_avatar(None, Some(vec![2, 2, 2]), 9);
+
+        assert_eq!(cache.avatar(Some(&[0u8; 16])), Some(&[1, 1, 1][..]));
+        assert_eq!(cache.avatar(None), Some(&[2, 2, 2][..]));
+        // И своё не попадает в список того, о чём спрашивают по меткам:
+        // себя в списке чатов не бывает.
+        assert!(cache.stale_avatars().is_empty());
+    }
+
+    #[test]
+    fn faces_survive_the_snapshot_but_not_a_foreign_one() {
+        let mut cache = Cache::new();
+        cache.remember_chats(vec![summary_with_avatar(1, 100)]);
+        cache.remember_avatar(Some([1u8; 16]), Some(vec![1, 2, 3]), 100);
+        cache.remember_avatar(None, Some(vec![4, 5, 6]), 9);
+
+        let back = Cache::from_value(&cache.to_value()).expect("свой снимок читается");
+        assert_eq!(back.avatar(Some(&[1u8; 16])), Some(&[1, 2, 3][..]));
+        assert_eq!(back.avatar(None), Some(&[4, 5, 6][..]));
+        assert_eq!(back.avatar_stamp(Some(&[1u8; 16])), Some(100), "метка тоже переживает");
+        assert!(!back.fresh(), "поднятое с диска телефон в этой связи не подтверждал");
+
+        // Запись без метки в снимок не пишется вовсе — встретив её, мы
+        // читаем не свой файл.
+        let broken = Value::Map(vec![
+            (Value::Integer(SNAP_KEY_VERSION.into()), Value::Integer(SNAP_VERSION.into())),
+            (Value::Integer(SNAP_KEY_CHATS.into()), Value::Array(Vec::new())),
+            (Value::Integer(SNAP_KEY_HISTORY.into()), Value::Array(Vec::new())),
+            (
+                Value::Integer(SNAP_KEY_AVATARS.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::Integer(SNAP_KEY_CHAT.into()), Value::Bytes(vec![1u8; 16])),
+                    (Value::Integer(SNAP_KEY_AVATAR.into()), Value::Bytes(vec![1, 2, 3])),
+                    (Value::Integer(SNAP_KEY_STAMP.into()), Value::Integer(0.into())),
+                ])]),
+            ),
+        ]);
+        assert!(Cache::from_value(&broken).is_err());
+    }
+
+    #[test]
+    fn the_number_of_faces_is_capped_by_what_the_list_shows_first() {
+        // Лицо весит до тридцати двух килобайт, а длину списка чатов
+        // называет телефон: без предела дисковый кэш растёт настолько,
+        // насколько велик чужой список.
+        let mut cache = Cache::new();
+        let chats: Vec<ChatSummary> =
+            (0..=u8::MAX).map(|n| summary_with_avatar(n, u64::from(n) + 1)).collect();
+        cache.remember_chats(chats);
+        for n in 0..=u8::MAX {
+            cache.remember_avatar(Some([n; 16]), Some(vec![n, n, n]), u64::from(n) + 1);
+        }
+        assert!(
+            cache.avatar(Some(&[0u8; 16])).is_some(),
+            "двести пятьдесят шесть — это ровно предел, а не больше него"
+        );
+
+        // Двести пятьдесят седьмое лицо вытесняет то, чего в начале списка
+        // уже нет: список приходит свежими вверх, и хвост — вытесняемое.
+        cache.remember_chats(vec![summary_with_avatar(1, 2)]);
+        assert!(cache.avatar(Some(&[1u8; 16])).is_some(), "оставшийся в списке — остался");
+        assert_eq!(cache.avatar(Some(&[2u8; 16])), None, "выпавшего из списка не держим");
     }
 }

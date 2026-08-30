@@ -241,17 +241,36 @@ fn read_or_create<S: Store>(
 /// Второй запуск с тем же `db_key` обязан вернуть **ту же** личность: на
 /// этом держится всё остальное, потому что контакты знают устройство по `IK`.
 pub fn load_or_create<S: Store>(store: &mut S, db_key: &[u8; 32]) -> Result<Identity, EngineError> {
-    if let Some(sealed) = store.meta(META_IDENTITY_SEED)? {
-        let seed = storage_key::open_field(db_key, SEED_AAD, &sealed)?;
-        let seed: [u8; SEED_LEN] =
-            seed.as_slice().try_into().map_err(|_| ratatosk_crypto::CryptoError::BadKeyMaterial)?;
-        return Ok(Identity::from_seed(seed));
+    if let Some(identity) = identity_in(store, db_key)? {
+        return Ok(identity);
     }
 
     let seed = generate_seed();
     let sealed = storage_key::seal_field(db_key, SEED_AAD, &seed[..])?;
     store.put_meta(META_IDENTITY_SEED, &sealed)?;
     Ok(Identity::from_seed(*seed))
+}
+
+/// Читает личность из хранилища, **ничего не заводя**.
+///
+/// `None` — зерна там нет. Отдельно от [`load_or_create`], потому что есть
+/// случай, где заводить нельзя ни в коем случае: чужая база, открытая
+/// на чтение (архив при слиянии знакомств, §12). Записать в неё свою
+/// личность значило бы испортить то, что нам не принадлежит, — та же
+/// причина, по которой `accepts_pin` не накатывает миграции.
+///
+/// # Errors
+///
+/// Отказ хранилища или расшифровки: не тот `db_key`, испорченное зерно.
+pub fn identity_in<S: Store>(
+    store: &S,
+    db_key: &[u8; 32],
+) -> Result<Option<Identity>, EngineError> {
+    let Some(sealed) = store.meta(META_IDENTITY_SEED)? else { return Ok(None) };
+    let seed = storage_key::open_field(db_key, SEED_AAD, &sealed)?;
+    let seed: [u8; SEED_LEN] =
+        seed.as_slice().try_into().map_err(|_| ratatosk_crypto::CryptoError::BadKeyMaterial)?;
+    Ok(Some(Identity::from_seed(seed)))
 }
 
 /// Читает ключ onion-сервиса, а если его нет — заводит и сохраняет (§3, §5.2).

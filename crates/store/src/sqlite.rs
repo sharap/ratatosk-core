@@ -110,6 +110,112 @@ impl SqliteStore {
             .map_err(|e| StoreError::Backend(e.to_string()))
     }
 
+    /// Выбрасывает из снимка всё, кроме знакомств (§12).
+    ///
+    /// **Оставляется перечисленное, опустошается остальное**, а не наоборот.
+    /// Список того, что выбрасывать, отстал бы от схемы молча: новая таблица
+    /// уехала бы вместе с графом, а в ней могла оказаться переписка.
+    /// Таблица, которой нет ни в одном списке, попадает в журнал — тем же
+    /// приёмом, что и `warn_if_filling`.
+    ///
+    /// Соединение своё и **без наших прагм**: внешние ключи здесь выключены
+    /// нарочно. Опустошаются целые таблицы, и порядок удаления при живых
+    /// ключах пришлось бы выстраивать; то, что остаётся, не ссылается
+    /// ни на что.
+    fn prune_to_graph(snapshot: &Path) -> Result<()> {
+        let conn = Connection::open(snapshot)?;
+
+        let mut tables: Vec<String> = Vec::new();
+        {
+            let mut statement = conn.prepare(
+                "SELECT name FROM sqlite_master \
+                   WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                tables.push(row?);
+            }
+        }
+
+        for table in &tables {
+            if !schema::ALL_TABLES.contains(&table.as_str()) {
+                tracing::warn!(
+                    table = %table,
+                    "таблица не описана в списках вывоза (§12) — уезжает пустой"
+                );
+            }
+            if schema::GRAPH_TABLES.contains(&table.as_str()) {
+                continue;
+            }
+            // Имя таблицы параметром быть не может, а взято оно из самой
+            // базы и сверено со списком — подставить сюда чужое неоткуда.
+            conn.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+
+        // `meta` уезжает не целиком: там и личность, и отметки прочтения
+        // по каждому чату. Строки перечислены поимённо по той же причине.
+        let holes = (1..=schema::GRAPH_META_KEYS.len())
+            .map(|n| format!("?{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!("DELETE FROM meta WHERE key NOT IN ({holes})"),
+            rusqlite::params_from_iter(schema::GRAPH_META_KEYS),
+        )?;
+
+        // Второй `VACUUM`: без него снимок остался бы размером с базу —
+        // страницы освободились, но файл не сжался, и «только контакты»
+        // весил бы как вся переписка.
+        conn.execute("VACUUM", [])?;
+        Ok(())
+    }
+
+    /// Читает снимок по куску, печатает `db_key` и кладёт в архив (§12).
+    ///
+    /// По куску, а не целиком: база бывает в сотни мегабайт, и держать
+    /// её в памяти дважды — открытую и запечатанную — телефон не обязан.
+    fn seal_snapshot_into(
+        &self,
+        snapshot: &Path,
+        sink: &mut dyn crate::archive::ArchiveSink,
+    ) -> Result<()> {
+        use std::io::Read;
+
+        let archive_id = sink.archive_id();
+        let mut file = std::fs::File::open(snapshot)
+            .map_err(|e| StoreError::Backend(format!("снимок базы не открыть: {e}")))?;
+        let mut buffer = vec![0u8; crate::archive::SNAPSHOT_CHUNK_BYTES];
+        let mut index = 0u64;
+        loop {
+            let mut filled = 0usize;
+            // Читаем до полного куска: `read` вправе вернуть меньше, чем
+            // просили, и в середине файла это не конец. Куски разной длины
+            // архив бы принял, но снимок из них потом не собрался бы.
+            while filled < buffer.len() {
+                let got = file
+                    .read(&mut buffer[filled..])
+                    .map_err(|e| StoreError::Backend(format!("снимок базы не прочитать: {e}")))?;
+                if got == 0 {
+                    break;
+                }
+                filled += got;
+            }
+            if filled == 0 {
+                break;
+            }
+            let aad = crate::archive::db_chunk_aad(&archive_id, index);
+            let sealed = storage_key::seal_field(&self.db_key, &aad, &buffer[..filled])
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            sink.put(crate::archive::EntryKind::Database, &[0u8; 16], index, &sealed)
+                .map_err(|e| StoreError::Backend(format!("архив не записался: {e}")))?;
+            index += 1;
+            if filled < buffer.len() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Переписывает поисковый индекс сообщения (§12).
     ///
     /// Сперва удаляет, потом вставляет: правка сообщения обязана убрать
@@ -833,14 +939,15 @@ impl Store for SqliteStore {
             self.seal("paired_devices.pairing_key_enc", &device.device_id, &device.pairing_public)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO paired_devices
-             (device_id, label, pairing_key_enc, paired_ms, last_seen_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 &device.device_id[..],
                 &device.label,
                 sealed,
                 sql_types::to_sql(device.paired_ms),
                 sql_types::to_sql(device.last_seen_ms),
+                &device.onion,
             ],
         )?;
         Ok(())
@@ -848,7 +955,7 @@ impl Store for SqliteStore {
 
     fn paired_devices(&self) -> Result<Vec<StoredPairedDevice>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, label, pairing_key_enc, paired_ms, last_seen_ms
+            "SELECT device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion
              FROM paired_devices ORDER BY paired_ms",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -858,12 +965,13 @@ impl Store for SqliteStore {
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
 
         let mut devices = Vec::new();
         for row in rows {
-            let (id, label, sealed, paired_ms, last_seen_ms) = row?;
+            let (id, label, sealed, paired_ms, last_seen_ms, onion) = row?;
             let device_id: [u8; 16] = id
                 .as_slice()
                 .try_into()
@@ -879,6 +987,7 @@ impl Store for SqliteStore {
                 pairing_public,
                 paired_ms: sql_types::from_sql(paired_ms),
                 last_seen_ms: sql_types::from_sql(last_seen_ms),
+                onion,
             });
         }
         Ok(devices)
@@ -887,6 +996,44 @@ impl Store for SqliteStore {
     fn delete_paired_device(&mut self, device_id: &[u8; 16]) -> Result<()> {
         self.conn.execute("DELETE FROM paired_devices WHERE device_id = ?1", [&device_id[..]])?;
         Ok(())
+    }
+
+    fn set_device_onion(&mut self, device_id: &[u8; 16], onion: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE paired_devices SET onion = ?2 WHERE device_id = ?1",
+            rusqlite::params![&device_id[..], onion],
+        )?;
+        Ok(())
+    }
+
+    fn remember_revocation(&mut self, pairing_public: &[u8; 32], revoked_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO revoked_devices (pairing_public, revoked_ms) VALUES (?1, ?2)
+             ON CONFLICT(pairing_public) DO UPDATE SET revoked_ms = excluded.revoked_ms",
+            rusqlite::params![&pairing_public[..], sql_types::to_sql(revoked_ms)],
+        )?;
+        Ok(())
+    }
+
+    fn revocation(&self, pairing_public: &[u8; 32]) -> Result<Option<u64>> {
+        self.conn
+            .query_row(
+                "SELECT revoked_ms FROM revoked_devices WHERE pairing_public = ?1",
+                [&pairing_public[..]],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|ms| Some(u64::try_from(ms).unwrap_or(0)))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })
+    }
+
+    fn prune_revocations(&mut self, before_ms: u64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM revoked_devices WHERE revoked_ms < ?1",
+            [sql_types::to_sql(before_ms)],
+        )?)
     }
 
     fn touch_paired_device(&mut self, device_id: &[u8; 16], now_ms: u64) -> Result<()> {
@@ -940,6 +1087,25 @@ impl Store for SqliteStore {
                 other => Err(StoreError::from(other)),
             })?;
         Ok(found.is_some())
+    }
+
+    fn avatar_stamp(&self, owner_ik: &[u8; 32]) -> Result<Option<u64>> {
+        self.conn
+            .query_row(
+                "SELECT updated_ms FROM avatars WHERE owner_ik = ?1",
+                [&owner_ik[..]],
+                |row| row.get::<_, i64>(0),
+            )
+            // Столбец объявлен INTEGER, и SQLite это знаковое число: строка,
+            // записанная сборкой с другими часами, вправе оказаться
+            // отрицательной. Ноль здесь честнее отрицательной метки —
+            // он значит «показывать нечего», а метка «до эпохи» разошлась бы
+            // со сравнением на десктопе неизвестно как.
+            .map(|ms| Some(u64::try_from(ms).unwrap_or(0)))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })
     }
 
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
@@ -1657,9 +1823,42 @@ impl Store for SqliteStore {
         Ok(affected as u64)
     }
 
-    fn export(&self, _destination: &Path) -> Result<()> {
-        // TODO(этап 4): VACUUM INTO во временный файл, затем шифрование тем же
-        // db_key; ключ показывается пользователю (§12).
-        todo!("этап 4: экспорт переписки (§12)")
+    fn export_into(
+        &self,
+        scope: crate::archive::ExportScope,
+        sink: &mut dyn crate::archive::ArchiveSink,
+    ) -> Result<()> {
+        // **`VACUUM INTO`, а не копия файла.** База открыта в режиме WAL:
+        // часть свежих строк лежит в журнале рядом, и копия одного файла
+        // дала бы архив без последних сообщений — молча, потому что такая
+        // база прекрасно открывается. Заодно снимок выбрасывает дыры
+        // от удалённых строк, и архив выходит меньше живой базы.
+        let temp = self.path.with_extension("export-tmp");
+        // Остаток прошлой неудачной попытки: `VACUUM INTO` отказывается
+        // писать в существующий файл, и без этой строки вторая попытка
+        // экспорта не состоялась бы никогда.
+        let _ = std::fs::remove_file(&temp);
+        let temp_text = temp.to_string_lossy().into_owned();
+        self.conn.execute("VACUUM INTO ?1", [temp_text.as_str()])?;
+
+        // Граф вывозится тем же снимком, из которого выброшено лишнее.
+        // Собирать его отдельным запросом значило бы завести второй способ
+        // читать контакты — и однажды они разошлись бы с первым.
+        let sealed = if scope == crate::archive::ExportScope::SocialGraph {
+            Self::prune_to_graph(&temp).and_then(|()| self.seal_snapshot_into(&temp, sink))
+        } else {
+            self.seal_snapshot_into(&temp, sink)
+        };
+        // Снимок убирается в любом исходе: он — незашифрованная копия базы
+        // рядом с базой, и оставлять его лежать нельзя тем более после
+        // неудачи, о которой человеку скажут словами.
+        if let Err(error) = std::fs::remove_file(&temp) {
+            tracing::warn!(?error, path = ?temp, "снимок базы убрать не вышло");
+        }
+        sealed
+    }
+
+    fn export_key(&self) -> Result<Zeroizing<[u8; 32]>> {
+        Ok(Zeroizing::new(*self.db_key))
     }
 }

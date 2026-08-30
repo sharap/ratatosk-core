@@ -19,8 +19,9 @@ use ratatosk_store::{FileId, Store, StoredFile, StoredMessage, StoredReaction};
 use ratatosk_transport::{Runner, TransportCommand, TransportError, TransportEvent};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::engine::ExportScope;
 use crate::engine::{Engine, EngineError};
-use crate::io::{ChatId, Command, Effect, Event, Input, Swept};
+use crate::io::{ArchiveKey, ChatId, Command, Effect, Event, Exported, Input, Merged, Swept};
 use crate::reader::FileReader;
 use ratatosk_transport::runner::PeerAddress;
 
@@ -96,6 +97,26 @@ enum Refusal {
 enum Chore {
     /// Стереть с диска вложения, которых нет в базе (§12).
     SweepOrphanFiles { reply: oneshot::Sender<Swept> },
+    /// Добавить к своим знакомствам те, что лежат в архиве (§12).
+    ///
+    /// Не восстановление: личность и переписка остаются свои.
+    MergeContacts {
+        archive: std::path::PathBuf,
+        unlock: ArchiveKey,
+        scratch: std::path::PathBuf,
+        reply: oneshot::Sender<Result<Merged, String>>,
+    },
+    /// Вывезти переписку в зашифрованный архив (§12).
+    ///
+    /// Отказ едет наверх словами, а не глотается: экспорт человек затеял
+    /// нарочно, и молчание он прочтёт как «получилось».
+    ExportHistory {
+        path: std::path::PathBuf,
+        scope: ExportScope,
+        /// Фраза, которой запирается архив. `None` — только сырой ключ.
+        phrase: Option<String>,
+        reply: oneshot::Sender<Result<Exported, String>>,
+    },
 }
 
 /// Сообщение вместе с тем, что к нему прилипло.
@@ -228,7 +249,8 @@ enum Query {
     /// Отдельным запросом, а не полем в [`ContactStatus`]: до тридцати двух
     /// килобайт на контакт, и тащить их в каждый показ списка чатов незачем.
     /// Клиент берёт байты, когда дошёл до отрисовки, и обновляет по событию
-    /// [`Event::AvatarChanged`].
+    /// [`Event::AvatarChanged`] — а своё по [`Event::OwnAvatarChanged`],
+    /// потому что сменить его вправе и сопряжённый десктоп (§13.4).
     Avatar { owner: Option<[u8; 32]>, reply: oneshot::Sender<Option<Vec<u8>>> },
 }
 
@@ -418,6 +440,14 @@ pub struct DeviceStatus {
     /// Считает телефон, хотя стирает десктоп: срок протокольный, и вторая
     /// его копия в десктопном коде однажды разошлась бы с этой.
     pub cache_expired: bool,
+    /// Назвал ли десктоп адрес, по которому до него дозвонятся вне общей
+    /// сети (§13.4).
+    ///
+    /// **Признак, а не адрес.** Сам адрес человеку ничего не говорит,
+    /// а вот ответ на «дотянется ли до этого ноутбука телефон из другого
+    /// города» — говорит, и другого способа его узнать нет. Ложь здесь
+    /// значит «только дома», и это законное, самое частое состояние.
+    pub reachable_anywhere: bool,
 }
 
 /// Что разбудило цикл. Существует только затем, чтобы решение принималось
@@ -577,6 +607,44 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Добавляет к своим знакомствам те, что лежат в архиве (§12).
+    ///
+    /// `None` — драйвер остановлен; `Some(Err(_))` — не вышло, и вот почему
+    /// словами. Известные контакты не трогаются ни в одном поле.
+    pub async fn merge_contacts(
+        &self,
+        archive: std::path::PathBuf,
+        unlock: ArchiveKey,
+        scratch: std::path::PathBuf,
+    ) -> Option<Result<Merged, String>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Chore(Chore::MergeContacts { archive, unlock, scratch, reply }))
+            .await
+            .ok()?;
+        answer.await.ok()
+    }
+
+    /// Вывозит переписку в зашифрованный архив (§12).
+    ///
+    /// `None` — драйвер остановлен; `Some(Err(_))` — не вышло, и вот почему
+    /// словами. `phrase` — фраза, которой запечатывается ключ архива;
+    /// `None` означает «только длинный ключ», и тогда без него архив
+    /// не открыть ничем. Дорогая: переписывает базу и все вложения.
+    pub async fn export_history(
+        &self,
+        path: std::path::PathBuf,
+        scope: ExportScope,
+        phrase: Option<String>,
+    ) -> Option<Result<Exported, String>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Chore(Chore::ExportHistory { path, scope, phrase, reply }))
+            .await
+            .ok()?;
+        answer.await.ok()
+    }
+
     // --- синхронные обёртки для UniFFI --------------------------------------
     //
     // Методы через UniFFI-границу синхронные, а драйвер живёт на своём потоке
@@ -653,6 +721,40 @@ impl DriverHandle {
     pub fn sweep_orphan_files_blocking(&self) -> Option<Swept> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Chore(Chore::SweepOrphanFiles { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Сливает знакомства из архива, блокируя вызывающий поток (§12).
+    ///
+    /// `None` — драйвер остановлен; `Some(Err(_))` — не вышло, и вот почему.
+    /// Читает архив с диска целиком, поэтому вызывать не из UI-потока.
+    pub fn merge_contacts_blocking(
+        &self,
+        archive: std::path::PathBuf,
+        unlock: ArchiveKey,
+        scratch: std::path::PathBuf,
+    ) -> Option<Result<Merged, String>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .blocking_send(Request::Chore(Chore::MergeContacts { archive, unlock, scratch, reply }))
+            .ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Вывозит переписку в архив, блокируя вызывающий поток (§12).
+    ///
+    /// `None` — драйвер остановлен; `Some(Err(_))` — не вышло, и вот почему.
+    /// Дорогая: переписывает базу и все вложения. Вызывать не из UI-потока.
+    pub fn export_history_blocking(
+        &self,
+        path: std::path::PathBuf,
+        scope: ExportScope,
+        phrase: Option<String>,
+    ) -> Option<Result<Exported, String>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .blocking_send(Request::Chore(Chore::ExportHistory { path, scope, phrase, reply }))
+            .ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -822,7 +924,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     self.tolerate(input).await?;
                 }
                 Wake::Query(query) => self.answer(query),
-                Wake::Chore(chore) => self.do_chore(chore),
+                Wake::Chore(chore) => self.do_chore(chore).await,
                 Wake::Timers => self.fire_due_timers().await?,
                 Wake::Notice(event) => {
                     // Новость не только уезжает, но и запоминается: экран,
@@ -901,8 +1003,44 @@ impl<S: Store, R: Runner> Driver<S, R> {
     /// шагами ядра, а не посреди одного. Для уборки это не деталь: чанк
     /// ложится на диск и отмечается в базе внутри одного шага, и уборка,
     /// вклинившаяся между этими двумя операциями, сочла бы живой чанк мусором.
-    fn do_chore(&mut self, chore: Chore) {
+    async fn do_chore(&mut self, chore: Chore) {
         match chore {
+            Chore::ExportHistory { path, scope, phrase, reply } => {
+                // **Отказ не глотается.** У уборки это можно — она вернёт
+                // нули и её повторят; здесь человек ждёт файл со своей
+                // перепиской и ключ к нему, и «ничего не произошло»
+                // он прочтёт как «готово».
+                let done =
+                    self.engine.export_history(&path, scope, phrase.as_deref()).map_err(|error| {
+                        tracing::warn!(?error, ?path, "экспорт переписки не состоялся");
+                        error.to_string()
+                    });
+                let _ = reply.send(done);
+            }
+            Chore::MergeContacts { archive, unlock, scratch, reply } => {
+                let now = now_ms();
+                // **Эффекты слияния исполняются здесь же.** Добавленный
+                // контакт — это и событие человеку, и новый маяк в списке
+                // (§5.1); отдать наверх одни числа значило бы завести
+                // контакты, которых не ищет транспорт и о которых не знает
+                // экран, до следующего перезапуска.
+                let done =
+                    self.engine.merge_contacts_from(now, &archive, unlock.as_unlock(), &scratch);
+                match done {
+                    Ok((merged, effects)) => {
+                        for effect in effects {
+                            if let Some(failed) = self.apply(now, effect).await {
+                                let _ = self.tolerate(failed).await;
+                            }
+                        }
+                        let _ = reply.send(Ok(merged));
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, ?archive, "слияние знакомств не состоялось");
+                        let _ = reply.send(Err(error.to_string()));
+                    }
+                }
+            }
             Chore::SweepOrphanFiles { reply } => {
                 // Отказ диска здесь — не повод ронять мессенджер: убранное
                 // до отказа убрано, остальное подберёт следующий запуск.
@@ -1089,6 +1227,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         // объявлялось бы просроченным на тридцать первые
                         // сутки от начала эпохи, то есть всегда.
                         cache_expired: device.last_seen_ms != 0 && device.cache_expired(now_ms()),
+                        reachable_anywhere: !device.onion.is_empty(),
                     })
                     .collect();
                 let _ = reply.send(found);
@@ -1346,14 +1485,28 @@ impl<S: Store, R: Runner> Driver<S, R> {
     /// Берутся из карточки (§4.1). Адреса в локальной сети здесь нет и быть
     /// не может: он меняется при каждом подключении к другой сети, поэтому
     /// его знает только обнаружение (§5.1).
+    /// Куда звонить этому ключу.
+    ///
+    /// **Не только контакты.** Свой десктоп контактом не является (§13.4)
+    /// и в списке чатов не появляется — и до тринадцатой версии провода
+    /// уходил отсюда с пустым адресом, то есть вне общей сети был
+    /// недостижим по построению. Адрес он называет сам, в рукопожатии;
+    /// ядро его помнит, здесь оно только спрашивается.
+    ///
+    /// Почты у десктопа нет и не будет: почтовый круг — это часы (§5.3),
+    /// а второй экран — про «здесь и сейчас».
     fn address_of(&self, peer_ik: [u8; 32]) -> PeerAddress {
-        match self.engine.contacts().get(&peer_ik) {
-            Some(contact) => PeerAddress {
+        if let Some(contact) = self.engine.contacts().get(&peer_ik) {
+            return PeerAddress {
                 ik: peer_ik,
                 onion: non_empty(&contact.card.onion),
                 chatmail: non_empty(&contact.card.chatmail),
-            },
-            None => PeerAddress { ik: peer_ik, onion: None, chatmail: None },
+            };
+        }
+        PeerAddress {
+            ik: peer_ik,
+            onion: self.engine.device_onion(&peer_ik).map(str::to_owned),
+            chatmail: None,
         }
     }
 }

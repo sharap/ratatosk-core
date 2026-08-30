@@ -38,6 +38,10 @@ pub struct MemoryStore {
     sessions: BTreeMap<u64, StoredSession>,
     avatars: BTreeMap<[u8; 32], StoredAvatar>,
     devices: BTreeMap<[u8; 16], StoredPairedDevice>,
+    /// Надгробия отозванных сопряжений (§13.4): ключ сопряжения и когда.
+    /// Записи об устройстве уже нет — есть только то, чем узнать его
+    /// в рукопожатии, чтобы ответить причиной вместо тишины.
+    revocations: BTreeMap<[u8; 32], u64>,
     /// Ключ — пара «сообщение, автор»: реакция от человека одна, новая
     /// заменяет прежнюю.
     reactions: BTreeMap<(MsgId, [u8; 32]), StoredReaction>,
@@ -342,6 +346,28 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn set_device_onion(&mut self, device_id: &[u8; 16], onion: &str) -> Result<()> {
+        if let Some(device) = self.devices.get_mut(device_id) {
+            device.onion = onion.to_owned();
+        }
+        Ok(())
+    }
+
+    fn remember_revocation(&mut self, pairing_public: &[u8; 32], revoked_ms: u64) -> Result<()> {
+        self.revocations.insert(*pairing_public, revoked_ms);
+        Ok(())
+    }
+
+    fn revocation(&self, pairing_public: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(self.revocations.get(pairing_public).copied())
+    }
+
+    fn prune_revocations(&mut self, before_ms: u64) -> Result<usize> {
+        let before = self.revocations.len();
+        self.revocations.retain(|_, at| *at >= before_ms);
+        Ok(before - self.revocations.len())
+    }
+
     fn touch_paired_device(&mut self, device_id: &[u8; 16], now_ms: u64) -> Result<()> {
         if let Some(device) = self.devices.get_mut(device_id) {
             device.last_seen_ms = now_ms;
@@ -363,6 +389,10 @@ impl Store for MemoryStore {
 
     fn has_avatar(&self, owner_ik: &[u8; 32]) -> Result<bool> {
         Ok(self.avatars.contains_key(owner_ik))
+    }
+
+    fn avatar_stamp(&self, owner_ik: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(self.avatars.get(owner_ik).map(|avatar| avatar.updated_ms))
     }
 
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
@@ -614,8 +644,17 @@ impl Store for MemoryStore {
         Ok(removed)
     }
 
-    fn export(&self, _destination: &std::path::Path) -> Result<()> {
+    fn export_into(
+        &self,
+        _scope: crate::archive::ExportScope,
+        _sink: &mut dyn crate::archive::ArchiveSink,
+    ) -> Result<()> {
         Err(StoreError::Unsupported("экспорт архива требует файловой базы (§12)"))
+    }
+
+    fn export_key(&self) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        // Ключа тут нет вовсе: хранилище в памяти ничего не шифрует.
+        Err(StoreError::Unsupported("у хранилища в памяти нет ключа базы"))
     }
 }
 
@@ -847,10 +886,19 @@ mod tests {
 
     #[test]
     fn export_says_it_cannot() {
+        // Отказ словами, а не паника: вывезти переписку из симуляции (§16)
+        // нельзя, и узнать об этом вызывающий обязан внятно.
         let s = store();
+        let mut nowhere = Vec::new();
+        let head = crate::archive::Header {
+            archive_id: [0u8; 16],
+            scope: crate::archive::ExportScope::Everything,
+        };
+        let mut sink = crate::archive::ArchiveWriter::start(&mut nowhere, head).unwrap();
         assert!(matches!(
-            s.export(std::path::Path::new("/tmp/x")),
+            s.export_into(crate::archive::ExportScope::Everything, &mut sink),
             Err(StoreError::Unsupported(_))
         ));
+        assert!(matches!(s.export_key(), Err(StoreError::Unsupported(_))));
     }
 }

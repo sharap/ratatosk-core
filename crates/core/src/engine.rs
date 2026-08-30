@@ -15,6 +15,7 @@
 //! без `_`, поэтому новый вариант `Command` сломает компиляцию здесь.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use ratatosk_codec::{ContactCard, Envelope, PayloadType, Value};
 use ratatosk_crdt::{DedupWindow, Hlc, HlcClock, MsgId};
@@ -37,9 +38,11 @@ use ratatosk_store::{
 };
 use ratatosk_wire::unpad;
 
+use crate::companion::DESKTOP_CACHE_TTL_MS;
 use crate::entropy::Entropy;
-use crate::io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};
+use crate::io::{ChatId, Command, Effect, Event, Exported, Input, Merged, OutgoingFile, Swept};
 use crate::reader::FileReader;
+pub use ratatosk_store::archive::ExportScope;
 
 /// Номер первого сообщения рукопожатия в поле `counter` заголовка.
 ///
@@ -946,6 +949,7 @@ impl<S: Store> Engine<S> {
         let mut reacted: Vec<(ChatId, MsgId)> = Vec::new();
         let mut progress: Vec<([u8; 16], u64, u64)> = Vec::new();
         let mut gone_files: Vec<[u8; 16]> = Vec::new();
+        let mut avatars: Vec<[u8; 32]> = Vec::new();
 
         for effect in effects {
             let Effect::Notify(event) = effect else { continue };
@@ -978,12 +982,41 @@ impl<S: Store> Engine<S> {
                         reacted.push((*chat, *msg_id));
                     }
                 }
+                // Аватарка контакта. Своя сюда не попадает: события о ней нет
+                // (`Command::SetAvatar` — единственное место, где она меняется,
+                // и новость оттуда уходит своей рукой), и заводить его ради
+                // одного места значило бы переписать пять утверждений в тестах
+                // §4.2 о том, чего установка своей аватарки **не** порождает.
+                Event::AvatarChanged { peer_ik } => {
+                    if !avatars.contains(peer_ik) {
+                        avatars.push(*peer_ik);
+                    }
+                }
                 _ => {}
             }
         }
 
         if chats_changed {
             self.companion_notices.push(PendingNotice::Ready(companion::Notice::ChatsChanged));
+        }
+        for peer_ik in avatars {
+            // §4.2 и здесь тот же: несверенному контакту метка не едет,
+            // и новость о его аватарке для десктопа — не новость. Байты
+            // при этом сохранены (`on_avatar` объясняет почему), и после
+            // сверки лицо появится без нового рукопожатия — по `ChatsChanged`,
+            // которую породит смена признака.
+            if !self.contacts.get(&peer_ik).is_some_and(|contact| contact.verified) {
+                continue;
+            }
+            // Отказ хранилища здесь ничего не роняет — как и всюду в этой
+            // функции. Ноль вместо метки означает «показывать нечего»:
+            // десктоп сотрёт лицо и спросит заново со следующим списком чатов,
+            // что честнее, чем оставить у него картинку с неизвестной меткой.
+            let avatar_ms = self.store.avatar_stamp(&peer_ik).unwrap_or(None).unwrap_or(0);
+            self.companion_notices.push(PendingNotice::Ready(companion::Notice::AvatarChanged {
+                chat: Some(Self::chat_id_for(&peer_ik)),
+                avatar_ms,
+            }));
         }
         for (chat, msg_ids) in gone {
             // Режется здесь, а не у получателя: «очистить чат» уносит всю
@@ -1268,7 +1301,7 @@ impl<S: Store> Engine<S> {
                 Ok(Vec::new())
             }
             Command::PairDevice { label } => self.on_pair_device(now_ms, &label),
-            Command::RevokePairing { device_id } => self.on_revoke_pairing(&device_id),
+            Command::RevokePairing { device_id } => self.on_revoke_pairing(now_ms, &device_id),
             Command::CreateGroup { .. }
             | Command::InviteToGroup { .. }
             | Command::EvictFromGroup { .. } => todo!("этап 5: группы (§11)"),
@@ -3884,6 +3917,237 @@ impl<S: Store> Engine<S> {
         self.sweep_abandoned_uploads(0)
     }
 
+    /// Добавляет к своим знакомствам те, что лежат в архиве (§12).
+    ///
+    /// **Это не восстановление, и путать их нельзя.** Восстановление
+    /// (`ratatosk_store::import_archive`) делает архив аккаунтом целиком
+    /// и требует чистого места. Здесь личность остаётся **своя**, переписка
+    /// своя, а из архива берутся только контакты — «добавь эти знакомства
+    /// к моим». Вопроса «чья личность» тут не возникает, поэтому и делать
+    /// это можно поверх живого аккаунта.
+    ///
+    /// # Известный контакт не трогается — никогда
+    ///
+    /// Ни адреса, ни версия карточки, ни сверка. Правило то же, что
+    /// у присланного контакта (§4.1), и по той же причине: карточка
+    /// в архиве **не подписана** — подпись есть у `CardUpdate`, а не
+    /// у карточки. Разреши мы обновление, и граф, полученный от кого
+    /// угодно, переписал бы onion-адрес моего собеседника на чужой.
+    /// Настоящий путь для нового адреса один — подписанное обновление
+    /// от самого человека (§4.3).
+    ///
+    /// # Сверка переносится только из **своего** прошлого
+    ///
+    /// Архив помнит, кого мы сверили голосом (§4.2). Если он вывезен этой же
+    /// личностью — это наша собственная запись, и терять её при переезде
+    /// незачем: иначе смена телефона молча снимала бы отметку со всех сразу.
+    /// Если чужой — сверка не переносится ни при каких условиях: доверие
+    /// не транзитивно, и поручительство друга сверкой голосом не является.
+    ///
+    /// По той же границе идут локальные имена: своё прошлое — своё, чужие
+    /// подписи к людям — чужие.
+    ///
+    /// `scratch` — каталог для черновика (см. `open_snapshot`).
+    ///
+    /// # Errors
+    ///
+    /// Файла нет, это не архив, он оборван, ключ или фраза не те, схема
+    /// новее этой сборки, отказ хранилища.
+    pub fn merge_contacts_from(
+        &mut self,
+        now_ms: u64,
+        archive: &Path,
+        unlock: ratatosk_store::ArchiveUnlock<'_>,
+        scratch: &Path,
+    ) -> Result<(Merged, Vec<Effect>), EngineError> {
+        let snapshot = ratatosk_store::open_snapshot(archive, unlock, scratch)?;
+
+        // Чей это граф — свой или чужой. Ответ решает две вещи: переносится
+        // ли сверка и переносятся ли локальные имена. Зерно личности лежит
+        // в архиве запечатанным тем же ключом, каким открыт сам архив.
+        let own_ik = self.identity.public().ik;
+        let theirs = crate::vault::identity_in(&snapshot.store, &snapshot.key)?;
+        let own_graph = theirs.map(|id| id.public().ik) == Some(own_ik);
+
+        let mut merged = Merged { own_graph, added: 0, known: 0, refused: 0 };
+        let mut effects = Vec::new();
+        for contact in snapshot.store.contacts()? {
+            // Сам себе не контакт: свой же `IK` в чужом графе — это запись
+            // о нас у кого-то другого, и заводить из неё «контакт» нельзя.
+            if contact.ik == own_ik {
+                continue;
+            }
+            if self.contacts.contains_key(&contact.ik) {
+                merged.known += 1;
+                continue;
+            }
+            // Карточка обязана разбираться, а её ключ — совпадать с ключом
+            // строки: архив мог быть собран не нами, и строка, чей `ik`
+            // разошёлся с карточкой, — это попытка подсунуть одного человека
+            // под именем другого.
+            let card = match ContactCard::decode(&contact.card_bytes) {
+                Ok(card) if card.value().ik == contact.ik => card,
+                _ => {
+                    merged.refused += 1;
+                    continue;
+                }
+            };
+            // И ключи обязаны складываться в отпечаток — то же, что при
+            // присланном контакте: карточка с мусором вместо `SK`
+            // не добавится никогда.
+            if ratatosk_crypto::PublicIdentity::from_bytes(contact.ik, card.value().sk).is_err() {
+                merged.refused += 1;
+                continue;
+            }
+
+            // Аватарка — **до** контакта: `add_contact` спрашивает, есть ли
+            // она, и порядок наоборот дал бы контакт с пометкой «аватарки
+            // нет» при лежащей рядом аватарке.
+            if let Some(avatar) = snapshot.store.avatar(&contact.ik)? {
+                self.store.put_avatar(&contact.ik, &avatar)?;
+            }
+
+            // Дверь та же, через которую контакты добавляются всегда:
+            // чат, событие, список маяков — всё оттуда.
+            effects.extend(self.add_contact(
+                now_ms,
+                &contact.card_bytes,
+                own_graph && contact.verified,
+            )?);
+            if own_graph {
+                if let Some(name) = contact.local_name {
+                    effects.extend(self.on_set_local_name(contact.ik, Some(name))?);
+                }
+            }
+            merged.added += 1;
+        }
+        Ok((merged, effects))
+    }
+
+    /// Вывозит переписку в зашифрованный архив (§12).
+    ///
+    /// **Единственный путь переноса истории на другое устройство в v1** —
+    /// так это названо в §12, и других не появится: ни синхронизации,
+    /// ни облака в v1 нет. Без архива переписка человека живёт ровно
+    /// столько, сколько его телефон.
+    ///
+    /// В архив кладётся снимок базы (печатает хранилище, ключ за его
+    /// пределы не выходит) и **все куски вложений как есть**: они уже
+    /// запечатаны своим ключом (§10.1), а ключ файла лежит в базе.
+    ///
+    /// Ключ архива возвращается строкой для показа человеку. Показать его
+    /// обязательно и обязательно **сразу**: второй раз этот же архив
+    /// не спросишь, а без ключа он не открывается нигде.
+    ///
+    /// Дорогая: переписывает базу и все вложения. Звать по кнопке,
+    /// а не по расписанию.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища, диска или уже существующий файл по этому пути:
+    /// перезаписать чужой архив молча нельзя — под ним может лежать
+    /// единственная копия чьей-то переписки.
+    pub fn export_history(
+        &mut self,
+        destination: &Path,
+        scope: ExportScope,
+        phrase: Option<&str>,
+    ) -> Result<Exported, EngineError> {
+        use ratatosk_store::archive::{ArchiveSink, ArchiveWriter, EntryKind, Header, KeyWrap};
+
+        // Ключ спрашивается **первым**: у хранилища в памяти его нет, и
+        // узнать об этом лучше до того, как на диске появится пустой файл.
+        let key = self.store.export_key()?;
+
+        if destination.exists() {
+            return Err(EngineError::Store(ratatosk_store::StoreError::Backend(
+                "файл по этому пути уже есть — под ним может лежать чужой архив".into(),
+            )));
+        }
+        let file = std::fs::File::create(destination)
+            .map_err(|e| ratatosk_store::StoreError::Backend(format!("архив не создать: {e}")))?;
+        // Идентификатор архива — из того же источника случайности, что и
+        // идентификаторы сообщений: шестнадцать байт, и повторяться им
+        // нельзя (см. `archive::db_chunk_aad`).
+        let archive_id = self.entropy.msg_id();
+        let header = Header { archive_id, scope };
+        let mut writer = ArchiveWriter::start(std::io::BufWriter::new(file), header)
+            .map_err(|e| ratatosk_store::StoreError::Backend(format!("архив не начат: {e}")))?;
+
+        // **Завёрнутый ключ — первой записью**, до всего остального: куски
+        // базы им открываются, а читает архив тот, кто идёт по нему потоком.
+        //
+        // Кладётся, только если человек назвал фразу. Без неё архив
+        // открывается сырым ключом — так делались все архивы до появления
+        // фразы, и так же делаются те, что уезжают в автоматический бэкап,
+        // где придумывать фразу некому.
+        if let Some(phrase) = phrase {
+            if phrase.trim().is_empty() {
+                return Err(EngineError::Store(ratatosk_store::StoreError::Backend(
+                    "пустая фраза не защищает ничего — либо фраза, либо ключ".into(),
+                )));
+            }
+            let mut salt = [0u8; ratatosk_store::archive::WRAP_SALT_LEN];
+            self.entropy.fill(&mut salt);
+            let params = ratatosk_crypto::storage_key::KdfParams::default();
+            let from_phrase = ratatosk_crypto::storage_key::derive_from_pin(phrase, &salt, params)?;
+            let sealed = ratatosk_crypto::storage_key::seal_field(
+                &from_phrase,
+                &ratatosk_store::archive::wrapped_key_aad(&archive_id),
+                &key[..],
+            )?;
+            let wrap = KeyWrap {
+                salt,
+                memory_kib: params.memory_kib,
+                iterations: params.iterations,
+                parallelism: params.parallelism,
+                sealed,
+            };
+            writer.put(EntryKind::WrappedKey, &[0u8; 16], 0, &wrap.to_bytes()).map_err(|e| {
+                ratatosk_store::StoreError::Backend(format!("ключ не записался: {e}"))
+            })?;
+        }
+
+        self.store.export_into(scope, &mut writer)?;
+
+        // Вложения — после базы и **все**, включая те, что ещё едут:
+        // приём продолжится на новом устройстве с той же дырки (§10.2),
+        // а выброшенный на полпути кусок пришлось бы качать заново.
+        //
+        // Область решает, едут ли они вообще. Без вложений архив легче
+        // на порядок и уезжает почтой — но записи о них в базе остаются,
+        // и ввоз обязан прочесть область (`ExportScope`), а не догадываться
+        // по тому, что вложений не встретилось.
+        let mut files = 0u64;
+        if scope.carries_attachments() {
+            for file_id in self.blobs.stored_files()? {
+                for (index, _) in self.blobs.stored_chunks(&file_id)? {
+                    let Some(bytes) = self.blobs.chunk(&file_id, index)? else { continue };
+                    writer.put(EntryKind::Attachment, &file_id, index, &bytes).map_err(|e| {
+                        ratatosk_store::StoreError::Backend(format!("вложение не записалось: {e}"))
+                    })?;
+                }
+                files += 1;
+            }
+        }
+
+        let (_, bytes) = writer
+            .finish()
+            .map_err(|e| ratatosk_store::StoreError::Backend(format!("архив не закрыт: {e}")))?;
+
+        Ok(Exported {
+            path: destination.to_path_buf(),
+            scope,
+            // Ключ отдаётся **всегда**, даже когда архив заперт фразой:
+            // это второй вход, и место ему — в менеджере паролей. Человек,
+            // забывший фразу через пять лет, иначе остался бы ни с чем.
+            key_text: ratatosk_crypto::storage_key::key_text(&key),
+            locked_by_phrase: phrase.is_some(),
+            files,
+            bytes,
+        })
+    }
+
     /// То же, но сперва выбрасывает выгрузки, брошенные раньше срока.
     ///
     /// `now_ms` = 0 означает «срок не считать»: у сверки, вызванной вручную,
@@ -4453,7 +4717,33 @@ impl<S: Store> Engine<S> {
             .map(|(peer_ik, _)| *peer_ik)
             .collect();
 
-        let mut effects = Vec::new();
+        // **Новость десктопу — своей рукой, а не через `note_for_companion`.**
+        // Та функция читает события шага, а установка своей аватарки события
+        // не порождает: `Event::AvatarChanged` означает «у контакта сменилось
+        // лицо», и в нём лежит `peer_ik` контакта. Завести его и для себя
+        // можно было бы, но тогда пять утверждений §4.2 в `tests/pair.rs`,
+        // проверяющих, что установка своей аватарки несверенному ничего
+        // не порождает, стали бы проверять не то, что написано в их именах.
+        //
+        // Опасность «забыли позвать» здесь мала ровно потому, что мест
+        // одно: своя аватарка меняется только здесь — и с телефона,
+        // и (в дальнейшем) с десктопа, который придёт в эту же функцию.
+        self.companion_notices.push(PendingNotice::Ready(companion::Notice::AvatarChanged {
+            chat: None,
+            avatar_ms: if bytes.is_empty() { 0 } else { now_ms },
+        }));
+
+        // **Событие о своём лице, и оно приезжает всегда — даже когда
+        // отправлять некому.** Пока смена шла только с телефона, экран
+        // телефона знал о ней от себя же и события не требовал. Теперь
+        // сюда приходит и десктоп (§13.4), и без этого экран телефона
+        // показывал бы прежнюю картинку до перезапуска — то самое «экран
+        // врёт», которое §14 запрещает.
+        //
+        // Отдельным видом, а не `AvatarChanged` с собственным `IK`:
+        // по тому событию потребитель идёт за контактом, и со своим ключом
+        // не нашёл бы там ничего.
+        let mut effects = vec![Effect::Notify(Event::OwnAvatarChanged)];
         for peer_ik in recipients {
             let Some(via) = self.direct_channel(&peer_ik) else { continue };
             effects.extend(self.send_avatar(now_ms, peer_ik, via, bytes)?);
@@ -4757,6 +5047,10 @@ impl<S: Store> Engine<S> {
             // Поставив здесь текущее время, мы дали бы десктопу тридцать
             // суток жизни кэша (§13.4), которого у него пока нет.
             last_seen_ms: 0,
+            // Адреса пока нет и быть не может: десктоп ещё не сказал ни слова.
+            // Скажет он его в первом же рукопожатии — там, где карточка
+            // у контактов (§8.2).
+            onion: String::new(),
         };
         self.store.put_paired_device(&device)?;
         self.devices.insert(pairing_public, device);
@@ -4788,13 +5082,44 @@ impl<S: Store> Engine<S> {
     /// а маяк его больше не слушается. Отдельного эффекта «закрыть сокет»
     /// у ядра нет и не заведено нарочно: сокет закрывает та сторона, которая
     /// его набрала, а решает вопрос не он, а отсутствие ключей.
-    fn on_revoke_pairing(&mut self, device_id: &[u8; 16]) -> Result<Vec<Effect>, EngineError> {
+    fn on_revoke_pairing(
+        &mut self,
+        now_ms: u64,
+        device_id: &[u8; 16],
+    ) -> Result<Vec<Effect>, EngineError> {
         let pairing_public = self
             .devices
             .iter()
             .find(|(_, device)| device.device_id == *device_id)
             .map(|(key, _)| *key)
             .ok_or(EngineError::UnknownDevice)?;
+
+        // **Прощание — до сноса ключей, и другого места у него нет.** После
+        // удаления сессии запечатать нечем, а очередь новостей выгребается
+        // в конце шага, когда ключей уже не будет. Поэтому кадр собирается
+        // здесь, своей рукой, и уезжает вместе с остальными эффектами.
+        //
+        // Не гарантия, а сообщение: доедет оно только до включённого
+        // десктопа, который телефону сейчас достижим. Отзывают же чаще
+        // всего потерянный ноутбук — то есть выключенный. Гарантия в §13.4
+        // одна, и она другая: тридцать суток без подключения.
+        //
+        // Отказ сборки кадра ничего не останавливает: отзыв — решение
+        // человека о своём телефоне, и не состояться он не может из-за того,
+        // что кому-то не удалось об этом сказать.
+        let mut effects = Vec::new();
+        if let Some(via) = self.device_links.get(&pairing_public).copied() {
+            match self.send_to_device(
+                now_ms,
+                pairing_public,
+                via,
+                PayloadType::CompanionNotice,
+                companion::notice_payload(&companion::Notice::Revoked),
+            ) {
+                Ok(sent) => effects.extend(sent),
+                Err(error) => tracing::warn!(?error, "прощание отозванному не собралось"),
+            }
+        }
 
         // **Все** сессии, а не одна на транспорт: отправленная на покой
         // живёт ради приёма — то есть ровно ради того, что отзыв обязан
@@ -4808,11 +5133,57 @@ impl<S: Store> Engine<S> {
         self.device_seen.remove(&pairing_public);
         self.store.delete_paired_device(device_id)?;
 
-        let mut effects = vec![Effect::Notify(Event::PairingRevoked { device_id: *device_id })];
+        // **Надгробие — ради того, кто был выключен.** Прощание выше доедет
+        // только до включённого; отзывают же чаще потерянный ноутбук, а он
+        // вернётся в сеть когда-нибудь потом. Тогда он постучится, и вот
+        // по этой записи ему ответят причиной вместо тишины (5вл).
+        //
+        // Заодно убираются просроченные: срок тот же, что у кэша десктопа
+        // (§13.4), и совпадение не случайно — к его концу десктоп стирает
+        // кэш сам, и говорить ему уже нечего. Уборка здесь, на редкой
+        // записи, а не на каждом чужом рукопожатии: там она была бы записью
+        // в базу по чужому кадру.
+        self.store.remember_revocation(&pairing_public, now_ms)?;
+        let _ = self.store.prune_revocations(now_ms.saturating_sub(DESKTOP_CACHE_TTL_MS));
+
+        effects.push(Effect::Notify(Event::PairingRevoked { device_id: *device_id }));
         if self.enabled.contains(Transport::Lan) {
             effects.push(self.watch_lan_peers());
         }
         Ok(effects)
+    }
+
+    /// Отвечает отозванному десктопу, что он отозван (§13.4).
+    ///
+    /// Пусто, если это не наш отозванный: незнакомцу, чьё рукопожатие
+    /// не разобралось, отвечать нечего, а отвечать всем подряд значило бы
+    /// сообщать любому, кто постучится, что мы здесь и мы что-то про него
+    /// знаем.
+    ///
+    /// **Срок проверяется на чтении, а не только уборкой.** Уборка идёт
+    /// на отзыве — то есть может не случиться годами, если отзывали один
+    /// раз, — и без этой проверки надгробие пережило бы обещанные тридцать
+    /// суток. Просроченному отвечают тишиной: к этому времени десктоп
+    /// стёр кэш сам, и сказать ему нечего.
+    ///
+    /// Отказ хранилища или сборки кадра ничего не роняет: чужое рукопожатие
+    /// не повод останавливать телефон, а человек об этом всё равно
+    /// не узнает — новость едет не ему.
+    fn tell_revoked(&mut self, now_ms: u64, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
+        let Ok(Some(revoked_ms)) = self.store.revocation(&peer_ik) else { return Vec::new() };
+        if now_ms.saturating_sub(revoked_ms) >= DESKTOP_CACHE_TTL_MS {
+            return Vec::new();
+        }
+        let key = ratatosk_crypto::companion::revocation_key(&self.identity, &peer_ik);
+        let mut nonce = [0u8; ratatosk_wire::NONCE_LEN];
+        self.entropy.fill(&mut nonce);
+        match crate::frames::revoked(&key, nonce) {
+            Ok(frame) => vec![Effect::Send { peer_ik, via, frame, handoff: None }],
+            Err(error) => {
+                tracing::warn!(?error, "кадр отзыва не собрался");
+                Vec::new()
+            }
+        }
     }
 
     /// Отмечает, что обратный путь до десктопа доказан.
@@ -5124,6 +5495,44 @@ impl<S: Store> Engine<S> {
             companion::Request::Hello => {
                 Ok(companion::Response::Hello { wire: companion::WIRE_VERSION })
             }
+            // Аватарка — своя или контакта. Правило §4.2 не повторяется здесь
+            // ни строкой: `avatar_of` уже отвечает `None` на несверенного,
+            // и второе такое же условие рядом однажды разошлось бы с первым.
+            //
+            // Неизвестный чат — тоже пустой ответ, а не отказ. Десктоп мог
+            // спросить про чат, который телефон только что удалил: сказать
+            // «нет такого чата» словами (§14) значило бы показать человеку
+            // сообщение об ошибке там, где ошибки нет.
+            // Тот же обработчик, что и у команды с телефона, — правило то же,
+            // что у правок и удалений: §4.2 решает, кому лицо уедет, и решает
+            // это в одном месте. Негодная картинка вернётся словами
+            // (`serve_companion` ловит `EngineError::Avatar`), и слова там
+            // человеческие: «формат не поддерживается» и «больше стольких-то
+            // байт» — ровно то, что человеку за ноутбуком надо знать.
+            companion::Request::SetMyAvatar { bytes } => {
+                effects.extend(self.on_set_avatar(now_ms, &bytes)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::Avatar { chat } => {
+                let owner = match chat {
+                    Some(chat) => self.by_chat.get(&chat).copied(),
+                    None => Some(self.identity.public().ik),
+                };
+                let bytes = match (chat, owner) {
+                    (Some(_), Some(peer_ik)) => self.avatar_of(&peer_ik)?,
+                    (None, _) => self.own_avatar()?,
+                    (Some(_), None) => None,
+                };
+                // Метка снимается **с той же строки**, из которой взяты байты,
+                // и только когда байты есть. Иначе несверенный контакт уехал
+                // бы с пустотой и живой меткой — то есть десктоп счёл бы,
+                // что лицо у него теперь есть, и перестал спрашивать.
+                let avatar_ms = match (&bytes, owner) {
+                    (Some(_), Some(owner)) => self.store.avatar_stamp(&owner)?.unwrap_or(0),
+                    _ => 0,
+                };
+                Ok(companion::Response::Avatar { bytes, avatar_ms })
+            }
         }
     }
 
@@ -5149,6 +5558,16 @@ impl<S: Store> Engine<S> {
                 verified: contact.verified,
                 last_text,
                 last_ms,
+                // §4.2 живёт здесь же, где и в `avatar_of`, и одинаково:
+                // несверенному контакту метка не едет вовсе. Иначе десктоп
+                // спрашивал бы аватарку, получал пустоту и спрашивал снова —
+                // а заодно узнавал бы, что лицо у телефона есть, при том
+                // что показать его нельзя.
+                avatar_ms: if contact.verified {
+                    self.store.avatar_stamp(peer_ik)?.unwrap_or(0)
+                } else {
+                    0
+                },
             });
         }
         // Свежие сверху — тот же порядок, в каком чаты показывает телефон.
@@ -5416,6 +5835,19 @@ impl<S: Store> Engine<S> {
         Ok(vec![Effect::Send { peer_ik: pairing_public, via, frame, handoff: None }])
     }
 
+    /// Адрес сопряжённого устройства, если оно его называло (§13.4).
+    ///
+    /// Отдельная выборка, а не обход [`Engine::paired_devices`]: спрашивают
+    /// её на **каждый** уходящий кадр, а тот список собирается заново
+    /// со всеми строками.
+    #[must_use]
+    pub fn device_onion(&self, pairing_public: &[u8; 32]) -> Option<&str> {
+        self.devices
+            .get(pairing_public)
+            .map(|device| device.onion.as_str())
+            .filter(|onion| !onion.is_empty())
+    }
+
     /// Сопряжённые устройства (§13.4).
     #[must_use]
     pub fn paired_devices(&self) -> Vec<crate::companion::PairedDevice> {
@@ -5427,6 +5859,7 @@ impl<S: Store> Engine<S> {
                 label: d.label.clone(),
                 paired_ms: d.paired_ms,
                 last_seen_ms: d.last_seen_ms,
+                onion: d.onion.clone(),
             })
             .collect()
     }
@@ -6015,7 +6448,21 @@ impl<S: Store> Engine<S> {
         match self.sessions.route(view.header.session_id) {
             ratatosk_proto::Route::Handshake => {
                 tracing::debug!(?via, step = view.header.counter, "кадр: рукопожатие");
-                let message = unpad(view.sealed)?.to_vec();
+                // **Испорченная набивка — брошенный кадр, а не отказ шага**,
+                // и это тот же разбор, что у рукопожатия без карточки, только
+                // старше. Здесь стояло `unpad(view.sealed)?`: кадр класса S
+                // со случайным содержимым — а таким выглядит и наш собственный
+                // кадр отзыва, попади он не туда, — ронял ядро целиком. Своего
+                // рукопожатия для этого не нужно: хватало любого соседа
+                // по локальной сети.
+                //
+                // §7.3 про такие кадры говорит прямо: они отбрасываются.
+                // Счётчик аномалий здесь не тронуть — чей это кадр, до Noise
+                // неизвестно, — и остаётся журнал.
+                let Ok(message) = unpad(view.sealed).map(<[u8]>::to_vec) else {
+                    tracing::debug!(?via, "набивка кадра рукопожатия испорчена — кадр отброшен");
+                    return Ok(Vec::new());
+                };
                 match view.header.counter {
                     HANDSHAKE_STEP_FIRST => self.on_handshake_first(now_ms, via, &message),
                     HANDSHAKE_STEP_RESPONSE => self.on_handshake_response(now_ms, via, &message),
@@ -6097,8 +6544,37 @@ impl<S: Store> Engine<S> {
 
         // В первом сообщении приехала карточка отправителя (§8.2). Контакт
         // остаётся непроверенным: карточка пришла по сети, а не из QR (§4.2).
+        //
+        // **Не разобравшаяся карточка — не отказ шага, а брошенный кадр**,
+        // и это разбор живой ошибки. Рукопожатие терминала возит пустую
+        // нагрузку: карточки у него нет и быть не может. Пока он числится
+        // устройством, сюда он не заходит; но отозванный десктоп числиться
+        // перестаёт — и заходил ровно сюда, где `ContactCard::decode`
+        // спотыкался о пустые байты и ронял **весь шаг ядра**. Отозванный
+        // ноутбук, повторяющий рукопожатие раз в пятнадцать секунд, делал
+        // это отказом ядра раз в пятнадцать секунд.
+        //
+        // Бросается кадр **до** сессии, а не после: незнакомцу, чьё первое
+        // сообщение не разобралось, сессия не полагается вовсе. Оставь мы
+        // её — на телефоне завелась бы запись под ключ, за которым не стоит
+        // ни контакта, ни устройства.
+        //
+        // Тихо, а не словами: §7.3 именно так поступает с мусорным кадром,
+        // и рассказывать человеку про чужое рукопожатие нечего.
         if !is_device && !self.contacts.contains_key(&peer_ik) {
-            effects.extend(self.add_contact(now_ms, &payload, false)?);
+            match self.add_contact(now_ms, &payload, false) {
+                Ok(added) => effects.extend(added),
+                Err(error) => {
+                    tracing::debug!(?error, "рукопожатие без разбираемой карточки — брошено");
+                    self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                    // **Но если это наш же отозванный десктоп — ему отвечают.**
+                    // Он был выключен в момент отзыва и прощания не получил;
+                    // без ответа его ждёт та же тишина, в которой «отозвали»
+                    // неотличимо от «телефона нет» (§14). Сессии для ответа
+                    // не нужно — и не может быть: её отсутствие и есть отзыв.
+                    return Ok(self.tell_revoked(now_ms, peer_ik, via));
+                }
+            }
         }
 
         let session_id = session.session_id;
@@ -6109,6 +6585,36 @@ impl<S: Store> Engine<S> {
         effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
 
         if is_device {
+            // **Адрес десктопа — из нагрузки рукопожатия, и больше ниоткуда.**
+            // Соединения односторонние (5ц): отвечаем мы не в принятое
+            // соединение, а в своё, набранное по адресу. В общей сети адрес
+            // даёт маяк §5.1, вне её — только это поле, и приехать оно обязано
+            // раньше первого ответа. Раньше ответа приходит одно рукопожатие.
+            //
+            // Пустое — законно и чаще всего: дома onion никому не нужен.
+            // Непонятое — тоже пустое: рукопожатие не разваливается из-за
+            // поля, без которого всё остальное работает.
+            //
+            // Записывается **только при изменении**: адрес приезжает с каждым
+            // рукопожатием, а рукопожатие случается на каждый разрыв связи.
+            // Та же причина, по какой отметка «подключалось» пишется
+            // на переходе, а не на каждой просьбе.
+            let told = companion::device_address_from_payload(&payload).onion;
+            if let Some(device) = self.devices.get_mut(&peer_ik) {
+                if device.onion != told {
+                    device.onion.clone_from(&told);
+                    let device_id = device.device_id;
+                    // Отказ записи не роняет рукопожатие: связь важнее
+                    // запомненного адреса, а по этой связи мы уже говорим.
+                    // В памяти адрес при этом уже новый — до перезапуска
+                    // телефон дозвонится, после придётся объявить заново,
+                    // что случится первым же рукопожатием.
+                    if let Err(error) = self.store.set_device_onion(&device_id, &told) {
+                        tracing::warn!(?error, "адрес десктопа не записался");
+                    }
+                }
+            }
+
             // Куда слать — знаем: сессия есть, транспорт известен. А вот
             // **человеку про связь пока не говорим**, и это отметка о деле
             // вместо отметки о намерении — та же ошибка, что была

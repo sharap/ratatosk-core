@@ -762,7 +762,19 @@ fn an_unverified_contact_gets_no_avatar() {
 
     let effects =
         alice.step(1_000, Input::Command(Command::SetAvatar(avatar(9)))).expect("аватарка принята");
-    assert!(effects.is_empty(), "отправлять некому и незачем: {effects:?}");
+    // **Про отправку, а не про пустоту.** Здесь стояло `effects.is_empty()`,
+    // и это утверждение было шире того, что тест проверяет: своё лицо
+    // теперь порождает `OwnAvatarChanged` — экран телефона обязан узнать
+    // о смене, потому что сменить её вправе и десктоп (§13.4). Не уехать
+    // должен **кадр**, и об этом надо было писать с самого начала.
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "отправлять некому и незачем: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::OwnAvatarChanged))),
+        "свой же экран обязан узнать, что лицо сменилось: {effects:?}"
+    );
 
     // Даже когда сессия появится, аватарка не поедет.
     let effects = send_text(&mut alice, &bob, 2_000, "здравствуйте");

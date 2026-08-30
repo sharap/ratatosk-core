@@ -1,0 +1,142 @@
+//! Ключ, которым телефон говорит отозванному десктопу, что он отозван (§13.4).
+//!
+//! **Спецификация v0.1 этого не описывает.** Это добавление, и §17 просит
+//! такие вещи записывать явно. Здесь — правило; разбор того, зачем оно
+//! понадобилось, — в `ARCHITECTURE.md`, 5вл.
+//!
+//! # Задача
+//!
+//! Отозванный десктоп приходит с рукопожатием к телефону, который снёс его
+//! запись. Сессии между ними нет и не будет — в том и смысл отзыва, — а
+//! сказать ему надо ровно одно: «сопряжение отозвано». Сказать это открытым
+//! кадром нельзя: любой сосед по локальной сети подделал бы его и заставил
+//! чужие десктопы стирать кэш.
+//!
+//! # Решение
+//!
+//! Статический DH: секретный `IK` телефона против ключа сопряжения
+//! десктопа. Оба уже знают публичную половину другого — телефон запомнил её
+//! при сопряжении и хранит даже после отзыва (ради этого и хранит), десктоп
+//! носит её в приглашении. Значит обе стороны выводят один ключ, не
+//! обменявшись ни одним кадром.
+//!
+//! Ключ выводится **только** этой функцией, и сырого DH наружу не выдаётся:
+//! материал у него общий с Noise IK, и разделяет их ярлык. Дай мы наружу
+//! секрет — разделять стало бы нечего.
+//!
+//! # Чего это не даёт
+//!
+//! Ни свежести, ни направления. Кадр воспроизводим: перехвативший его может
+//! повторить — но только тому же десктопу, который и так отозван. Новое
+//! сопряжение заводится новым зерном, то есть другим статическим ключом,
+//! и старый кадр под ним не открывается.
+//!
+//! И это по-прежнему **сообщение, а не гарантия**: доедет оно до того, кто
+//! пришёл спросить. Тот, кто забрал ноутбук, спрашивать не обязан.
+
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
+
+use crate::identity::Identity;
+use crate::kdf::{self, Key32};
+use crate::labels;
+
+/// Ключ кадра отзыва между этими двумя устройствами.
+///
+/// Симметричен: телефон зовёт его со своей личностью и ключом сопряжения
+/// десктопа, десктоп — со своей и `IK` телефона, и получают они одно
+/// и то же. Ради этого DH и взят: договориться заранее им негде.
+#[must_use]
+pub fn revocation_key(ours: &Identity, theirs_ik: &[u8; 32]) -> Key32 {
+    let shared = shared_secret(ours.ik_secret(), theirs_ik);
+    kdf::derive(labels::COMPANION_REVOKED, shared.as_ref())
+}
+
+/// Зерно onion-сервиса десктопа (§13.4).
+///
+/// Выводится из зерна сопряжения, а не хранится отдельным файлом: другого
+/// долговременного секрета у десктопа нет, и заводить ему второй значит
+/// завести то, что теряют и переносят отдельно от всего остального. Тот же
+/// путь, что у ключа кэша (`labels::COMPANION_CACHE`), и та же честная
+/// граница — см. [`labels::COMPANION_ONION`].
+///
+/// Адрес получается **устойчивым**: он переживает и перезапуск, и стирание
+/// кэша, и не требует ничего, кроме той же ссылки сопряжения, по которой
+/// десктоп и так подключается. Телефон вывести его не может — секретной
+/// половины зерна у него нет (§13.4), — и не должен: адрес ему называют
+/// вслух, в рукопожатии.
+#[must_use]
+pub fn onion_seed(ours: &Identity) -> Key32 {
+    kdf::derive(labels::COMPANION_ONION, ours.backup_seed())
+}
+
+fn shared_secret(ours: &StaticSecret, theirs_ik: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let theirs = PublicKey::from(*theirs_ik);
+    Zeroizing::new(ours.diffie_hellman(&theirs).to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_sides_derive_the_same_key_without_talking() {
+        // Ради этого свойства DH здесь и взят: у отозванного десктопа
+        // с телефоном нет ни сессии, ни возможности её завести.
+        let phone = Identity::from_seed([1u8; 32]);
+        let desktop = Identity::from_seed([2u8; 32]);
+
+        let theirs = revocation_key(&phone, &desktop.public().ik);
+        let ours = revocation_key(&desktop, &phone.public().ik);
+        assert_eq!(theirs.as_ref(), ours.as_ref(), "стороны обязаны сойтись в ключе");
+    }
+
+    #[test]
+    fn a_third_device_derives_something_else() {
+        // Иначе сосед по локальной сети заставлял бы чужие десктопы
+        // стирать кэш одним подделанным кадром.
+        let phone = Identity::from_seed([1u8; 32]);
+        let desktop = Identity::from_seed([2u8; 32]);
+        let stranger = Identity::from_seed([3u8; 32]);
+
+        let ours = revocation_key(&phone, &desktop.public().ik);
+        let theirs = revocation_key(&phone, &stranger.public().ik);
+        assert_ne!(ours.as_ref(), theirs.as_ref(), "ключ обязан зависеть от того, кому он");
+    }
+
+    #[test]
+    fn the_onion_seed_is_stable_and_belongs_to_one_pairing() {
+        // Устойчивость — то, ради чего зерно выводится, а не хранится:
+        // адрес обязан пережить перезапуск и стирание кэша, не требуя
+        // ничего, кроме ссылки сопряжения.
+        let desktop = Identity::from_seed([2u8; 32]);
+        assert_eq!(onion_seed(&desktop).as_ref(), onion_seed(&desktop).as_ref());
+
+        // И принадлежит одному сопряжению: второй десктоп заводится новым
+        // QR, то есть новым зерном, и адрес у него обязан быть другой.
+        let second = Identity::from_seed([3u8; 32]);
+        assert_ne!(onion_seed(&desktop).as_ref(), onion_seed(&second).as_ref());
+    }
+
+    #[test]
+    fn the_onion_seed_is_not_the_pairing_seed_itself() {
+        // Ярлык — единственное, что разделяет три ключа из одного материала:
+        // сессионный, кэшевый и этот. Совпади хоть один с зерном — разделять
+        // было бы нечего.
+        let desktop = Identity::from_seed([2u8; 32]);
+        assert_ne!(onion_seed(&desktop).as_ref(), desktop.backup_seed());
+        assert_ne!(onion_seed(&desktop).as_ref(), revocation_key(&desktop, &[9u8; 32]).as_ref());
+    }
+
+    #[test]
+    fn the_key_is_not_the_raw_shared_secret() {
+        // Материал общий с Noise IK, и разделяет их ярлык. Совпади ключ
+        // с самим секретом — разделять было бы нечего.
+        let phone = Identity::from_seed([1u8; 32]);
+        let desktop = Identity::from_seed([2u8; 32]);
+
+        let raw = shared_secret(phone.ik_secret(), &desktop.public().ik);
+        let key = revocation_key(&phone, &desktop.public().ik);
+        assert_ne!(raw.as_ref(), key.as_ref());
+    }
+}

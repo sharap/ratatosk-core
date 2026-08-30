@@ -128,6 +128,7 @@ val companion = RatatoskCompanion.open(
     port = 0.toUShort(),         // пусть выберет система
     peerAddr = null,             // адрес телефона, если mDNS не работает
     cachePath = null,            // снимок на диск не кладём (умолчание §13.4)
+    torDir = null,               // свой onion не поднимаем — только общая сеть
 )
 companion.setObserver(observer)
 ```

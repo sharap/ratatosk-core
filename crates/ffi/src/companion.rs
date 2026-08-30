@@ -50,7 +50,22 @@ use ratatosk_core::{
     CompanionHandle, OsEntropy,
 };
 use ratatosk_proto::companion::{Attachment, ChatSummary, Message, PairingInvite, Reaction};
-use ratatosk_transport::{LanConfig, LanRunner, Runner, TransportCommand};
+use ratatosk_transport::{Disabled, LanConfig, LanRunner, Runner, TransportCommand, Transports};
+
+/// Составной транспорт терминала: локальная сеть, свой onion, почты нет.
+///
+/// Почты нет и не будет ни при каких признаках: почтовый круг — это часы
+/// (§5.3), а второй экран про «здесь и сейчас».
+///
+/// Тип один на обе сборки — с живым arti и без него, — и это не украшение:
+/// `start` возвращает раннер, а две ветки с разными типами не собрались бы
+/// в одну функцию.
+#[cfg(feature = "tor")]
+type CompanionOnion = ratatosk_transport::Switched<ratatosk_transport::onion::arti::OnionRunner>;
+#[cfg(not(feature = "tor"))]
+type CompanionOnion = Disabled;
+
+type CompanionRunner = Transports<LanRunner, CompanionOnion, Disabled>;
 
 use crate::{to_chat, to_file_id, to_msg_id, to_msg_ids, FfiDeliveryStatus, RatatoskError};
 
@@ -139,6 +154,17 @@ pub struct FfiCompanionChat {
     pub last_text: String,
     /// Когда оно было, мс.
     pub last_ms: u64,
+    /// Метка аватарки; `0` — показывать нечего.
+    ///
+    /// **Не байты, а число**, и не для показа: список чатов приезжает
+    /// целиком и часто, а лицо весит до 32 КиБ. Клиент сравнивает метку
+    /// с той, при которой он забирал картинку в прошлый раз, и зовёт
+    /// `avatar` только для разошедшихся.
+    ///
+    /// Ноль означает «показывать нечего» и покрывает два случая сразу:
+    /// аватарки нет и контакт не сверен (§4.2). Различить их клиент
+    /// не может намеренно — рисовать в обоих надо заглушку.
+    pub avatar_ms: u64,
 }
 
 /// Сообщение в том виде, в каком его видит десктоп.
@@ -294,6 +320,45 @@ pub enum FfiCompanionEvent {
         /// Байты, если они есть.
         bytes: Option<Vec<u8>>,
     },
+    /// Аватарка — или её отсутствие.
+    ///
+    /// `bytes: None` — показывать нечего: аватарки нет либо контакт
+    /// не сверен (§4.2). Случаи неразличимы намеренно, рисовать в обоих
+    /// надо одно.
+    ///
+    /// Не больше 32 КиБ — предел проверен проводом, но декодировать эти
+    /// байты всё равно клиенту, и с чужого телефона они пришли ровно так же,
+    /// как превью: обращаться с ними надо как с любым чужим файлом.
+    Avatar {
+        /// Чей чат; `None` — своя.
+        chat_id: Option<Vec<u8>>,
+        /// Байты, если они есть.
+        bytes: Option<Vec<u8>>,
+        /// Подтверждено ли телефоном сейчас; `false` — показанное из кэша.
+        fresh: bool,
+    },
+    /// Сопряжение отозвано — этот компьютер больше не второй экран (§13.4).
+    ///
+    /// Кэш к этому моменту стёрт и в памяти, и на диске. Окну остаётся
+    /// одно, и это **обязательно**: сказать человеку словами. До этой
+    /// новости отзыв выглядел тишиной, неотличимой от «телефон не в сети»,
+    /// и окно вечно писало «подключаемся» (§14).
+    ///
+    /// Дальше объект жив, но бесполезен: подключаться он не пробует,
+    /// а на любую команду отвечает [`FfiCompanionEvent::Refused`]. Новый
+    /// второй экран заводится новым QR — то есть новым объектом.
+    Revoked,
+    /// Лицо сменилось — прежнее убрать, новое спросить.
+    ///
+    /// Байтов не несёт: новость приезжает без спроса. Клиенту тут работы
+    /// на две строки — стереть показанное и, если `avatar_ms` не ноль,
+    /// позвать `avatar`.
+    AvatarChanged {
+        /// Чей чат; `None` — своя.
+        chat_id: Option<Vec<u8>>,
+        /// Новая метка; `0` — показывать нечего, и спрашивать не о чем.
+        avatar_ms: u64,
+    },
     /// Вложение забрано и лежит по этому пути.
     FileSaved {
         /// Какое.
@@ -414,6 +479,22 @@ impl RatatoskCompanion {
     /// который лежит рядом, значит защита работает против скопированного
     /// файла и бэкапа, но не против забранной машины.
     ///
+    /// `tor_dir` — каталог состояния своего onion-сервиса. `None` — сервис
+    /// не поднимать, и это умолчание: **вне общей сети терминал тогда
+    /// не работает вовсе**, а в общей сети onion не нужен. Задав его,
+    /// скажите человеку, что первый подъём идёт десятки секунд и что до него
+    /// телефон дотянется только по локальной сети.
+    ///
+    /// Каталог обязателен, а не временный: адрес выводится из секрета
+    /// сопряжения и потому постоянен, но arti держит там состояние сети
+    /// и ключи, и одноразовый каталог означал бы полный bootstrap на каждый
+    /// запуск. Класть его надо туда же, куда кладут кэш, — и защищать
+    /// так же.
+    ///
+    /// Без признака сборки `tor` живого arti в двоичном файле нет, и параметр
+    /// не делает ничего: сервис не поднимется, а `reachable_anywhere`
+    /// у сопряжения останется ложью.
+    ///
     /// Возврат **не** означает, что телефон ответил: рукопожатие идёт своим
     /// чередом и повторяется по таймеру. Ждать надо
     /// [`FfiCompanionEvent::Linked`].
@@ -427,6 +508,7 @@ impl RatatoskCompanion {
         port: u16,
         peer_addr: Option<String>,
         cache_path: Option<String>,
+        tor_dir: Option<String>,
     ) -> Result<Arc<Self>, RatatoskError> {
         let observer: Arc<Mutex<Option<Arc<dyn CompanionObserver>>>> = Arc::new(Mutex::new(None));
         let pump_observer = Arc::clone(&observer);
@@ -456,7 +538,7 @@ impl RatatoskCompanion {
                         }
                     };
                 runtime.block_on(async move {
-                    let started = start(&invite_uri, port, peer_addr).await;
+                    let started = start(&invite_uri, port, peer_addr, tor_dir).await;
                     let (mut driver, handle, events, linked) = match started {
                         Ok(parts) => parts,
                         Err(error) => {
@@ -768,6 +850,51 @@ impl RatatoskCompanion {
         self.ask(CompanionCommand::Preview { file_id: to_file_id(&file_id)? })
     }
 
+    /// Спрашивает аватарку — контакта или свою.
+    ///
+    /// `chat_id = None` — своя. Ответ приедет событием
+    /// [`FfiCompanionEvent::Avatar`], байтами, и мера у этого та же, что
+    /// у превью: лицо не больше 32 КиБ.
+    ///
+    /// **Звать стоит по метке, а не на каждый показ списка.**
+    /// [`FfiCompanionChat::avatar_ms`] говорит, изменилось ли лицо
+    /// с прошлого раза; спросив без этой проверки, окно возит по сети
+    /// тридцать два килобайта на контакт при каждом обновлении списка.
+    /// Свою — раз за подключение: метки для сравнения у неё нет.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn avatar(&self, chat_id: Option<Vec<u8>>) -> Result<(), RatatoskError> {
+        let chat = match chat_id {
+            Some(chat_id) => Some(to_chat(&chat_id)?),
+            None => None,
+        };
+        self.ask(CompanionCommand::Avatar { chat })
+    }
+
+    /// Ставит или снимает **свою** аватарку (§4.2).
+    ///
+    /// `None` — снять. Байты готовит клиент, как и превью: масштабирование
+    /// и перекодирование — работа платформенного декодера, а не ядра,
+    /// которое держит ключи. Предел — `max_avatar_bytes()`; картинку больше
+    /// провод отвергнет, а негодный формат вернётся `Refused` со словами.
+    ///
+    /// **Чужую аватарку поменять нельзя ни отсюда, ни откуда-либо ещё.**
+    /// Лицо контакта приходит от него самого по установленной сессии.
+    ///
+    /// Разошлёт её сверенным контактам телефон — рассылка отсюда невозможна
+    /// в принципе: сессии с контактами есть только у него (§13.4). Ответ
+    /// приедет событием [`FfiCompanionEvent::AvatarChanged`] с `chat_id:
+    /// None`; его получат **все** сопряжённые десктопы, включая этот.
+    ///
+    /// # Errors
+    ///
+    /// Остановленный компаньон.
+    pub fn set_avatar(&self, bytes: Option<Vec<u8>>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SetAvatar { bytes: bytes.unwrap_or_default() })
+    }
+
     /// Забирает вложение с телефона в файл по этому пути.
     ///
     /// Байты пишет ядро: путь, а не поток. `chunk_total` берётся
@@ -905,7 +1032,11 @@ async fn start(
     invite_uri: &str,
     port: u16,
     peer_addr: Option<std::net::SocketAddr>,
-) -> Result<(CompanionDriver<LanRunner>, CompanionHandle, CompanionEvents, Linked), RatatoskError> {
+    tor_dir: Option<String>,
+) -> Result<
+    (CompanionDriver<CompanionRunner>, CompanionHandle, CompanionEvents, Linked),
+    RatatoskError,
+> {
     let invite = PairingInvite::from_uri(invite_uri.trim()).map_err(|_| {
         RatatoskError::internal("ссылка сопряжения не годится: ждётся ratatosk:v0:pair:…")
     })?;
@@ -935,7 +1066,74 @@ async fn start(
         .await
         .map_err(RatatoskError::internal)?;
 
-    let (driver, handle, events) = CompanionDriver::new(client, lan);
+    // Свой onion-сервис (§13.4). Оба случая дают **один тип**: без каталога
+    // подъём сразу объявляется неудавшимся, и составной раннер остаётся тем
+    // же. Каталог обязателен потому, что адрес обязан пережить перезапуск —
+    // телефон запомнил его с прошлого рукопожатия, а сервис на одноразовом
+    // каталоге поднялся бы под другим.
+    let tor_handle = ratatosk_transport::onion::TorHandle::default();
+    #[cfg(feature = "tor")]
+    let mut runner = {
+        let layout = tor_dir
+            .as_deref()
+            .map(|dir| ratatosk_core::TorLayout::under(std::path::PathBuf::from(dir)));
+        if let Some(layout) = layout.as_ref() {
+            // Ключ раскладывается до подъёма и на каждый запуск: arti читает
+            // его из каталога, а файл могли удалить или перенести каталог.
+            ratatosk_core::write_onion_keystore(&layout.keys, &client.onion_key())
+                .map_err(RatatoskError::internal)?;
+        }
+        let setup = std::sync::Arc::new((layout, client.onion_key()));
+        let handle = tor_handle.clone();
+        let onion = ratatosk_transport::Switched::new(move |progress| {
+            let setup = std::sync::Arc::clone(&setup);
+            let tor = handle.clone();
+            async move {
+                let (layout, key) = &*setup;
+                let Some(layout) = layout.as_ref() else {
+                    return Err(ratatosk_transport::TransportError::Unavailable);
+                };
+                ratatosk_transport::onion::arti::OnionRunner::start(
+                    ratatosk_transport::onion::arti::OnionSetup {
+                        state_dir: &layout.state,
+                        cache_dir: &layout.cache,
+                        keystore_dir: &layout.keys,
+                        key,
+                        // На десктопе проверка прав `fs-mistrust` осмысленна
+                        // и остаётся включённой — в отличие от Android,
+                        // где предки пути принадлежат системе.
+                        dangerously_trust_filesystem: false,
+                        tor,
+                    },
+                    progress,
+                )
+                .await
+            }
+        });
+        Transports::new(lan, onion, Disabled)
+    };
+    #[cfg(not(feature = "tor"))]
+    let mut runner = {
+        let _ = (&tor_handle, &tor_dir);
+        Transports::new(lan, Disabled, Disabled)
+    };
+
+    // **Включать приходится своей рукой.** У терминала нет ядра, а
+    // `Switched` поднимается только по `SetEnabled` — у телефона это говорит
+    // `Engine::startup_effects`, здесь сказать некому. Без этой строки сервис
+    // остался бы выключенным навсегда, и адрес в рукопожатии приезжал бы
+    // пустым при поднятом Tor.
+    if tor_dir.is_some() {
+        runner
+            .execute(TransportCommand::SetEnabled {
+                transport: ratatosk_proto::Transport::Onion,
+                enabled: true,
+            })
+            .await
+            .map_err(RatatoskError::internal)?;
+    }
+
+    let (driver, handle, events) = CompanionDriver::new(client, runner);
     let linked = Linked {
         handle: handle.clone(),
         device_id: linked_parts.0,
@@ -1007,6 +1205,13 @@ fn translate(event: CompanionEvent) -> FfiCompanionEvent {
         CompanionEvent::FilePreview { file_id, bytes } => {
             FfiCompanionEvent::FilePreview { file_id: file_id.to_vec(), bytes }
         }
+        CompanionEvent::Revoked => FfiCompanionEvent::Revoked,
+        CompanionEvent::Avatar { chat, bytes, fresh } => {
+            FfiCompanionEvent::Avatar { chat_id: chat.map(|chat| chat.to_vec()), bytes, fresh }
+        }
+        CompanionEvent::AvatarChanged { chat, avatar_ms } => {
+            FfiCompanionEvent::AvatarChanged { chat_id: chat.map(|chat| chat.to_vec()), avatar_ms }
+        }
         CompanionEvent::FileGone { file_id } => {
             FfiCompanionEvent::FileGone { file_id: file_id.to_vec() }
         }
@@ -1052,6 +1257,7 @@ fn chat_of(chat: &ChatSummary) -> FfiCompanionChat {
         verified: chat.verified,
         last_text: chat.last_text.clone(),
         last_ms: chat.last_ms,
+        avatar_ms: chat.avatar_ms,
     }
 }
 
@@ -1191,6 +1397,7 @@ mod tests {
             verified: true,
             last_text: "ага".to_owned(),
             last_ms: 5,
+            avatar_ms: 9,
         };
         let it = chat_of(&chat);
         assert_eq!(it.chat_id, vec![7u8; 16]);
@@ -1199,6 +1406,9 @@ mod tests {
         // со сверенным нельзя ни на телефоне, ни на десктопе (§4.2).
         assert!(it.verified);
         assert_eq!((it.last_text.as_str(), it.last_ms), ("ага", 5));
+        // Метка лица — тоже: без неё клиент возил бы по сети тридцать два
+        // килобайта на контакт при каждом обновлении списка.
+        assert_eq!(it.avatar_ms, 9);
     }
 
     #[test]

@@ -28,6 +28,12 @@
 //!
 //! # Режим компаньона (§13.4)
 //!
+//! Ключ `--tordir` даёт терминалу свой onion-сервис: с ним телефон дотянется
+//! до него из другого города, без него — только по общей сети. Нужен
+//! и признак сборки `tor`, и постоянный каталог: адрес постоянен (выводится
+//! из секрета сопряжения), но состояние сети arti держит на диске, и
+//! одноразовый каталог означал бы полный bootstrap на каждый запуск.
+//!
 //! Ключ `--companion` полностью меняет роль стенда: вместо узла со своей
 //! личностью он становится **терминалом** к телефону. Проверяется это двумя
 //! процессами на одной машине:
@@ -75,10 +81,10 @@ use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
 #[cfg(feature = "tor")]
 use ratatosk_transport::Switched;
-// `Disabled` нужен только тем сборкам, где чего-то нет. С обоими признаками
-// сразу все три ступени заняты настоящими раннерами, и безусловный импорт
-// становится предупреждением — в сборке, которая как раз и есть рабочая.
-#[cfg(any(not(feature = "tor"), not(feature = "mail")))]
+// Условным этот импорт был, пока `Disabled` требовался только сборкам,
+// где чего-то нет. Теперь он нужен **всегда**: у терминала почты нет
+// и не будет ни при каких признаках — почтовый круг это часы (§5.3),
+// а второй экран про «здесь и сейчас».
 use ratatosk_transport::Disabled;
 use ratatosk_transport::{
     LanConfig, LanDirectory, LanRunner, Runner, TransportCommand, Transports,
@@ -141,6 +147,12 @@ struct Args {
     /// Полностью меняет режим стенда: своей личности, своей истории и своих
     /// контактов у терминала нет — он показывает чужие и просит чужой рукой.
     companion: Option<String>,
+    /// Каталог состояния Tor для терминала (`--tordir`).
+    ///
+    /// Без него терминал остаётся при локальной сети: свой onion-сервис
+    /// поднимать негде, а поднятый на одноразовом каталоге исчез бы вместе
+    /// с процессом вместе с адресом, который телефон уже запомнил.
+    tordir: Option<PathBuf>,
     /// Куда класть кэш терминала (§13.4). `None` — никуда.
     ///
     /// Это и есть та самая галочка «хранить кэш на диске»: по умолчанию
@@ -148,6 +160,16 @@ struct Args {
     /// на экране сопряжения и переключается позже; здесь — ключ запуска
     /// и команда `/cache`.
     cache: Option<PathBuf>,
+    /// Ввезти архив переписки (§12) и выйти: `--import <файл> --key <ключ>`.
+    ///
+    /// Отдельным запуском, а не командой в диалоге, и это не лень: ввоз
+    /// происходит **до** того, как появляется аккаунт, — базы, в которую
+    /// можно было бы дать команду, ещё нет.
+    import: Option<PathBuf>,
+    /// Ключ архива — та строка, что печаталась при `/export`.
+    import_key: Option<String>,
+    /// Фраза, которой заперт архив (`--phrase`).
+    import_phrase: Option<String>,
     /// Адрес телефона, если mDNS не работает: `127.0.0.1:41234`.
     ///
     /// Для проверки двумя процессами на одной машине это основной путь:
@@ -168,6 +190,10 @@ fn parse_args() -> Args {
         accounts: None,
         account: None,
         companion: None,
+        tordir: None,
+        import: None,
+        import_key: None,
+        import_phrase: None,
         peer: None,
         cache: None,
     };
@@ -184,6 +210,10 @@ fn parse_args() -> Args {
             "--accounts" => args.accounts = argv.next().map(PathBuf::from),
             "--account" => args.account = argv.next(),
             "--companion" => args.companion = argv.next(),
+            "--tordir" => args.tordir = argv.next().map(PathBuf::from),
+            "--import" => args.import = argv.next().map(PathBuf::from),
+            "--key" => args.import_key = argv.next(),
+            "--phrase" => args.import_phrase = argv.next(),
             "--peer" => args.peer = argv.next(),
             "--cache" => args.cache = argv.next().map(PathBuf::from),
             other => eprintln!("неизвестный ключ: {other}"),
@@ -219,6 +249,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+
+    // Ввоз — тоже отдельный режим, и он раньше всего: аккаунта, в который
+    // можно было бы войти, ещё нет, а после ввоза он открывается **прежним**
+    // PIN — соль уехала в архиве вместе с базой.
+    if let Some(archive) = args.import.clone() {
+        return run_import(&args, &archive);
     }
 
     // Терминал — другой режим целиком, и разбирается он до всего остального:
@@ -295,14 +332,92 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     // Телефон объявляется от своего `IK`, и без этой строки его маяк
     // не с чем было бы сравнить.
     lan.execute(TransportCommand::WatchLanPeers(vec![phone_ik])).await?;
+    // Порт снимается **до** сборки составного раннера: `lan` уезжает в него
+    // целиком, а число нужно ещё дважды — в шапке и в подсказке `/devaddr`.
+    let lan_port = lan.port();
+
+    // Свой onion-сервис. Оба случая дают **один тип** — как и у узла выше:
+    // без каталога подъём сразу объявляется неудавшимся, и составной раннер
+    // остаётся тем же. Каталог обязателен потому, что адрес обязан пережить
+    // перезапуск: телефон запомнил его с прошлого рукопожатия, а сервис
+    // на одноразовом каталоге поднялся бы под другим.
+    let tor_handle = ratatosk_transport::onion::TorHandle::default();
+    #[cfg(feature = "tor")]
+    let mut runner = {
+        let layout = args.tordir.clone().map(ratatosk_core::TorLayout::under);
+        if let Some(layout) = layout.as_ref() {
+            // Ключ раскладывается до подъёма и на каждый запуск: arti читает
+            // его из каталога, а файл могли удалить или перенести каталог.
+            ratatosk_core::write_onion_keystore(&layout.keys, &client.onion_key())?;
+        }
+        let setup = std::sync::Arc::new((layout, client.onion_key(), args.trust_fs));
+        let handle = tor_handle.clone();
+        let onion = Switched::new(move |progress| {
+            let setup = std::sync::Arc::clone(&setup);
+            let tor = handle.clone();
+            async move {
+                let (layout, key, trust_fs) = &*setup;
+                let Some(layout) = layout.as_ref() else {
+                    return Err(ratatosk_transport::TransportError::Unavailable);
+                };
+                ratatosk_transport::onion::arti::OnionRunner::start(
+                    ratatosk_transport::onion::arti::OnionSetup {
+                        state_dir: &layout.state,
+                        cache_dir: &layout.cache,
+                        keystore_dir: &layout.keys,
+                        key,
+                        dangerously_trust_filesystem: *trust_fs,
+                        tor,
+                    },
+                    progress,
+                )
+                .await
+            }
+        });
+        Transports::new(lan, onion, Disabled)
+    };
+    #[cfg(not(feature = "tor"))]
+    let mut runner = {
+        let _ = &tor_handle;
+        Transports::new(lan, Disabled, Disabled)
+    };
+
+    // **Включать приходится своей рукой.** У терминала нет ядра, а
+    // `Switched` поднимается только по `SetEnabled` — у телефона это говорит
+    // `Engine::startup_effects`, здесь сказать некому. Без этой строки
+    // сервис остался бы выключенным навсегда, и адрес в рукопожатии
+    // приезжал бы пустым при поднятом Tor.
+    if args.tordir.is_some() {
+        runner
+            .execute(TransportCommand::SetEnabled {
+                transport: ratatosk_proto::Transport::Onion,
+                enabled: true,
+            })
+            .await?;
+    }
 
     println!("терминал : к «{}»", client.phone_name());
     println!("id       : {}", data_encoding::HEXLOWER.encode(&client.device_id()));
-    println!("порт     : {}", lan.port());
+    println!("порт     : {lan_port}");
     if invite.onion.is_empty() {
-        println!("onion    : в приглашении пусто — только локальная сеть");
+        println!("телефон  : onion в приглашении пуст — звонить только локальной сетью");
     } else {
-        println!("onion    : {} (пока не используется: см. ARCHITECTURE, 5бб)", invite.onion);
+        println!("телефон  : {}", invite.onion);
+    }
+    match (&args.tordir, cfg!(feature = "tor")) {
+        (Some(dir), true) => {
+            // Адрес печатается сразу: он выведен из зерна сопряжения и
+            // известен до всякого подъёма. Сам сервис поднимается десятки
+            // секунд, и до `TorReady` телефону он не объявляется.
+            println!("свой     : {}", client.onion_key().address());
+            println!("           каталог {} — поднимаем в фоне", dir.display());
+        }
+        (Some(_), false) => {
+            println!("свой     : собрано без --features tor — сервис не поднимется");
+        }
+        (None, _) => {
+            println!("свой     : --tordir не задан — только локальная сеть");
+        }
     }
     println!();
     // Соединения односторонние (`ARCHITECTURE.md`, 5ц): телефон обязан
@@ -316,7 +431,7 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     }
     println!("если телефон не находит терминал сам, выполните на нём:");
     println!();
-    println!("/devaddr {} 127.0.0.1:{}", data_encoding::HEXLOWER.encode(&client.ik()), lan.port());
+    println!("/devaddr {} 127.0.0.1:{lan_port}", data_encoding::HEXLOWER.encode(&client.ik()));
     println!();
     println!("команды: /chats   /open <номер>   /more   /read   /cache [on <путь>|off]   /quit");
     println!("         /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
@@ -324,6 +439,8 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     println!("         /accept <n> [k]   — качать вложение;  /pause — передумать");
     println!("         /decline <n> [k]  — отказаться совсем: приехавшее стирается");
     println!("         /preview <n> [k]  — превью вложения, если оно есть");
+    println!("         /avatar [номер чата] — лицо контакта; без номера — своё");
+    println!("         /setavatar [путь]    — поставить своё лицо; без пути — снять");
     println!("         /save <n> [k] <путь>   — забрать сюда;  /stop — прекратить");
     println!("         /send <путь…> [-- подпись] — отправить файлы одним сообщением");
     println!("         /sendpic <файл-превью> <путь> [подпись] — то же с превью");
@@ -334,7 +451,7 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     // Среда — у драйвера, консоль — здесь. До этой поставки они были одним
     // куском, и переехали ради того, что этим же куском будет пользоваться
     // Kotlin: через UniFFI sans-io не пролезает (§13.3).
-    let (mut driver, handle, events) = CompanionDriver::new(client, lan);
+    let (mut driver, handle, events) = CompanionDriver::new(client, runner);
     let console = tokio::spawn(companion_console(handle, events, args.cache.clone()));
     tokio::select! {
         () = driver.run() => {}
@@ -362,6 +479,19 @@ struct Console {
 }
 
 impl Console {
+    /// Как назвать того, чьё это лицо, — для строки в консоли.
+    ///
+    /// По списку чатов, а не по идентификатору: шестнадцать байт человеку
+    /// ничего не говорят, а имя чат везёт с собой. Чат, которого в списке
+    /// уже нет, называется отпечатком — это честнее, чем «неизвестно».
+    fn whose_face(chats: &[ChatSummary], chat: Option<[u8; 16]>) -> String {
+        let Some(chat) = chat else { return "своё".to_owned() };
+        chats
+            .iter()
+            .find(|known| known.chat == chat)
+            .map_or_else(|| short(&chat), |known| format!("«{}»", known.title))
+    }
+
     fn new() -> Console {
         Console { chats: Vec::new(), current: None, page: Vec::new(), oldest: None, newest: None }
     }
@@ -398,7 +528,11 @@ impl Console {
                 }
                 for (n, chat) in self.chats.iter().enumerate() {
                     let mark = if chat.verified { "+" } else { " " };
-                    println!("< {:>2}. {mark} {}: {}", n + 1, chat.title, chat.last_text);
+                    // Лицо консоль не нарисует, но сказать о нём обязана:
+                    // иначе `/avatar` выглядит командой, которая никогда
+                    // не работает.
+                    let face = if chat.avatar_ms == 0 { "" } else { "  (лицо: /avatar)" };
+                    println!("< {:>2}. {mark} {}: {}{face}", n + 1, chat.title, chat.last_text);
                 }
             }
             CompanionEvent::History { chat, page, fresh } => {
@@ -494,6 +628,34 @@ impl Console {
                 ),
                 None => println!("< превью {}: телефону нечего показать", short(&file_id)),
             },
+            CompanionEvent::Revoked => {
+                println!("< сопряжение отозвано с телефона: этот компьютер больше не второй");
+                println!("<   экран. Кэш стёрт — и в памяти, и на диске. Чтобы связать заново,");
+                println!("<   нужен новый QR: /pair на телефоне.");
+            }
+            CompanionEvent::Avatar { chat, bytes, fresh } => {
+                let whose = Self::whose_face(&self.chats, chat);
+                let from_cache = if fresh { "" } else { " (из памяти)" };
+                match bytes {
+                    // Как и с превью: консоль картинку не нарисует,
+                    // и притворяться незачем.
+                    Some(bytes) => println!(
+                        "< лицо {whose}: {}{from_cache} — консоль его не покажет, окно покажет",
+                        bytes_text(bytes.len() as u64)
+                    ),
+                    // Двух причин здесь намеренно не различить: аватарки нет
+                    // и контакт не сверен (§4.2) выглядят одинаково.
+                    None => println!("< лицо {whose}: показывать нечего{from_cache}"),
+                }
+            }
+            CompanionEvent::AvatarChanged { chat, avatar_ms } => {
+                let whose = Self::whose_face(&self.chats, chat);
+                if avatar_ms == 0 {
+                    println!("< лицо {whose} снято");
+                } else {
+                    println!("< лицо {whose} сменилось — /avatar покажет размер нового");
+                }
+            }
             CompanionEvent::FileGone { file_id } => {
                 for message in &mut self.page {
                     message.files.retain(|file| file.file_id != file_id);
@@ -693,6 +855,40 @@ impl Console {
             }
             return Some(CompanionCommand::Preview { file_id: file.file_id });
         }
+        if line.trim() == "/setavatar" {
+            // Без пути — снять. Пустые байты здесь законное значение,
+            // а не пустая команда.
+            println!("< аватарка снимается — сверенные контакты узнают об этом");
+            return Some(CompanionCommand::SetAvatar { bytes: Vec::new() });
+        }
+        if let Some(rest) = line.strip_prefix("/setavatar ") {
+            let path = rest.trim();
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    println!("< {path} не прочитать: {error}");
+                    return None;
+                }
+            };
+            // Предел проверит провод, а формат — телефон, и отказ приедет
+            // словами. Размер печатается здесь, чтобы «не влезло» было видно
+            // до того, как оно не влезет.
+            println!("< отправляю своё лицо: {}", bytes_text(bytes.len() as u64));
+            return Some(CompanionCommand::SetAvatar { bytes });
+        }
+        if line.trim() == "/avatar" {
+            // Без номера — своё: себя в списке чатов нет, и спрашивается
+            // оно без метки для сравнения.
+            return Some(CompanionCommand::Avatar { chat: None });
+        }
+        if let Some(rest) = line.strip_prefix("/avatar ") {
+            let n = rest.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+            let Some(n) = n else {
+                println!("< нужен номер из /chats, от 1 до {}", self.chats.len());
+                return None;
+            };
+            return Some(CompanionCommand::Avatar { chat: Some(self.chats[n - 1].chat) });
+        }
         if let Some(rest) = line.strip_prefix("/decline ") {
             let file_id = self.pick_file(rest)?.file_id;
             println!("< собеседник об отказе не узнает — это решение о своей памяти");
@@ -826,7 +1022,7 @@ impl Console {
             println!("<   /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
             println!("<   /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
             println!("<   /accept <n> [k]   /pause <n> [k]   /decline <n> [k]");
-            println!("<   /preview <n> [k]");
+            println!("<   /preview <n> [k]   /avatar [номер чата]   /setavatar [путь]");
             println!("<   /save <n> [k] <путь>   /stop");
             println!("<   /send <путь…> [-- подпись]   /sendpic <превью> <путь> [подпись]");
             println!("<   /unsend");
@@ -932,6 +1128,57 @@ async fn run_ephemeral(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // секунд. Команда `/onion` при этом работает: она проверяет §4.3,
     // а не сеть.
     run(args, identity, store, onion, None).await
+}
+
+/// Ввозит архив и выходит (§12).
+///
+/// Печатает, **что именно** приехало: сто контактов и ноль сообщений — это
+/// граф, и человек, ждавший переписку, обязан увидеть это сразу, а не через
+/// неделю.
+fn run_import(args: &Args, archive: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = args.data.clone() else {
+        eprintln!("ввозить некуда: укажите --data <файл базы>");
+        return Ok(());
+    };
+    // Что спрашивать, говорит сам архив: экран, требующий фразу от архива,
+    // в котором её нет, — тупик.
+    let peek = ratatosk_store::peek_archive(archive)?;
+    let key = match args.import_key.clone() {
+        Some(text) => Some(
+            ratatosk_crypto::storage_key::key_from_text(&text)
+                .map_err(|_| "ключ не разобрался: перепишите его целиком")?,
+        ),
+        None => None,
+    };
+    let unlock = match (&args.import_phrase, &key) {
+        (Some(phrase), _) => ratatosk_store::ArchiveUnlock::Passphrase(phrase),
+        (None, Some(key)) => ratatosk_store::ArchiveUnlock::Key(key),
+        (None, None) => {
+            if peek.takes_passphrase {
+                eprintln!("этот архив заперт фразой: --phrase <фраза>");
+                eprintln!("(или сырым ключом, если вы его сохранили: --key <строка>)");
+            } else {
+                eprintln!("нужен ключ архива: --key <строка с экрана>");
+            }
+            return Ok(());
+        }
+    };
+
+    // Вложения — туда же, куда их кладёт обычный запуск с `--data`.
+    let mut blobs = FsBlobs::new(path.with_extension("files"));
+    let done = ratatosk_store::import_archive(archive, unlock, &path, &mut blobs)?;
+
+    println!("ввезено: {}", done.scope.title());
+    println!("контактов: {}", done.contacts);
+    println!("сообщений: {}", done.messages);
+    println!("вложений : {} (целиком доехало {})", done.files, done.whole_files);
+    println!("байт     : {}", done.bytes);
+    println!("база     : {}", path.display());
+    println!();
+    println!("Открывать её надо **прежним** PIN: соль уехала вместе с базой.");
+    println!("И прежним устройством пользоваться больше нельзя — личность одна");
+    println!("на двоих не делится (§13.4: для второго экрана есть компаньон).");
+    Ok(())
 }
 
 /// Хранилище на диске: личность и переписка переживают перезапуск.
@@ -1103,7 +1350,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /quit"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1284,6 +1531,84 @@ async fn console(
                                 );
                             }
                         }
+                        None => return,
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/export ") {
+                    // §12: единственный путь переноса истории. Ключ печатается
+                    // **один раз** и больше не показывается — как ссылка
+                    // сопряжения: второй раз этот же архив не спросишь.
+                    // Фраза — после `--`, как подпись у `/send`: в ней бывают
+                    // пробелы, и разбирать её по словам нельзя.
+                    let (rest, phrase) = match rest.split_once(" -- ") {
+                        Some((head, phrase)) => (head, Some(phrase.trim().to_owned())),
+                        None => (rest, None),
+                    };
+                    let rest = rest.trim();
+                    let (scope, path) = match rest.split_once(char::is_whitespace) {
+                        Some(("nofiles", path)) => {
+                            (ratatosk_core::ExportScope::WithoutAttachments, path)
+                        }
+                        Some(("graph", path)) => (ratatosk_core::ExportScope::SocialGraph, path),
+                        _ => (ratatosk_core::ExportScope::Everything, rest),
+                    };
+                    let path = std::path::PathBuf::from(path.trim());
+                    match handle.export_history(path, scope, phrase).await {
+                        Some(Ok(done)) => {
+                            println!(
+                                "< архив: {} — {} ({} вложений, {} байт)",
+                                done.path.display(),
+                                done.scope.title(),
+                                done.files,
+                                done.bytes
+                            );
+                            if done.locked_by_phrase {
+                                println!("< заперт фразой; ключ — запасной вход: {}", done.key_text);
+                            } else {
+                                println!(
+                                    "< ключ (запишите, второй раз не покажу): {}",
+                                    done.key_text
+                                );
+                            }
+                        }
+                        Some(Err(why)) => println!("< не вышло: {why}"),
+                        None => return,
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/merge ") {
+                    // Слияние — **не** ввоз: личность и переписка остаются
+                    // свои, из архива берутся только знакомства. Поэтому
+                    // командой в живом аккаунте, а не отдельным запуском.
+                    let (path, secret) = match rest.trim().split_once(" -- ") {
+                        Some((path, secret)) => (path.trim(), Some(secret.trim())),
+                        None => (rest.trim(), None),
+                    };
+                    let archive = std::path::PathBuf::from(path);
+                    let unlock = match secret {
+                        Some(secret) => ratatosk_core::ArchiveKey::Passphrase(secret.to_owned()),
+                        None => {
+                            println!("< нужна фраза: /merge <архив> -- <фраза>");
+                            continue;
+                        }
+                    };
+                    let scratch = std::env::temp_dir().join("ratatosk-lab-merge");
+                    match handle.merge_contacts(archive, unlock, scratch).await {
+                        Some(Ok(merged)) => {
+                            println!(
+                                "< добавлено {}, уже были {}, отвергнуто {}",
+                                merged.added, merged.known, merged.refused
+                            );
+                            if merged.own_graph {
+                                println!("< это ваш же граф: сверка и локальные имена перенесены");
+                            } else {
+                                println!(
+                                    "< список чужой: никто не сверен (§4.2), имена не перенесены"
+                                );
+                            }
+                        }
+                        Some(Err(why)) => println!("< не вышло: {why}"),
                         None => return,
                     }
                     continue;
@@ -1556,6 +1881,7 @@ async fn console(
                     | Event::ContactChanged { .. }
                     | Event::ContactRemoved { .. }
                     | Event::AvatarChanged { .. }
+                    | Event::OwnAvatarChanged
                     | Event::GroupMembershipChanged { .. }
                     | Event::FileProgress { .. }
                     | Event::FileGone { .. }
@@ -1639,6 +1965,15 @@ async fn show_devices(handle: &DriverHandle, directory: &LanDirectory) {
                 println!("    адреса нет — ответить ему телефон не сможет");
                 println!("    ждём маяка mDNS либо вписываем руками: /devaddr");
             }
+        }
+        // Адрес в справочнике выше — это **локальная сеть**: маяк или
+        // вписанное руками. А это — про другой город: назвал ли десктоп
+        // свой onion в рукопожатии. Две разные достижимости, и путать
+        // их при разборе «не подключается» — терять полдня.
+        if device.reachable_anywhere {
+            println!("    свой onion назвал — дозвонимся и вне общей сети");
+        } else {
+            println!("    onion не назвал — только общая сеть");
         }
         if device.last_seen_ms == 0 {
             println!("    ни разу не подключался");
@@ -2066,6 +2401,11 @@ fn report(event: &Event) {
             // Стенд картинок не рисует — но показать, что кадр дошёл, обязан:
             // иначе «аватарка не появилась» неотличимо от «не отправилась».
             println!("< у {} сменилась аватарка", short(peer_ik));
+        }
+        Event::OwnAvatarChanged => {
+            // Сменить своё лицо может и сопряжённый десктоп: тогда эта
+            // строка — единственный признак, что оно уже другое.
+            println!("< своя аватарка сменилась");
         }
         Event::GroupMembershipChanged { chat } => {
             println!("< состав группы {} изменился", short(chat));

@@ -29,6 +29,7 @@
 #![warn(missing_docs)]
 
 pub mod aead;
+pub mod companion;
 pub mod error;
 pub mod file;
 pub mod handshake;

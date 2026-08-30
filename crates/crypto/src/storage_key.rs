@@ -140,6 +140,50 @@ pub fn open_field(db_key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Result<Zeroiz
     Ok(buffer)
 }
 
+/// Сколько символов в группе показанного ключа.
+const KEY_GROUP_LEN: usize = 4;
+
+/// Показывает ключ базы человеку (§12).
+///
+/// **Ключ придётся переписать руками**, и от этого весь вид: base32 без
+/// похожих знаков (тот же алфавит, что у отпечатка §3 — «0 или O» человек
+/// не должен решать по-разному в разных местах приложения), группами
+/// по четыре. Тридцать два байта дают 52 символа, то есть тринадцать групп.
+///
+/// Длинно, и короче не выйдет: это ключ, а не пароль. Сокращать его —
+/// значит сокращать защиту архива, который уедет на флешке.
+#[must_use]
+pub fn key_text(key: &[u8; 32]) -> String {
+    let text = crate::identity::crockford().encode(key);
+    text.as_bytes()
+        .chunks(KEY_GROUP_LEN)
+        .map(|group| String::from_utf8_lossy(group).into_owned())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Читает ключ, переписанный человеком.
+///
+/// Разделители и регистр не важны: человек перепишет как получится,
+/// и отказывать ему из-за строчной буквы значит отказывать зря.
+///
+/// # Errors
+///
+/// [`CryptoError::BadKeyMaterial`], если строка не разбирается или в ней
+/// не тридцать два байта.
+pub fn key_from_text(text: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let bytes = crate::identity::crockford()
+        .decode(cleaned.as_bytes())
+        .map_err(|_| CryptoError::BadKeyMaterial)?;
+    let key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| CryptoError::BadKeyMaterial)?;
+    Ok(Zeroizing::new(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +278,30 @@ mod tests {
     #[test]
     fn db_keys_are_not_repeated() {
         assert_ne!(*generate_db_key(), *generate_db_key());
+    }
+
+    #[test]
+    fn a_shown_key_reads_back() {
+        let key = [7u8; 32];
+        let text = key_text(&key);
+        assert_eq!(text.len(), 52 + 12, "52 символа и двенадцать дефисов");
+        assert_eq!(*key_from_text(&text).unwrap(), key);
+    }
+
+    #[test]
+    fn a_key_written_down_by_a_human_still_reads() {
+        // Человек перепишет как получится: строчными, с пробелами вместо
+        // дефисов, с лишним пробелом в конце. Отказывать ему из-за этого
+        // значит отказывать зря — а второй попытки у него может не быть.
+        let key = [0xABu8; 32];
+        let text = key_text(&key).to_lowercase().replace('-', " ");
+        assert_eq!(*key_from_text(&format!("  {text} ")).unwrap(), key);
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_key_is_refused() {
+        assert!(key_from_text("").is_err(), "пустая строка — не ключ");
+        assert!(key_from_text("0123").is_err(), "коротко");
+        assert!(key_from_text(&key_text(&[1u8; 32])[..20]).is_err(), "обрезано");
     }
 }

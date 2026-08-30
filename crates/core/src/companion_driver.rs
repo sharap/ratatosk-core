@@ -183,6 +183,34 @@ pub enum CompanionCommand {
         /// Какое вложение.
         file_id: FileId,
     },
+    /// Спросить аватарку — контакта или свою.
+    ///
+    /// **Байты, а не путь**, по той же мере, что и у [`CompanionCommand::Preview`]:
+    /// лицо не больше 32 КиБ, и временный файл ради тридцати килобайт стоил
+    /// бы дороже картинки.
+    ///
+    /// Спрашивать имеет смысл про те чаты, у которых `avatar_ms` в списке
+    /// разошёлся с показанным, — их называет `Cache::stale_avatars`. Своё
+    /// (`chat: None`) спрашивается раз за подключение: метки для сравнения
+    /// у него нет, себя в списке чатов не бывает.
+    Avatar {
+        /// Чей чат, или `None` — своя.
+        chat: Option<[u8; 16]>,
+    },
+    /// Поставить или снять **свою** аватарку (§4.2).
+    ///
+    /// **Байты, а не путь** — то же исключение, что у превью и у чтения
+    /// лица: 32 КиБ, одна копия, и временный файл ради них стоил бы дороже
+    /// картинки.
+    ///
+    /// Пусто — «снять». Разошлёт её сверенным контактам телефон: сессии
+    /// с ними есть только у него (§13.4). Ответ — `Done` молчанием
+    /// и `CompanionEvent::AvatarChanged` следом; негодная картинка вернётся
+    /// `Refused` со словами.
+    SetAvatar {
+        /// Байты картинки; пусто — снять.
+        bytes: Vec<u8>,
+    },
     /// Забрать вложение с телефона в файл по этому пути.
     ///
     /// Байты пишет драйвер: путь, а не поток, — см. заголовок модуля.
@@ -308,6 +336,40 @@ pub enum CompanionEvent {
         file_id: FileId,
         /// Байты, если они есть. Не больше 32 КиБ — проверено проводом.
         bytes: Option<Vec<u8>>,
+    },
+    /// Аватарка — или её отсутствие.
+    ///
+    /// `bytes: None` — показывать нечего, и это ответ, а не отказ: аватарки
+    /// нет либо контакт не сверен (§4.2). Снаружи эти случаи неразличимы
+    /// намеренно, и рисовать в обоих надо одно — заглушку.
+    Avatar {
+        /// Чей чат, или `None` — своя.
+        chat: Option<[u8; 16]>,
+        /// Байты, если они есть. Не больше 32 КиБ — проверено проводом.
+        bytes: Option<Vec<u8>>,
+        /// Подтверждено ли телефоном сейчас; `false` — показанное из кэша.
+        fresh: bool,
+    },
+    /// Сопряжение отозвано — этот компьютер больше не второй экран (§13.4).
+    ///
+    /// К этому моменту кэш пуст и в памяти, и на диске: файл драйвер стёр
+    /// сам. Ждать решения человека тут нечего — решение он уже принял,
+    /// на телефоне.
+    ///
+    /// Показать **обязательно и словами**: до этой новости отзыв выглядел
+    /// тишиной, неотличимой от «телефон не в сети». Дальше терминал
+    /// не подключается и на просьбы отвечает отказом; новый второй экран
+    /// заводится новым QR.
+    Revoked,
+    /// Лицо сменилось — прежнее с экрана убрать, новое спросить.
+    ///
+    /// Байтов не несёт: новость приезжает без спроса, и тридцать два
+    /// килобайта без спроса — трафик, за который окно не просило.
+    AvatarChanged {
+        /// Чей чат, или `None` — своя.
+        chat: Option<[u8; 16]>,
+        /// Новая метка; `0` — показывать нечего, и спрашивать не о чем.
+        avatar_ms: u64,
     },
     /// Вложение забрано и лежит по этому пути.
     FileSaved {
@@ -458,6 +520,22 @@ pub struct CompanionDriver<R: Runner> {
     retry_wait_ms: u64,
     /// Куда класть снимок кэша. `None` — никуда, и это умолчание (§13.4).
     cache_path: Option<PathBuf>,
+    /// Каким транспортом звонить телефону.
+    ///
+    /// **Не лестница §5.4, и это осознанно.** Там три ступени, сроки
+    /// и откаты, потому что там сообщение обязано дойти хоть когда-нибудь.
+    /// Здесь всё иначе: у второго экрана два транспорта, а «не дошло»
+    /// означает «окно не обновилось» — беда, которая чинится следующим
+    /// рукопожатием через секунду.
+    ///
+    /// Правило поэтому в одну строку: **пока телефон видно в общей сети —
+    /// общая сеть**, иначе onion, если адрес известен. Локальная сеть
+    /// быстрее, дешевле и не поднимает Tor ради соседней комнаты.
+    ///
+    /// Начинаем с локальной: маяк §5.1 приходит быстро, а onion до первого
+    /// разочарования означал бы цепочку Tor у людей, сидящих в метре
+    /// друг от друга.
+    via: Transport,
     /// Когда кэш можно писать снова. Ноль — можно сейчас.
     cache_after_ms: u64,
     /// Собранный снимок, который не лёг на диск. Ждёт следующей попытки.
@@ -495,6 +573,7 @@ impl<R: Runner> CompanionDriver<R> {
             retry_at_ms: 0,
             retry_wait_ms: RETRY_MIN_MS,
             cache_path: None,
+            via: Transport::Lan,
             cache_after_ms: 0,
             cache_pending: None,
             saving: None,
@@ -569,14 +648,62 @@ impl<R: Runner> CompanionDriver<R> {
             // Маяк телефона в эфире — повод поздороваться. Повторы
             // безвредны: пока связь жива, терминал их не замечает.
             TransportEvent::SeenOnLan { .. } | TransportEvent::Connected { .. } => {
+                // Телефон в общей сети — возвращаемся к ней. Возврат нужен
+                // не меньше отката: ушедший на onion терминал остался бы
+                // там навсегда, гоняя переписку через три реле в соседнюю
+                // комнату.
+                self.via = Transport::Lan;
                 self.feed(ClientInput::Reach).await;
             }
-            TransportEvent::Disconnected { .. } | TransportEvent::ConnectFailed { .. } => {
-                self.feed(ClientInput::Lost).await;
+            // Разрыв транспорта не называет, и это не пробел: канал
+            // у терминала один, и разорваться мог только он.
+            TransportEvent::Disconnected { .. } => self.on_link_gone(None).await,
+            TransportEvent::ConnectFailed { via, .. } => self.on_link_gone(Some(via)).await,
+            // Свой onion поднялся — телефону будет чем перезвонить.
+            // Уезжает адрес не сейчас, а следующим рукопожатием: живой
+            // связи он не нужен, а нужен он ровно тогда, когда терминал
+            // не в общей сети, — и такой разговор всегда начинается новым
+            // рукопожатием (§13.4).
+            TransportEvent::TorReady { onion } => {
+                self.feed(ClientInput::OnionReady(onion)).await;
             }
             // Остальное компаньона не касается: у него нет ни доставки,
-            // ни почты, ни onion-сервиса.
+            // ни почты.
             _ => {}
+        }
+    }
+
+    /// Канал пропал: связь потеряна, и, может быть, пора сменить транспорт.
+    ///
+    /// `failed` — каким транспортом не дозвонились, если транспорт назван.
+    /// Сверяется он с тем, которым звоним **мы**: отказ чужого транспорта
+    /// о нашем не говорит ничего.
+    async fn on_link_gone(&mut self, failed: Option<Transport>) {
+        // Локальная сеть не отозвалась — пробуем через Tor, если есть куда.
+        // Без адреса переключаться некуда, и остаёмся при своём: «звоню туда,
+        // где никого нет» честнее, чем «звоню в никуда».
+        let ours = match failed {
+            Some(via) => via == self.via,
+            None => true,
+        };
+        let switched = ours && self.via == Transport::Lan && !self.client.phone_onion().is_empty();
+        if switched {
+            self.via = Transport::Onion;
+            tracing::debug!("локальная сеть молчит — пробуем onion");
+        }
+        self.feed(ClientInput::Lost).await;
+
+        // **Сменив транспорт, пробуем сразу, не досиживая до тика.** Пауза
+        // здесь бессмысленна: мы только что решили попробовать другую дорогу,
+        // и ждать секунду, чтобы этой дорогой воспользоваться, — значит
+        // держать окно пустым ровно столько же.
+        //
+        // Кольца из этого не выходит: смена бывает одна (общая сеть → onion),
+        // а обратно возвращает только маяк, который и так здоровается сам.
+        // Отказ **onion** сюда приходит уже при `via == Onion`, ничего
+        // не меняет и нового круга не заводит.
+        if switched {
+            self.feed(ClientInput::Reach).await;
         }
     }
 
@@ -611,6 +738,8 @@ impl<R: Runner> CompanionDriver<R> {
             CompanionCommand::PauseFile { file_id } => Request::PauseFile { file_id },
             CompanionCommand::DeclineFile { file_id } => Request::DeclineFile { file_id },
             CompanionCommand::Preview { file_id } => Request::FilePreview { file_id },
+            CompanionCommand::Avatar { chat } => Request::Avatar { chat },
+            CompanionCommand::SetAvatar { bytes } => Request::SetMyAvatar { bytes },
 
             CompanionCommand::SaveFile { file_id, chunk_total, path } => {
                 self.start_save(file_id, chunk_total, path).await;
@@ -833,12 +962,19 @@ impl<R: Runner> CompanionDriver<R> {
     }
 
     /// Отдаёт кадр в сеть.
+    ///
+    /// Адрес телефона берётся из приглашения — там он и лежит с самого
+    /// сопряжения (`PairingInvite::onion`). До этой поставки сюда уезжал
+    /// `None`, и вне общей сети терминал звонил в никуда, даже имея адрес
+    /// в руках.
     async fn push(&mut self, frame: Vec<u8>) {
+        let onion = self.client.phone_onion();
+        let onion = (!onion.is_empty()).then(|| onion.to_owned());
         let sent = self
             .runner
             .execute(TransportCommand::Send {
-                peer: PeerAddress { ik: self.phone_ik, onion: None, chatmail: None },
-                via: Transport::Lan,
+                peer: PeerAddress { ik: self.phone_ik, onion, chatmail: None },
+                via: self.via,
                 frame,
                 handoff: None,
             })
@@ -977,6 +1113,34 @@ impl<R: Runner> CompanionDriver<R> {
             }
             ClientEvent::FilePreview { file_id, bytes } => {
                 self.tell(CompanionEvent::FilePreview { file_id, bytes }).await;
+                None
+            }
+            ClientEvent::Revoked => {
+                // **Файл стирается здесь, а не оставляется до выключения
+                // кэша человеком.** Терминал уже выбросил всё из памяти;
+                // оставленный файл пережил бы перезапуск и поднялся бы
+                // в окно, которому в этой переписке отказано.
+                //
+                // Путь тоже забывается: писать в него больше нечего,
+                // а `persist_cache` без этого положил бы туда пустой снимок
+                // сразу после стирания.
+                self.cache_pending = None;
+                if let Some(path) = self.cache_path.take() {
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(?error, "снимок кэша отозванного стереть не вышло");
+                        }
+                    }
+                }
+                self.tell(CompanionEvent::Revoked).await;
+                None
+            }
+            ClientEvent::Avatar { chat, bytes, fresh } => {
+                self.tell(CompanionEvent::Avatar { chat, bytes, fresh }).await;
+                None
+            }
+            ClientEvent::AvatarChanged { chat, avatar_ms } => {
+                self.tell(CompanionEvent::AvatarChanged { chat, avatar_ms }).await;
                 None
             }
             ClientEvent::FileGone { file_id } => {

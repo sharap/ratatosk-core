@@ -37,7 +37,12 @@ pub const FINGERPRINT_GROUP_LEN: usize = 4;
 pub const FINGERPRINT_BYTES: usize = 15;
 
 /// Алфавит base32 без похожих знаков (Crockford: без I, L, O, U).
-fn fingerprint_encoding() -> &'static Encoding {
+///
+/// Общий на весь крейт: им же показывается ключ вывезенного архива (§12).
+/// Два разных алфавита для двух строк, которые человек переписывает
+/// с экрана, означали бы, что «0 или O» приходится решать по-разному
+/// в зависимости от того, что переписываешь.
+pub(crate) fn crockford() -> &'static Encoding {
     static ENC: OnceLock<Encoding> = OnceLock::new();
     ENC.get_or_init(|| {
         let mut spec = data_encoding::Specification::new();
@@ -72,7 +77,7 @@ impl PublicIdentity {
         hasher.update(&self.sk);
         let digest = hasher.finalize();
 
-        let text = fingerprint_encoding().encode(&digest.as_bytes()[..FINGERPRINT_BYTES]);
+        let text = crockford().encode(&digest.as_bytes()[..FINGERPRINT_BYTES]);
         text.as_bytes()
             .chunks(FINGERPRINT_GROUP_LEN)
             .take(FINGERPRINT_GROUPS)

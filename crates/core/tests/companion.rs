@@ -192,6 +192,21 @@ fn handshake_frame(step: u64, message: &[u8]) -> Vec<u8> {
     ratatosk_wire::assemble(&header, &sealed).expect("сборка кадра")
 }
 
+/// Кадр рукопожатия с содержимым **как есть**, без набивки.
+///
+/// Нужен ровно для одного: показать телефону то, что набивкой не является.
+/// Так выглядит и мусор соседа по сети, и наш собственный кадр отзыва,
+/// попади он не туда.
+fn handshake_frame_raw(step: u64, sealed: &[u8]) -> Vec<u8> {
+    let header = Header::new(
+        FrameType::Handshake,
+        ratatosk_wire::HANDSHAKE_SESSION_ID,
+        step,
+        [0u8; ratatosk_wire::NONCE_LEN],
+    );
+    ratatosk_wire::assemble(&header, sealed).expect("сборка кадра")
+}
+
 /// Свой временный путь вместо зависимости ради одной функции.
 ///
 /// То же, что в `restart.rs`, и по той же причине: перезапуск проверяется
@@ -333,6 +348,47 @@ fn ask<S: Store>(
     answer.expect("на просьбу обязан прийти ответ")
 }
 
+/// Байты, которые `avatar::check` признаёт картинкой.
+///
+/// Восемь байт сигнатуры PNG и ничего больше: ядро изображение не разбирает
+/// (см. `ratatosk_proto::avatar`), и рисовать настоящий файл ради теста
+/// значило бы проверять чужой кодек вместо своего провода.
+fn png() -> Vec<u8> {
+    vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+}
+
+/// Кладёт контакту лицо прямо в хранилище.
+///
+/// **Мимо провода контактов, и это осознанно.** Настоящая дорога — сессия
+/// с собеседником и `PayloadType::Avatar`; она проверена в `tests/pair.rs`
+/// и здесь проверялась бы второй раз, зато потребовала бы второго телефона
+/// с рукопожатием. Проверяется тут провод **компаньона**, и ему всё равно,
+/// как строка в `avatars` появилась.
+fn put_avatar<S: Store>(phone: &mut Engine<S>, peer_ik: &[u8; 32], at_ms: u64) {
+    phone
+        .store_mut()
+        .put_avatar(peer_ik, &ratatosk_store::StoredAvatar { bytes: png(), updated_ms: at_ms })
+        .expect("аватарка ложится в хранилище");
+}
+
+/// Единственная новость, уехавшая десктопу за этот шаг.
+///
+/// Именно единственная: «пришла нужная» и «пришла только нужная» — разные
+/// утверждения, и второе ловит лишнюю рассылку, которую первое пропустит.
+fn only_notice(desktop: &mut Desktop, effects: Vec<Effect>, now_ms: u64) -> companion::Notice {
+    let (frames, _) = split(effects);
+    let mut notices = Vec::new();
+    for frame in addressed_to(frames, desktop.ik()) {
+        let Some(envelope) = desktop.take(&frame, now_ms) else { continue };
+        if envelope.payload_type != PayloadType::CompanionNotice {
+            continue;
+        }
+        notices.push(companion::notice_from_payload(&envelope.payload).expect("разбор новости"));
+    }
+    assert_eq!(notices.len(), 1, "ожидалась ровно одна новость, приехало: {notices:?}");
+    notices.remove(0)
+}
+
 /// Заводит телефону собеседника, чтобы десктопу было что показывать.
 fn with_contact<S: Store>(phone: &mut Engine<S>, now_ms: u64) -> [u8; 32] {
     let other = Identity::from_seed([9u8; 32]);
@@ -402,6 +458,151 @@ fn the_desktop_sees_the_chat_list_the_phone_would_show() {
     );
     assert_eq!(chats[0].title, "сосед", "заголовок считает телефон (§13.3)");
     assert!(chats[0].verified, "контакт добавлен из QR — сверен (§4.2)");
+}
+
+#[test]
+fn the_desktop_gets_a_face_only_for_a_verified_contact() {
+    // §4.2 симметричен, и провод компаньона обязан его держать так же,
+    // как провод контактов: несверенному лицо не показывается. Если бы
+    // правило жило только в UI телефона, второй экран открывал бы обход
+    // в одну строку — а §13.3 ровно это и запрещает.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    // Лицо приехало от контакта, но сверку с него сняли.
+    phone
+        .step(1_150, Input::Command(Command::RevokeVerification { peer_ik }))
+        .expect("отзыв сверки");
+    put_avatar(&mut phone, &peer_ik, 1_160);
+
+    let Response::Chats(chats) = ask(&mut phone, &mut desktop, 1_200, &Request::Chats) else {
+        panic!("список чатов");
+    };
+    assert_eq!(chats[0].avatar_ms, 0, "несверенному метка не едет — иначе десктоп бы спрашивал");
+
+    let answer = ask(&mut phone, &mut desktop, 1_250, &Request::Avatar { chat: Some(chat) });
+    assert_eq!(
+        answer,
+        Response::Avatar { bytes: None, avatar_ms: 0 },
+        "и байты тоже: правило одно на оба экрана"
+    );
+
+    // Сверили — и лицо появилось, без нового рукопожатия.
+    phone.step(1_300, Input::Command(Command::MarkVerified { peer_ik })).expect("сверка");
+    let Response::Chats(chats) = ask(&mut phone, &mut desktop, 1_350, &Request::Chats) else {
+        panic!("список чатов");
+    };
+    assert_eq!(chats[0].avatar_ms, 1_160, "метка — та же, что у строки в хранилище");
+
+    let answer = ask(&mut phone, &mut desktop, 1_400, &Request::Avatar { chat: Some(chat) });
+    let Response::Avatar { bytes, avatar_ms } = answer else {
+        panic!("на просьбу об аватарке обязан прийти ответ об аватарке");
+    };
+    assert!(bytes.is_some(), "сверенному лицо показывается");
+    assert_eq!(avatar_ms, chats[0].avatar_ms, "метка в ответе и в списке — одна и та же строка");
+}
+
+#[test]
+fn ones_own_face_is_asked_for_without_a_chat() {
+    // Себя в списке чатов нет, и метки для сравнения у своего лица нет тоже:
+    // `None` здесь значит «про себя», а не «поля нет».
+    let (mut phone, mut desktop, _) = paired(1_000);
+    phone
+        .step(1_100, Input::Command(Command::SetAvatar(png())))
+        .expect("своя аватарка принимается");
+
+    let answer = ask(&mut phone, &mut desktop, 1_200, &Request::Avatar { chat: None });
+    let Response::Avatar { bytes, avatar_ms } = answer else {
+        panic!("ответ об аватарке");
+    };
+    assert_eq!(bytes, Some(png()), "своё лицо десктопу отдаётся целиком");
+    assert_eq!(avatar_ms, 1_100, "метка — часы того шага, на котором её поставили");
+}
+
+#[test]
+fn changing_ones_own_face_reaches_the_desktop_without_being_asked() {
+    // Иначе второй экран показывал бы прежнее лицо до перезапуска: свою
+    // аватарку меняют на телефоне, а десктоп об этом узнать неоткуда —
+    // в списке чатов себя нет.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let effects =
+        phone.step(1_100, Input::Command(Command::SetAvatar(png()))).expect("своя аватарка");
+
+    let notice = only_notice(&mut desktop, effects, 1_100);
+    assert_eq!(
+        notice,
+        companion::Notice::AvatarChanged { chat: None, avatar_ms: 1_100 },
+        "новость о своём лице обязана приехать без спроса"
+    );
+
+    // Снятие — такая же новость с нулевой меткой: иначе лицо осталось бы
+    // на втором экране навсегда.
+    let effects =
+        phone.step(1_200, Input::Command(Command::SetAvatar(Vec::new()))).expect("снятие");
+    let notice = only_notice(&mut desktop, effects, 1_200);
+    assert_eq!(notice, companion::Notice::AvatarChanged { chat: None, avatar_ms: 0 });
+}
+
+#[test]
+fn a_face_set_from_the_desktop_lands_on_the_phone_and_goes_to_contacts() {
+    // Ради этого вторая половина и существует: человек кладёт картинку
+    // на десктопе, а рассылает её телефон — своим ключом, по своим сессиям.
+    // Десктоп в рассылке не участвует и не может: сессий с контактами
+    // у него нет (§13.4).
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+
+    let answer = ask(&mut phone, &mut desktop, 1_200, &Request::SetMyAvatar { bytes: png() });
+    assert_eq!(answer, Response::Done, "картинка законная — телефон обязан её принять");
+    assert_eq!(phone.own_avatar().unwrap(), Some(png()), "и положить у себя");
+
+    // И отдать её обратно тому же десктопу — с меткой того шага, на котором
+    // она легла.
+    let answer = ask(&mut phone, &mut desktop, 1_300, &Request::Avatar { chat: None });
+    assert_eq!(answer, Response::Avatar { bytes: Some(png()), avatar_ms: 1_200 });
+
+    // Снятие — та же просьба с пустыми байтами.
+    let answer = ask(&mut phone, &mut desktop, 1_400, &Request::SetMyAvatar { bytes: Vec::new() });
+    assert_eq!(answer, Response::Done);
+    assert_eq!(phone.own_avatar().unwrap(), None, "пусто — это «снять», а не «не трогать»");
+
+    // Контакт при этом остался сверенным и никуда не делся: рассылка —
+    // дело телефона, и она не роняет ничего, даже когда сессии нет.
+    assert!(phone.contacts()[&peer_ik].verified);
+}
+
+#[test]
+fn a_bad_face_from_the_desktop_comes_back_in_words() {
+    // Просьба с другого устройства не вправе ронять шаг ядра, а человек
+    // за ноутбуком обязан узнать, **почему** не вышло: «не картинка»
+    // и «телефон сломался» чинятся по-разному (§14).
+    let (mut phone, mut desktop, _) = paired(1_000);
+
+    let answer =
+        ask(&mut phone, &mut desktop, 1_200, &Request::SetMyAvatar { bytes: b"<svg/>".to_vec() });
+    let Response::Refused(why) = answer else {
+        panic!("негодная картинка обязана вернуться отказом, а не `Done`");
+    };
+    assert!(!why.trim().is_empty(), "отказ без слов человеку показать нечего");
+    assert_eq!(phone.own_avatar().unwrap(), None, "негодное не должно было лечь в хранилище");
+}
+
+#[test]
+fn the_phones_own_screen_learns_about_a_face_the_desktop_set() {
+    // Без этого события телефон показывал бы прежнюю картинку до
+    // перезапуска — то самое «экран врёт», ради которого §14 и написан.
+    // Пока смена шла только с телефона, экран знал о ней от себя же;
+    // теперь он вправе узнать последним.
+    let (mut phone, mut desktop, _) = paired(1_000);
+
+    let (_, frame) = desktop.ask(&Request::SetMyAvatar { bytes: png() });
+    let effects = phone.step(1_200, Input::Received { via: Transport::Lan, frame }).expect("шаг");
+    let (_, events) = split(effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::OwnAvatarChanged)),
+        "экран телефона обязан узнать о смене своего лица: {events:?}"
+    );
 }
 
 #[test]
@@ -1081,6 +1282,45 @@ fn a_revoked_desktop_is_not_recognised_any_more() {
 
     let page = phone.store().messages(&chat, 10, None).expect("история");
     assert!(page.is_empty(), "отозванный десктоп не отправляет от имени пользователя");
+}
+
+#[test]
+fn a_handshake_frame_of_noise_does_not_fell_the_core() {
+    // Разбор дефекта, который старше режима компаньона. Кадр класса S с типом
+    // «рукопожатие» и случайным содержимым проходил `unpad(view.sealed)?`
+    // и ронял **весь шаг ядра** — своего рукопожатия для этого не требовалось,
+    // хватало любого соседа по локальной сети. §7.3 про такие кадры говорит
+    // прямо: они отбрасываются.
+    let mut phone = phone(1, "телефон");
+    let noise: Vec<u8> = (0..SizeClass::S.sealed_len()).map(|n| (n % 251) as u8 + 1).collect();
+    let frame = handshake_frame_raw(0, &noise);
+
+    let effects = phone
+        .step(1_000, Input::Received { via: Transport::Lan, frame })
+        .expect("мусорный кадр рукопожатия роняться не должен");
+    assert!(effects.is_empty(), "и отвечать на него нечем: {effects:?}");
+}
+
+#[test]
+fn a_stranger_whose_handshake_does_not_parse_gets_silence() {
+    // Отозванному телефон отвечает надгробием (5вл) — но **только ему**.
+    // Отвечать всем, чьё рукопожатие не разобралось, значило бы сообщать
+    // любому, кто постучится, что мы здесь и что-то про него знаем.
+    //
+    // И заодно: такое рукопожатие не роняет шаг ядра и не заводит ни
+    // контакта, ни сессии. До разбора 5вл роняло — `ContactCard::decode`
+    // спотыкался о пустые байты.
+    let mut phone = phone(1, "телефон");
+    let phone_ik = phone.own_card().ik;
+
+    let mut stranger = Desktop::with_identity(Identity::from_seed([42u8; 32]));
+    let hello = stranger.hello(&phone_ik, &[]);
+
+    let effects = phone
+        .step(1_000, Input::Received { via: Transport::Lan, frame: hello })
+        .expect("рукопожатие без карточки роняться не должно");
+    assert!(effects.is_empty(), "незнакомцу не отвечают ничем: {effects:?}");
+    assert!(phone.contacts().is_empty(), "и контактом он не становится");
 }
 
 #[test]

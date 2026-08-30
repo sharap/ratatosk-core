@@ -754,6 +754,110 @@ fn a_message_sent_with_nowhere_to_go_is_still_kept() {
 }
 
 #[test]
+fn a_message_in_flight_when_the_process_died_still_gets_sent() {
+    // Самая старая дыра в доставке, и закрывается она здесь.
+    //
+    // Очередь ожидающих на диск ложилась давно: «отправим, когда появится» —
+    // обещание, и без записи оно жило бы до конца процесса. А доставка
+    // **в полёте** — та, для которой транспорт нашёлся и кадр ушёл, — жила
+    // только в памяти. Убей процесс между «кадр отдан транспорту»
+    // и подтверждением, и сообщение оставалось в `Pending` навсегда:
+    // в очереди его нет, срок сработать неоткуда, вернуться некому.
+    // На Android процесс убивают постоянно.
+    //
+    // Проверяется на **настоящей базе**: у `MemoryStore` нет ни файла,
+    // ни перезапуска, и эту дыру он не показал бы никогда.
+    let db = TempDb::new("in-flight");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+    let chat = Engine::<SqliteStore>::chat_id_for(&peer_ik);
+
+    let msg_id = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .unwrap();
+
+        // Сессия заводится напрямую: проверяется переживание перезапуска,
+        // а не §8.2. Порядок важен — `restore` перечитывает контакты с диска
+        // и сбросил бы отметку «виден в эфире», поставь мы её раньше.
+        let session = Session::derive(Role::Initiator, peer_ik, b"transcript", b"noise", 1_000);
+        engine
+            .store_mut()
+            .put_session(&StoredSession {
+                session_id: session.session_id,
+                peer_ik,
+                lan: true,
+                snapshot: session.export().to_vec(),
+                established_ms: 1_000,
+            })
+            .unwrap();
+        engine.restore().unwrap();
+
+        engine
+            .step(
+                1_100,
+                Input::Command(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Lan,
+                    enabled: true,
+                }),
+            )
+            .unwrap();
+        engine
+            .step(1_100, Input::TransportReady { transport: ratatosk_proto::Transport::Lan })
+            .unwrap();
+        engine.step(1_100, Input::SeenOnLan { peer_ik }).unwrap();
+
+        let effects = engine
+            .step(2_000, Input::Command(Command::SendText { chat, text: "улетело".to_owned() }))
+            .unwrap();
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                ratatosk_core::Effect::Send { via, .. }
+                    if *via == ratatosk_proto::Transport::Lan
+            )),
+            "кадр обязан уйти — иначе это не полёт, а ожидание, и тест проверял бы не то"
+        );
+        assert_eq!(engine.queued(), 1, "доставка в полёте");
+        assert_eq!(
+            engine.store().outbox().unwrap().len(),
+            1,
+            "и лежит на диске: процесс могут убить прямо сейчас"
+        );
+
+        engine.store().messages(&chat, 10, None).unwrap()[0].msg_id
+    };
+
+    // Процесс убили между «кадр отдан транспорту» и подтверждением.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).unwrap();
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().unwrap();
+
+    assert_eq!(engine.queued(), 0, "в полёте после старта никого — и не должно быть");
+    assert_eq!(
+        engine.store().outbox().unwrap().len(),
+        1,
+        "а на диске доставка на месте и ждёт своего часа"
+    );
+
+    // И ядро возвращается к ней **само**, первым же действием запуска —
+    // не дожидаясь, пока собеседник объявится в эфире.
+    //
+    // Проверяется именно `startup_effects`, а не `TransportReady`: у локальной
+    // сети готовность выставлена с рождения (`IMMEDIATE_TRANSPORTS`), и такого
+    // события для неё после старта не приходит вовсе. Полагаться на него
+    // значило бы полагаться на то, чего нет.
+    let startup = engine.startup_effects();
+    assert!(!startup.is_empty());
+    assert_eq!(engine.queued(), 1, "запуск сам взял недоделанную доставку в работу");
+    assert!(engine.store().message(&msg_id).unwrap().is_some(), "сообщение никуда не делось");
+}
+
+#[test]
 fn a_waiting_message_still_waits_after_a_restart() {
     // Статус «отправим, когда появится» — обещание, и оно чего-то стоит только
     // если переживает перезапуск. В памяти оно не переживало бы убитый процесс,

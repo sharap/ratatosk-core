@@ -481,6 +481,40 @@ pub fn check_name(name: &str) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Запас под одно предложение файла помимо превью.
+///
+/// `file_id` (16), ключ файла (32), размер, ключи CBOR — и имя длиной
+/// до [`MAX_FILE_NAME_CHARS`], которое в UTF-8 занимает до четырёх байт
+/// на символ. Число с запасом, и достаточность запаса проверяется тестом
+/// `a_message_with_ten_previewed_files_fits_one_frame` на настоящем
+/// конверте, а не на оценке.
+pub const OFFER_RESERVE_BYTES: usize = 256 + MAX_FILE_NAME_CHARS * 4;
+
+/// Наибольшая длина текста сообщения в **байтах** (не символах).
+///
+/// **Выводится, а не назначается.** Текст едет в одном кадре с предложениями
+/// файлов (`offer_payload`), и худший случай — десять вложений, у каждого
+/// превью в 32 КиБ и имя в 255 символов. Всё это обязано поместиться в кадр
+/// класса L вместе с текстом; значит текст — это то, что от кадра остаётся.
+///
+/// Одно число на все случаи, а не два: «столько, если без файлов, и столько,
+/// если с ними» — правило, которое клиент однажды применит не то. Ценой
+/// становится то, что у сообщения без вложений остаётся неиспользованный
+/// запас, — и это дешевле ошибки.
+///
+/// **Байты, а не символы**, и клиент обязан считать так же: кириллица
+/// в UTF-8 идёт по два байта, эмодзи по четыре, и счётчик символов
+/// в поле ввода обманул бы человека ровно вдвое.
+pub const MAX_TEXT_BYTES: usize = SizeClass::L.max_payload()
+    - ENVELOPE_RESERVE_BYTES
+    - MAX_FILES_PER_MESSAGE * (PREVIEW_LIMIT_BYTES + OFFER_RESERVE_BYTES);
+
+/// Помещается ли текст сообщения в предел.
+#[must_use]
+pub const fn text_fits(bytes: usize) -> bool {
+    bytes <= MAX_TEXT_BYTES
+}
+
 /// Проверяет одно предложение файла — до отправки и на приёме.
 ///
 /// # Errors
@@ -753,6 +787,76 @@ mod tests {
             encoded.len(),
             SizeClass::L.max_payload()
         );
+    }
+
+    #[test]
+    fn a_message_with_ten_previewed_files_fits_one_frame() {
+        // **Замер худшего случая целиком**, а не по частям. Порознь проверено
+        // всё: кусок влезает, превью влезает, предложение с превью влезает.
+        // А вот десять предложений с превью **плюс** текст предельной длины
+        // в одном кадре не мерил никто — и именно этот случай стал достижим,
+        // когда десктоп научился отправлять несколько файлов разом.
+        //
+        // Из этого же замера выведен `MAX_TEXT_BYTES`: провал здесь означает,
+        // что запас в `OFFER_RESERVE_BYTES` мал, а не что предел текста велик.
+        use ratatosk_codec::{Envelope, Fragment, PayloadType};
+        use ratatosk_crdt::Hlc;
+
+        let offers: Vec<FileOffer> = (0..MAX_FILES_PER_MESSAGE)
+            .map(|n| FileOffer {
+                file_id: [u8::try_from(n).unwrap_or(0); 16],
+                // Имя предельной длины и **худшими** символами: `check_name`
+                // считает символы, а в кадр едут байты, и эмодзи — четыре
+                // байта на символ. Кириллица дала бы вдвое более лёгкий
+                // случай, то есть измерила бы не тот край.
+                name: "😀".repeat(MAX_FILE_NAME_CHARS),
+                // Наибольший **законный** размер, а не `u64::MAX`. Здесь
+                // стояло `u64::MAX` — и `check_offers` отвергал такое
+                // предложение раньше всякого замера: файл больше
+                // `MAX_FILE_BYTES` не поедет вовсе, а значит и мерить его
+                // незачем. Заодно это и есть худший случай кодировки:
+                // два гигабайта CBOR пишет пятью байтами.
+                size_bytes: MAX_FILE_BYTES,
+                key: [0xAB; 32],
+                preview: Some(vec![0xCD; PREVIEW_LIMIT_BYTES]),
+            })
+            .collect();
+        check_offers(&offers).expect("десять предложений законны");
+
+        // Текст предельной длины — и тоже в байтах, а не символах.
+        let text = "т".repeat(MAX_TEXT_BYTES / 2);
+        assert!(text_fits(text.len()), "текст обязан помещаться в собственный предел");
+
+        let mut envelope = Envelope::new(
+            [0xAB; 16],
+            Hlc::new(u64::MAX, u32::MAX),
+            PayloadType::FileOffer,
+            offer_payload(&text, &offers),
+        );
+        envelope.group_id = Some(vec![0xCD; 16]);
+        envelope.fragment = Some(Fragment { uid: [0xEF; 16], index: 4095, total: 4096 });
+
+        let encoded = envelope.encode().expect("конверт должен собираться");
+        assert!(
+            encoded.len() <= SizeClass::L.max_payload(),
+            "сообщение с десятью превью и предельным текстом заняло {} байт при пределе {}; \
+             мал запас в OFFER_RESERVE_BYTES",
+            encoded.len(),
+            SizeClass::L.max_payload()
+        );
+    }
+
+    #[test]
+    fn the_text_limit_leaves_room_for_a_real_message() {
+        // Предел выведен из худшего случая, и стоит убедиться, что человеку
+        // от него осталось не «двести байт»: правило, которое запрещает
+        // обычное сообщение, — не предел, а поломка.
+        assert!(
+            MAX_TEXT_BYTES > 64 * 1024,
+            "на текст осталось {MAX_TEXT_BYTES} байт — это уже мешает человеку"
+        );
+        assert!(text_fits(MAX_TEXT_BYTES), "ровно предел законен");
+        assert!(!text_fits(MAX_TEXT_BYTES + 1), "на байт больше — уже нет");
     }
 
     #[test]

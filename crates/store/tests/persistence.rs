@@ -392,6 +392,50 @@ fn a_late_copy_does_not_resurrect_a_deleted_message() {
 }
 
 #[test]
+fn a_tombstone_satisfies_the_foreign_key_and_that_is_the_trap() {
+    // Тест написан после того, как автор ошибся ровно здесь, — и этим же
+    // тестом был пойман. Неверное рассуждение сохранено, чтобы не вернулось:
+    //
+    //     «`put_message` на надгробии молча ничего не пишет; значит вложение,
+    //      приложенное следом, упрётся во внешний ключ, и ядро остановится».
+    //
+    // Неверно во второй половине. Надгробие — это `UPDATE`, а не `DELETE`:
+    // строка сообщения **остаётся**, у неё лишь проставлен `tombstone_ms`.
+    // Внешний ключ она удовлетворяет полностью.
+    //
+    // Отсюда настоящее правило, и оно неприятнее выдуманного: **база
+    // в этом месте не защищает ничего**, а `store.message()` при этом
+    // возвращает `None`, потому что надгробия он отсеивает. Вызывающий,
+    // понадеявшийся на отказ базы, тихо приложит вложения к удалённому
+    // сообщению — в чате их не видно, а чанки качаются.
+    let db = TempDb::new("orphan-child");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_message(&message(1, 100)).unwrap();
+    store.tombstone_message(&[1u8; 16], 1_000).unwrap();
+
+    // Копия пришла вторым транспортом (§9.2) — и не легла.
+    store.put_message(&message(1, 100)).unwrap();
+    assert!(store.message(&[1u8; 16]).unwrap().is_none(), "читателю сообщения нет");
+
+    let share = |n: u8| ratatosk_store::StoredContactShare {
+        msg_id: [n; 16],
+        ik: [7u8; 32],
+        card_bytes: vec![1, 2, 3],
+    };
+
+    assert!(
+        store.put_contact_share(&share(1)).is_ok(),
+        "к надгробию содержимое прикладывается беспрепятственно: строка на месте"
+    );
+    assert!(
+        store.put_contact_share(&share(2)).is_err(),
+        "а вот к идентификатору, которого не было вовсе, — нет: вот где ключ и работает"
+    );
+}
+
+#[test]
 fn tombstones_expire_after_ninety_days_and_take_the_row() {
     let db = TempDb::new("tombstone-ttl");
     let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
@@ -676,11 +720,55 @@ fn file(n: u8, msg: u8, incoming: bool) -> ratatosk_store::StoredFile {
         chunk_total: 3,
         key: [n.wrapping_add(1); 32],
         preview: None,
+        ordinal: 0,
         incoming,
         source_path: (!incoming).then(|| "/tmp/ishodnyj".to_owned()),
         accepted: !incoming,
         complete: false,
     }
+}
+
+#[test]
+fn attachments_come_back_in_the_order_they_were_put_in() {
+    // **Проверяется запросом, а не памятью.** Здесь стояло `ORDER BY file_id`,
+    // то есть по случайным шестнадцати байтам: три фотографии, выбранные
+    // подряд, приходили в произвольном порядке. Заметить это на одном
+    // вложении нельзя, и потому оно прожило до первого сообщения с тремя.
+    //
+    // Идентификаторы нарочно **против** порядка: если сортировка вернётся
+    // к `file_id`, тест увидит это сразу.
+    let db = TempDb::new("file-order");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+
+    for (ordinal, id) in [30u8, 20, 10].into_iter().enumerate() {
+        let mut record = file(id, 1, true);
+        record.ordinal = u32::try_from(ordinal).unwrap();
+        record.name = format!("файл {ordinal}");
+        store.put_file(&record).unwrap();
+    }
+
+    let names: Vec<String> =
+        store.files_of(&[1u8; 16]).unwrap().into_iter().map(|f| f.name).collect();
+    assert_eq!(names, ["файл 0", "файл 1", "файл 2"], "порядок обещан `Store::files_of`");
+}
+
+#[test]
+fn attachments_from_before_the_order_existed_keep_their_old_one() {
+    // У строк, заведённых до столбца, `ordinal` равен нулю — у всех. Значит
+    // порядок между ними решает `file_id`, то есть остаётся ровно тем, в каком
+    // они показывались раньше. Прошлое не переписывается.
+    let db = TempDb::new("file-order-old");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    for id in [30u8, 10, 20] {
+        store.put_file(&file(id, 1, true)).unwrap();
+    }
+    let ids: Vec<u8> =
+        store.files_of(&[1u8; 16]).unwrap().into_iter().map(|f| f.file_id[0]).collect();
+    assert_eq!(ids, [10, 20, 30], "при равном порядке — по идентификатору, как было");
 }
 
 #[test]
@@ -745,6 +833,39 @@ fn chunks_are_counted_and_the_first_gap_is_the_resume_point() {
 }
 
 #[test]
+fn taking_the_consent_back_keeps_what_already_arrived() {
+    // **На настоящей базе**, потому что проверяется SQL, которого компилятор
+    // не читает: `UPDATE files SET accepted = ?2`. Память бы это пропустила —
+    // там поле просто присваивается.
+    //
+    // Суть в том, что снятие согласия не трогает приехавшее. Иначе «передумал
+    // на середине гигабайта» означало бы «начать заново», а на мобильном
+    // канале это не пауза, а потеря.
+    let db = TempDb::new("file-pause");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_file(&file(2, 1, true)).unwrap();
+
+    assert!(store.set_accepted(&[2u8; 16], true).unwrap());
+    store.note_chunk(&[2u8; 16], 0).unwrap();
+
+    assert!(store.set_accepted(&[2u8; 16], false).unwrap(), "согласие снимается тем же путём");
+    let paused = store.file(&[2u8; 16]).unwrap().expect("запись остаётся");
+    assert!(!paused.accepted, "согласия больше нет");
+    assert_eq!(store.received_chunks(&[2u8; 16]).unwrap(), 1, "а приехавшее — на месте");
+    assert_eq!(
+        store.next_missing_chunk(&[2u8; 16], 3).unwrap(),
+        Some(1),
+        "и продолжать надо с той же дырки, а не с нуля"
+    );
+
+    // Файла нет — и это не отказ базы, а `false`: решать про то, чего нет,
+    // вызывающий волен, и падать тут не на чем.
+    assert!(!store.set_accepted(&[9u8; 16], false).unwrap());
+}
+
+#[test]
 fn an_unfinished_file_survives_a_restart() {
     // Ради этого учёт и лежит в базе: после перезапуска передача обязана
     // продолжиться с того же места, а не начаться заново.
@@ -755,7 +876,7 @@ fn an_unfinished_file_survives_a_restart() {
         store.migrate().unwrap();
         store.put_message(&message(1, 100)).unwrap();
         store.put_file(&file(2, 1, true)).unwrap();
-        store.accept_file(&[2u8; 16]).unwrap();
+        store.set_accepted(&[2u8; 16], true).unwrap();
         store.note_chunk(&[2u8; 16], 0).unwrap();
     }
 
@@ -787,6 +908,110 @@ fn deleting_a_message_takes_its_files_and_their_chunk_tally() {
     store.put_file(&file(3, 1, true)).unwrap();
     store.delete_chat(&[9u8; 16]).unwrap();
     assert!(store.file(&[3u8; 16]).unwrap().is_none());
+}
+
+/// Выгрузка с десктопа — то, чего ещё нет ни в сообщении, ни в чате.
+fn staged(n: u8, started_ms: u64) -> ratatosk_store::StagedUpload {
+    ratatosk_store::StagedUpload {
+        file_id: [n; 16],
+        chat_id: [9u8; 16],
+        name: format!("выгрузка {n}.pdf"),
+        size_bytes: 5_000,
+        chunk_total: 3,
+        key: [n.wrapping_add(1); 32],
+        preview: None,
+        started_ms,
+    }
+}
+
+#[test]
+fn a_staged_upload_round_trips_and_is_sealed() {
+    // Выгрузка живёт **до** сообщения: сообщения, к которому её приложить,
+    // ещё нет, и чата в базе может не быть тоже. Значит внешним ключом её
+    // не привязать ни к чему — и это нарочно, а не забывчивость.
+    let db = TempDb::new("staged");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        let mut with_preview = staged(2, 1_000);
+        with_preview.preview = Some(vec![0x89, b'P', b'N', b'G']);
+        // Ни `put_message`, ни `put_contact` перед этим — и это должно пройти.
+        store.put_staged(&with_preview).unwrap();
+        store.put_staged(&staged(3, 2_000)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.staged_uploads().unwrap();
+    assert_eq!(found.len(), 2, "обе выгрузки пережили перезапуск");
+    assert_eq!(found[0].file_id, [2u8; 16], "порядок — по времени начала");
+    assert_eq!(found[0].name, "выгрузка 2.pdf");
+    assert_eq!(found[0].key, [3u8; 32], "без ключа куски не собрать");
+    assert_eq!(found[0].preview.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
+    assert_eq!(found[0].chat_id, [9u8; 16], "куда уедет, когда соберётся");
+    assert_eq!(found[1].preview, None);
+
+    // Имя выгрузки говорит о переписке ровно то же, что имя вложения (§12).
+    let wrong = SqliteStore::open(&db.0, key(2)).unwrap();
+    assert!(wrong.staged_uploads().is_err(), "чужой ключ не должен открывать имя и ключ файла");
+}
+
+#[test]
+fn the_holes_in_a_staged_upload_are_named_and_not_counted() {
+    // То же правило, что у приёма (§10.2), и по той же причине: куски вправе
+    // приехать не по порядку, и «сколько принято» не отвечает на вопрос
+    // «каких нет». Отсюда набор, а не счётчик.
+    let db = TempDb::new("staged-chunks");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_staged(&staged(2, 1_000)).unwrap();
+
+    assert!(store.staged_chunks(&[2u8; 16]).unwrap().is_empty());
+
+    store.note_staged_chunk(&[2u8; 16], 2).unwrap();
+    store.note_staged_chunk(&[2u8; 16], 0).unwrap();
+    // Повтор — не ошибка: десктоп вправе прислать кусок ещё раз.
+    store.note_staged_chunk(&[2u8; 16], 0).unwrap();
+    assert_eq!(
+        store.staged_chunks(&[2u8; 16]).unwrap(),
+        vec![0, 2],
+        "по возрастанию и без повторов"
+    );
+
+    store.note_staged_chunk(&[2u8; 16], 1).unwrap();
+    assert_eq!(store.staged_chunks(&[2u8; 16]).unwrap(), vec![0, 1, 2]);
+}
+
+#[test]
+fn deleting_a_staged_upload_takes_its_chunk_marks() {
+    // Иначе отметки пережили бы саму выгрузку, и следующий файл с тем же
+    // идентификатором (а он назначается заново) считался бы уже принятым.
+    let db = TempDb::new("staged-del");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_staged(&staged(2, 1_000)).unwrap();
+    store.note_staged_chunk(&[2u8; 16], 0).unwrap();
+
+    store.delete_staged(&[2u8; 16]).unwrap();
+    assert!(store.staged_uploads().unwrap().is_empty());
+    assert!(store.staged_chunks(&[2u8; 16]).unwrap().is_empty(), "отметки ушли каскадом");
+}
+
+#[test]
+fn an_old_staged_upload_is_found_by_the_time_it_was_started() {
+    // Брошенную выгрузку никто не закрывает: у десктопа сдох процесс, и ни
+    // отправки, ни отказа не придёт. Место в хранилище байтов вернёт только
+    // срок — а срок считается от начала, потому что кусков может не быть
+    // вовсе.
+    let db = TempDb::new("staged-old");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_staged(&staged(2, 1_000)).unwrap();
+    store.put_staged(&staged(3, 5_000)).unwrap();
+
+    assert!(store.staged_older_than(1_000).unwrap().is_empty(), "ровно срок — ещё живая");
+    assert_eq!(store.staged_older_than(1_001).unwrap(), vec![[2u8; 16]]);
+    assert_eq!(store.staged_older_than(9_000).unwrap().len(), 2);
 }
 
 /// Сообщение с заданным текстом — для тестов поиска.

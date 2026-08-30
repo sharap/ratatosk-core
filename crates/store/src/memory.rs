@@ -15,8 +15,9 @@ use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
 use crate::{
-    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredContactShare, StoredFile,
-    StoredMessage, StoredOutbox, StoredReaction, StoredSession,
+    FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
+    StoredContactShare, StoredFile, StoredMessage, StoredOutbox, StoredPairedDevice,
+    StoredReaction, StoredSession,
 };
 
 /// Хранилище в оперативной памяти.
@@ -36,6 +37,7 @@ pub struct MemoryStore {
     contacts: BTreeMap<[u8; 32], StoredContact>,
     sessions: BTreeMap<u64, StoredSession>,
     avatars: BTreeMap<[u8; 32], StoredAvatar>,
+    devices: BTreeMap<[u8; 16], StoredPairedDevice>,
     /// Ключ — пара «сообщение, автор»: реакция от человека одна, новая
     /// заменяет прежнюю.
     reactions: BTreeMap<(MsgId, [u8; 32]), StoredReaction>,
@@ -46,6 +48,11 @@ pub struct MemoryStore {
     /// Какие чанки приняты. `BTreeSet` по паре, чтобы «первый недостающий»
     /// считался обходом по порядку, как и в файловой базе.
     chunks: std::collections::BTreeSet<(FileId, u64)>,
+    /// Незаконченные выгрузки с десктопа (§13.4) и их куски — тем же
+    /// разделением, что у файлов: сведения отдельно, отметки о кусках
+    /// отдельно.
+    staged: BTreeMap<FileId, StagedUpload>,
+    staged_chunks: std::collections::BTreeSet<(FileId, u64)>,
     meta: BTreeMap<String, Vec<u8>>,
 }
 
@@ -314,6 +321,34 @@ impl Store for MemoryStore {
             .collect())
     }
 
+    fn put_paired_device(&mut self, device: &StoredPairedDevice) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.devices.insert(device.device_id, device.clone());
+        Ok(())
+    }
+
+    fn paired_devices(&self) -> Result<Vec<StoredPairedDevice>> {
+        // По времени сопряжения, как и в SQLite: порядок списка на экране
+        // не должен зависеть от того, какое хранилище под ним.
+        let mut found: Vec<StoredPairedDevice> = self.devices.values().cloned().collect();
+        found.sort_by_key(|d| d.paired_ms);
+        Ok(found)
+    }
+
+    fn delete_paired_device(&mut self, device_id: &[u8; 16]) -> Result<()> {
+        self.devices.remove(device_id);
+        Ok(())
+    }
+
+    fn touch_paired_device(&mut self, device_id: &[u8; 16], now_ms: u64) -> Result<()> {
+        if let Some(device) = self.devices.get_mut(device_id) {
+            device.last_seen_ms = now_ms;
+        }
+        Ok(())
+    }
+
     fn put_avatar(&mut self, owner_ik: &[u8; 32], avatar: &StoredAvatar) -> Result<()> {
         if !self.migrated {
             return Err(StoreError::Backend("хранилище не проинициализировано".into()));
@@ -367,7 +402,14 @@ impl Store for MemoryStore {
     }
 
     fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
-        Ok(self.files.values().filter(|f| f.msg_id == *msg_id).cloned().collect())
+        let mut found: Vec<StoredFile> =
+            self.files.values().filter(|f| f.msg_id == *msg_id).cloned().collect();
+        // Тот же порядок, что обещает `Store::files_of` и выдаёт SQLite:
+        // сперва по месту в сообщении, а при равенстве — по идентификатору.
+        // Расхождение двух хранилищ здесь было бы худшим сортом ошибки:
+        // тесты на памяти зелёные, на устройстве вложения переставлены.
+        found.sort_by_key(|file| (file.ordinal, file.file_id));
+        Ok(found)
     }
 
     fn put_contact_share(&mut self, share: &StoredContactShare) -> Result<()> {
@@ -382,9 +424,9 @@ impl Store for MemoryStore {
         Ok(self.contact_shares.get(msg_id).cloned())
     }
 
-    fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
+    fn set_accepted(&mut self, file_id: &FileId, accepted: bool) -> Result<bool> {
         let Some(file) = self.files.get_mut(file_id) else { return Ok(false) };
-        file.accepted = true;
+        file.accepted = accepted;
         Ok(true)
     }
 
@@ -405,6 +447,50 @@ impl Store for MemoryStore {
 
     fn received_chunks(&self, file_id: &FileId) -> Result<u64> {
         Ok(self.chunks.range((*file_id, 0)..=(*file_id, u64::MAX)).count() as u64)
+    }
+
+    fn put_staged(&mut self, staged: &StagedUpload) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.staged.insert(staged.file_id, staged.clone());
+        Ok(())
+    }
+
+    fn staged_uploads(&self) -> Result<Vec<StagedUpload>> {
+        let mut found: Vec<StagedUpload> = self.staged.values().cloned().collect();
+        // Тот же порядок, что обещан трейтом и что даёт SQLite: ключ карты —
+        // `file_id`, и без этой строки две реализации разошлись бы молча.
+        found.sort_by_key(|staged| (staged.started_ms, staged.file_id));
+        Ok(found)
+    }
+
+    fn note_staged_chunk(&mut self, file_id: &FileId, index: u64) -> Result<()> {
+        self.staged_chunks.insert((*file_id, index));
+        Ok(())
+    }
+
+    fn staged_chunks(&self, file_id: &FileId) -> Result<Vec<u64>> {
+        Ok(self
+            .staged_chunks
+            .range((*file_id, 0)..=(*file_id, u64::MAX))
+            .map(|(_, index)| *index)
+            .collect())
+    }
+
+    fn delete_staged(&mut self, file_id: &FileId) -> Result<()> {
+        self.staged.remove(file_id);
+        self.staged_chunks.retain(|(id, _)| id != file_id);
+        Ok(())
+    }
+
+    fn staged_older_than(&self, cutoff_ms: u64) -> Result<Vec<FileId>> {
+        Ok(self
+            .staged
+            .values()
+            .filter(|staged| staged.started_ms < cutoff_ms)
+            .map(|staged| staged.file_id)
+            .collect())
     }
 
     fn next_missing_chunk(&self, file_id: &FileId, chunk_total: u64) -> Result<Option<u64>> {
@@ -695,6 +781,36 @@ mod tests {
     }
 
     #[test]
+    fn attachments_come_back_in_the_same_order_as_from_sqlite() {
+        // **Два хранилища обязаны отвечать одинаково.** Расхождение здесь —
+        // худший сорт ошибки: тесты на памяти зелёные, а на устройстве
+        // вложения переставлены. Правило одно: сперва `ordinal`, при равенстве
+        // — `file_id`; тот же порядок закреплён в `tests/persistence.rs`.
+        let mut s = store();
+        s.put_message(&message(1, 100)).unwrap();
+        for (ordinal, id) in [30u8, 20, 10].into_iter().enumerate() {
+            s.put_file(&StoredFile {
+                file_id: [id; 16],
+                msg_id: [1u8; 16],
+                name: format!("файл {ordinal}"),
+                size_bytes: 10,
+                chunk_total: 1,
+                key: [0u8; 32],
+                preview: None,
+                ordinal: u32::try_from(ordinal).unwrap(),
+                incoming: true,
+                source_path: None,
+                accepted: true,
+                complete: true,
+            })
+            .unwrap();
+        }
+        let names: Vec<String> =
+            s.files_of(&[1u8; 16]).unwrap().into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["файл 0", "файл 1", "файл 2"]);
+    }
+
+    #[test]
     fn the_resume_point_is_the_first_gap() {
         // То же правило, что в файловой базе: продолжать надо с дырки,
         // а не с числа принятых. Разойдясь здесь, симуляция (§16) перестала бы
@@ -709,6 +825,7 @@ mod tests {
             chunk_total: 3,
             key: [0u8; 32],
             preview: None,
+            ordinal: 0,
             incoming: true,
             source_path: None,
             accepted: false,

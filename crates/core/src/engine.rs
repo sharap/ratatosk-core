@@ -23,6 +23,7 @@ use ratatosk_crypto::handshake::{
     Accepted, HandshakeOutcome, Initiator, PendingHandshake, Responder,
 };
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
+use ratatosk_proto::companion;
 use ratatosk_proto::fragment::Reassembler;
 use ratatosk_proto::mail::{AccountUrl, MailAccount, Secret};
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
@@ -31,9 +32,10 @@ use ratatosk_proto::transport_policy::{
 };
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{
-    Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredMessage, Task,
+    Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredMessage,
+    StoredPairedDevice, Task,
 };
-use ratatosk_wire::{pad_to, unpad, FrameType, Header, SizeClass};
+use ratatosk_wire::unpad;
 
 use crate::entropy::Entropy;
 use crate::io::{ChatId, Command, Effect, Event, Input, OutgoingFile, Swept};
@@ -78,12 +80,6 @@ const DEFAULT_TRANSPORTS: TransportSet =
 /// Наружу это выглядело как «отправлено» у сообщения, которого никто
 /// не отправлял, — то самое, что §14 запрещает прямо.
 const IMMEDIATE_TRANSPORTS: TransportSet = TransportSet::none().with(Transport::Lan);
-
-/// Класс кадра для рукопожатия (§5.5).
-///
-/// Первое сообщение — это `e` (32) + зашифрованный `s` (48) + карточка
-/// (около 200 байт, §4.1) + тег. Всё укладывается в 4 КиБ с запасом.
-const HANDSHAKE_CLASS: SizeClass = SizeClass::S;
 
 /// Страховочный таймаут попытки, если транспорт своего не задаёт.
 ///
@@ -167,6 +163,13 @@ pub enum EngineError {
     /// Локальное имя длиннее [`MAX_LOCAL_NAME_CHARS`].
     #[error("локальное имя длиннее {MAX_LOCAL_NAME_CHARS} символов")]
     LocalNameTooLong,
+    /// Текст сообщения длиннее [`ratatosk_proto::files::MAX_TEXT_BYTES`].
+    ///
+    /// **В байтах, а не в символах**, и разница здесь не педантизм:
+    /// кириллица в UTF-8 идёт по два байта, эмодзи по четыре, и счётчик
+    /// символов в поле ввода обманул бы человека вдвое или вчетверо.
+    #[error("текст длиннее {} байт", ratatosk_proto::files::MAX_TEXT_BYTES)]
+    TextTooLong,
     /// Правка не принята: пустая, поздняя или не своя.
     #[error("правка: {0}")]
     Edit(#[from] ratatosk_proto::edit::EditError),
@@ -196,6 +199,17 @@ pub enum EngineError {
     /// ссылка, и человек чинит разные поля.
     #[error("ссылка на регистрацию: {0}")]
     MailUrl(#[from] ratatosk_proto::mail::AccountUrlError),
+    /// Сопряжение с десктопом не заведено (§13.4).
+    #[error("сопряжение: {0}")]
+    Pairing(#[from] ratatosk_proto::companion::PairingError),
+    /// Обращение к неизвестному сопряжённому устройству (§13.4).
+    ///
+    /// Отдельно от [`EngineError::UnknownPeer`], и не ради стройности:
+    /// отзыв сопряжения — команда, которую UI даёт по списку устройств,
+    /// и «такого устройства нет» человек обязан отличать от «такого
+    /// контакта нет». Списки разные, и чинятся эти два случая по-разному.
+    #[error("устройство неизвестно")]
+    UnknownDevice,
 }
 
 // Варианта «нет доступного транспорта» здесь нет сознательно. Раньше он был,
@@ -640,6 +654,101 @@ pub struct Engine<S: Store> {
     /// Обнуляется при смене карточки: прежние отправки к новой версии
     /// отношения не имеют.
     card_pushed: BTreeSet<[u8; 32]>,
+    /// Сопряжённые устройства-компаньоны по публичной половине их ключа
+    /// сопряжения (§13.4).
+    ///
+    /// Ключ карты — то же, что `peer_ik` в сессии: для Noise десктоп
+    /// и есть сторона с этим статическим ключом. Отсюда и способ узнать
+    /// его в рукопожатии — заглянуть сюда прежде, чем заводить контакт.
+    devices: BTreeMap<[u8; 32], StoredPairedDevice>,
+    /// У каких устройств сейчас есть канал и какой.
+    ///
+    /// Транспорт запоминается, потому что спросить его потом неоткуда:
+    /// §5.4 выбирает ступень по [`PeerAvailability`] контакта, а устройство
+    /// контактом не является и адресов в карточке не имеет. Канал у него
+    /// ровно один — тот, по которому пришло рукопожатие.
+    device_links: BTreeMap<[u8; 32], Transport>,
+    /// Устройства, про которые доказано, что обратный путь работает.
+    ///
+    /// **Отдельно от `device_links`, и это исправление собственной грубости.**
+    /// Сперва одно поле отвечало на оба вопроса сразу — «куда слать» и «что
+    /// показать человеку», — и правка, потребовавшая честности во втором,
+    /// молча испортила первый: новости переставали уходить в окно между
+    /// рукопожатием и первой просьбой.
+    ///
+    /// Вопросы разные. **Куда слать** известно сразу, как установлена
+    /// сессия: попытка стоит одного кадра и ничем не грозит, если он
+    /// не уедет. **Что показать** — только после первой просьбы от
+    /// устройства: она единственная доказывает, что наш ответ дошёл
+    /// и обратный путь есть (§14, `ARCHITECTURE.md` 5бз). Один флаг на два
+    /// вопроса однажды разошёлся бы — и уже разошёлся.
+    device_seen: BTreeSet<[u8; 32]>,
+    /// Файлы, которые десктоп выгружает сюда и ещё не досказал (§13.4).
+    ///
+    /// **В памяти, а не в базе, и это осознанный предел.** Строка в `files`
+    /// требует сообщения (внешний ключ), а сообщения ещё нет и не должно
+    /// быть: недоехавший файл не имеет права появиться в переписке даже
+    /// заготовкой. Заводить ради этого таблицу — значит хранить то, что
+    /// живёт минуты и не переживает ни одного осмысленного отказа.
+    ///
+    /// Цена названа честно: телефон перезапустился посреди выгрузки —
+    /// её нет, и десктоп начнёт заново. Куски, успевшие лечь в хранилище
+    /// байтов, останутся сиротами и уйдут с ближайшей сверкой
+    /// ([`Engine::sweep_orphan_files`]) — она для того и написана.
+    uploads: Vec<Upload>,
+    /// Новости десктопу, накопленные за шаг.
+    ///
+    /// Копятся, а не отправляются на месте, и это не оптимизация. Новость
+    /// рождается в `remember` и `note_status` — единственных дверях
+    /// в историю и в статусы, — а они возвращают `Result<()>`, не эффекты.
+    /// Раздав им возврат эффектов, пришлось бы переписать три десятка мест
+    /// ради того, что честнее собрать в одном.
+    companion_notices: Vec<PendingNotice>,
+}
+
+/// Файл, который десктоп выгружает на телефон и ещё не досказал.
+struct Upload {
+    file_id: FileId,
+    /// Кому это уедет, когда всё соберётся.
+    chat: ChatId,
+    name: String,
+    size_bytes: u64,
+    chunk_total: u64,
+    /// Ключ файла (§10.1). Придумывает **телефон**: границу устройства
+    /// ключевой материал не пересекает (§13.4), и десктоп его не видит.
+    key: [u8; 32],
+    /// Превью (§10.3), собранное клиентом десктопа. Ждёт здесь третьего
+    /// шага вместе с кусками: запись файла заводится только в `FileSend`.
+    ///
+    /// Подписи рядом нет: она принадлежит **сообщению**, а сообщение
+    /// собирается из нескольких таких выгрузок и рождается на третьем шаге.
+    preview: Option<Vec<u8>>,
+    /// Какие куски уже легли. Набор, а не счётчик: куски вправе приехать
+    /// не по порядку, и «сколько» не отвечает на вопрос «все ли».
+    have: BTreeSet<u64>,
+}
+
+/// Новость десктопу до того, как её собрали.
+///
+/// **Появилась из-за настоящей потери, а не из аккуратности.** Новость
+/// о сообщении рождается в [`Engine::remember`] — то есть в тот момент, когда
+/// в базе есть строка сообщения и **ещё нет** строк его вложений: внешний
+/// ключ `files.msg_id → messages.msg_id` требует именно такого порядка,
+/// и обе двери (`on_send_files`, `on_file_offer`) кладут файлы после текста.
+/// Собранная на месте, новость уезжала бы к десктопу без вложений — и человек
+/// видел бы «вот отчёт» без отчёта до тех пор, пока не перечитает историю.
+///
+/// Поэтому сообщение откладывается **идентификатором**, а собирается при
+/// отправке, когда шаг ядра уже дописал всё, что дописывал.
+///
+/// Остальные новости готовы сразу и лежат готовыми: правка, статус, исчезновение
+/// и реакция ничего после себя не дописывают. Заворачивать и их значило бы
+/// заводить чтение из базы там, где ответ уже в руках.
+enum PendingNotice {
+    /// Собрана и готова к отправке.
+    Ready(companion::Notice),
+    /// Сообщение, которое надо собрать, когда шаг закончил писать.
+    Message(MsgId),
 }
 
 impl<S: Store> Engine<S> {
@@ -685,6 +794,11 @@ impl<S: Store> Engine<S> {
             schedule: Schedule::default(),
             announced: None,
             card_pushed: BTreeSet::new(),
+            devices: BTreeMap::new(),
+            device_links: BTreeMap::new(),
+            device_seen: BTreeSet::new(),
+            uploads: Vec::new(),
+            companion_notices: Vec::new(),
         }
     }
 
@@ -783,7 +897,169 @@ impl<S: Store> Engine<S> {
     /// Единственный метод, меняющий состояние. Одна и та же последовательность
     /// входов при одном и том же начальном состоянии даёт одну и ту же
     /// последовательность эффектов — на этом держится §16.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища, разбора или криптослоя — см. [`EngineError`].
     pub fn step(&mut self, now_ms: u64, input: Input) -> Result<Vec<Effect>, EngineError> {
+        // Новости компаньону (§13.4) собираются по ходу шага, а отдаются
+        // здесь, одним местом. Иначе каждая функция, кладущая сообщение
+        // в историю или двигающая статус, обязана была бы помнить про
+        // десктоп — и первая же забывшая тихо перестала бы его обновлять.
+        let mut effects = match self.dispatch(now_ms, input) {
+            Ok(effects) => effects,
+            Err(error) => {
+                // Шаг не сложился — накопленное до отказа выбрасывается,
+                // не отправляясь. Очередь новостей не журнал: пережив
+                // отказавшие шаги, она однажды вывалилась бы на десктоп
+                // лавиной сведений о давно прошедшем. А запечатывать кадры
+                // здесь и вовсе нельзя: вызывающий получит `Err` и эффекты
+                // не увидит, а позиции в цепочке ретчета уже сожжены.
+                self.companion_notices.clear();
+                return Err(error);
+            }
+        };
+        self.note_for_companion(&effects);
+        effects.extend(self.flush_companion_notices(now_ms));
+        Ok(effects)
+    }
+
+    /// Превращает события шага в новости для десктопа (§13.4).
+    ///
+    /// Место выбрано именно такое — **по эффектам шага**, а не в функциях,
+    /// которые эти события порождают. Функций полдюжины на каждый вид:
+    /// список чатов меняют добавление руками, добавление из рукопожатия
+    /// (§8.2), обновление карточки (§4.3), подпись именем (§4.1), сверка
+    /// и её отзыв (§4.2), удаление; исчезновение сообщений — удаление у себя,
+    /// отзыв собеседником и очистка чата. Разложив рассылку по ним, мы завели
+    /// бы дюжину мест, где про десктоп надо помнить, и первое же забытое
+    /// молча оставило бы у него на экране то, чего на телефоне уже нет.
+    /// Через `step` же проходят **все** эффекты, и один разбор здесь заменяет
+    /// дюжину аккуратно расставленных вызовов.
+    ///
+    /// Отказ хранилища здесь ничего не останавливает: новость десктопу —
+    /// не то, ради чего стоит ронять шаг телефона.
+    fn note_for_companion(&mut self, effects: &[Effect]) {
+        let mut chats_changed = false;
+        let mut gone: Vec<(ChatId, Vec<MsgId>)> = Vec::new();
+        let mut edited: Vec<MsgId> = Vec::new();
+        let mut reacted: Vec<(ChatId, MsgId)> = Vec::new();
+        let mut progress: Vec<([u8; 16], u64, u64)> = Vec::new();
+        let mut gone_files: Vec<[u8; 16]> = Vec::new();
+
+        for effect in effects {
+            let Effect::Notify(event) = effect else { continue };
+            match event {
+                Event::ContactAdded { .. }
+                | Event::ContactChanged { .. }
+                | Event::ContactRemoved { .. } => chats_changed = true,
+                Event::MessagesDeleted { chat, msg_ids } => gone.push((*chat, msg_ids.clone())),
+                Event::MessageEdited { msg_id, .. } => edited.push(*msg_id),
+                // Последняя за шаг побеждает: приход чанка и сборка файла
+                // приезжают двумя событиями подряд, и рассказывать десктопу
+                // «восемь из девяти», а следом «девять из девяти» незачем —
+                // он всё равно нарисует второе.
+                Event::FileProgress { file_id, received, total } => {
+                    progress.retain(|known| known.0 != *file_id);
+                    progress.push((*file_id, *received, *total));
+                }
+                Event::FileGone { file_id } => {
+                    // И движение того же вложения за этот шаг отменяется:
+                    // рассказывать про полоску того, чего больше нет, —
+                    // ровно тот призрак, ради которого событие и заведено.
+                    progress.retain(|known| known.0 != *file_id);
+                    gone_files.push(*file_id);
+                }
+                Event::ReactionChanged { chat, msg_id, .. } => {
+                    // Автор не запоминается: новость везёт **набор целиком**,
+                    // и два события об одном сообщении за один шаг дали бы две
+                    // одинаковые новости. Своё и чужое различит `mine`.
+                    if !reacted.contains(&(*chat, *msg_id)) {
+                        reacted.push((*chat, *msg_id));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if chats_changed {
+            self.companion_notices.push(PendingNotice::Ready(companion::Notice::ChatsChanged));
+        }
+        for (chat, msg_ids) in gone {
+            // Режется здесь, а не у получателя: «очистить чат» уносит всю
+            // переписку разом, и список идентификаторов в один кадр (§5.5)
+            // может не влезть. Не влезший он не уехал бы вовсе — то есть
+            // десктоп продолжал бы показывать стёртое.
+            for part in msg_ids.chunks(companion::MAX_GONE_IDS) {
+                self.companion_notices.push(PendingNotice::Ready(companion::Notice::Gone {
+                    chat,
+                    msg_ids: part.to_vec(),
+                }));
+            }
+        }
+        for msg_id in edited {
+            // Текст читается здесь и едет целиком. Отдав десктопу голый
+            // идентификатор, мы заставили бы его сходить за текстом отдельной
+            // просьбой — заплатить кругом по сети за то, что у нас в руках.
+            let found = self.store.message(&msg_id).map_err(EngineError::from).and_then(|found| {
+                found.map(|message| self.companion_message(&message)).transpose()
+            });
+            match found {
+                Ok(Some(message)) => {
+                    self.companion_notices
+                        .push(PendingNotice::Ready(companion::Notice::Edited(message)));
+                }
+                // Правку успели стереть — рассказывать нечего: об удалении
+                // десктоп узнает своей новостью.
+                Ok(None) => {}
+                Err(error) => tracing::warn!(?error, "правку десктопу не рассказать"),
+            }
+        }
+        for file_id in gone_files {
+            self.companion_notices
+                .push(PendingNotice::Ready(companion::Notice::FileGone { file_id }));
+        }
+        for (file_id, have_chunks, chunk_total) in progress {
+            // Полоска обязана двигаться на глазах: без этой новости «идёт
+            // приём» и «зависло» на втором экране выглядят одинаково (§14),
+            // а узнать разницу можно было бы только перечитыванием истории —
+            // то есть опросом вместо новости.
+            //
+            // Согласие едет вместе с числами, а не отдельной новостью: движение
+            // и решение — про одно и то же вложение, и раздельно они однажды
+            // разъехались бы. Отсутствие записи читается как «согласия нет»:
+            // так выглядит отказ, который её уносит, — и «файла больше нет»
+            // честнее показать как «не принято, ноль из нуля», чем промолчать.
+            let accepted = match self.store.file(&file_id) {
+                Ok(found) => found.is_some_and(|file| file.accepted),
+                Err(error) => {
+                    tracing::warn!(?error, "решение по вложению десктопу не рассказать");
+                    false
+                }
+            };
+            self.companion_notices.push(PendingNotice::Ready(companion::Notice::FileProgress {
+                file_id,
+                have_chunks,
+                chunk_total,
+                accepted,
+            }));
+        }
+        for (chat, msg_id) in reacted {
+            // Набор читается заново, а не собирается из события: событие
+            // говорит «у этого сообщения что-то изменилось», и восстанавливать
+            // по нему состояние значило бы вести на телефоне вторую копию
+            // таблицы реакций.
+            match self.companion_reactions(&msg_id) {
+                Ok(reactions) => {
+                    let notice = companion::Notice::Reacted { chat, msg_id, reactions };
+                    self.companion_notices.push(PendingNotice::Ready(notice));
+                }
+                Err(error) => tracing::warn!(?error, "реакцию десктопу не рассказать"),
+            }
+        }
+    }
+
+    fn dispatch(&mut self, now_ms: u64, input: Input) -> Result<Vec<Effect>, EngineError> {
         match input {
             Input::Command(command) => self.on_command(now_ms, command),
             Input::Received { via, frame } => self.on_frame(now_ms, via, &frame),
@@ -867,6 +1143,16 @@ impl<S: Store> Engine<S> {
             // Сессия переживает разрыв TCP. Закрывает её теперь только
             // молчание в ответ на отправленный кадр — см. [`Failure`].
             Input::ConnectionLost { peer_ik, via } => {
+                // У десктопа (§13.4) разрыв значит ровно то, что сказано,
+                // и ничего больше: очереди доставки у него нет, ступеней
+                // §5.4 для него нет — есть один прямой канал, и он либо
+                // есть, либо нет. Пустить это в `on_delivery_failed` нельзя
+                // не только поэтому: та функция спрашивает доступность
+                // **контакта**, а устройство контактом не является, и весь
+                // шаг ядра упал бы на `UnknownPeer`.
+                if self.devices.contains_key(&peer_ik) {
+                    return self.drop_device_link(peer_ik);
+                }
                 self.on_delivery_failed(peer_ik, via, Failure::Reported)
             }
             Input::Handed { peer_ik, via, handoff } => self.on_handed(peer_ik, via, handoff),
@@ -966,6 +1252,7 @@ impl<S: Store> Engine<S> {
                 self.on_send_files(now_ms, chat, &files, &text)
             }
             Command::AcceptFile { file_id } => self.on_accept_file(now_ms, file_id),
+            Command::PauseFile { file_id } => self.on_pause_file(file_id),
             Command::DeclineFile { file_id } => self.on_decline_file(file_id),
             Command::AnnounceAddresses { onion, chatmail } => {
                 self.on_announce_addresses(now_ms, onion, chatmail)
@@ -980,6 +1267,8 @@ impl<S: Store> Engine<S> {
                 self.store.put_meta(ratatosk_store::META_AUTO_ACCEPT, &value)?;
                 Ok(Vec::new())
             }
+            Command::PairDevice { label } => self.on_pair_device(now_ms, &label),
+            Command::RevokePairing { device_id } => self.on_revoke_pairing(&device_id),
             Command::CreateGroup { .. }
             | Command::InviteToGroup { .. }
             | Command::EvictFromGroup { .. } => todo!("этап 5: группы (§11)"),
@@ -1039,6 +1328,31 @@ impl<S: Store> Engine<S> {
             }
         }
 
+        // Сопряжённые устройства (§13.4) — до контактов: рукопожатие
+        // от десктопа может прийти в тот же миг, что и первое от контакта,
+        // и узнать своё устройство ядро обязано с первой попытки.
+        for device in self.store.paired_devices()? {
+            self.devices.insert(device.pairing_public, device);
+        }
+
+        // Незаконченные выгрузки с десктопа — тем же приёмом, что доставки:
+        // они лежат на диске, и запуск берёт их в работу сам. Иначе
+        // перезапуск телефона посреди выгрузки означал бы, что десктопу
+        // придётся начинать с первого файла (5вб).
+        for staged in self.store.staged_uploads()? {
+            let have = self.store.staged_chunks(&staged.file_id)?.into_iter().collect();
+            self.uploads.push(Upload {
+                file_id: staged.file_id,
+                chat: staged.chat_id,
+                name: staged.name,
+                size_bytes: staged.size_bytes,
+                chunk_total: staged.chunk_total,
+                key: staged.key,
+                preview: staged.preview,
+                have,
+            });
+        }
+
         let stored = self.store.contacts()?;
         let restored = stored.len();
         for contact in stored {
@@ -1077,13 +1391,17 @@ impl<S: Store> Engine<S> {
             }
         }
 
-        // Очередь ожидающих — то, ради чего статус «отправим, когда появится»
+        // Очередь доставок — то, ради чего статус «отправим, когда появится»
         // вообще имеет право существовать. Без неё обещание жило бы только
         // до конца процесса, а на Android процесс убивают постоянно: человек
         // видел бы «ждём» у сообщения, к которому никто уже не вернётся.
         //
-        // К отправке это состояние не приводит: ядро тронет очередь, когда
-        // клиент включит LAN, сменится сеть или объявится собеседник.
+        // Здесь поднимается **и то, что было в полёте**: для ядра после
+        // старта разницы нет — сессии той уже нет, транспорт выбирается
+        // заново, и правильное состояние у обоих одно.
+        //
+        // К отправке это состояние само не приводит; за неё берётся
+        // `startup_effects` — первым же действием запуска.
         for waiting in self.store.outbox()? {
             // Контакт мог быть удалён между запусками — тогда ехать некому.
             if !self.contacts.contains_key(&waiting.recipient_ik) {
@@ -1188,6 +1506,32 @@ impl<S: Store> Engine<S> {
         let Some(bound) = self.sessions.get(session_id) else {
             return Ok(());
         };
+
+        // **Сессия с сопряжённым устройством (§13.4) на диск не ложится.**
+        //
+        // Начиналось это как отказ базы, а не как решение. Столбец
+        // `sessions.peer_ik` объявлен `REFERENCES contacts(ik)`, устройство
+        // контактом не является нарочно — и первая же сессия с десктопом
+        // упиралась во внешний ключ. Наружу это выглядело как остановка
+        // ядра: `step` возвращал отказ хранилища, драйвер печатал
+        // «ядро остановилось», телефон переставал отвечать вообще.
+        //
+        // Не всплыло в тестах потому, что и они, и стенд без `--data` живут
+        // на `MemoryStore`, у которого внешних ключей нет. Урок тот же,
+        // что с миграцией (`ARCHITECTURE.md`, 5бв): всё, что компилятор
+        // видит как строку, обязано быть закрыто тестом **на настоящем
+        // хранилище**.
+        //
+        // Но решение здесь не «снять ключ», а «не писать», и вот почему.
+        // Сессия терминала одноразовая по построению (5бг): он выбрасывает
+        // её вместе с каналом и здоровается заново, потому что круг
+        // по локальной сети стоит миллисекунды. Значит на диске она
+        // не нужна никому: пережив перезапуск телефона, она бы только
+        // разошлась с той, которой у десктопа уже нет.
+        if self.devices.contains_key(&bound.session.peer_ik) {
+            return Ok(());
+        }
+
         let stored = ratatosk_store::StoredSession {
             session_id,
             peer_ik: bound.session.peer_ik,
@@ -1642,16 +1986,31 @@ impl<S: Store> Engine<S> {
 
     /// Что надо сделать один раз при запуске, до первой команды клиента.
     ///
-    /// Сейчас это ровно одно: сказать транспортам, кого из них человек
-    /// оставил включённым в прошлый раз, и выдать список маяков, если
-    /// включена локальная сеть.
+    /// Две вещи: сказать транспортам, кого из них человек оставил включённым
+    /// в прошлый раз (вместе со списком маяков и ящиком), и **вернуться
+    /// к недоделанным доставкам**.
     ///
     /// Отдельно от [`Engine::restore`] потому, что `restore` эффектов
     /// не возвращает по устройству: он зовётся до того, как появился
     /// драйвер, и вернуть их было бы некуда. Здесь же они нужны — и зовёт
     /// это драйвер, когда уже готов их исполнить.
-    #[must_use]
-    pub fn startup_effects(&self) -> Vec<Effect> {
+    ///
+    /// **Почему возврат к доставкам стоит здесь, а не ждёт события.**
+    /// `restore` кладёт поднятое с диска в очередь ожидающих, а трогает её
+    /// событие: включили транспорт, сменилась сеть, собеседник объявился.
+    /// События эти приходят — но не всегда и не сразу, а у локальной сети
+    /// готовность и вовсе выставлена с рождения (`IMMEDIATE_TRANSPORTS`),
+    /// так что `TransportReady` для неё после старта не приходит вообще.
+    /// Получалось, что переживший перезапуск исход зависел от того, объявится
+    /// ли собеседник в эфире. Обещание, которое сбывается «обычно», —
+    /// не обещание (§14).
+    ///
+    /// Отказ хранилища здесь не останавливает запуск: до первой команды
+    /// человека ещё далеко, а открыть приложение важнее, чем дослать одно
+    /// сообщение. В журнал он уходит.
+    #[must_use = "не исполнив их, транспорты останутся выключенными, \
+                  а недоделанные доставки — недоделанными"]
+    pub fn startup_effects(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         for transport in [Transport::Lan, Transport::Onion, Transport::Mail] {
             effects.push(Effect::SetTransportEnabled {
@@ -1664,6 +2023,11 @@ impl<S: Store> Engine<S> {
         effects.push(Effect::SetMailAccount(self.mail.clone()));
         if self.enabled.contains(Transport::Lan) {
             effects.push(self.watch_lan_peers());
+        }
+
+        match self.retry_deferred(None) {
+            Ok(resumed) => effects.extend(resumed),
+            Err(error) => tracing::warn!(?error, "к недоделанным доставкам вернуться не вышло"),
         }
         effects
     }
@@ -2014,6 +2378,12 @@ impl<S: Store> Engine<S> {
         if files.is_empty() || files.len() > files::MAX_FILES_PER_MESSAGE {
             return Err(files::FileError::TooMany.into());
         }
+        // Подпись считается тем же пределом, что и текст без вложений:
+        // предел один на оба случая, и выведен он как раз из худшего —
+        // десять вложений с превью плюс текст в одном кадре.
+        if !files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
 
         let msg_id = self.entropy.msg_id();
         let hlc = self.clock.now(now_ms)?;
@@ -2058,6 +2428,9 @@ impl<S: Store> Engine<S> {
                 msg_id,
                 name,
                 size_bytes,
+                // Порядок, в каком человек выбрал файлы: он приехал списком
+                // и другого источника у него нет.
+                ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
                 chunk_total: files::chunk_count(size_bytes),
                 key,
                 preview: file.preview.clone(),
@@ -2485,10 +2858,403 @@ impl<S: Store> Engine<S> {
         if !file.incoming || file.complete {
             return Ok(Vec::new());
         }
-        self.store.accept_file(&file_id)?;
+        self.store.set_accepted(&file_id, true)?;
         // Первая просьба про файл — «начните сначала», то есть тот же случай,
         // что и возобновление: у отправителя об этой передаче ещё ничего нет.
         self.ask_for_file(now_ms, &file, true)
+    }
+
+    /// Десктоп просит место под выгрузку файла (§13.4).
+    ///
+    /// **Здесь и только здесь проверяется правило §13.4 про 20 МБ**, и оно
+    /// не про предел, а про то, чей трафик. Файл больше двадцати мегабайт
+    /// разрешён «только когда оба устройства в одной сети» — иначе выгрузка
+    /// идёт через мобильный канал телефона, и платит за неё человек
+    /// с телефоном, а решает — человек с ноутбука.
+    ///
+    /// Спрашивается это **до** передачи, а не после: сказать «слишком
+    /// большой» после гигабайта по проводу — издевательство.
+    ///
+    /// # Errors
+    ///
+    /// Имя не годится, файл больше [`files::MAX_FILE_BYTES`], правило §13.4
+    /// не пускает, или мест под выгрузки больше нет.
+    fn on_upload_offer(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        chat: ChatId,
+        name: &str,
+        size_bytes: u64,
+        preview: Option<Vec<u8>>,
+    ) -> Result<companion::Response, EngineError> {
+        use ratatosk_proto::files;
+
+        if !self.by_chat.contains_key(&chat) {
+            return Err(EngineError::UnknownPeer);
+        }
+        files::check_name(name)?;
+        if size_bytes > files::MAX_FILE_BYTES {
+            return Err(files::FileError::TooLarge.into());
+        }
+        // Предел превью проверяется и здесь, хотя провод его уже проверил:
+        // проверка провода — про кадр, эта — про запись в базе, и жить она
+        // обязана там же, где такая же проверка для файла с телефона
+        // (`on_send_files`). Один предел, два входа — и оба его знают.
+        if let Some(preview) = &preview {
+            if !files::preview_fits(preview.len()) {
+                return Err(files::FileError::PreviewTooLarge.into());
+            }
+        }
+        // «В одной сети» — это про канал, которым разговаривают **сейчас**,
+        // а не про то, каким сопрягались: сессия LAN не продолжается через
+        // onion (§5.4), и вопрос всегда о нынешнем.
+        if !files::companion_may_upload(size_bytes, via == Transport::Lan) {
+            return Ok(companion::Response::Refused(
+                "файл больше 20 МБ уедет через мобильный канал телефона — \
+                 подключитесь к общей сети (§13.4)"
+                    .to_owned(),
+            ));
+        }
+        if self.uploads.len() >= companion::MAX_UPLOADS {
+            return Ok(companion::Response::Refused(
+                "телефон уже принимает другие файлы — дождитесь конца".to_owned(),
+            ));
+        }
+
+        let file_id = self.entropy.msg_id();
+        let mut key = [0u8; 32];
+        self.entropy.fill(&mut key);
+        let chunk_total = files::chunk_count(size_bytes);
+        // **На диск, а не только в память.** Перезапуск телефона посреди
+        // выгрузки стирал её целиком; с пятью файлами это потеря четырёх
+        // выгруженных ради пятого (`ARCHITECTURE.md`, 5вб).
+        self.store.put_staged(&ratatosk_store::StagedUpload {
+            file_id,
+            chat_id: chat,
+            name: name.to_owned(),
+            size_bytes,
+            chunk_total,
+            key,
+            preview: preview.clone(),
+            started_ms: now_ms,
+        })?;
+        self.uploads.push(Upload {
+            file_id,
+            chat,
+            name: name.to_owned(),
+            size_bytes,
+            chunk_total,
+            key,
+            preview,
+            have: BTreeSet::new(),
+        });
+        Ok(companion::Response::FileOffer { file_id, chunk_total })
+    }
+
+    /// Приехал кусок выгружаемого файла.
+    ///
+    /// **Кладётся запечатанным тем же ключом, каким уедет собеседнику.**
+    /// Открытым текстом на диск телефона он лечь не может: этот файл человек
+    /// туда не клал, и оставлять его там в открытом виде — новая утечка,
+    /// которой у отправляемого с самого телефона нет (тот и так лежит
+    /// открытым там, куда его положил хозяин).
+    ///
+    /// Запечатывание детерминированное (nonce выводится, §10.1), поэтому
+    /// отправка потом берёт эти же байты как есть — расшифровывать
+    /// и запечатывать заново незачем.
+    ///
+    /// # Errors
+    ///
+    /// Выгрузки нет, номер за концом, кусок не той длины или отказ хранилища.
+    fn on_upload_put(
+        &mut self,
+        file_id: FileId,
+        index: u64,
+        bytes: &[u8],
+    ) -> Result<companion::Response, EngineError> {
+        use ratatosk_proto::files;
+
+        let Some(upload) = self.uploads.iter().find(|u| u.file_id == file_id) else {
+            return Ok(companion::Response::Refused(
+                "про этот файл телефон не договаривался".to_owned(),
+            ));
+        };
+        if index >= upload.chunk_total {
+            return Ok(companion::Response::Refused("кусок за концом файла".to_owned()));
+        }
+        // Длина куска задана размером файла, и проверить её обязан тот, кто
+        // размер объявлял. Иначе «файл на гигабайт» приехал бы гигабайтом
+        // в одном куске и мегабайтом в остальных.
+        let last = index + 1 == upload.chunk_total;
+        let expected = if last {
+            let tail = upload.size_bytes % files::CHUNK_BYTES as u64;
+            if tail == 0 && upload.size_bytes != 0 {
+                files::CHUNK_BYTES
+            } else {
+                usize::try_from(tail).unwrap_or(files::CHUNK_BYTES)
+            }
+        } else {
+            files::CHUNK_BYTES
+        };
+        if bytes.len() != expected {
+            return Ok(companion::Response::Refused(
+                "кусок не той длины, какую обещал размер файла".to_owned(),
+            ));
+        }
+
+        let sealed = ratatosk_crypto::file::seal_chunk(&upload.key, &file_id, index, bytes)?;
+        self.blobs.put_chunk(&file_id, index, &sealed)?;
+        // Отметка на диске **после** байтов: обратный порядок означал бы
+        // «кусок есть», когда его нет, и выгрузка объявилась бы собранной
+        // с дырой. Тот же порядок, что у принимаемых чанков.
+        self.store.note_staged_chunk(&file_id, index)?;
+        if let Some(upload) = self.uploads.iter_mut().find(|u| u.file_id == file_id) {
+            upload.have.insert(index);
+        }
+        Ok(companion::Response::Done)
+    }
+
+    /// Выгрузка закончена — заводим сообщение и отправляем.
+    ///
+    /// Недостача — отказ словами, и **до** появления сообщения: файл с дырой,
+    /// уехавший собеседнику, тот соберёт и не проверит (хэш считается от
+    /// целого), а человек увидит «отправлено».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки сообщения.
+    fn on_upload_send(
+        &mut self,
+        now_ms: u64,
+        file_ids: &[FileId],
+        text: &str,
+    ) -> Result<(companion::Response, Vec<Effect>), EngineError> {
+        // **Сперва проверяется всё, потом делается всё.** Половина сообщения
+        // — вложения из одной выгрузки при недостаче в другой — это ровно
+        // тот исход, которого §14 не разрешает: человек увидит «отправлено»
+        // и не узнает, что уехало не то, что он выбрал.
+        let mut at = Vec::with_capacity(file_ids.len());
+        let mut chat = None;
+        for file_id in file_ids {
+            let Some(found) = self.uploads.iter().position(|u| u.file_id == *file_id) else {
+                return Ok((
+                    companion::Response::Refused(
+                        "про этот файл телефон не договаривался".to_owned(),
+                    ),
+                    Vec::new(),
+                ));
+            };
+            // Один и тот же файл, названный дважды, — это не два вложения,
+            // а одно; вторая позиция указывала бы на уже вынутую выгрузку.
+            if at.contains(&found) {
+                return Ok((
+                    companion::Response::Refused("один и тот же файл назван дважды".to_owned()),
+                    Vec::new(),
+                ));
+            }
+            let missing = self.uploads[found].chunk_total - self.uploads[found].have.len() as u64;
+            if missing != 0 {
+                return Ok((
+                    companion::Response::Refused(format!(
+                        "не хватает {missing} кусков — отправлять файл с дырой нельзя"
+                    )),
+                    Vec::new(),
+                ));
+            }
+            // Сообщение одно, значит и чат один. Иначе половина вложений
+            // уехала бы не тому человеку — и это худшая из ошибок,
+            // какие тут возможны.
+            match chat {
+                None => chat = Some(self.uploads[found].chat),
+                Some(first) if first != self.uploads[found].chat => {
+                    return Ok((
+                        companion::Response::Refused(
+                            "вложения из разных чатов в одно сообщение не складываются".to_owned(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                Some(_) => {}
+            }
+            at.push(found);
+        }
+
+        // Вынимаются по одному с поиском заново: `remove` сдвигает индексы,
+        // и запомненные позиции после первого же удаления врут. Порядок
+        // сохраняется тот, в каком их назвал десктоп.
+        let mut taken = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
+            let Some(found) = self.uploads.iter().position(|u| u.file_id == *file_id) else {
+                // Сюда попасть нельзя — список только что проверен целиком.
+                // Но вернуть выгрузки на место дешевле, чем паниковать
+                // в ядре, которое держит переписку.
+                self.uploads.append(&mut taken);
+                return Ok((
+                    companion::Response::Refused("выгрузка пропала на полпути".to_owned()),
+                    Vec::new(),
+                ));
+            };
+            taken.push(self.uploads.remove(found));
+            // Отметка с диска уходит вместе с выгрузкой: дальше эти байты
+            // живут строкой в `files`, и вторая запись о них означала бы,
+            // что уборка сирот однажды сотрёт отправленный файл.
+            self.store.delete_staged(file_id)?;
+        }
+
+        let effects = self.send_uploaded(now_ms, taken, text)?;
+        Ok((companion::Response::Done, effects))
+    }
+
+    /// Десктоп передумал: выбросить выгруженное.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища байтов.
+    fn on_upload_abort(&mut self, file_id: FileId) -> Result<companion::Response, EngineError> {
+        let Some(at) = self.uploads.iter().position(|u| u.file_id == file_id) else {
+            return Ok(companion::Response::Done);
+        };
+        self.uploads.remove(at);
+        self.store.delete_staged(&file_id)?;
+        self.blobs.remove(&file_id)?;
+        Ok(companion::Response::Done)
+    }
+
+    /// Заводит сообщение с выгруженным файлом и отправляет предложение.
+    ///
+    /// Это `on_send_files` для файла, которого нет на диске телефона:
+    /// байты уже лежат в хранилище **запечатанными**, и `source_path`
+    /// у записи пустой. Всё остальное — то же самое, и намеренно: получатель
+    /// не должен и не может отличить файл, отправленный с телефона,
+    /// от выгруженного с ноутбука.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки конверта.
+    fn send_uploaded(
+        &mut self,
+        now_ms: u64,
+        uploads: Vec<Upload>,
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::files;
+
+        let Some(first) = uploads.first() else {
+            return Err(EngineError::UnknownPeer);
+        };
+        let chat = first.chat;
+        let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
+        let msg_id = self.entropy.msg_id();
+        let hlc = self.clock.now(now_ms)?;
+        let own_ik = self.identity.public().ik;
+
+        let offers: Vec<files::FileOffer> = uploads
+            .iter()
+            .map(|upload| files::FileOffer {
+                file_id: upload.file_id,
+                name: upload.name.clone(),
+                size_bytes: upload.size_bytes,
+                key: upload.key,
+                // Превью с десктопа приезжает в первой просьбе выгрузки
+                // и дальше едет собеседнику наравне с превью своего файла:
+                // §10.3 отдаёт его вместе с предложением, а собирает его тот,
+                // кто видит содержимое, — то есть клиент, на обоих устройствах.
+                preview: upload.preview.clone(),
+            })
+            .collect();
+        // Проверяются **все** сразу: и каждое по отдельности, и их число.
+        // Тот же вход, что у файлов с самого телефона, — правило одно
+        // и живёт в одном месте.
+        files::check_offers(&offers).map_err(EngineError::File)?;
+
+        self.remember(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: own_ik,
+            hlc,
+            body: text.as_bytes().to_vec(),
+            received_ms: now_ms,
+            status: Some(DeliveryStatus::Pending.code()),
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+        for (at, upload) in uploads.into_iter().enumerate() {
+            self.store.put_file(&StoredFile {
+                file_id: upload.file_id,
+                msg_id,
+                name: upload.name,
+                size_bytes: upload.size_bytes,
+                // Порядок, в каком их назвал десктоп, — то есть тот,
+                // в каком человек выбрал файлы.
+                ordinal: u32::try_from(at).unwrap_or(u32::MAX),
+                chunk_total: upload.chunk_total,
+                key: upload.key,
+                preview: upload.preview,
+                // Не входящий: качать его не надо, он уже здесь.
+                incoming: false,
+                // **Пусто, и это признак «байты в хранилище, а не на диске».**
+                // Отправка читает по нему: есть путь — читаем открытый файл
+                // хозяина, нет — берём запечатанный кусок как есть.
+                source_path: None,
+                accepted: true,
+                complete: true,
+            })?;
+        }
+
+        let envelope =
+            Envelope::new(msg_id, hlc, PayloadType::FileOffer, files::offer_payload(text, &offers));
+        let mut effects = self.enqueue(Delivery {
+            msg_id,
+            peer_ik,
+            envelope: envelope.encode()?,
+            attempt: Attempt::new(),
+            state: DeliveryState::AwaitingSession,
+            queued_ms: now_ms,
+            session_reset_used: false,
+        })?;
+        // Предупреждение одно на сообщение — по первому файлу, которому
+        // не хватило канала. Второе про то же самое ничего не добавляет:
+        // ждать всё равно одного и того же — появления собеседника.
+        for offer in &offers {
+            if self.file_channel(&peer_ik, offer.size_bytes).is_none() {
+                effects.push(Effect::Notify(Event::FileWaitsForChannel { file_id: offer.file_id }));
+                break;
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Человек передумал качать — но не передумал получать.
+    ///
+    /// **Отличие от отказа в том, что остаётся.** Отказ уносит и байты,
+    /// и запись: «этого файла у меня не будет». Здесь снимается только
+    /// согласие — приехавшие куски лежат, предложение живёт, и согласие,
+    /// поставленное заново, продолжает с той же дырки (§10.2).
+    ///
+    /// Это не украшение для медленной сети, а единственный честный ответ
+    /// на «не сейчас». Без него у человека на мобильном канале два выхода:
+    /// доплатить за гигабайт или потерять файл насовсем.
+    ///
+    /// Собеседнику не уходит ничего — по той же причине, что и при отказе:
+    /// он увидит, что чанки перестали просить, и это всё, что ему полагается
+    /// знать. Сроки молчания при этом снимаются: иначе через полчаса ядро
+    /// само спросило бы продолжение того, что человек остановил.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn on_pause_file(&mut self, file_id: FileId) -> Result<Vec<Effect>, EngineError> {
+        let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
+        if !file.incoming || file.complete {
+            return Ok(Vec::new());
+        }
+        self.store.set_accepted(&file_id, false)?;
+        self.file_timers.remove(&file_id);
+        self.file_attempts.remove(&file_id);
+        let received = self.store.received_chunks(&file_id)?;
+        Ok(vec![Effect::Notify(Event::FileProgress { file_id, received, total: file.chunk_total })])
     }
 
     /// Человек отказался от файла.
@@ -2505,7 +3271,11 @@ impl<S: Store> Engine<S> {
         // на диске без всякого следа о том, чьи они.
         self.blobs.remove(&file_id)?;
         self.store.delete_file(&file_id)?;
-        Ok(vec![Effect::Notify(Event::FileProgress { file_id, received: 0, total: 0 })])
+        // Своим событием, а не `FileProgress` с нулями: «строки больше нет»
+        // и «полоска сдвинулась» — разные новости, и числом первую сказать
+        // нельзя. Нулями это и говорилось, и обошлось в две ошибки сразу —
+        // см. `Event::FileGone`.
+        Ok(vec![Effect::Notify(Event::FileGone { file_id })])
     }
 
     /// Просит собеседника продолжить (или начать) передачу файла.
@@ -2638,6 +3408,33 @@ impl<S: Store> Engine<S> {
         let mut effects =
             self.on_incoming_text(now_ms, via, peer_ik, envelope, &caption, TextKind::Plain)?;
 
+        // Записи о файлах — только если сообщение действительно легло.
+        //
+        // `put_message` **молча ничего не пишет**, если на идентификатор уже
+        // стоит надгробие (§9.2: удалённое не воскрешаем), и вернуть это
+        // наружу нечем — подпись у него `Result<()>`. Спросить хранилище —
+        // единственный способ узнать.
+        //
+        // **Внешний ключ тут ни при чём, хотя сперва казалось иначе.**
+        // Первая версия этого комментария объясняла проверку тем, что
+        // вложение упрётся в `files.msg_id → messages.msg_id` и остановит
+        // ядро. Неверно: надгробие — это `UPDATE`, строка сообщения остаётся,
+        // и ключ она удовлетворяет. Поймал это тест на настоящей базе
+        // (`a_tombstone_satisfies_the_foreign_key_and_that_is_the_trap`).
+        //
+        // Настоящая цена промаха тише и потому противнее: вложения легли бы
+        // к удалённому сообщению. В чате их не видно — надгробие не
+        // показывается, — а чанки при этом качаются, занимая ящик (§5.3)
+        // и трафик ради того, что человек уже стёр.
+        //
+        // Случай узкий: дубль предложения обычно отсекает дедупликация,
+        // и сюда он доходит, только если её запись успела уйти по сроку,
+        // а надгробие осталось. Но цена проверки — одна строка.
+        if self.store.message(&envelope.msg_id)?.is_none() {
+            effects.clear();
+            return Ok(effects);
+        }
+
         let mut records = Vec::with_capacity(offers.len());
         for offer in offers {
             let chunk_total = ratatosk_proto::files::chunk_count(offer.size_bytes);
@@ -2646,6 +3443,9 @@ impl<S: Store> Engine<S> {
                 msg_id: envelope.msg_id,
                 name: offer.name,
                 size_bytes: offer.size_bytes,
+                // Порядок предложений в конверте — он же порядок, в каком
+                // их выбрал отправитель. Своего мнения у получателя тут нет.
+                ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
                 chunk_total,
                 key: offer.key,
                 preview: offer.preview,
@@ -2754,7 +3554,7 @@ impl<S: Store> Engine<S> {
             // и объяснения этому нет ни на экране, ни в журнале.
             return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
         };
-        let Some(source) = file.source_path.clone() else { return Ok(Vec::new()) };
+        let source = file.source_path.clone();
         let Some(session_id) = self.sessions.for_peer(&sending.peer_ik, via) else {
             return Ok(Vec::new());
         };
@@ -2767,16 +3567,38 @@ impl<S: Store> Engine<S> {
         let mut effects = Vec::new();
         let mut next = sending.sent_upto;
         while next < limit {
-            let offset = next * files::CHUNK_BYTES as u64;
-            // Отказ чтения и пустой ответ — один и тот же случай: файла там
-            // больше нет или он стал короче. Отказ **не** поднимается выше:
-            // это не поломка ядра, а исчезнувший исходник, и сказать о нём
-            // надо человеку, а не вызывающему коду.
-            let plain = self
-                .blobs
-                .read_at(std::path::Path::new(&source), offset, files::CHUNK_BYTES)
-                .unwrap_or_default();
-            if plain.is_empty() {
+            // Две дороги к одним и тем же байтам, и различает их **пустой
+            // путь**. Файл, который человек выбрал на телефоне, лежит у него
+            // открытым там, где лежал, — читаем и запечатываем. Файл,
+            // выгруженный с ноутбука, на диск телефона открытым лечь не мог
+            // (это была бы новая утечка), поэтому он лежит в хранилище уже
+            // запечатанным — и берётся как есть.
+            //
+            // Как есть, а не «расшифровать и запечатать заново»: запечатывание
+            // детерминированное (§10.1, выведенный nonce), так что второй
+            // проход дал бы те же байты, потратив на это гигабайт работы.
+            let sealed = match source.as_deref() {
+                Some(path) => {
+                    let offset = next * files::CHUNK_BYTES as u64;
+                    // Отказ чтения и пустой ответ — один и тот же случай:
+                    // файла там больше нет или он стал короче. Отказ **не**
+                    // поднимается выше: это не поломка ядра, а исчезнувший
+                    // исходник, и сказать о нём надо человеку.
+                    let plain = self
+                        .blobs
+                        .read_at(std::path::Path::new(path), offset, files::CHUNK_BYTES)
+                        .unwrap_or_default();
+                    if plain.is_empty() {
+                        Vec::new()
+                    } else {
+                        ratatosk_crypto::file::seal_chunk(&file.key, &file.file_id, next, &plain)?
+                    }
+                }
+                // Пропал кусок из хранилища — тот же случай и тот же ответ:
+                // передача встала, и сказать об этом надо человеку.
+                None => self.blobs.chunk(&file.file_id, next)?.unwrap_or_default(),
+            };
+            if sealed.is_empty() {
                 // Молчать нельзя: передача встанет, и человек будет думать,
                 // что она идёт.
                 self.sending.retain(|s| s.file_id != file.file_id);
@@ -2785,7 +3607,6 @@ impl<S: Store> Engine<S> {
                 }));
                 break;
             }
-            let sealed = ratatosk_crypto::file::seal_chunk(&file.key, &file.file_id, next, &plain)?;
             let envelope = Envelope::new(
                 self.entropy.msg_id(),
                 self.clock.now(now_ms)?,
@@ -2967,6 +3788,11 @@ impl<S: Store> Engine<S> {
     fn remember(&mut self, message: &StoredMessage) -> Result<(), EngineError> {
         self.store.put_message(message)?;
         self.messages_since_compaction = self.messages_since_compaction.saturating_add(1);
+        // Одно место на все сообщения — своё, принятое, пересланное, ответ, —
+        // и десктоп (§13.4) узнаёт о них здесь же. Разослать новость из каждой
+        // вызывающей функции значило бы завести пять мест, где про десктоп
+        // надо помнить, и первая же забывшая тихо перестала бы его обновлять.
+        self.companion_notices.push(PendingNotice::Message(message.msg_id));
         Ok(())
     }
 
@@ -3055,8 +3881,40 @@ impl<S: Store> Engine<S> {
     /// уборка не транзакция, и делать её транзакцией незачем — повторный
     /// запуск просто доделает остальное.
     pub fn sweep_orphan_files(&mut self) -> Result<Swept, EngineError> {
-        let known: BTreeSet<FileId> = self.store.all_file_ids()?.into_iter().collect();
+        self.sweep_abandoned_uploads(0)
+    }
+
+    /// То же, но сперва выбрасывает выгрузки, брошенные раньше срока.
+    ///
+    /// `now_ms` = 0 означает «срок не считать»: у сверки, вызванной вручную,
+    /// часов нет, а выбрасывать чужие байты по неизвестному времени нельзя.
+    ///
+    /// **Срок нужен, потому что брошенную выгрузку никто не закрывает.**
+    /// Десктоп, у которого сдох процесс посреди третьего файла, не пришлёт
+    /// ни `FileSend`, ни `FileAbort`; его куски будут лежать в хранилище
+    /// телефона до конца времён, а сверка сирот их не тронет — она их
+    /// нарочно пропускает.
+    pub fn sweep_abandoned_uploads(&mut self, now_ms: u64) -> Result<Swept, EngineError> {
         let mut swept = Swept::default();
+        if now_ms > companion::STAGED_TTL_MS {
+            for file_id in self.store.staged_older_than(now_ms - companion::STAGED_TTL_MS)? {
+                swept.bytes +=
+                    self.blobs.stored_chunks(&file_id)?.iter().map(|(_, size)| *size).sum::<u64>();
+                swept.files += 1;
+                self.uploads.retain(|upload| upload.file_id != file_id);
+                self.store.delete_staged(&file_id)?;
+                self.blobs.remove(&file_id)?;
+            }
+        }
+
+        let mut known: BTreeSet<FileId> = self.store.all_file_ids()?.into_iter().collect();
+        // **Идущая выгрузка с десктопа — не сирота, хотя выглядит ею.** Её
+        // куски уже лежат в хранилище, а строки в базе ещё нет и не должно
+        // быть: сообщение заводится в конце (см. `Engine::uploads`). Сверка,
+        // случившаяся посреди выгрузки, стёрла бы их молча — и отправка
+        // упала бы на «кусок пропал» через минуту после уборки, никак с ней
+        // не связанная на вид.
+        known.extend(self.uploads.iter().map(|upload| upload.file_id));
 
         for file_id in self.blobs.stored_files()? {
             let chunks = self.blobs.stored_chunks(&file_id)?;
@@ -3069,6 +3927,12 @@ impl<S: Store> Engine<S> {
             // Идущую передачу это не трогает: чанк отмечается в базе в том же
             // шаге, в котором ложится на диск, а уборка идёт между шагами.
             // Неотмеченный чанк здесь — всегда след прошлой жизни процесса.
+            //
+            // Кроме выгрузки с десктопа: там отметок в базе нет вовсе, потому
+            // что нет и строки файла. Её куски пропускаются целиком.
+            if self.uploads.iter().any(|upload| upload.file_id == file_id) {
+                continue;
+            }
             for (index, size) in chunks {
                 if !self.store.has_chunk(&file_id, index)? {
                     self.blobs.remove_chunk(&file_id, index)?;
@@ -3149,6 +4013,11 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
         ratatosk_proto::edit::check(text)?;
+        // Правка едет своим кадром, и предел у неё тот же: иначе сообщение,
+        // которое отправилось, стало бы непоправимым — или наоборот.
+        if !ratatosk_proto::files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
 
         // Чьё сообщение и когда оно появилось — знает хранилище, а не клиент.
         let own_ik = self.identity.public().ik;
@@ -3819,12 +4688,757 @@ impl<S: Store> Engine<S> {
         if !self.store.set_status(&msg_id, status.code())? {
             return Ok(Vec::new());
         }
+        // Десктопу — та же новость (§13.4): у него своя копия чата, и статус
+        // «доставлено» обязан появиться там же, где на телефоне. Очередь
+        // выгребается в конце шага, см. `Engine::step`.
+        self.companion_notices.push(PendingNotice::Ready(companion::Notice::Status {
+            msg_id,
+            status: status.code(),
+        }));
         Ok(vec![Effect::Notify(Event::StatusChanged { msg_id, status })])
     }
 
     /// Список контактов, чьи маяки транспорт должен искать в эфире (§5.1).
     fn watch_lan_peers(&self) -> Effect {
-        Effect::WatchLanPeers(self.contacts.keys().copied().collect())
+        // Сопряжённые устройства — наравне с контактами, и иначе нельзя.
+        // Соединения односторонние (`ARCHITECTURE.md`, 5ц): каждая сторона
+        // набирает своё и пишет только в него, а значит **обе** обязаны
+        // найти друг друга в эфире. Десктоп объявляет маяк от своего ключа
+        // сопряжения — по тому же правилу §5.1, что и контакт от `IK`, —
+        // и без этой строки телефон принял бы рукопожатие и не смог бы
+        // ответить.
+        Effect::WatchLanPeers(self.contacts.keys().chain(self.devices.keys()).copied().collect())
+    }
+
+    // --- компаньон (§13.4) --------------------------------------------------
+    //
+    // Десктоп — терминал к телефону, а не второй участник разговора. Из этого
+    // следует всё остальное в этом разделе: у него нет своих `IK`/`SK`, своей
+    // истории и своего места в §5.4; есть одна сессия Noise с телефоном
+    // и по ней — просьбы и новости (`ratatosk_proto::companion`).
+    //
+    // **Только локальная сеть, и на этом этапе сознательно.** Onion отложен
+    // не из лени: соединения односторонние (`ARCHITECTURE.md`, 5ц) — каждая
+    // сторона пишет только в то, что набрала сама. Чтобы отвечать десктопу
+    // через Tor, телефон обязан **набрать** его, то есть у десктопа должен
+    // быть свой onion-сервис. Его нет, и заводить его — отдельная работа
+    // в транспорте, а не строчка здесь.
+
+    /// Заводит сопряжение и отдаёт приглашение (§13.4).
+    ///
+    /// **Секрет в приглашении — зерно, а не готовый ключ.** Спецификация
+    /// говорит про «X25519 pairing_key», и буквальное прочтение — «сгенерируй
+    /// пару, отдай секретную половину» — здесь отвергнуто. Причина в том,
+    /// какой ключ нужен десктопу на самом деле: он выступает инициатором
+    /// Noise IK, а инициатору нужен **статический ключ в том виде, в каком
+    /// его строит `Identity`**. Отдав зерно, мы отдаём ровно то, из чего
+    /// десктоп соберёт `Identity::from_seed` — ту же самую, что построили
+    /// здесь мы, — и обе стороны получают один и тот же публичный ключ,
+    /// не сговариваясь о формате.
+    ///
+    /// Телефон секрет **не хранит**. Хранить его незачем: узнать своё
+    /// устройство в рукопожатии можно по публичной половине, а лежащее
+    /// на диске зерно — это ключ, которым можно представиться нами же.
+    /// Отсюда и правило показа: ссылка живёт только в этом событии.
+    fn on_pair_device(&mut self, now_ms: u64, label: &str) -> Result<Vec<Effect>, EngineError> {
+        companion::check_label(label)?;
+
+        let mut seed = [0u8; 32];
+        self.entropy.fill(&mut seed);
+        let pairing_public = Identity::from_seed(seed).public().ik;
+        let device_id = companion::device_id(&pairing_public);
+
+        let device = StoredPairedDevice {
+            device_id,
+            label: label.trim().to_owned(),
+            pairing_public,
+            paired_ms: now_ms,
+            // Ноль, а не `now_ms`: устройство ещё ни разу не подключалось.
+            // Поставив здесь текущее время, мы дали бы десктопу тридцать
+            // суток жизни кэша (§13.4), которого у него пока нет.
+            last_seen_ms: 0,
+        };
+        self.store.put_paired_device(&device)?;
+        self.devices.insert(pairing_public, device);
+
+        let card = self.own_card();
+        let invite = companion::PairingInvite {
+            ik: card.ik,
+            secret: companion::PairingSecret::new(seed),
+            onion: card.onion.clone(),
+            display_name: card.display_name.clone(),
+        };
+        let uri = invite.to_uri()?;
+
+        let mut effects = vec![Effect::Notify(Event::PairingReady { device_id, uri })];
+        // Список маяков изменился: десктоп объявится от ключа сопряжения,
+        // и без этого телефон его в эфире не услышит (§5.1).
+        if self.enabled.contains(Transport::Lan) {
+            effects.push(self.watch_lan_peers());
+        }
+        Ok(effects)
+    }
+
+    /// Отзывает сопряжение (§13.4).
+    ///
+    /// «Отзыв — удаление записи и **немедленный** разрыв сессии.» Разрыв
+    /// здесь выражается тем, чем ядро располагает: сессия убирается из реестра
+    /// и с диска сразу, в этом же шаге. Дальше кадры отозванного десктопа
+    /// не расшифровываются вовсе — они уходят в «неизвестная сессия» (§7.3), —
+    /// а маяк его больше не слушается. Отдельного эффекта «закрыть сокет»
+    /// у ядра нет и не заведено нарочно: сокет закрывает та сторона, которая
+    /// его набрала, а решает вопрос не он, а отсутствие ключей.
+    fn on_revoke_pairing(&mut self, device_id: &[u8; 16]) -> Result<Vec<Effect>, EngineError> {
+        let pairing_public = self
+            .devices
+            .iter()
+            .find(|(_, device)| device.device_id == *device_id)
+            .map(|(key, _)| *key)
+            .ok_or(EngineError::UnknownDevice)?;
+
+        // **Все** сессии, а не одна на транспорт: отправленная на покой
+        // живёт ради приёма — то есть ровно ради того, что отзыв обязан
+        // прекратить. То же рассуждение, что в `on_delete_contact`.
+        for session_id in self.sessions.all_for_peer(&pairing_public) {
+            self.sessions.remove(session_id);
+            self.store.delete_session(session_id)?;
+        }
+        self.devices.remove(&pairing_public);
+        self.device_links.remove(&pairing_public);
+        self.device_seen.remove(&pairing_public);
+        self.store.delete_paired_device(device_id)?;
+
+        let mut effects = vec![Effect::Notify(Event::PairingRevoked { device_id: *device_id })];
+        if self.enabled.contains(Transport::Lan) {
+            effects.push(self.watch_lan_peers());
+        }
+        Ok(effects)
+    }
+
+    /// Отмечает, что обратный путь до десктопа доказан.
+    ///
+    /// Зовётся с каждой просьбы, а не только с первой: сессия переживает
+    /// перезапуск телефона (§8.3), а признак в памяти — нет, и без этого
+    /// живой десктоп после перезапуска числился бы отключённым навсегда.
+    ///
+    /// Отсюда и ранний выход: **на диск пишется только переход**. Отметка
+    /// «последний раз подключалось» — про появление связи, а не про каждый
+    /// кадр по ней; писать её на каждую просьбу значило бы гонять запись
+    /// в базу телефона со скоростью, с какой человек печатает на десктопе.
+    ///
+    /// Транспорт обновляется всегда: десктоп мог вернуться другой ступенью,
+    /// и слать новости надо туда, откуда он говорит сейчас.
+    fn note_device_link(
+        &mut self,
+        now_ms: u64,
+        pairing_public: [u8; 32],
+        via: Transport,
+    ) -> Result<Vec<Effect>, EngineError> {
+        self.device_links.insert(pairing_public, via);
+        if !self.device_seen.insert(pairing_public) {
+            return Ok(Vec::new());
+        }
+        let Some(device) = self.devices.get_mut(&pairing_public) else { return Ok(Vec::new()) };
+        device.last_seen_ms = now_ms;
+        let device_id = device.device_id;
+        // По этому же числу десктоп отмеряет тридцать суток жизни кэша
+        // (§13.4), и разъехаться двум сторонам в нём нельзя.
+        self.store.touch_paired_device(&device_id, now_ms)?;
+
+        Ok(vec![Effect::Notify(Event::DeviceLink { device_id, connected: true })])
+    }
+
+    /// Десктоп отключился.
+    fn drop_device_link(&mut self, pairing_public: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
+        self.device_links.remove(&pairing_public);
+        // Сказать «отключился» можно только тому, кому говорили «на связи».
+        // Иначе человек увидел бы, что отключилось то, что не подключалось.
+        if !self.device_seen.remove(&pairing_public) {
+            return Ok(Vec::new());
+        }
+        let Some(device) = self.devices.get(&pairing_public) else { return Ok(Vec::new()) };
+        Ok(vec![Effect::Notify(Event::DeviceLink {
+            device_id: device.device_id,
+            connected: false,
+        })])
+    }
+
+    /// Пришёл кадр от сопряжённого устройства.
+    fn on_device_frame(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        pairing_public: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Устройство говорит только просьбами. Ответ и новость идут в другую
+        // сторону, всё остальное — не его разговор: терминал, приславший
+        // текстовое сообщение «как контакт», либо сломан, либо не тот,
+        // за кого себя выдаёт.
+        if envelope.payload_type != PayloadType::CompanionRequest {
+            self.sessions.note_anomaly(pairing_public, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+        let Ok((id, request)) = companion::request_from_payload(&envelope.payload) else {
+            self.sessions.note_anomaly(pairing_public, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+
+        // Просьба пришла — значит наш ответ дошёл и обратный путь есть.
+        // Это единственное доказательство, какое у нас бывает, и потому
+        // «на связи» ставится здесь.
+        //
+        // На каждой просьбе, а не только на первой: сессия переживает
+        // перезапуск телефона (§8.3), а признаки в памяти — нет, и без этой
+        // строки живой десктоп после перезапуска числился бы отключённым,
+        // а новости ему не уходили бы вовсе.
+        let mut effects = self.note_device_link(now_ms, pairing_public, via)?;
+
+        let response = self.serve_companion(now_ms, via, request, &mut effects);
+        let sealed = self.send_to_device(
+            now_ms,
+            pairing_public,
+            via,
+            PayloadType::CompanionResponse,
+            companion::response_payload(id, &response),
+        );
+        match sealed {
+            Ok(sent) => effects.extend(sent),
+            Err(error) => {
+                // Ответ не влез в кадр — история чата длинных сообщений или
+                // список из сотен контактов. Молчание десктоп прочтёт как
+                // «телефон завис»; слова влезут всегда (§14).
+                tracing::warn!(?error, "ответ компаньону не собрался");
+                let refusal = companion::Response::Refused(
+                    "ответ не влезает в кадр — попросите меньше".to_owned(),
+                );
+                let told = self.send_to_device(
+                    now_ms,
+                    pairing_public,
+                    via,
+                    PayloadType::CompanionResponse,
+                    companion::response_payload(id, &refusal),
+                );
+                match told {
+                    Ok(sent) => effects.extend(sent),
+                    Err(error) => tracing::warn!(?error, "и отказ не собрался"),
+                }
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Выполняет просьбу десктопа и отвечает словами, что получилось.
+    ///
+    /// Отказ здесь — **ответ, а не ошибка шага**, и различие содержательное.
+    /// Просьба пришла с другого устройства; уронив из-за неё шаг ядра, мы дали
+    /// бы десктопу способ ронять телефон — пустой текст, чат которого удалили
+    /// секунду назад, и приложение падает у человека в кармане. Поэтому всё,
+    /// что не сложилось, возвращается словами: их покажет десктоп (§14),
+    /// а телефон продолжает работать.
+    fn serve_companion(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        request: companion::Request,
+        effects: &mut Vec<Effect>,
+    ) -> companion::Response {
+        match self.try_serve_companion(now_ms, via, request, effects) {
+            Ok(response) => response,
+            Err(error) => {
+                // Вслух: отказ на просьбе десктопа — единственный след того,
+                // что на телефоне что-то не так, а увидит его человек
+                // на другом экране и без подробностей.
+                tracing::warn!(?error, "просьба компаньона не выполнена");
+                companion::Response::Refused(error.to_string())
+            }
+        }
+    }
+
+    fn try_serve_companion(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        request: companion::Request,
+        effects: &mut Vec<Effect>,
+    ) -> Result<companion::Response, EngineError> {
+        match request {
+            companion::Request::Chats => Ok(companion::Response::Chats(self.chat_summaries()?)),
+            companion::Request::History { chat, limit, before } => {
+                match self.history_page(chat, limit, before)? {
+                    Some(page) => Ok(companion::Response::History(page)),
+                    // Словами, а не пустой страницей: человеку надо сказать,
+                    // что делать, а сделать он может ровно одно — открыть чат
+                    // заново. Отказ он увидит (§14); край истории — не увидит.
+                    None => Ok(companion::Response::Refused(
+                        "с этого места листать больше нечего — сообщения нет, откройте чат заново"
+                            .to_owned(),
+                    )),
+                }
+            }
+            companion::Request::SendText { chat, text } => {
+                effects.extend(self.send_text(now_ms, chat, &text)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::MarkRead { chat, up_to } => {
+                effects.extend(self.on_mark_read(now_ms, chat, up_to)?);
+                Ok(companion::Response::Done)
+            }
+            // Дальше — то, чем десктоп распоряжается чужой уже написанной
+            // перепиской. Каждая ветка зовёт **тот же самый обработчик**,
+            // что и команда с телефона, и это здесь главное: решение о том,
+            // что можно править только своё и только неделю, что «удалить»
+            // и «отозвать» — разные вещи, а очистка чата отзыва не имеет,
+            // принимается в одном месте. Скопируй мы сюда хоть одно из этих
+            // правил — и второй экран однажды разрешил бы то, чего не
+            // разрешает первый.
+            //
+            // Отказы приезжают словами (`serve_companion` ловит `EngineError`
+            // и превращает в `Refused`), и это не заглушка: «правка старше
+            // недели» и «телефон сломался» человек за ноутбуком обязан
+            // различать (§14).
+            companion::Request::SetReaction { chat, msg_id, emoji } => {
+                effects.extend(self.on_set_reaction(now_ms, chat, msg_id, &emoji)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::SendReply { chat, reply_to, text } => {
+                effects.extend(self.on_send_reply(now_ms, chat, reply_to, &text)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::EditMessage { chat, msg_id, text } => {
+                effects.extend(self.on_edit_message(now_ms, chat, msg_id, &text)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::DeleteMessages { chat, msg_ids } => {
+                effects.extend(self.forget_messages(now_ms, chat, &msg_ids));
+                Ok(companion::Response::Done)
+            }
+            companion::Request::RetractMessages { chat, msg_ids } => {
+                effects.extend(self.on_retract_messages(now_ms, chat, &msg_ids)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::ForwardMessages { chat, msg_ids } => {
+                effects.extend(self.on_forward_messages(now_ms, chat, &msg_ids)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::ClearChat { chat } => {
+                effects.extend(self.on_clear_chat(now_ms, chat)?);
+                Ok(companion::Response::Done)
+            }
+            // **Расшифровка происходит здесь, в цикле ядра, и это известная
+            // цена.** `reader.rs` заведён ровно затем, чтобы чтение вложения
+            // в цикле не стояло: открытие файла на полгигабайта — пятьсот
+            // заходов по мебибайту, и всё это время не уходят сообщения
+            // и не срабатывают таймеры. Здесь тот же счёт, и вынести его
+            // некуда: ответ обязан быть запечатан сессией устройства, а она
+            // живёт в ядре и на каждом кадре двигает цепочку (§7.3). Отдав
+            // её другому потоку, мы получили бы две стороны, одновременно
+            // расходующие позиции, — то есть разрушенное шифрование кадра
+            // вместо задержки.
+            //
+            // Смягчение простое и честное: кусок за просьбу, а не файл
+            // за просьбу. Между кусками ядро успевает всё остальное,
+            // и «телефон замер на время выгрузки» превращается в «телефон
+            // отвечает медленнее, пока идёт выгрузка».
+            companion::Request::FileChunk { file_id, index } => {
+                let Some(reader) = self.open_file(&file_id)? else {
+                    return Ok(companion::Response::Refused(
+                        "этого вложения у телефона нет".to_owned(),
+                    ));
+                };
+                match reader.chunk(index)? {
+                    Some(bytes) => Ok(companion::Response::FileChunk { index, bytes }),
+                    // Три случая на один ответ, и различать их телефон
+                    // не может сам (`FileReader::chunk`): кусок ещё не
+                    // приехал, номер за концом файла, тег не сошёлся.
+                    // Показывать нечего во всех трёх, а гадать о причине —
+                    // не работа показа.
+                    None => Ok(companion::Response::Refused(
+                        "этого куска у телефона пока нет".to_owned(),
+                    )),
+                }
+            }
+            // Принять — это про **телефон**: начать качать у собеседника.
+            // Забрать принятое себе десктоп просит отдельно, и порядок
+            // обязателен: пока телефон не принял, забирать нечего.
+            companion::Request::AcceptFile { file_id } => {
+                effects.extend(self.on_accept_file(now_ms, file_id)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::DeclineFile { file_id } => {
+                effects.extend(self.on_decline_file(file_id)?);
+                Ok(companion::Response::Done)
+            }
+            // Единственная просьба, ответ на которую ничего не читает
+            // и ничего не меняет: телефон называет свой провод. Сборка
+            // постарше этого вида не знает и не ответит вовсе — по этому
+            // молчанию десктоп её и узнаёт.
+            companion::Request::PauseFile { file_id } => {
+                effects.extend(self.on_pause_file(file_id)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::FileOffer { chat, name, size_bytes, preview } => {
+                self.on_upload_offer(now_ms, via, chat, &name, size_bytes, preview)
+            }
+            companion::Request::FilePut { file_id, index, bytes } => {
+                self.on_upload_put(file_id, index, &bytes)
+            }
+            companion::Request::FileSend { file_ids, text } => {
+                let (response, produced) = self.on_upload_send(now_ms, &file_ids, &text)?;
+                effects.extend(produced);
+                Ok(response)
+            }
+            companion::Request::FileAbort { file_id } => self.on_upload_abort(file_id),
+            // Превью (§10.3) — отдельной просьбой, а не в странице: тридцать
+            // два килобайта на сотню сообщений не влезут в кадр. Читается оно
+            // из записи файла, а не из содержимого: превью кладут рядом
+            // с предложением, и оно есть до того, как приехал первый кусок.
+            //
+            // Пропавшее вложение — **не** отказ: `None` здесь честный ответ
+            // «показать нечего», а `Refused` десктоп обязан донести до
+            // человека словами (§14), и строка «превью нет» на каждой
+            // картинке без превью — шум, а не сообщение.
+            companion::Request::FilePreview { file_id } => Ok(companion::Response::FilePreview {
+                bytes: self.store.file(&file_id)?.and_then(|file| file.preview),
+            }),
+            // Что осталось от прерванной выгрузки (§13.4). Спрашивается
+            // при каждом подключении: отличить «связь пропала» от «телефон
+            // перезапустился» десктоп не может, а ответ почти всегда пуст.
+            companion::Request::Staged => Ok(companion::Response::Staged {
+                files: self
+                    .uploads
+                    .iter()
+                    .map(|upload| companion::StagedFile {
+                        file_id: upload.file_id,
+                        name: upload.name.clone(),
+                        size_bytes: upload.size_bytes,
+                        chunk_total: upload.chunk_total,
+                        // Дырки, а не число: продолжать надо с пропущенного,
+                        // и куски вправе были приехать не по порядку.
+                        missing: (0..upload.chunk_total)
+                            .filter(|index| !upload.have.contains(index))
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+            companion::Request::Hello => {
+                Ok(companion::Response::Hello { wire: companion::WIRE_VERSION })
+            }
+        }
+    }
+
+    /// Список чатов для десктопа (§13.4).
+    ///
+    /// Заголовок считает телефон, и это правило §13.3, а не удобство:
+    /// «локальное имя вытесняет имя из карточки» — протокольное решение
+    /// (§4.1), и повторённое в десктопе оно однажды разошлось бы с этим.
+    fn chat_summaries(&self) -> Result<Vec<companion::ChatSummary>, EngineError> {
+        let mut out = Vec::with_capacity(self.contacts.len());
+        for (peer_ik, contact) in &self.contacts {
+            let chat = Self::chat_id_for(peer_ik);
+            // Одно сообщение — последнее: строка под именем в списке чатов.
+            // Хранилище отдаёт хвост окна, надгробия (§12) отсеивая само.
+            let last = self.store.messages(&chat, 1, None)?;
+            let (last_text, last_ms) = last.last().map_or_else(
+                || (String::new(), 0),
+                |m| (String::from_utf8_lossy(&m.body).into_owned(), m.hlc.wall_ms),
+            );
+            out.push(companion::ChatSummary {
+                chat,
+                title: Self::title_of(contact, peer_ik),
+                verified: contact.verified,
+                last_text,
+                last_ms,
+            });
+        }
+        // Свежие сверху — тот же порядок, в каком чаты показывает телефон.
+        // Считает его телефон по той же причине, что и заголовок: правило
+        // одно, и жить ему в одном месте.
+        out.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.chat.cmp(&b.chat)));
+        Ok(out)
+    }
+
+    /// Как назвать чат в списке.
+    ///
+    /// Порядок: подпись пользователя (§4.1), имя из карточки, отпечаток.
+    /// Последнее — не заглушка: имя в карточке задаёт собеседник, и пустым
+    /// оно бывает законно, а чат без названия выбрать в списке нельзя.
+    fn title_of(contact: &Contact, peer_ik: &[u8; 32]) -> String {
+        if let Some(name) = contact.local_name.as_ref().filter(|n| !n.trim().is_empty()) {
+            return name.clone();
+        }
+        if !contact.card.display_name.trim().is_empty() {
+            return contact.card.display_name.clone();
+        }
+        peer_ik[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Страница истории чата для десктопа.
+    ///
+    /// `None` означает, что **курсор мёртв**: сообщение, «перед» которым
+    /// просили страницу, у нас исчезло. Это не то же, что пустая страница,
+    /// и раньше было тем же — с последствием, которое видно только на втором
+    /// экране. Пустая страница читается как «дальше ничего нет», то есть как
+    /// край истории; но за мёртвым курсором история как раз есть, просто
+    /// отсчитывать от него больше не от чего. Десктоп, услышав «край»,
+    /// переставал листать назад — и переписка недельной давности выглядела
+    /// отсутствующей до тех пор, пока человек не откроет чат заново.
+    ///
+    /// Начало чата вместо этого отдавать нельзя: десктоп листает **назад**,
+    /// и хвост в ответ на «дай что было раньше» устроил бы бесконечный
+    /// список из одной и той же страницы.
+    fn history_page(
+        &self,
+        chat: ChatId,
+        limit: u32,
+        before: Option<MsgId>,
+    ) -> Result<Option<Vec<companion::Message>>, EngineError> {
+        // Предел свой, а не тот, что попросили: §13.4 отдаёт десктопу окно,
+        // а не всю историю, и верить числу с другого устройства в вопросе
+        // «сколько прочитать из базы» нельзя — ноль вернул бы пустую
+        // страницу навсегда, миллион прочитал бы весь чат в память телефона.
+        let limit = limit.clamp(1, companion::MAX_PAGE) as usize;
+
+        let before_hlc = match before {
+            Some(msg_id) => match self.store.message(&msg_id)? {
+                Some(message) => Some(message.hlc),
+                // Сообщение удалили, отозвали или унесла очистка чата,
+                // пока десктоп был не на связи.
+                None => return Ok(None),
+            },
+            None => None,
+        };
+
+        let stored = self.store.messages(&chat, limit, before_hlc)?;
+        let mut page = Vec::with_capacity(stored.len());
+        for message in &stored {
+            page.push(self.companion_message(message)?);
+        }
+        Ok(Some(page))
+    }
+
+    /// Переводит запись истории в то, что видит десктоп.
+    ///
+    /// «Своё ли» считает телефон: сравнение с собственным `IK` — протокольное
+    /// знание, а `IK` границу устройства не пересекает (§13.4).
+    /// # Errors
+    ///
+    /// Отказ хранилища при чтении реакций.
+    fn companion_message(
+        &self,
+        message: &StoredMessage,
+    ) -> Result<companion::Message, EngineError> {
+        Ok(companion::Message {
+            msg_id: message.msg_id,
+            chat: message.chat_id,
+            mine: message.sender_ik == self.identity.public().ik,
+            // Потерянные байты — не повод потерять сообщение: тело пришло
+            // из сети и могло быть каким угодно, а десктоп ждёт текст.
+            text: String::from_utf8_lossy(&message.body).into_owned(),
+            wall_ms: message.hlc.wall_ms,
+            status: message.status,
+            // Читаются здесь, а не у вызывающих, и функция ради этого стала
+            // возвращать `Result`. Дверь одна по той же причине, что и у
+            // [`Engine::remember`]: сообщение уезжает к десктопу из трёх мест
+            // — из истории, из новости о приходе, из новости о правке, —
+            // и забытые в одном из них реакции выглядели бы как снятые.
+            reactions: self.companion_reactions(&message.msg_id)?,
+            // Три отметки, которые телефон показывает у себя с самого начала
+            // (`FfiMessage`), а десктопу не отдавал. «Изменено» из них —
+            // не украшение: прежнего текста нет ни у кого, и без отметки
+            // подменённые слова выглядят так, будто их такими и написали.
+            // §14 это запрещает, и запрещает на **обоих** экранах.
+            edited_ms: message.edited_ms,
+            forwarded: message.forwarded,
+            reply_to: message.reply_to,
+            files: self.companion_files(&message.msg_id)?,
+        })
+    }
+
+    /// Вложения сообщения в том виде, в каком их видит десктоп (§10, §13.4).
+    ///
+    /// **Ключ файла остаётся здесь.** §13.4 не пускает его через границу
+    /// устройства, и потому наружу едет `file_id` — им десктоп адресует
+    /// просьбу, — а расшифровывает телефон, отдавая уже открытые байты
+    /// куском за просьбу.
+    ///
+    /// «Сколько уже приехало» считается так же, как для своего UI
+    /// (`Driver`): у исходящего и у собранного — все куски, у остальных
+    /// спрашивается хранилище. Повтор этого счёта в двух местах — плата
+    /// за то, что `MessageView` собирает драйвер, а не ядро; свести их
+    /// стоило бы протаскивания драйверного типа ниже границы.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn companion_files(&self, msg_id: &MsgId) -> Result<Vec<companion::Attachment>, EngineError> {
+        let mut out = Vec::new();
+        for file in self.store.files_of(msg_id)?.into_iter().take(companion::MAX_ATTACHMENTS) {
+            let have_chunks = if !file.incoming || file.complete {
+                file.chunk_total
+            } else {
+                self.store.received_chunks(&file.file_id)?
+            };
+            out.push(companion::Attachment {
+                file_id: file.file_id,
+                name: file.name,
+                size_bytes: file.size_bytes,
+                chunk_total: file.chunk_total,
+                have_chunks,
+                accepted: file.accepted,
+                // Признак, а не байты: сама картинка приедет отдельной
+                // просьбой и только про то, что десктоп показывает сейчас.
+                has_preview: file.preview.is_some(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Реакции на сообщение в том виде, в каком их видит десктоп.
+    ///
+    /// Ни отсева снятых, ни сортировки здесь нет намеренно: и то и другое —
+    /// обещание [`ratatosk_store::Store::reactions`], записанное там прямым
+    /// текстом («фильтр живёт здесь, а не у каждого читателя»). Повторив его,
+    /// мы завели бы второе место, которое выглядит как страховка, а работает
+    /// как расхождение: правило поменяется в одном, останется в другом,
+    /// и разойдутся они молча.
+    ///
+    /// Своё дело у этой функции ровно одно, и оно про границу устройства:
+    /// превратить автора в «своё или чужое». `IK` наверх не уходит (§13.4),
+    /// а сравнение с собственным — протокольное знание, которому §13.3
+    /// не даёт подняться выше.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn companion_reactions(&self, msg_id: &MsgId) -> Result<Vec<companion::Reaction>, EngineError> {
+        let own_ik = self.identity.public().ik;
+        Ok(self
+            .store
+            .reactions(msg_id)?
+            .into_iter()
+            // Предел провода (§5.5), а не хранилища: у себя телефон держит
+            // столько реакций, сколько поставили.
+            .take(companion::MAX_REACTIONS)
+            .map(|reaction| companion::Reaction {
+                mine: reaction.author_ik == own_ik,
+                emoji: reaction.emoji,
+            })
+            .collect())
+    }
+
+    /// Отдаёт накопленные за шаг новости всем подключённым устройствам.
+    ///
+    /// **Без `Result`, и это то же правило, что у [`Engine::serve_companion`],
+    /// только в обратную сторону.** Там просьба с другого устройства не вправе
+    /// уронить шаг ядра; здесь не вправе и новость к нему. Не собравшийся
+    /// кадр — беда терминала, а не телефона: телефон продолжает работать,
+    /// а десктоп увидит расхождение при первом же перечитывании истории.
+    fn flush_companion_notices(&mut self, now_ms: u64) -> Vec<Effect> {
+        let notices = std::mem::take(&mut self.companion_notices);
+        // Очередь выгребается **всегда**, даже когда слушать некому: она
+        // не журнал и не кэш. Кэш — забота десктопа (§13.4), и он его
+        // наполняет запросом истории при подключении; копить новости
+        // здесь значило бы завести на телефоне вторую, никем не читаемую
+        // историю, которая растёт, пока десктоп выключен.
+        if notices.is_empty() || self.device_links.is_empty() {
+            return Vec::new();
+        }
+
+        // Отложенные собираются **здесь**, когда шаг уже дописал всё, что
+        // дописывал: вложения ложатся в базу после текста, и новость,
+        // собранная в `remember`, уехала бы без них.
+        //
+        // Собирается только то, что будет отправлено: слушателей уже
+        // проверили выше, и на телефоне без сопряжённых устройств чтений
+        // из базы не прибавляется вовсе.
+        let mut ready = Vec::with_capacity(notices.len());
+        for notice in notices {
+            match notice {
+                PendingNotice::Ready(notice) => ready.push(notice),
+                PendingNotice::Message(msg_id) => match self.store.message(&msg_id) {
+                    // Сообщение успели стереть на том же шаге — рассказывать
+                    // нечего: об удалении десктоп узнает своей новостью.
+                    Ok(None) => {}
+                    Ok(Some(message)) => match self.companion_message(&message) {
+                        Ok(message) => ready.push(companion::Notice::Message(message)),
+                        Err(error) => tracing::warn!(?error, "сообщение десктопу не собрать"),
+                    },
+                    Err(error) => tracing::warn!(?error, "сообщение десктопу не прочитать"),
+                },
+            }
+        }
+        let notices = ready;
+
+        let links: Vec<([u8; 32], Transport)> =
+            self.device_links.iter().map(|(key, via)| (*key, *via)).collect();
+        let mut effects = Vec::new();
+        for (pairing_public, via) in links {
+            for notice in &notices {
+                let sealed = self.send_to_device(
+                    now_ms,
+                    pairing_public,
+                    via,
+                    PayloadType::CompanionNotice,
+                    companion::notice_payload(notice),
+                );
+                match sealed {
+                    Ok(sent) => effects.extend(sent),
+                    Err(error) => tracing::warn!(?error, "новость компаньону не ушла"),
+                }
+            }
+        }
+        effects
+    }
+
+    /// Запечатывает кадр в сессию устройства.
+    ///
+    /// Прямо в сессию, минуя очередь §5.4, и это не срез угла. Очередь —
+    /// про доставку **сообщений**: она переживает перезапуск, перебирает
+    /// ступени и в конце объявляет «не доставлено». Разговор с терминалом
+    /// не таков ни в одной из трёх частей: пережившая перезапуск просьба
+    /// протухла, ступеней у него одна, а «не доставлено» ему скажет
+    /// собственная тишина.
+    fn send_to_device(
+        &mut self,
+        now_ms: u64,
+        pairing_public: [u8; 32],
+        via: Transport,
+        payload_type: PayloadType,
+        payload: Value,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(session_id) = self.sessions.for_peer(&pairing_public, via) else {
+            return Ok(Vec::new());
+        };
+        let envelope =
+            Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
+        let frame = self.seal_for(session_id, &envelope.encode()?)?;
+        Ok(vec![Effect::Send { peer_ik: pairing_public, via, frame, handoff: None }])
+    }
+
+    /// Сопряжённые устройства (§13.4).
+    #[must_use]
+    pub fn paired_devices(&self) -> Vec<crate::companion::PairedDevice> {
+        self.devices
+            .values()
+            .map(|d| crate::companion::PairedDevice {
+                device_id: d.device_id,
+                pairing_public: d.pairing_public,
+                label: d.label.clone(),
+                paired_ms: d.paired_ms,
+                last_seen_ms: d.last_seen_ms,
+            })
+            .collect()
+    }
+
+    /// Есть ли прямо сейчас канал с этим устройством.
+    #[must_use]
+    pub fn device_connected(&self, device_id: &[u8; 16]) -> bool {
+        // По доказанному пути, а не по тому, куда мы готовы слать: наружу
+        // отдаётся то, что показывают человеку.
+        self.device_seen
+            .iter()
+            .any(|key| self.devices.get(key).is_some_and(|d| d.device_id == *device_id))
     }
 
     fn send_text(
@@ -3875,6 +5489,11 @@ impl<S: Store> Engine<S> {
         text: &str,
         kind: TextKind,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Отказ **до** записи в историю: сообщение, легшее в базу и не
+        // собравшееся в кадр, человек видел бы у себя вечно ждущим отправки.
+        if !ratatosk_proto::files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
         let hlc = self.clock.now(now_ms)?;
         let msg_id = self.entropy.msg_id();
         let envelope = Envelope::new(msg_id, hlc, kind.payload_type(), kind.payload(text));
@@ -3959,9 +5578,46 @@ impl<S: Store> Engine<S> {
         // уход почтой (§9.4 — дальше «отправлено» статус не растёт) и
         // исчерпание транспортов. Всё остальное — ожидание.
         if !delivery.attempt.is_finished() {
+            // **И на диск тоже** — вот этого не было, и это была самая старая
+            // дыра в доставке.
+            //
+            // Очередь ожидающих (`remember_undelivered`) на диск ложилась
+            // давно: «отправим, когда появится» — обещание, и без записи оно
+            // жило бы до конца процесса. А доставка **в полёте** — та, для
+            // которой транспорт нашёлся и кадр ушёл, — жила только в памяти.
+            // Убей процесс между «кадр отдан транспорту» и подтверждением,
+            // и сообщение оставалось в `Pending` навсегда: в очереди его нет,
+            // срок сработать неоткуда, вернуться к нему некому. На Android
+            // процесс убивают постоянно, а с честным «отправлено» (§9.4)
+            // окно у почты выросло с нуля до минут.
+            //
+            // Запись идёт **до** того, как вызывающий получит эффекты, то
+            // есть до настоящей отправки, — тот же порядок и та же причина,
+            // что у `persist_session`: между «решили отправить» и «записали»
+            // не должно быть ничего, что может не вернуться.
+            //
+            // Цена повтора — дубль у получателя, и его съедает дедупликация
+            // (§9.2). Цена пропуска — сообщение, которое человек считает
+            // отправленным, а оно никуда не денется.
+            self.persist_delivery(&delivery)?;
             self.outbox.push(delivery);
         }
         Ok(effects)
+    }
+
+    /// Кладёт доставку на диск, чтобы она пережила убитый процесс.
+    ///
+    /// Одно место на оба случая — ожидание и полёт: строка одна и та же,
+    /// а разведённые по двум местам они однажды разошлись бы в том, что
+    /// именно записано.
+    fn persist_delivery(&mut self, delivery: &Delivery) -> Result<(), EngineError> {
+        self.store.put_outbox(&ratatosk_store::StoredOutbox {
+            msg_id: delivery.msg_id,
+            recipient_ik: delivery.peer_ik,
+            envelope: delivery.envelope.clone(),
+            queued_ms: delivery.queued_ms,
+        })?;
+        Ok(())
     }
 
     /// Пробует следующий транспорт по §5.4.
@@ -4319,39 +5975,20 @@ impl<S: Store> Engine<S> {
 
     // --- кадры --------------------------------------------------------------
 
+    // Сборка кадра живёт в `crate::frames`, а не здесь, и это не вкусовщина:
+    // с появлением терминала (§13.4) сторон стало две, и правила сборки
+    // у них обязаны совпадать до байта. Здесь остаётся ровно то, чего у той
+    // стороны нет: источник случайности, реестр сессий и запись на диск.
+
     fn handshake_frame(&mut self, step: u64, message: &[u8]) -> Result<Vec<u8>, EngineError> {
         let mut nonce = [0u8; ratatosk_wire::NONCE_LEN];
         self.entropy.fill(&mut nonce);
-        let header =
-            Header::new(FrameType::Handshake, ratatosk_wire::HANDSHAKE_SESSION_ID, step, nonce);
-
-        // Кадр рукопожатия не запечатывается нашим AEAD: его содержимое уже
-        // зашифровал Noise. Дополняется он до всей запечатанной области —
-        // места под наш тег здесь нет.
-        let mut sealed = Vec::new();
-        pad_to(message, HANDSHAKE_CLASS.sealed_len(), &mut sealed)?;
-        Ok(ratatosk_wire::assemble(&header, &sealed)?)
+        Ok(crate::frames::handshake(step, message, nonce)?)
     }
 
     fn seal_for(&mut self, session_id: u64, envelope: &[u8]) -> Result<Vec<u8>, EngineError> {
-        let class = SizeClass::smallest_for(envelope.len()).ok_or(
-            ratatosk_wire::WireError::PayloadTooLarge {
-                got: envelope.len(),
-                max: SizeClass::L.max_payload(),
-            },
-        )?;
-
         let bound = self.sessions.get_mut(session_id).ok_or(EngineError::UnknownPeer)?;
-        let (counter, key) = bound.session.send.next();
-
-        // Nonce выводится из счётчика, а не из случайности. Ключ сообщения
-        // и так свежий на каждый кадр (§8.4), так что повтора nonce быть
-        // не может; зато кадр становится воспроизводимым, а §16 этого и хочет.
-        let mut nonce = [0u8; ratatosk_wire::NONCE_LEN];
-        nonce[..8].copy_from_slice(&counter.to_be_bytes());
-
-        let header = Header::new(FrameType::Data, session_id, counter, nonce);
-        let frame = aead::seal(&key, &header, class, envelope)?;
+        let frame = crate::frames::seal(&mut bound.session, envelope)?;
 
         // Запись до возврата кадра, а не после его отправки: см. пояснение
         // к `persist_session`. Между продвижением цепочки и записью не должно
@@ -4448,9 +6085,19 @@ impl<S: Store> Engine<S> {
         let peer_ik = session.peer_ik;
         let mut effects = Vec::new();
 
+        // Это может быть не контакт, а свой же десктоп (§13.4). Различить
+        // их можно и нужно **здесь**: статический ключ в рукопожатии — тот
+        // самый ключ сопряжения, и другого признака у нас нет.
+        //
+        // Дальше расходится почти всё. Устройство не заводится контактом
+        // (иначе оно появилось бы в списке чатов как собеседник), ему
+        // не уходит ни аватарка, ни карточка, и недокачанные файлы у него
+        // не спрашиваются: файлов у него нет — история живёт на телефоне.
+        let is_device = self.devices.contains_key(&peer_ik);
+
         // В первом сообщении приехала карточка отправителя (§8.2). Контакт
         // остаётся непроверенным: карточка пришла по сети, а не из QR (§4.2).
-        if !self.contacts.contains_key(&peer_ik) {
+        if !is_device && !self.contacts.contains_key(&peer_ik) {
             effects.extend(self.add_contact(now_ms, &payload, false)?);
         }
 
@@ -4460,6 +6107,27 @@ impl<S: Store> Engine<S> {
 
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
         effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
+
+        if is_device {
+            // Куда слать — знаем: сессия есть, транспорт известен. А вот
+            // **человеку про связь пока не говорим**, и это отметка о деле
+            // вместо отметки о намерении — та же ошибка, что была
+            // с `card_pushed` (5аж).
+            //
+            // Ответ рукопожатия только что положен в эффекты, но уедет ли он —
+            // неизвестно. Соединения односторонние (`ARCHITECTURE.md`, 5ц):
+            // принятое от десктопа мы читаем, а отвечаем в своё, набранное
+            // по адресу из справочника. Адреса может не быть вовсе — десктоп
+            // объявился секунду назад или не объявился совсем, — и тогда ответ
+            // не уходит никуда, а телефон говорил «десктоп на связи» ровно
+            // в тот момент, когда не смог ему ответить.
+            //
+            // «На связи» ставит **первая просьба** от устройства
+            // (`on_device_frame`): она доказывает, что наш ответ дошёл.
+            // Ничто другое этого не доказывает.
+            self.device_links.insert(peer_ik, via);
+            return Ok(effects);
+        }
         // После ответа, а не до: пока сессия не подтверждена нашим кадром,
         // отправлять по ней нечего. Сверенному контакту уедет лицо, всем
         // остальным — ничего (§4.2).
@@ -4646,12 +6314,7 @@ impl<S: Store> Engine<S> {
 
         // На диск — до того, как объявлен статус. Обещание, которого нет
         // в базе, не переживёт убитый процесс, а на экране останется.
-        self.store.put_outbox(&ratatosk_store::StoredOutbox {
-            msg_id: delivery.msg_id,
-            recipient_ik: delivery.peer_ik,
-            envelope: delivery.envelope.clone(),
-            queued_ms: delivery.queued_ms,
-        })?;
+        self.persist_delivery(delivery)?;
 
         let mut waiting = delivery.clone();
         waiting.attempt = Attempt::new();
@@ -4914,6 +6577,18 @@ impl<S: Store> Engine<S> {
         // но не показалось.
         tracing::debug!(kind = ?envelope.payload_type, "кадр разобран");
 
+        // Кадр от своего же десктопа (§13.4) — и дальше по этой ветке ему
+        // делать нечего. Ни окно дедупликации, ни часы §9.1, ни квитанции
+        // §9.4 к нему не относятся: всё это про **сообщения**, а компаньон
+        // возит просьбы. У просьбы нет показа — значит нечего защищать
+        // от повторного показа; идентификаторы просьб, попав в окно, только
+        // вытесняли бы оттуда настоящие. И метку часов десктопа наблюдать
+        // нельзя вовсе: HLC — общий порядок разговора с людьми, и дать
+        // терминалу двигать его вперёд значит отдать ему чужие часы.
+        if self.devices.contains_key(&peer_ik) {
+            return self.on_device_frame(now_ms, via, peer_ik, &envelope);
+        }
+
         // §9.2: одно сообщение может законно прийти дважды — разными
         // транспортами или повторной отправкой. Это нормальный режим, а не
         // ошибка. Здесь дубль — всегда **другой кадр с тем же `msg_id`**:
@@ -5128,6 +6803,17 @@ impl<S: Store> Engine<S> {
                 todo!("этап 5: группы (§11)")
             }
             PayloadType::CardUpdate => self.on_card_update(now_ms, peer_ik, &envelope),
+            // Компаньон (§13.4) едет по тем же кадрам и той же сессии,
+            // но обслуживает его не эта ветка: у него своя сторона провода
+            // и свой разбор. Пришедший **от контакта** такой кадр —
+            // не наше дело: контакт компаньоном не бывает, и путать эти
+            // два разговора нельзя.
+            PayloadType::CompanionRequest
+            | PayloadType::CompanionResponse
+            | PayloadType::CompanionNotice => {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                Ok(Vec::new())
+            }
         }
     }
 }

@@ -10,7 +10,7 @@
 //! но места, которые они чистят, заданы уже здесь.
 
 /// Версия схемы. Увеличивается на каждую миграцию.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Прагмы, выставляемые при каждом открытии соединения.
 pub const PRAGMAS: &str = "\
@@ -216,15 +216,6 @@ CREATE TABLE outbox (
     PRIMARY KEY (msg_id, recipient_ik)
 ) STRICT;
 CREATE INDEX outbox_schedule ON outbox(next_attempt_ms);
-
--- Сопряжённые десктопы (§13.4). Отзыв — удаление строки и разрыв сессии.
-CREATE TABLE paired_devices (
-    device_id       BLOB PRIMARY KEY NOT NULL,
-    label           TEXT NOT NULL,
-    pairing_key_enc BLOB NOT NULL,
-    paired_ms       INTEGER NOT NULL,
-    last_seen_ms    INTEGER NOT NULL
-) STRICT;
 
 -- Служебное: версия схемы, гибридные часы, счётчики.
 CREATE TABLE meta (
@@ -513,8 +504,84 @@ CREATE TABLE contact_shares (
 CREATE INDEX contact_shares_by_ik ON contact_shares(ik);
 "#;
 
+/// Сопряжённые десктопы (§13.4).
+///
+/// Отдельной миграцией, а не строкой в [`MIGRATION_0001`], и это исправление
+/// настоящей ошибки, а не педантизм. Таблица была дописана в первую миграцию,
+/// то есть в ту, которая на всех уже живущих устройствах давно выполнена.
+/// Собралось бы это без единого предупреждения: SQL — строка, компилятор
+/// в неё не смотрит. А на устройстве первое же сопряжение упало бы на
+/// «no such table: paired_devices», и починить это можно было бы только
+/// удалив базу, то есть переписку.
+///
+/// Отсюда правило: **выполненная миграция заморожена**. Новая таблица,
+/// новый столбец, новый индекс — всегда следующим номером. За этим следит
+/// `released_migrations_are_frozen`.
+pub const MIGRATION_0011: &str = r#"
+CREATE TABLE paired_devices (
+    device_id       BLOB PRIMARY KEY NOT NULL,
+    label           TEXT NOT NULL,
+    pairing_key_enc BLOB NOT NULL,               -- ключ сопряжения под db_key
+    paired_ms       INTEGER NOT NULL,
+    last_seen_ms    INTEGER NOT NULL             -- 0 — ни разу не подключалось
+) STRICT;
+"#;
+
+/// Порядок вложений внутри сообщения (§10).
+///
+/// **Появилась потому, что порядка не было вовсе, а он казался очевидным.**
+/// `files_of` отдавала вложения `ORDER BY file_id`, то есть по случайным
+/// шестнадцати байтам: три фотографии, выбранные человеком подряд, приходили
+/// собеседнику в произвольном порядке. Заметить это на одном вложении нельзя,
+/// а на трёх — сразу.
+///
+/// Столбец, а не сортировка по имени или размеру: порядок выбрал человек,
+/// и вывести его из содержимого нельзя ничем.
+///
+/// Умолчание `0` у всех уже лежащих строк — и это правильно: у сообщений
+/// с одним вложением порядок не значит ничего, а у прежних многофайловых
+/// он и был произвольным. Чтение сортирует `ordinal, file_id`, так что старые
+/// строки сохраняют ровно тот порядок, в каком показывались раньше.
+pub const MIGRATION_0012: &str = r#"
+ALTER TABLE files ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Незаконченные выгрузки с десктопа (§13.4).
+///
+/// **Отдельные таблицы, а не строка в `files`.** У выгрузки нет сообщения:
+/// оно заводится только третьим шагом, когда собраны все куски, — а
+/// `files.msg_id` объявлен `NOT NULL REFERENCES messages`. Ослабить его
+/// значило бы перестроить таблицу, в которой лежит настоящая переписка,
+/// ради состояния, живущего минуты.
+///
+/// Здесь же и причина, по которой это вообще понадобилось: до сих пор
+/// выгрузка жила в памяти ядра, и перезапуск телефона стирал её целиком.
+/// С одним файлом это была досада, с пятью — потеря четырёх выгруженных
+/// ради пятого.
+///
+/// `started_ms` нужен уборке: брошенная выгрузка занимает место в хранилище
+/// байтов, и без срока это место не вернётся никогда.
+pub const MIGRATION_0013: &str = r#"
+CREATE TABLE staged_files (
+    file_id         BLOB PRIMARY KEY NOT NULL,   -- 16 байт, назначил телефон
+    chat_id         BLOB NOT NULL,               -- кому уедет, когда соберётся
+    name_enc        BLOB NOT NULL,               -- имя говорит о переписке (§12)
+    size_bytes      INTEGER NOT NULL,
+    chunk_total     INTEGER NOT NULL,
+    file_key_enc    BLOB NOT NULL,               -- ключ файла (§10.1)
+    preview_enc     BLOB,                        -- до 32 КиБ, класс M (§10.3)
+    started_ms      INTEGER NOT NULL             -- когда завели: для уборки
+) STRICT;
+
+CREATE TABLE staged_chunks (
+    file_id         BLOB NOT NULL REFERENCES staged_files(file_id) ON DELETE CASCADE,
+    chunk_index     INTEGER NOT NULL,
+    PRIMARY KEY (file_id, chunk_index)
+) STRICT;
+"#;
+
 /// Все миграции по порядку.
-pub const MIGRATIONS: [&str; 10] = [
+pub const MIGRATIONS: [&str; 13] = [
     MIGRATION_0001,
     MIGRATION_0002,
     MIGRATION_0003,
@@ -525,6 +592,9 @@ pub const MIGRATIONS: [&str; 10] = [
     MIGRATION_0008,
     MIGRATION_0009,
     MIGRATION_0010,
+    MIGRATION_0011,
+    MIGRATION_0012,
+    MIGRATION_0013,
 ];
 
 #[cfg(test)]
@@ -534,6 +604,65 @@ mod tests {
     #[test]
     fn migration_count_matches_version() {
         assert_eq!(MIGRATIONS.len() as u32, SCHEMA_VERSION);
+    }
+
+    /// Контрольные суммы выпущенных миграций.
+    ///
+    /// Каждая из них уже выполнена на живых устройствах. Правка любой из них
+    /// не даёт **ничего** тому, у кого база уже есть: миграция с этим номером
+    /// у него отмечена выполненной и второй раз не пойдёт. Новая таблица
+    /// попадёт только на свежеустановленные устройства, и расхождение между
+    /// двумя половинами пользователей вскроется не сборкой, а падением
+    /// на «no such table» у одной из них.
+    ///
+    /// Так уже случилось: таблица `paired_devices` (§13.4) была дописана
+    /// в [`MIGRATION_0001`] и переехала в [`MIGRATION_0011`] отдельным
+    /// исправлением. Этот список существует затем, чтобы это не повторилось.
+    ///
+    /// **Что делать, если тест упал.** Почти наверняка вы правите выпущенную
+    /// миграцию — верните её как было и заведите следующий номер. Число здесь
+    /// меняют только вместе с добавлением новой миграции в конец списка.
+    const FROZEN: [u64; 13] = [
+        0xa3f5_d87f_eeaa_0e3c,
+        0x7996_4d61_828d_b650,
+        0x67d3_78d4_c2cc_c4f1,
+        0xa17e_09c9_981f_39a6,
+        0xd2f7_425e_015d_be60,
+        0x6054_f58b_0da1_40be,
+        0x1357_bf71_164f_d540,
+        0xc24a_a2bb_94f8_9ae1,
+        0xf06e_e041_8bdd_ac39,
+        0xa26a_3e5f_41b0_c803,
+        0xde25_353b_dd1a_d1da,
+        0xdceb_7612_67d6_ce9a,
+        0x8f1d_f010_038e_1883,
+    ];
+
+    /// FNV-1a, 64 бита.
+    ///
+    /// Своя функция вместо зависимости: криптографической стойкости здесь
+    /// не нужно — тест ловит **свою** невнимательность, а не подмену.
+    fn checksum(text: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    #[test]
+    fn released_migrations_are_frozen() {
+        assert_eq!(FROZEN.len(), MIGRATIONS.len(), "у новой миграции нет контрольной суммы");
+        for (number, (migration, frozen)) in MIGRATIONS.iter().zip(FROZEN).enumerate() {
+            assert_eq!(
+                checksum(migration),
+                frozen,
+                "миграция {:04} изменена. Она уже выполнена на живых устройствах, \
+                 и правка до них не доедет — заведите следующий номер",
+                number + 1
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,29 @@
 //! Wi-Fi, и часть корпоративных сетей. Поэтому есть `/addr` — вписать адрес
 //! руками. Передача и обнаружение проверяются по отдельности намеренно:
 //! иначе неудача не отличима от «сеть не пропускает mDNS».
+//!
+//! # Режим компаньона (§13.4)
+//!
+//! Ключ `--companion` полностью меняет роль стенда: вместо узла со своей
+//! личностью он становится **терминалом** к телефону. Проверяется это двумя
+//! процессами на одной машине:
+//!
+//! ```text
+//! # первый — телефон
+//! cargo run -p ratatosk-lab -- --name телефон --port 41234
+//! > /pair ноутбук                   # печатает ссылку — скопировать целиком
+//!
+//! # второй — десктоп
+//! cargo run -p ratatosk-lab -- --companion 'ratatosk:v0:pair:…' \
+//!                              --peer 127.0.0.1:41234
+//! > /devaddr …                      # строку печатает сам терминал —
+//! >                                 # выполнить её надо на телефоне
+//! ```
+//!
+//! Двух строк с адресами здесь не одна, а две, и это не избыточность:
+//! соединения односторонние (`ARCHITECTURE.md`, 5ц), каждая сторона пишет
+//! только в то, что набрала сама, — значит найти друг друга обязаны обе.
+//! На loopback mDNS чаще всего нет, поэтому оба адреса вписываются руками.
 
 // Предел глубины запросов компилятора поднят намеренно.
 //
@@ -41,8 +64,12 @@ use std::path::{Path, PathBuf};
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
 use ratatosk_codec::ContactCard;
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
-use ratatosk_core::{vault, Command, Engine, Event, OsEntropy, SelfAddresses};
+use ratatosk_core::{
+    vault, Command, CompanionClient, CompanionCommand, CompanionDriver, CompanionEvent,
+    CompanionHandle, Engine, Event, OsEntropy, SelfAddresses,
+};
 use ratatosk_crypto::{Identity, OnionKey};
+use ratatosk_proto::companion::{ChatSummary, Message, PairingInvite, Reaction};
 use ratatosk_proto::mail::MailAccount;
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
@@ -53,7 +80,9 @@ use ratatosk_transport::Switched;
 // становится предупреждением — в сборке, которая как раз и есть рабочая.
 #[cfg(any(not(feature = "tor"), not(feature = "mail")))]
 use ratatosk_transport::Disabled;
-use ratatosk_transport::{LanConfig, LanDirectory, LanRunner, Transports};
+use ratatosk_transport::{
+    LanConfig, LanDirectory, LanRunner, Runner, TransportCommand, Transports,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Есть ли в этом двоичном файле живой arti (§5.2).
@@ -107,6 +136,24 @@ struct Args {
     accounts: Option<PathBuf>,
     /// Имя аккаунта в этом каталоге; заводится, если его там ещё нет.
     account: Option<String>,
+    /// Работать терминалом к телефону (§13.4): ссылка `ratatosk:v0:pair:…`.
+    ///
+    /// Полностью меняет режим стенда: своей личности, своей истории и своих
+    /// контактов у терминала нет — он показывает чужие и просит чужой рукой.
+    companion: Option<String>,
+    /// Куда класть кэш терминала (§13.4). `None` — никуда.
+    ///
+    /// Это и есть та самая галочка «хранить кэш на диске»: по умолчанию
+    /// её нет, и на диск не ложится ничего. В настоящем клиенте она стоит
+    /// на экране сопряжения и переключается позже; здесь — ключ запуска
+    /// и команда `/cache`.
+    cache: Option<PathBuf>,
+    /// Адрес телефона, если mDNS не работает: `127.0.0.1:41234`.
+    ///
+    /// Для проверки двумя процессами на одной машине это основной путь:
+    /// mDNS на loopback работает не везде, а два процесса на 127.0.0.1 —
+    /// самый короткий способ увидеть режим целиком.
+    peer: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -120,6 +167,9 @@ fn parse_args() -> Args {
         pin: None,
         accounts: None,
         account: None,
+        companion: None,
+        peer: None,
+        cache: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -133,6 +183,9 @@ fn parse_args() -> Args {
             "--pin" => args.pin = argv.next(),
             "--accounts" => args.accounts = argv.next().map(PathBuf::from),
             "--account" => args.account = argv.next(),
+            "--companion" => args.companion = argv.next(),
+            "--peer" => args.peer = argv.next(),
+            "--cache" => args.cache = argv.next().map(PathBuf::from),
             other => eprintln!("неизвестный ключ: {other}"),
         }
     }
@@ -168,6 +221,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Терминал — другой режим целиком, и разбирается он до всего остального:
+    // ни хранилища, ни личности, ни аккаунтов ему не нужно.
+    if let Some(uri) = args.companion.clone() {
+        return run_companion(&args, &uri).await;
+    }
+
     match (&args.data, &args.pin) {
         // §8.6: PIN необязателен, и его отсутствие — не ошибка. Но db_key
         // тогда надо класть в хранилище ключей ОС, которого у стенда нет,
@@ -179,6 +238,662 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         (None, _) => run_ephemeral(&args).await,
+    }
+}
+
+/// Стенд в роли десктопа-компаньона (§13.4).
+///
+/// Ничего своего у него нет: ни личности, ни истории, ни контактов. Есть
+/// ссылка сопряжения, из зерна которой выводится статический ключ, и телефон
+/// на другом конце. Всё, что показывается, приезжает оттуда.
+///
+/// **Проверять этим удобнее всего двумя процессами на одной машине:**
+///
+/// ```text
+/// # первый — телефон
+/// cargo run -p ratatosk-lab -- --name телефон --port 41234
+/// > /pair ноутбук          # печатает ссылку — скопировать целиком
+///
+/// # второй — десктоп
+/// cargo run -p ratatosk-lab -- --companion 'ratatosk:v0:pair:…' \
+///                              --peer 127.0.0.1:41234
+/// ```
+///
+/// `--peer` здесь не запасной путь, а основной: mDNS на loopback работает
+/// не везде, и полагаться на него в проверке, которая должна быть быстрой,
+/// незачем.
+async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let invite = match PairingInvite::from_uri(uri.trim()) {
+        Ok(invite) => invite,
+        Err(error) => {
+            eprintln!("ссылка сопряжения не годится: {error}");
+            eprintln!("ждётся строка вида ratatosk:v0:pair:… — её печатает /pair на телефоне");
+            return Ok(());
+        }
+    };
+
+    let client = CompanionClient::from_invite(&invite, Box::new(OsEntropy));
+    let phone_ik = client.phone_ik();
+
+    // Маяк объявляется от **ключа сопряжения**, а не от какой-то своей
+    // личности: телефон ищет в эфире именно его (§5.1), и другого способа
+    // набрать десктоп у него нет — соединения односторонние.
+    let config = LanConfig { enabled: true, port: args.port, discovery: args.discovery };
+    let mut lan = LanRunner::start(config, client.ik()).await?;
+
+    if let Some(peer) = args.peer.as_deref() {
+        match peer.parse::<SocketAddr>() {
+            Ok(addr) => lan.note_address(phone_ik, addr),
+            Err(_) => eprintln!("--peer: нужен адрес вида 127.0.0.1:41234, а не «{peer}»"),
+        }
+    }
+    lan.execute(TransportCommand::SetEnabled {
+        transport: ratatosk_proto::Transport::Lan,
+        enabled: true,
+    })
+    .await?;
+    // Телефон объявляется от своего `IK`, и без этой строки его маяк
+    // не с чем было бы сравнить.
+    lan.execute(TransportCommand::WatchLanPeers(vec![phone_ik])).await?;
+
+    println!("терминал : к «{}»", client.phone_name());
+    println!("id       : {}", data_encoding::HEXLOWER.encode(&client.device_id()));
+    println!("порт     : {}", lan.port());
+    if invite.onion.is_empty() {
+        println!("onion    : в приглашении пусто — только локальная сеть");
+    } else {
+        println!("onion    : {} (пока не используется: см. ARCHITECTURE, 5бб)", invite.onion);
+    }
+    println!();
+    // Соединения односторонние (`ARCHITECTURE.md`, 5ц): телефон обязан
+    // набрать десктоп сам, а на loopback mDNS работает не везде. Поэтому
+    // строка печатается готовой к вставке — угадывать порт не придётся.
+    if args.cache.is_none() {
+        // §14: молчание об этом человек прочитает как «кэш есть».
+        println!("кэш     : только в памяти — закроете окно, и он исчезнет");
+        println!("           хранить на диске: --cache <путь> или /cache on <путь>");
+        println!();
+    }
+    println!("если телефон не находит терминал сам, выполните на нём:");
+    println!();
+    println!("/devaddr {} 127.0.0.1:{}", data_encoding::HEXLOWER.encode(&client.ik()), lan.port());
+    println!();
+    println!("команды: /chats   /open <номер>   /more   /read   /cache [on <путь>|off]   /quit");
+    println!("         /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
+    println!("         /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
+    println!("         /accept <n> [k]   — качать вложение;  /pause — передумать");
+    println!("         /decline <n> [k]  — отказаться совсем: приехавшее стирается");
+    println!("         /preview <n> [k]  — превью вложения, если оно есть");
+    println!("         /save <n> [k] <путь>   — забрать сюда;  /stop — прекратить");
+    println!("         /send <путь…> [-- подпись] — отправить файлы одним сообщением");
+    println!("         /sendpic <файл-превью> <путь> [подпись] — то же с превью");
+    println!("         номер n — из строк, показанных /open и /more");
+    println!("всё остальное уходит текстом в открытый чат");
+    println!();
+
+    // Среда — у драйвера, консоль — здесь. До этой поставки они были одним
+    // куском, и переехали ради того, что этим же куском будет пользоваться
+    // Kotlin: через UniFFI sans-io не пролезает (§13.3).
+    let (mut driver, handle, events) = CompanionDriver::new(client, lan);
+    let console = tokio::spawn(companion_console(handle, events, args.cache.clone()));
+    tokio::select! {
+        () = driver.run() => {}
+        _ = console => {}
+    }
+    Ok(())
+}
+
+/// Всё, что помнит консоль терминала.
+///
+/// Помнит она мало и нарочно: история, список чатов и заголовки живут
+/// на телефоне (§13.3), кэш и файлы — у [`CompanionDriver`], а здесь лежит
+/// ровно то, без чего не составить следующую команду: какой чат открыт
+/// и какие строки показаны последними.
+struct Console {
+    chats: Vec<ChatSummary>,
+    /// Открытый чат. `None` — не выбран или связь пропала.
+    current: Option<[u8; 16]>,
+    /// Последняя показанная страница — то, на что ссылаются номера.
+    page: Vec<Message>,
+    /// Самое старое из показанного — курсор для `/more`.
+    oldest: Option<[u8; 16]>,
+    /// Самое новое из показанного — граница для `/read`.
+    newest: Option<[u8; 16]>,
+}
+
+impl Console {
+    fn new() -> Console {
+        Console { chats: Vec::new(), current: None, page: Vec::new(), oldest: None, newest: None }
+    }
+
+    /// Печатает событие компаньона и обновляет то немногое, что помним.
+    fn show(&mut self, event: CompanionEvent) {
+        match event {
+            CompanionEvent::Linked => println!("< телефон на связи"),
+            CompanionEvent::Wire { theirs, ours } => match theirs {
+                // Совпало — молчим: сообщать «всё в порядке» на каждом
+                // подключении значит приучить не читать эту строку.
+                Some(theirs) if theirs == ours => {}
+                Some(theirs) => {
+                    println!("< ВНИМАНИЕ: провод телефона версии {theirs}, здесь {ours}");
+                    println!("    показ будет неполным — часть нового просто не приедет");
+                }
+                None => {
+                    println!("< ВНИМАНИЕ: телефон не назвал версию провода вовсе");
+                    println!("    значит его сборка старее этой — пересоберите ядро");
+                }
+            },
+            CompanionEvent::Unlinked => {
+                // §14, пункт 5: телефон офлайн — десктоп не работает.
+                self.current = None;
+                println!("< телефона нет в сети — отсюда сейчас не отправить ничего");
+            }
+            CompanionEvent::Chats { chats, fresh } => {
+                self.chats = chats;
+                if self.chats.is_empty() {
+                    println!("< чатов нет");
+                }
+                if !fresh {
+                    println!("< (из памяти — телефон ещё не подтверждал)");
+                }
+                for (n, chat) in self.chats.iter().enumerate() {
+                    let mark = if chat.verified { "+" } else { " " };
+                    println!("< {:>2}. {mark} {}: {}", n + 1, chat.title, chat.last_text);
+                }
+            }
+            CompanionEvent::History { chat, page, fresh } => {
+                // Чат в событии, а не по памяти: `/open` могли нажать, пока
+                // эта страница ехала, и высыпать её в чужой разговор — худшее,
+                // что можно сделать с историей.
+                if self.current != Some(chat) {
+                    println!("< страница не открытого сейчас чата — пропущена");
+                    return;
+                }
+                if !fresh {
+                    println!("< (из памяти — телефон ещё не подтверждал)");
+                }
+                if let Some(first) = page.first() {
+                    self.oldest = Some(first.msg_id);
+                }
+                if let Some(last) = page.last() {
+                    self.newest = Some(last.msg_id);
+                }
+                if page.is_empty() {
+                    println!("< дальше ничего нет");
+                }
+                self.page = page;
+                for (n, message) in self.page.iter().enumerate() {
+                    println!("< {:>2}. {}", n + 1, line(message));
+                }
+            }
+            CompanionEvent::Arrived(message) => {
+                self.newest = Some(message.msg_id);
+                self.page.push(message);
+                let n = self.page.len();
+                println!("< {n:>2}. {}", line(&self.page[n - 1]));
+            }
+            CompanionEvent::Status { msg_id, status } => match DeliveryStatus::from_code(status) {
+                Some(status) => println!("< {} -> {status:?}", short(&msg_id)),
+                None => println!("< {}: статус {status} неизвестен", short(&msg_id)),
+            },
+            CompanionEvent::ChatsChanged => println!("< список чатов изменился — /chats"),
+            CompanionEvent::Gone { msg_ids, .. } => {
+                for msg_id in &msg_ids {
+                    println!("< {} стёрто", short(msg_id));
+                }
+                let before = self.page.len();
+                self.page.retain(|message| !msg_ids.contains(&message.msg_id));
+                if self.page.len() != before {
+                    println!("< (нумерация сдвинулась — /open покажет заново)");
+                }
+                if self.oldest.is_some_and(|id| msg_ids.contains(&id)) {
+                    self.oldest = None;
+                }
+                if self.newest.is_some_and(|id| msg_ids.contains(&id)) {
+                    self.newest = None;
+                }
+            }
+            CompanionEvent::Edited(message) => {
+                println!("< {} исправлено: {}", short(&message.msg_id), line(&message));
+            }
+            CompanionEvent::Reacted { msg_id, reactions, .. } => {
+                if reactions.is_empty() {
+                    println!("< {}: реакций больше нет", short(&msg_id));
+                } else {
+                    println!("< {}: реакции{}", short(&msg_id), adorn(&reactions));
+                }
+            }
+            CompanionEvent::FileProgress { file_id, have_chunks, chunk_total, accepted } => {
+                for message in &mut self.page {
+                    for file in message.files.iter_mut().filter(|f| f.file_id == file_id) {
+                        file.have_chunks = have_chunks;
+                        file.accepted = accepted;
+                    }
+                }
+                // Три разных состояния при одних и тех же числах, и путать
+                // их нельзя: остановлено человеком, идёт, готово.
+                if !accepted {
+                    println!(
+                        "< {}: остановлено на {have_chunks}/{chunk_total} — /accept продолжит",
+                        short(&file_id)
+                    );
+                } else if have_chunks >= chunk_total {
+                    println!("< {} принят целиком — можно /save", short(&file_id));
+                } else {
+                    println!("< {}: {have_chunks}/{chunk_total}", short(&file_id));
+                }
+            }
+            CompanionEvent::FilePreview { file_id, bytes } => match bytes {
+                // Консоль картинку не нарисует, и притворяться незачем:
+                // она говорит, что приехало и сколько. Настоящему клиенту
+                // здесь место для самого изображения.
+                Some(bytes) => println!(
+                    "< превью {}: {} — консоль его не покажет, окно покажет",
+                    short(&file_id),
+                    bytes_text(bytes.len() as u64)
+                ),
+                None => println!("< превью {}: телефону нечего показать", short(&file_id)),
+            },
+            CompanionEvent::FileGone { file_id } => {
+                for message in &mut self.page {
+                    message.files.retain(|file| file.file_id != file_id);
+                }
+                println!("< вложение {} убрано — от него отказались", short(&file_id));
+            }
+            CompanionEvent::FileSaved { path, .. } => {
+                println!("< вложение сохранено: {}", path.display());
+            }
+            CompanionEvent::FilesSent { file_ids } => {
+                let files = if file_ids.len() == 1 {
+                    "файл".to_owned()
+                } else {
+                    format!("{} файлов одним сообщением", file_ids.len())
+                };
+                println!("< {files} отправлен — «отправлено», а не «доставлено» (§9.4)");
+            }
+            CompanionEvent::FetchPaused => {
+                println!("< связь пропала — приём ждёт, записанное лежит рядом с «.part»");
+            }
+            CompanionEvent::FetchResumed { done, total } => {
+                println!("< продолжаю приём: {done} кусков из {total} уже на диске");
+            }
+            CompanionEvent::SendPaused => {
+                println!("< связь пропала — отправка ждёт, выгруженное лежит у телефона");
+            }
+            CompanionEvent::SendResumed { done, total } => {
+                println!("< продолжаю отправку: {done} из {total} файлов уже на телефоне");
+            }
+            CompanionEvent::Done => {}
+            CompanionEvent::Refused(why) => println!("< телефон отказал: {why}"),
+            CompanionEvent::NotLinked => println!("< телефона нет в сети"),
+        }
+    }
+
+    /// Номер из последней показанной страницы — в идентификатор сообщения.
+    fn pick(&self, picked: &str) -> Option<[u8; 16]> {
+        if self.current.is_none() {
+            println!("< сперва /open <номер>");
+            return None;
+        }
+        match picked.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.page.len()) {
+            Some(n) => Some(self.page[n - 1].msg_id),
+            None => {
+                println!("< нужен номер строки из показанного, от 1 до {}", self.page.len());
+                None
+            }
+        }
+    }
+
+    /// То же для списка номеров через пробел.
+    fn pick_many(&self, picked: &str) -> Option<Vec<[u8; 16]>> {
+        let mut out = Vec::new();
+        for word in picked.split_whitespace() {
+            out.push(self.pick(word)?);
+        }
+        if out.is_empty() {
+            println!("< нужен хотя бы один номер строки");
+            return None;
+        }
+        Some(out)
+    }
+
+    /// «<номер строки> [номер вложения]» — во вложение.
+    fn pick_file(&self, rest: &str) -> Option<&ratatosk_proto::companion::Attachment> {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let (picked, which) = match words.as_slice() {
+            [n] => (*n, 1usize),
+            [n, k] => (*n, k.parse::<usize>().unwrap_or(0)),
+            _ => {
+                println!("< нужен номер строки, и через пробел — номер вложения, если их много");
+                return None;
+            }
+        };
+        let msg_id = self.pick(picked)?;
+        let message = self.page.iter().find(|m| m.msg_id == msg_id)?;
+        match which.checked_sub(1).and_then(|k| message.files.get(k)) {
+            Some(file) => Some(file),
+            None if message.files.is_empty() => {
+                println!("< в этом сообщении вложений нет");
+                None
+            }
+            None => {
+                println!("< у этого сообщения вложений {}", message.files.len());
+                None
+            }
+        }
+    }
+
+    /// Превращает строку человека в команду компаньону.
+    ///
+    /// `None` — просить нечего: команда обслужена на месте либо не понята.
+    fn parse(&mut self, line: String) -> Option<CompanionCommand> {
+        if line == "/chats" {
+            return Some(CompanionCommand::Chats);
+        }
+        if let Some(rest) = line.strip_prefix("/open ") {
+            let picked =
+                rest.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+            let Some(n) = picked else {
+                println!("< нужен номер из /chats, от 1 до {}", self.chats.len());
+                return None;
+            };
+            let chat = self.chats[n - 1].chat;
+            self.current = Some(chat);
+            self.oldest = None;
+            self.newest = None;
+            println!("< открыт чат «{}»", self.chats[n - 1].title);
+            return Some(CompanionCommand::History { chat, limit: 20, before: None });
+        }
+        if line == "/more" {
+            let Some(chat) = self.current else {
+                println!("< сперва /open <номер>");
+                return None;
+            };
+            let Some(before) = self.oldest else {
+                println!("< листать нечего: в этом чате ничего не показано");
+                return None;
+            };
+            return Some(CompanionCommand::History { chat, limit: 20, before: Some(before) });
+        }
+        if let Some(rest) = line.strip_prefix("/react ") {
+            let (picked, emoji) = split_first(rest);
+            let msg_id = self.pick(picked)?;
+            let chat = self.current?;
+            return Some(CompanionCommand::SetReaction { chat, msg_id, emoji: emoji.to_owned() });
+        }
+        if let Some(rest) = line.strip_prefix("/reply ") {
+            let (picked, text) = split_first(rest);
+            let reply_to = self.pick(picked)?;
+            let chat = self.current?;
+            if text.is_empty() {
+                println!("< ответ без слов — не ответ: /reply <номер> <текст>");
+                return None;
+            }
+            return Some(CompanionCommand::SendReply { chat, reply_to, text: text.to_owned() });
+        }
+        if let Some(rest) = line.strip_prefix("/edit ") {
+            let (picked, text) = split_first(rest);
+            let msg_id = self.pick(picked)?;
+            let chat = self.current?;
+            if text.is_empty() {
+                // Пустая правка — это не правка, а удаление, и для него
+                // есть отдельная команда.
+                println!("< пустая правка — это удаление: /del или /retract");
+                return None;
+            }
+            return Some(CompanionCommand::EditMessage { chat, msg_id, text: text.to_owned() });
+        }
+        if let Some(rest) = line.strip_prefix("/del ") {
+            let msg_ids = self.pick_many(rest)?;
+            let chat = self.current?;
+            return Some(CompanionCommand::DeleteMessages { chat, msg_ids });
+        }
+        if let Some(rest) = line.strip_prefix("/retract ") {
+            let msg_ids = self.pick_many(rest)?;
+            let chat = self.current?;
+            println!("< это просьба, а не гарантия: чужой клиент вправе её не выполнить");
+            return Some(CompanionCommand::RetractMessages { chat, msg_ids });
+        }
+        if let Some(rest) = line.strip_prefix("/fwd ") {
+            let (picked, target) = split_first(rest);
+            let msg_ids = self.pick_many(picked)?;
+            let into =
+                target.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+            let Some(n) = into else {
+                println!("< куда пересылать: /fwd <номер сообщения> <номер чата из /chats>");
+                return None;
+            };
+            return Some(CompanionCommand::ForwardMessages {
+                chat: self.chats[n - 1].chat,
+                msg_ids,
+            });
+        }
+        if line == "/clear" {
+            let Some(chat) = self.current else {
+                println!("< сперва /open <номер>");
+                return None;
+            };
+            println!("< чат очищается **у себя**: собеседник не узнает ничего");
+            return Some(CompanionCommand::ClearChat { chat });
+        }
+        if let Some(rest) = line.strip_prefix("/accept ") {
+            let file_id = self.pick_file(rest)?.file_id;
+            return Some(CompanionCommand::AcceptFile { file_id });
+        }
+        if let Some(rest) = line.strip_prefix("/pause ") {
+            let file_id = self.pick_file(rest)?.file_id;
+            println!("< приехавшее остаётся: /accept продолжит с того же места");
+            return Some(CompanionCommand::PauseFile { file_id });
+        }
+        if let Some(rest) = line.strip_prefix("/preview ") {
+            let file = self.pick_file(rest)?;
+            if !file.has_preview {
+                println!("< у этого вложения превью нет — спрашивать нечего");
+                return None;
+            }
+            return Some(CompanionCommand::Preview { file_id: file.file_id });
+        }
+        if let Some(rest) = line.strip_prefix("/decline ") {
+            let file_id = self.pick_file(rest)?.file_id;
+            println!("< собеседник об отказе не узнает — это решение о своей памяти");
+            return Some(CompanionCommand::DeclineFile { file_id });
+        }
+        if let Some(rest) = line.strip_prefix("/save ") {
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let (picked, path) = match words.as_slice() {
+                [n, path] => (format!("{n}"), *path),
+                [n, k, path] => (format!("{n} {k}"), *path),
+                _ => {
+                    println!("< /save <номер строки> [номер вложения] <путь без пробелов>");
+                    return None;
+                }
+            };
+            let file = self.pick_file(&picked)?;
+            if !file.accepted {
+                println!("< телефон это вложение ещё не принял — сперва /accept");
+                return None;
+            }
+            if file.have_chunks < file.chunk_total {
+                println!(
+                    "< телефон получил {} кусков из {} — вложение ещё едет к нему самому",
+                    file.have_chunks, file.chunk_total
+                );
+                return None;
+            }
+            return Some(CompanionCommand::SaveFile {
+                file_id: file.file_id,
+                chunk_total: file.chunk_total,
+                path: PathBuf::from(path),
+            });
+        }
+        if line == "/stop" {
+            return Some(CompanionCommand::CancelSave);
+        }
+        // Превью собирает клиент — стенд не клиент и картинок не рисует.
+        // Поэтому он берёт **готовый файл** и отдаёт его байтами: проверить
+        // дорогу можно, не заводя в стенде декодера изображений, которому
+        // рядом с ключами и не место (§10.3).
+        // Превью собирает клиент — стенд не клиент и картинок не рисует.
+        // Поэтому он берёт **готовый файл** и отдаёт его байтами: проверить
+        // дорогу можно, не заводя в стенде декодера изображений, которому
+        // рядом с ключами и не место (§10.3).
+        if let Some(rest) = line.strip_prefix("/sendpic ") {
+            let (pic, rest) = split_first(rest);
+            let (path, text) = split_first(rest);
+            let Some(chat) = self.current else {
+                println!("< сперва /open <номер>");
+                return None;
+            };
+            if path.is_empty() {
+                println!("< /sendpic <файл-превью> <путь> [подпись]");
+                return None;
+            }
+            let preview = match std::fs::read(pic) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    println!("< превью {pic} не прочитать: {error}");
+                    return None;
+                }
+            };
+            println!("< превью: {}", bytes_text(preview.len() as u64));
+            return Some(CompanionCommand::SendFiles {
+                chat,
+                files: vec![(PathBuf::from(path), Some(preview))],
+                text: text.to_owned(),
+            });
+        }
+        // Несколько файлов — одним сообщением. Разделитель `--`, а не пробел:
+        // пути с пробелами стенд и так не берёт, но подпись отличить от пути
+        // иначе нечем, а «последнее слово — подпись» ломается на первом же
+        // однословном пути.
+        if let Some(rest) = line.strip_prefix("/send ") {
+            let Some(chat) = self.current else {
+                println!("< сперва /open <номер>");
+                return None;
+            };
+            let (paths, text) = match rest.split_once(" -- ") {
+                Some((paths, text)) => (paths, text.trim()),
+                None => (rest, ""),
+            };
+            let files: Vec<(PathBuf, Option<Vec<u8>>)> = paths
+                .split_whitespace()
+                // Без превью — законный и обычный случай: не картинка,
+                // не смогли, не захотели.
+                .map(|path| (PathBuf::from(path), None))
+                .collect();
+            if files.is_empty() {
+                println!("< /send <путь…> [-- подпись]");
+                return None;
+            }
+            if files.len() > 1 {
+                println!("< {} файлов одним сообщением", files.len());
+            }
+            return Some(CompanionCommand::SendFiles { chat, files, text: text.to_owned() });
+        }
+        if line == "/unsend" {
+            return Some(CompanionCommand::CancelSend);
+        }
+        if let Some(rest) = line.strip_prefix("/cache") {
+            let rest = rest.trim();
+            if rest == "off" {
+                println!("< кэш выключен и файл стёрт");
+                return Some(CompanionCommand::KeepCache { path: None });
+            }
+            if let Some(path) = rest.strip_prefix("on ") {
+                // §14: сказать, чего это шифрование НЕ даёт, — обязательно.
+                println!("    зашифрован ключом из зерна сопряжения, а зерно лежит рядом:");
+                println!("    защищает от скопированного файла и от бэкапа, но не от");
+                println!("    того, кто забрал эту машину целиком");
+                return Some(CompanionCommand::KeepCache {
+                    path: Some(PathBuf::from(path.trim())),
+                });
+            }
+            println!("< /cache on <путь> | /cache off");
+            return None;
+        }
+        if line == "/read" {
+            return match (self.current, self.newest) {
+                (Some(chat), Some(up_to)) => Some(CompanionCommand::MarkRead { chat, up_to }),
+                _ => {
+                    println!("< нечего отмечать: сперва /open <номер>");
+                    None
+                }
+            };
+        }
+        if line.starts_with('/') {
+            println!("< команды:");
+            println!("<   /chats   /open <номер>   /more   /read");
+            println!("<   /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
+            println!("<   /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
+            println!("<   /accept <n> [k]   /pause <n> [k]   /decline <n> [k]");
+            println!("<   /preview <n> [k]");
+            println!("<   /save <n> [k] <путь>   /stop");
+            println!("<   /send <путь…> [-- подпись]   /sendpic <превью> <путь> [подпись]");
+            println!("<   /unsend");
+            println!("<   /cache [on <путь>|off]   /quit");
+            return None;
+        }
+        // Предел в **байтах**: кириллица в UTF-8 идёт по два, эмодзи по
+        // четыре. Стенд говорит это до отправки — ровно то, что настоящее
+        // окно обязано показывать счётчиком.
+        if !ratatosk_proto::files::text_fits(line.len()) {
+            println!(
+                "< {} байт при пределе {} — столько в одно сообщение не влезает",
+                line.len(),
+                ratatosk_proto::files::MAX_TEXT_BYTES
+            );
+            return None;
+        }
+        match self.current {
+            Some(chat) => Some(CompanionCommand::SendText { chat, text: line }),
+            None => {
+                println!("< сперва /open <номер> — /chats покажет список");
+                None
+            }
+        }
+    }
+}
+
+/// Консоль терминала: строки со stdin и события компаньона.
+///
+/// Транспорта, часов и диска здесь больше нет — всё это у
+/// [`CompanionDriver`]. Осталось то, чем консоль и является: разбор строк
+/// и печать.
+async fn companion_console(
+    handle: CompanionHandle,
+    mut events: ratatosk_core::CompanionEvents,
+    cache_path: Option<PathBuf>,
+) {
+    let mut console = Console::new();
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+
+    if let Some(path) = cache_path {
+        println!("< кэш будет лежать в {}", path.display());
+        handle.send(CompanionCommand::KeepCache { path: Some(path) }).await.ok();
+    }
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else { return };
+                let line = line.trim().to_owned();
+                if line.is_empty() {
+                    continue;
+                }
+                if line == "/quit" {
+                    return;
+                }
+                if let Some(command) = console.parse(line) {
+                    if handle.send(command).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            event = events.next() => {
+                let Some(event) = event else { return };
+                console.show(event);
+            }
+        }
     }
 }
 
@@ -388,7 +1103,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /find <слова>   /share   /take <msg_id>   /sweep   /quit"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /quit"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -449,6 +1164,54 @@ async fn console(
                     show_contacts(&handle, &directory).await;
                     continue;
                 }
+                if line == "/devices" {
+                    show_devices(&handle, &directory).await;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/devaddr ") {
+                    // Адрес десктопа руками — по тем же двум причинам, что
+                    // и `/addr` у контакта: mDNS в сети может не работать,
+                    // а на loopback его чаще всего нет вовсе. Ключ здесь
+                    // не `IK` человека, а публичная половина ключа
+                    // сопряжения: именно от неё десктоп объявляется (§5.1).
+                    let mut parts = rest.split_whitespace();
+                    let key = parts.next().unwrap_or_default();
+                    let addr = parts.next().unwrap_or_default();
+                    match (
+                        data_encoding::HEXLOWER.decode(key.as_bytes()),
+                        addr.parse::<std::net::SocketAddr>(),
+                    ) {
+                        (Ok(raw), Ok(addr)) if raw.len() == 32 => {
+                            let mut ik = [0u8; 32];
+                            ik.copy_from_slice(&raw);
+                            directory.note(ik, addr);
+                            println!("< терминал {} по адресу {addr}", short(&ik));
+                        }
+                        _ => println!(
+                            "< нужно: /devaddr <64 знака hex> <ip:порт> — строку печатает сам терминал"
+                        ),
+                    }
+                    continue;
+                }
+                if let Some(label) = line.strip_prefix("/pair ") {
+                    // Ссылка придёт событием `PairingReady` — и только им.
+                    // Второго показа не будет: см. §13.4 и `on_pair_device`.
+                    handle.send(Command::PairDevice { label: label.trim().to_owned() }).await.ok();
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/unpair ") {
+                    match data_encoding::HEXLOWER.decode(rest.trim().as_bytes()) {
+                        Ok(raw) if raw.len() == 16 => {
+                            let mut device_id = [0u8; 16];
+                            device_id.copy_from_slice(&raw);
+                            handle.send(Command::RevokePairing { device_id }).await.ok();
+                        }
+                        // Печатается полностью в `/devices` — короткой формы
+                        // из журнала событий здесь не хватит.
+                        _ => println!("< нужен полный id устройства в hex (32 знака) — /devices"),
+                    }
+                    continue;
+                }
                 if line == "/share" {
                     // Делимся с текущим собеседником **своей** карточкой:
                     // на стенде третьего обычно нет, а проверить путь этого
@@ -477,6 +1240,32 @@ async fn console(
                             println!("< если карточка была — контакт добавлен непроверенным");
                         }
                         _ => println!("< нужен полный msg_id в hex (32 знака)"),
+                    }
+                    continue;
+                }
+                if line == "/react" || line.starts_with("/react ") {
+                    // Реагируем на **последнее** сообщение чата, а не на
+                    // названный идентификатор: набирать тридцать два знака
+                    // hex ради смайлика человек не станет, а проверяется
+                    // здесь дорога до второго экрана, а не разбор строки.
+                    // Без аргумента — снятие: пустая строка и есть «снято»
+                    // (`ratatosk_proto::reaction`).
+                    let emoji = line.strip_prefix("/react ").unwrap_or("").trim().to_owned();
+                    if peer.is_none() {
+                        peer = sole_contact(&handle).await;
+                    }
+                    let Some(ik) = peer else {
+                        println!("< некому: сперва /add <карточка>");
+                        continue;
+                    };
+                    let chat = Engine::<MemoryStore>::chat_id_for(&ik);
+                    match handle.messages(chat, 1).await.and_then(|found| found.into_iter().next()) {
+                        Some(view) => {
+                            let msg_id = view.message.msg_id;
+                            handle.send(Command::SetReaction { chat, msg_id, emoji }).await.ok();
+                            println!("< реакция на {}", short(&msg_id));
+                        }
+                        None => println!("< в чате пока нечего отмечать"),
                     }
                     continue;
                 }
@@ -769,6 +1558,7 @@ async fn console(
                     | Event::AvatarChanged { .. }
                     | Event::GroupMembershipChanged { .. }
                     | Event::FileProgress { .. }
+                    | Event::FileGone { .. }
                     // Печатается в `report`, а здесь делать нечего: ход
                     // подъёма Tor ничего не меняет в состоянии стенда.
                     | Event::HonestNotice { .. }
@@ -779,6 +1569,11 @@ async fn console(
                     | Event::MailAccountFailed { .. }
                     | Event::MailLoginFailed { .. }
                     | Event::MailLimits { .. }
+                    // Тоже в `report`. Список устройств стенд не ведёт:
+                    // спросит `/devices`, когда понадобится.
+                    | Event::PairingReady { .. }
+                    | Event::PairingRevoked { .. }
+                    | Event::DeviceLink { .. }
                     | Event::FileWaitsForChannel { .. } => {}
                     // Печатается в `report`, а здесь запоминается: `/tor`
                     // обязан отвечать и тогда, когда строка уехала вверх.
@@ -816,6 +1611,43 @@ async fn sole_contact(handle: &DriverHandle) -> Option<[u8; 32]> {
 /// Это главная диагностика стенда. `Undeliverable` сам по себе не говорит
 /// ничего: он значит «ни один транспорт не подошёл», а какой именно признак
 /// не сложился — видно только здесь.
+/// Сопряжённые десктопы (§13.4).
+async fn show_devices(handle: &DriverHandle, directory: &LanDirectory) {
+    let Some(devices) = handle.devices().await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if devices.is_empty() {
+        println!("< сопряжений нет: /pair <метка>");
+        return;
+    }
+    for device in devices {
+        // Идентификатор целиком: им отзывают сопряжение, и обрезанный
+        // пришлось бы искать глазами по журналу.
+        println!(
+            "< {} «{}»: {}",
+            data_encoding::HEXLOWER.encode(&device.device_id),
+            device.label,
+            if device.connected { "на связи" } else { "не подключён" }
+        );
+        // Главный вопрос при разборе «почему не подключается»: знает ли
+        // телефон, куда звонить. Ответить на него больше нечем — соединения
+        // односторонние, и без адреса ответ на рукопожатие уходит в никуда.
+        match directory.get(&device.pairing_public) {
+            Some(addr) => println!("    адрес: {addr}"),
+            None => {
+                println!("    адреса нет — ответить ему телефон не сможет");
+                println!("    ждём маяка mDNS либо вписываем руками: /devaddr");
+            }
+        }
+        if device.last_seen_ms == 0 {
+            println!("    ни разу не подключался");
+        } else if device.cache_expired {
+            println!("    больше тридцати суток без связи — кэш на десктопе стёрт (§13.4)");
+        }
+    }
+}
+
 async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
     let Some(contacts) = handle.contacts().await else {
         println!("< драйвер остановлен");
@@ -1241,6 +2073,9 @@ fn report(event: &Event) {
         Event::FileProgress { file_id, received, total } => {
             println!("< файл {}: {received}/{total}", short(file_id));
         }
+        Event::FileGone { file_id } => {
+            println!("< вложение {} убрано — от него отказались", short(file_id));
+        }
         Event::HonestNotice { text } => println!("< {text}"),
         Event::CommandRefused { reason } => {
             // §14: человек что-то сделал и обязан узнать, почему не вышло.
@@ -1306,6 +2141,24 @@ fn report(event: &Event) {
                 println!("    места меньше, чем нужно одной передаче, — файлы не принимаются");
             }
         }
+        Event::PairingReady { device_id, uri } => {
+            // Ссылка целиком и один раз. Второго события не будет: секрет
+            // живёт только здесь, телефон его не хранит (§13.4).
+            println!("< сопряжение {} заведено", short(device_id));
+            println!("    {uri}");
+            println!("    это единственный показ — на телефоне секрета не остаётся");
+            println!("    терминал: cargo run -p ratatosk-lab -- --companion '<ссылка>' \\");
+            println!(
+                "                                           --peer 127.0.0.1:<порт этого узла>"
+            );
+        }
+        Event::PairingRevoked { device_id } => {
+            println!("< сопряжение {} отозвано, сессия разорвана", short(device_id));
+        }
+        Event::DeviceLink { device_id, connected } => {
+            let state = if *connected { "на связи" } else { "отключился" };
+            println!("< десктоп {}: {state}", short(device_id));
+        }
     }
 }
 
@@ -1318,6 +2171,87 @@ fn bytes_text(bytes: u64) -> String {
     }
 }
 
+/// Делит строку на первое слово и остаток.
+///
+/// Остаток отдаётся **как есть**, без повторного разбиения: это текст
+/// сообщения, и пробелы в нём принадлежат человеку.
+fn split_first(rest: &str) -> (&str, &str) {
+    match rest.trim_start().split_once(char::is_whitespace) {
+        Some((first, tail)) => (first, tail.trim_start()),
+        None => (rest.trim(), ""),
+    }
+}
+
 fn short(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(&bytes[..bytes.len().min(6)])
+}
+
+/// Строка сообщения так, как её видит человек за десктопом.
+///
+/// Одна функция на все три места, где сообщение печатается, — страница,
+/// новость о приходе, новость о правке. Три похожих `println!` разошлись бы
+/// на первой же новой отметке, и разошлись бы молча: заметить, что «изменено»
+/// рисуется в истории и не рисуется у только что пришедшего, можно только
+/// глазами и только случайно.
+///
+/// Отметки обязательны, а не украшательны. «Изменено» — потому что прежнего
+/// текста не остаётся ни у кого, и без него подменённые слова выглядят
+/// исходными (§14). «Переслано» — потому что это утверждение о происхождении
+/// слов. Ответ печатается ссылкой: цитату рисуют из своей копии, а её
+/// у терминала может и не быть — тогда честно виден голый идентификатор,
+/// а не выдуманный текст.
+fn line(message: &Message) -> String {
+    let mut out = String::new();
+    if let Some(reply_to) = message.reply_to {
+        out.push_str(&format!("в ответ на {}: ", short(&reply_to)));
+    }
+    out.push_str(if message.mine { "-> " } else { "<- " });
+    if message.forwarded {
+        out.push_str("(переслано) ");
+    }
+    out.push_str(&message.text);
+    if message.edited_ms.is_some() {
+        out.push_str(" (изменено)");
+    }
+    out.push_str(&adorn(&message.reactions));
+    for (n, file) in message.files.iter().enumerate() {
+        // Пара чисел, а не проценты: доля — это представление, и считать её
+        // должен показ, а не провод. Зато по «2/9» сразу видно и то, что
+        // приём идёт, и то, что забирать пока нечего.
+        out.push_str(&format!(
+            "\n<     [файл {}] {} — {}, кусков {}/{}{}",
+            n + 1,
+            file.name,
+            bytes_text(file.size_bytes),
+            file.have_chunks,
+            file.chunk_total,
+            // Без этой пометки «телефон не принял» и «телефон качает» —
+            // оба ноль из N, и человек не знает, ждать ему или решать.
+            if file.accepted { "" } else { "  ← ждёт решения: /accept" }
+        ));
+        // Картинку консоль не нарисует, но сказать, что она есть, обязана:
+        // иначе `/preview` выглядит командой, которая никогда не работает.
+        if file.has_preview {
+            out.push_str("  (превью: /preview)");
+        }
+    }
+    out
+}
+
+/// Приписка с реакциями к строке сообщения.
+///
+/// Пусто, когда реакций нет: в разговоре их не бывает у подавляющего
+/// большинства сообщений, и пустые скобки после каждой строки сделали бы
+/// ленту нечитаемой. Своя помечается звёздочкой — консоль не умеет показать
+/// это иначе, а отличать своё от чужого надо: нажать «поставить» второй раз
+/// человек не должен.
+fn adorn(reactions: &[Reaction]) -> String {
+    if reactions.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = reactions
+        .iter()
+        .map(|r| if r.mine { format!("{}*", r.emoji) } else { r.emoji.clone() })
+        .collect();
+    format!("  [{}]", list.join(" "))
 }

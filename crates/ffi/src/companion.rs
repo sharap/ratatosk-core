@@ -1,0 +1,1240 @@
+//! Граница компаньона (§13.4): второй экран для Kotlin.
+//!
+//! # Почему это отдельный объект, а не режим клиента
+//!
+//! [`RatatoskClient`](crate::RatatoskClient) — телефон: у него база, личность
+//! и история. Компаньон — терминал: у него нет ничего из этого, и он
+//! **не вправе** это заводить. Один объект с двумя режимами означал бы, что
+//! половина методов в каждом режиме отвечает «не сейчас», а UI решает,
+//! какая именно, — то есть протокольное знание выше границы, чего §13.3
+//! не разрешает.
+//!
+//! Поэтому объектов два, и общего у них ровно то, что и должно быть общим:
+//! слова ошибок ([`RatatoskError`]) и правило «наружу простые типы».
+//!
+//! # Почему записи здесь свои, а не общие с телефоном
+//!
+//! Соблазн переиспользовать [`FfiMessage`](crate::FfiMessage) сильный
+//! и неверный. У телефона в сообщении есть то, чего у десктопа нет
+//! и не будет:
+//!
+//! * `FfiReaction::author_ik` — в переписке двоих «своя или его» отвечает
+//!   на вопрос об авторе исчерпывающе, и провод компаньона везёт флаг
+//!   `mine` вместо ключа. Группам (§11) этого будет мало, и тогда рядом
+//!   с флагом появится имя — рядом, а не вместо;
+//! * `FfiFile::complete` и `incoming` — «целиком ли» десктоп считает сам,
+//!   сравнив `have_chunks` с `chunk_total`, а «входящее ли» на втором экране
+//!   отвечает `mine` у сообщения. Признак превью у него свой и с тем же
+//!   именем, но значит он другое: не «превью лежит в этой записи», а «есть
+//!   что спросить»;
+//! * `FfiMessage::shared_contact` — присланная карточка требует решения
+//!   «добавить», а добавление контакта живёт на телефоне.
+//!
+//! Общая запись означала бы поля, которые на десктопе всегда пусты, и UI,
+//! который обязан помнить, какие именно. Пустое поле не отличается
+//! от «этого не было», и §14 запрещает ровно такие обещания.
+//!
+//! # Байты вложений границу не пересекают
+//!
+//! Ни в одну сторону: [`RatatoskCompanion::save_file`] берёт путь,
+//! [`RatatoskCompanion::send_files`] берёт пути, читает и пишет
+//! [`CompanionDriver`]. Причина в заголовке `core::companion_driver`:
+//! UniFFI копирует каждый `Vec<u8>`, и мебибайт на кусок превратил бы
+//! гигабайтный файл в два гигабайта копирований.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use ratatosk_core::{
+    CompanionClient, CompanionCommand, CompanionDriver, CompanionEvent, CompanionEvents,
+    CompanionHandle, OsEntropy,
+};
+use ratatosk_proto::companion::{Attachment, ChatSummary, Message, PairingInvite, Reaction};
+use ratatosk_transport::{LanConfig, LanRunner, Runner, TransportCommand};
+
+use crate::{to_chat, to_file_id, to_msg_id, to_msg_ids, FfiDeliveryStatus, RatatoskError};
+
+/// Реакция в том виде, в каком её видит десктоп.
+///
+/// Автор — флагом, а не ключом: в переписке двоих «своя или его» отвечает
+/// на вопрос об авторе исчерпывающе. Группам (§11) этого будет мало, и тогда
+/// рядом с флагом появится имя.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionReaction {
+    /// Эмодзи.
+    pub emoji: String,
+    /// Своя ли.
+    pub mine: bool,
+}
+
+/// Вложение в сообщении, показанном на десктопе.
+///
+/// Байтов здесь нет и быть не может: страница возит сотню сообщений.
+/// Содержимое забирается отдельно — [`RatatoskCompanion::save_file`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionAttachment {
+    /// Чем адресуются команды по этому вложению.
+    pub file_id: Vec<u8>,
+    /// Имя для показа. Задал его собеседник, поэтому **путём его считать
+    /// нельзя**: сохранять надо через системный выбор места.
+    pub name: String,
+    /// Размер открытого содержимого.
+    pub size_bytes: u64,
+    /// Сколько всего кусков — столько же понадобится
+    /// [`RatatoskCompanion::save_file`].
+    pub chunk_total: u64,
+    /// Сколько кусков уже у телефона.
+    pub have_chunks: u64,
+    /// Согласен ли телефон качать его сейчас.
+    ///
+    /// **Ноль кусков при `accepted = false` и ноль при `accepted = true` —
+    /// разные вещи**, и чинятся они по-разному: первое ждёт `accept_file`,
+    /// второе ждёт собеседника. Показывать их одинаково нельзя.
+    pub accepted: bool,
+    /// Есть ли превью (§10.3), которое стоит спросить.
+    ///
+    /// Признак, а не байты: страница возит сотню сообщений, и превью
+    /// по 32 КиБ в ней не поместятся. Картинку берёт
+    /// [`RatatoskCompanion::preview`] — и только для того, что на экране
+    /// сейчас, а не для всей страницы вперёд.
+    ///
+    /// `false` означает и «картинки нет», и «телефон постарше превью
+    /// не отдаёт». Обе читаются одинаково и правильно: рисовать нечего,
+    /// спрашивать незачем.
+    pub has_preview: bool,
+}
+
+/// Файл, который десктоп просит отправить.
+///
+/// Пара «путь и превью», а не путь: превью нужно **каждому** файлу своё,
+/// и два параллельных списка означали бы способ перепутать их местами.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionOutgoing {
+    /// Путь на этом компьютере. Файл **не копируется** — ядро читает его
+    /// по куску, пока идёт отправка, значит до её конца он должен оставаться
+    /// на месте.
+    pub path: String,
+    /// Превью до [`max_preview_bytes`](crate::max_preview_bytes) (§10.3).
+    ///
+    /// Готовит клиент; `None` законно и обычно.
+    pub preview: Option<Vec<u8>>,
+}
+
+/// Чат в списке на десктопе.
+///
+/// Заголовок считает **телефон**: локальное имя (§4.1) вытесняет имя
+/// из карточки, и решение это протокольное. Десктоп рисует то, что дали.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionChat {
+    /// Идентификатор чата — им адресуются все команды.
+    pub chat_id: Vec<u8>,
+    /// Что показать в списке.
+    pub title: String,
+    /// Сверен ли отпечаток голосом (§4.2).
+    ///
+    /// Едет сюда, потому что показывать несверенный контакт наравне
+    /// со сверенным нельзя ни на телефоне, ни на десктопе.
+    pub verified: bool,
+    /// Последнее сообщение — текстом, для строки под именем.
+    pub last_text: String,
+    /// Когда оно было, мс.
+    pub last_ms: u64,
+}
+
+/// Сообщение в том виде, в каком его видит десктоп.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionMessage {
+    /// Идентификатор.
+    pub msg_id: Vec<u8>,
+    /// В каком чате.
+    pub chat_id: Vec<u8>,
+    /// Своё ли. Считает телефон: сравнение с собственным `IK` — протокольное
+    /// знание, и §13.3 не пускает его выше границы.
+    pub mine: bool,
+    /// Текст.
+    pub body: String,
+    /// Физическая компонента метки порядка (§9.1), миллисекунды.
+    ///
+    /// Показывать её как время можно, сортировать по ней — нет: порядок
+    /// задаёт HLC целиком, и он уже применён к странице.
+    pub wall_ms: u64,
+    /// Судьба отправки (§9.4). `None` у принятых — принятое уже здесь.
+    pub status: Option<FfiDeliveryStatus>,
+    /// Реакции — полный набор на момент отправки, а не дополнение.
+    pub reactions: Vec<FfiCompanionReaction>,
+    /// Когда сообщение правили. `None` — не правили.
+    ///
+    /// Показывать отметку **обязательно**: прежнего текста не остаётся
+    /// ни у кого, и без отметки подменённые слова выглядят так, будто их
+    /// такими и написали (§14).
+    pub edited_at_ms: Option<u64>,
+    /// Переслано из другого разговора. Имени автора рядом нет намеренно:
+    /// подпись при пересылке не сохраняется.
+    pub forwarded: bool,
+    /// На какое сообщение это отвечает. `None` — ответом не является.
+    ///
+    /// Ссылка **мягкая**: сообщения с таким `msg_id` у десктопа может
+    /// не быть — оно глубже страницы, стёрто или не доехало. Тогда надо
+    /// сказать это словами, а не придумать текст и не спрятать сам ответ.
+    pub reply_to: Option<Vec<u8>>,
+    /// Вложения (§10). Пусто у обычного сообщения.
+    pub files: Vec<FfiCompanionAttachment>,
+}
+
+/// Что компаньон говорит окну.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiCompanionEvent {
+    /// Сессия с телефоном установлена.
+    Linked,
+    /// Канала больше нет.
+    ///
+    /// §14, пункт 5: телефона нет — десктоп не работает. Показывать это
+    /// обязательно, а не молча оставлять последний экран: он выглядит
+    /// точно так же, как живой.
+    Unlinked,
+    /// Каким проводом говорит телефон.
+    ///
+    /// Приходит один раз при подключении и **только при расхождении**:
+    /// «всё в порядке» на каждом подключении приучает не читать эту строку.
+    /// `theirs = None` означает сборку телефона старее самого вопроса.
+    Wire {
+        /// Что назвал телефон.
+        theirs: Option<u32>,
+        /// Что здесь.
+        ours: u32,
+    },
+    /// Список чатов.
+    Chats {
+        /// Чаты.
+        chats: Vec<FfiCompanionChat>,
+        /// Подтверждён ли телефоном в этой связи.
+        ///
+        /// `false` — это память с прошлого раза (дисковый кэш). Показывать
+        /// её можно, выдавать за сейчас — нет: стёртое на телефоне при
+        /// выключенном ноутбуке лежит в ней целым.
+        fresh: bool,
+    },
+    /// Страница истории, от старых к новым.
+    History {
+        /// Какого чата.
+        chat_id: Vec<u8>,
+        /// Сообщения.
+        page: Vec<FfiCompanionMessage>,
+        /// Подтверждена ли телефоном в этой связи.
+        fresh: bool,
+    },
+    /// Пришло сообщение.
+    Arrived {
+        /// Оно.
+        message: FfiCompanionMessage,
+    },
+    /// Сменился статус доставки.
+    StatusChanged {
+        /// Какого сообщения.
+        msg_id: Vec<u8>,
+        /// Новый.
+        status: FfiDeliveryStatus,
+    },
+    /// Список чатов изменился — перечитать [`RatatoskCompanion::chats`].
+    ChatsChanged,
+    /// Сообщений больше нет — убрать со страницы.
+    Gone {
+        /// В каком чате.
+        chat_id: Vec<u8>,
+        /// Каких.
+        msg_ids: Vec<Vec<u8>>,
+    },
+    /// Сообщение поправили — вот оно целиком.
+    Edited {
+        /// Оно.
+        message: FfiCompanionMessage,
+    },
+    /// У сообщения сменился набор реакций.
+    Reacted {
+        /// В каком чате.
+        chat_id: Vec<u8>,
+        /// На каком сообщении.
+        msg_id: Vec<u8>,
+        /// Все реакции сейчас — набор целиком, а не дополнение.
+        reactions: Vec<FfiCompanionReaction>,
+    },
+    /// У вложения на телефоне сдвинулся приём.
+    FileProgress {
+        /// Какого.
+        file_id: Vec<u8>,
+        /// Сколько кусков у телефона.
+        have_chunks: u64,
+        /// Сколько всего.
+        chunk_total: u64,
+        /// Согласен ли телефон качать его сейчас.
+        accepted: bool,
+    },
+    /// Вложения больше нет — убрать строку, оставив сообщение.
+    ///
+    /// Отдельное событие, а не нули в [`FfiCompanionEvent::FileProgress`]:
+    /// число не может значить «чисел больше не будет», и пустой файл давал
+    /// ровно те же нули.
+    FileGone {
+        /// Какого.
+        file_id: Vec<u8>,
+    },
+    /// Превью вложения (§10.3) — или его отсутствие.
+    ///
+    /// `bytes: None` — превью нет, и это **ответ, а не отказ**: вложение без
+    /// картинки обычное дело. Рисовать нечего, и говорить об этом человеку
+    /// незачем.
+    ///
+    /// Не больше 32 КиБ — предел проверен проводом, но декодировать эти
+    /// байты всё равно клиенту, и декодер изображений — большая поверхность
+    /// атаки. Картинка пришла с чужого телефона: обращаться с ней надо как
+    /// с любым чужим файлом, а не как со своим ресурсом.
+    FilePreview {
+        /// Какого вложения.
+        file_id: Vec<u8>,
+        /// Байты, если они есть.
+        bytes: Option<Vec<u8>>,
+    },
+    /// Вложение забрано и лежит по этому пути.
+    FileSaved {
+        /// Какое.
+        file_id: Vec<u8>,
+        /// Где.
+        path: String,
+    },
+    /// Файлы выгружены на телефон, и телефон отправил сообщение с ними.
+    ///
+    /// «Отправил» означает то же, что для текста: сообщение легло в историю
+    /// и встало в очередь §5.4. Дошло ли — скажет статус (§14).
+    FilesSent {
+        /// Какие — все разом, в порядке выбора.
+        file_ids: Vec<Vec<u8>>,
+    },
+    /// Связь пропала посреди приёма вложения — он **ждёт**, а не сорвался.
+    ///
+    /// Записанное лежит на диске под именем с припиской `.part`, и
+    /// продолжение допишет его с того же места. Полоску приёма надо
+    /// оставить с пометкой «ждёт связи»; файла под настоящим именем
+    /// до конца приёма не появится вовсе.
+    FetchPaused,
+    /// Приём вложения продолжился с того места, где его оборвали.
+    FetchResumed {
+        /// Сколько кусков уже на диске.
+        done: u64,
+        /// Сколько их всего.
+        total: u64,
+    },
+    /// Связь пропала посреди отправки — она **ждёт**, а не сорвалась.
+    ///
+    /// Показывать иначе, чем отказ: куски уже на телефоне, пути открыты,
+    /// продолжение начнётся само. Полоску отправки стоит оставить на экране
+    /// с пометкой «ждёт связи», а не убирать — иначе человек начнёт заново
+    /// то, что и так доедет.
+    SendPaused,
+    /// Отправка продолжилась с того места, где её оборвали.
+    SendResumed {
+        /// Сколько файлов уже целиком у телефона.
+        done: u32,
+        /// Сколько их всего в сообщении.
+        total: u32,
+    },
+    /// Сделано, сказать нечего.
+    Done,
+    /// Не вышло, и вот почему — словами, для показа человеку (§14).
+    Refused {
+        /// Причина.
+        reason: String,
+    },
+    /// Спросить не у кого: сессии нет.
+    NotLinked,
+}
+
+/// Подписка окна на события компаньона.
+///
+/// Колбэк, а не опрос, — по той же причине, что у телефона: опрос стоил бы
+/// батареи планшету, который работает компаньоном.
+///
+/// `foreign`, а не `rust, foreign`: трейт реализует только UI.
+#[uniffi::export(foreign)]
+pub trait CompanionObserver: Send + Sync {
+    /// Вызывается на каждое событие.
+    fn on_event(&self, event: FfiCompanionEvent);
+}
+
+/// Всё, что стало известно при подключении и дальше не меняется.
+struct Linked {
+    handle: CompanionHandle,
+    device_id: Vec<u8>,
+    desktop_ik: Vec<u8>,
+    phone_name: String,
+    port: u16,
+}
+
+/// Второй экран телефона — то, что держит Kotlin (§13.4).
+///
+/// Устроен так же, как [`RatatoskClient`](crate::RatatoskClient), и по той же
+/// причине: методы через UniFFI синхронные, а драйвер асинхронный. Поэтому
+/// внутри живёт свой поток с рантаймом, а наружу уходит ручка из каналов.
+///
+/// Уничтожение объекта закрывает канал команд, драйвер выходит из цикла,
+/// поток завершается. Отдельного `close` нет намеренно.
+///
+/// # Чего у него нет и не появится
+///
+/// Ни базы, ни личности, ни истории. Всё, что он показывает, приехало
+/// с телефона в этой связи или лежит в дисковом кэше с прошлой — и во втором
+/// случае об этом сказано полем `fresh`. Выключенный телефон означает
+/// нерабочий десктоп, и изображать обратное §14 запрещает прямо.
+#[derive(uniffi::Object)]
+pub struct RatatoskCompanion {
+    linked: Linked,
+    observer: Arc<Mutex<Option<Arc<dyn CompanionObserver>>>>,
+}
+
+#[uniffi::export]
+impl RatatoskCompanion {
+    /// Подключается к телефону по ссылке сопряжения.
+    ///
+    /// `invite_uri` — строка `ratatosk:v0:pair:…`, которую телефон печатает
+    /// на `pair_device`. Хранит её **клиент**: диска у терминала нет (§13.3),
+    /// а без неё он не переподключится после перезапуска. Держать её надо
+    /// там же, где хранят пароли, — ссылка и есть секрет сопряжения.
+    ///
+    /// `port` — TCP-порт для входящих. `0` означает «пусть выберет система»,
+    /// и это правильное умолчание: соединения односторонние (§5ц), телефон
+    /// набирает десктоп сам, а порт он узнаёт из маяка.
+    ///
+    /// `peer_addr` — адрес телефона вида `192.168.1.5:41234`, если он уже
+    /// известен. Обычно не нужен: в общей сети маяк §5.1 находит телефон сам.
+    /// Нужен там, где mDNS не работает, — на loopback, в гостевом Wi-Fi
+    /// с изоляцией клиентов, за некоторыми корпоративными точками.
+    ///
+    /// `cache_path` — куда класть снимок переписки. `None` — не класть никуда,
+    /// и это умолчание §13.4. Включив кэш, обязательно скажите человеку, чего
+    /// это шифрование **не** даёт: ключ выводится из секрета сопряжения,
+    /// который лежит рядом, значит защита работает против скопированного
+    /// файла и бэкапа, но не против забранной машины.
+    ///
+    /// Возврат **не** означает, что телефон ответил: рукопожатие идёт своим
+    /// чередом и повторяется по таймеру. Ждать надо
+    /// [`FfiCompanionEvent::Linked`].
+    ///
+    /// # Errors
+    ///
+    /// Негодная ссылка, занятый порт, невозможность поднять поток.
+    #[uniffi::constructor]
+    pub fn open(
+        invite_uri: String,
+        port: u16,
+        peer_addr: Option<String>,
+        cache_path: Option<String>,
+    ) -> Result<Arc<Self>, RatatoskError> {
+        let observer: Arc<Mutex<Option<Arc<dyn CompanionObserver>>>> = Arc::new(Mutex::new(None));
+        let pump_observer = Arc::clone(&observer);
+
+        // Адрес разбирается **до** потока: негодная строка — это ошибка
+        // клиента, и узнать о ней он обязан отказом здесь, а не тишиной
+        // в чужом потоке.
+        let peer_addr = match peer_addr {
+            None => None,
+            Some(text) => Some(text.parse::<std::net::SocketAddr>().map_err(|_| {
+                RatatoskError::internal("адрес телефона: нужен вид 192.168.1.5:41234")
+            })?),
+        };
+
+        let (ready_tx, ready_rx) =
+            std::sync::mpsc::sync_channel::<Result<Linked, RatatoskError>>(1);
+
+        std::thread::Builder::new()
+            .name("ratatosk-companion".to_owned())
+            .spawn(move || {
+                let runtime =
+                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(RatatoskError::internal(error)));
+                            return;
+                        }
+                    };
+                runtime.block_on(async move {
+                    let started = start(&invite_uri, port, peer_addr).await;
+                    let (mut driver, handle, events, linked) = match started {
+                        Ok(parts) => parts,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                    if let Some(path) = cache_path {
+                        // До первого шага драйвера: поднятый кэш должен
+                        // оказаться на экране раньше, чем ответ телефона,
+                        // иначе окно откроется пустым и заполнится рывком.
+                        let _ = handle
+                            .send(CompanionCommand::KeepCache { path: Some(PathBuf::from(path)) })
+                            .await;
+                    }
+                    if ready_tx.send(Ok(linked)).is_err() {
+                        // Клиент не дождался — поднимать связь незачем.
+                        return;
+                    }
+                    tokio::spawn(pump_events(events, pump_observer));
+                    driver.run().await;
+                });
+            })
+            .map_err(RatatoskError::internal)?;
+
+        let linked = ready_rx
+            .recv()
+            .map_err(|_| RatatoskError::internal("поток компаньона завершился при запуске"))??;
+
+        Ok(Arc::new(RatatoskCompanion { linked, observer }))
+    }
+
+    /// Подписывает окно на события.
+    pub fn set_observer(&self, observer: Arc<dyn CompanionObserver>) {
+        if let Ok(mut slot) = self.observer.lock() {
+            *slot = Some(observer);
+        }
+    }
+
+    /// Как эта запись называется на телефоне (§13.4).
+    ///
+    /// Тот же идентификатор, что показывает список устройств на телефоне.
+    /// Показать его рядом с «подключено» стоит: человек, у которого два
+    /// компьютера, иначе не знает, какой из них отзывает.
+    pub fn device_id(&self) -> Vec<u8> {
+        self.linked.device_id.clone()
+    }
+
+    /// Имя телефона из ссылки сопряжения.
+    ///
+    /// Выбрал его владелец телефона, и проверить его нечем — как и всякое
+    /// имя из карточки (§4.1). Для заголовка окна этого достаточно.
+    pub fn phone_name(&self) -> String {
+        self.linked.phone_name.clone()
+    }
+
+    /// Порт, который занял терминал.
+    ///
+    /// Нужен ровно для одного: если телефон не находит десктоп сам, человек
+    /// вводит на телефоне адрес руками, и в нём этот порт.
+    pub fn port(&self) -> u16 {
+        self.linked.port
+    }
+
+    /// Ключ, которым терминал объявляется в эфире.
+    ///
+    /// Не личность и не контакт: он выведен из секрета сопряжения, и телефон
+    /// ищет в эфире именно его (§5.1). Вторая половина той же строки, что
+    /// и [`RatatoskCompanion::port`].
+    pub fn desktop_ik(&self) -> Vec<u8> {
+        self.linked.desktop_ik.clone()
+    }
+
+    /// Просит список чатов.
+    ///
+    /// Ответ приедет событием [`FfiCompanionEvent::Chats`], а не отсюда:
+    /// считает его телефон, и ждать его синхронно значило бы держать окно
+    /// на круге по сети.
+    ///
+    /// # Errors
+    ///
+    /// Компаньон остановлен.
+    pub fn chats(&self) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::Chats)
+    }
+
+    /// Просит страницу истории.
+    ///
+    /// `before` — `None` для конца ленты, иначе `msg_id` самого старого
+    /// из показанных. Ответ — [`FfiCompanionEvent::History`].
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn history(
+        &self,
+        chat_id: Vec<u8>,
+        limit: u32,
+        before: Option<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        let before = match before {
+            None => None,
+            Some(id) => Some(to_msg_id(&id)?),
+        };
+        self.ask(CompanionCommand::History { chat: to_chat(&chat_id)?, limit, before })
+    }
+
+    /// Отправляет текст в чат.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn send_text(&self, chat_id: Vec<u8>, text: String) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SendText { chat: to_chat(&chat_id)?, text })
+    }
+
+    /// Отвечает на сообщение.
+    ///
+    /// Едет ссылка, а не отрывок цитаты: цитату рисует та сторона, у которой
+    /// есть своя копия.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn send_reply(
+        &self,
+        chat_id: Vec<u8>,
+        reply_to: Vec<u8>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SendReply {
+            chat: to_chat(&chat_id)?,
+            reply_to: to_msg_id(&reply_to)?,
+            text,
+        })
+    }
+
+    /// Заменяет текст своего сообщения.
+    ///
+    /// Окно правки (неделя) считается по часам **телефона** (§9.1): часы
+    /// ноутбука к этому порядку не относятся, и проверять их здесь нечем.
+    /// Просроченная правка вернётся [`FfiCompanionEvent::Refused`] со словами.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn edit_message(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::EditMessage {
+            chat: to_chat(&chat_id)?,
+            msg_id: to_msg_id(&msg_id)?,
+            text,
+        })
+    }
+
+    /// Ставит или снимает реакцию. Пустая строка снимает.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn set_reaction(
+        &self,
+        chat_id: Vec<u8>,
+        msg_id: Vec<u8>,
+        emoji: String,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SetReaction {
+            chat: to_chat(&chat_id)?,
+            msg_id: to_msg_id(&msg_id)?,
+            emoji,
+        })
+    }
+
+    /// Удаляет сообщения **у себя**.
+    ///
+    /// Собеседник их сохраняет; чтобы попросить и его, есть
+    /// [`RatatoskCompanion::retract_messages`]. Разницу человеку надо
+    /// показать до нажатия, а не после (§14).
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn delete_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::DeleteMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Удаляет у себя и **просит** собеседника сделать то же.
+    ///
+    /// Просьба — и ничего больше: выполнит её клиент собеседника или нет,
+    /// проверить нельзя. Обещать «сообщение удалено у всех» §14 запрещает.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn retract_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::RetractMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Пересылает сообщения в другой чат.
+    ///
+    /// Автор при пересылке **не сохраняется** — ни в проводе, ни на экране:
+    /// «переслано от N» было бы утверждением, которое никто не проверит.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn forward_messages(
+        &self,
+        chat_id: Vec<u8>,
+        msg_ids: Vec<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::ForwardMessages {
+            chat: to_chat(&chat_id)?,
+            msg_ids: to_msg_ids(&msg_ids)?,
+        })
+    }
+
+    /// Очищает чат **у себя**.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn clear_chat(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::ClearChat { chat: to_chat(&chat_id)? })
+    }
+
+    /// Отмечает прочитанным до этого сообщения включительно (§9.4).
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn mark_read(&self, chat_id: Vec<u8>, up_to: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::MarkRead { chat: to_chat(&chat_id)?, up_to: to_msg_id(&up_to)? })
+    }
+
+    /// Просит **телефон** начать качать вложение у собеседника.
+    ///
+    /// Порядок обязателен и его надо объяснять человеку: сперва телефон
+    /// забирает файл у собеседника, и только потом
+    /// [`RatatoskCompanion::save_file`] переносит его сюда. До `accept_file`
+    /// забирать нечего.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn accept_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::AcceptFile { file_id: to_file_id(&file_id)? })
+    }
+
+    /// Останавливает приём, **не отказываясь**: приехавшее остаётся.
+    ///
+    /// `accept_file` продолжит с той же дырки. Показывать это надо словами
+    /// «остановлено, продолжить», а не «отменено»: прочитавший «отменено»
+    /// не станет продолжать то, что считает потерянным.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn pause_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::PauseFile { file_id: to_file_id(&file_id)? })
+    }
+
+    /// Отказывается от вложения совсем: приехавшее на телефоне стирается.
+    ///
+    /// Вложение исчезнет событием [`FfiCompanionEvent::FileGone`], а само
+    /// сообщение с текстом останется.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn decline_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::DeclineFile { file_id: to_file_id(&file_id)? })
+    }
+
+    /// Просит превью вложения (§10.3).
+    ///
+    /// Ответ приедет событием [`FfiCompanionEvent::FilePreview`] — байтами,
+    /// а не путём, и это единственное место, где содержимое файла доходит
+    /// до окна целиком. Оправдано мерой: превью не больше 32 КиБ, тогда как
+    /// кусок файла — мебибайт.
+    ///
+    /// Спрашивать стоит там, где [`FfiCompanionAttachment::has_preview`]
+    /// говорит «есть», и **только для того, что на экране сейчас**. Просьба
+    /// на всю страницу вперёд — это те самые мегабайты, ради которых превью
+    /// и вынесли из страницы; вдобавок каждая из них занимает круг по сети.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn preview(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::Preview { file_id: to_file_id(&file_id)? })
+    }
+
+    /// Забирает вложение с телефона в файл по этому пути.
+    ///
+    /// Байты пишет ядро: путь, а не поток. `chunk_total` берётся
+    /// из [`FfiCompanionAttachment::chunk_total`] — своей разбивки у десктопа
+    /// нет и быть не должно, она обязана совпадать с §10.2.
+    ///
+    /// Забирать имеет смысл то, что телефон уже собрал целиком
+    /// (`have_chunks == chunk_total`); начатое раньше остановится на первой
+    /// же дырке. Конец — [`FfiCompanionEvent::FileSaved`].
+    ///
+    /// **Одно вложение за раз.** Второй вызов до конца первого вернётся
+    /// отказом словами, а не встанет в очередь.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn save_file(
+        &self,
+        file_id: Vec<u8>,
+        chunk_total: u64,
+        path: String,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SaveFile {
+            file_id: to_file_id(&file_id)?,
+            chunk_total,
+            path: PathBuf::from(path),
+        })
+    }
+
+    /// Прекращает начатое сохранение и убирает недописанный файл.
+    ///
+    /// Обрывок стирается всегда, и это не уборка ради чистоты: недокачанный
+    /// файл на диске выглядит ровно как докачанный (§14).
+    ///
+    /// # Errors
+    ///
+    /// Компаньон остановлен.
+    pub fn cancel_save(&self) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::CancelSave)
+    }
+
+    /// Отправляет файлы с этого компьютера **одним сообщением**.
+    ///
+    /// От одного до [`max_files_per_message`](crate::max_files_per_message)
+    /// вложений. Порядок списка — тот, в каком их увидит собеседник, и менять
+    /// его ядро не станет.
+    ///
+    /// Читает файлы ядро, по куску за раз и по одному файлу, — значит,
+    /// до конца отправки они должны оставаться на месте. Подпись пустая
+    /// законна: файлы сами по себе тоже сообщение.
+    ///
+    /// Идёт это в три шага на каждый файл: телефон отводит место, принимает
+    /// куски, — и только когда собраны **все**, отправляет одно сообщение.
+    /// Сообщение с половиной вложений хуже неотправленного, поэтому между
+    /// вторым шагом и третьим не уходит ничего. Конец —
+    /// [`FfiCompanionEvent::FilesSent`].
+    ///
+    /// Превью у каждого файла **готовит клиент**, ровно как на телефоне
+    /// (`FfiOutgoingFile::preview`): декодер изображений — большая поверхность
+    /// атаки, и в процессе, который держит ключи, ему делать нечего.
+    /// Масштабировать и перекодировать исходник — работа Kotlin; ядро
+    /// проверяет только длину. `None` законно и обычно: файл не картинка,
+    /// декодер не справился, человек не захотел, — тогда собеседник решает
+    /// по имени файла, как решал всегда.
+    ///
+    /// **Одно сообщение за раз.** Второй вызов до конца первого вернётся
+    /// событием `Refused`.
+    ///
+    /// Превью больше предела, пустой список и список длиннее предела
+    /// отвергаются **событием** `Refused`, а не отказом отсюда: правила живут
+    /// в ядре, и второе место с теми же числами разошлось бы с первым молча.
+    /// Сколько можно, скажут [`max_preview_bytes`](crate::max_preview_bytes)
+    /// и [`max_files_per_message`](crate::max_files_per_message).
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор чата или остановленный компаньон.
+    pub fn send_files(
+        &self,
+        chat_id: Vec<u8>,
+        files: Vec<FfiCompanionOutgoing>,
+        text: String,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SendFiles {
+            chat: to_chat(&chat_id)?,
+            files: files.into_iter().map(|f| (PathBuf::from(f.path), f.preview)).collect(),
+            text,
+        })
+    }
+
+    /// Передумывает отправлять: выгруженное на телефоне выбрасывается.
+    ///
+    /// # Errors
+    ///
+    /// Компаньон остановлен.
+    pub fn cancel_send(&self) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::CancelSend)
+    }
+
+    /// Включает или выключает снимок переписки на диске.
+    ///
+    /// `None` **стирает** уже лежащий файл, а не перестаёт его обновлять:
+    /// человек, снявший галочку, имел в виду «здесь этого не должно быть».
+    ///
+    /// Что сказать ему при включении, сказано у [`RatatoskCompanion::open`],
+    /// и сказать это обязательно.
+    ///
+    /// # Errors
+    ///
+    /// Компаньон остановлен.
+    pub fn set_cache_path(&self, path: Option<String>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::KeepCache { path: path.map(PathBuf::from) })
+    }
+}
+
+impl RatatoskCompanion {
+    /// Общий путь всех команд.
+    ///
+    /// Живёт **в этом** блоке, а не в экспортируемом: `#[uniffi::export]`
+    /// берёт из блока все методы, не разбирая, какие из них `pub`,
+    /// а `CompanionCommand` — тип ядра, и через границу он не ходит.
+    fn ask(&self, command: CompanionCommand) -> Result<(), RatatoskError> {
+        self.linked
+            .handle
+            .send_blocking(command)
+            .map_err(|_| RatatoskError::internal("компаньон остановлен"))
+    }
+}
+
+/// Поднимает терминал и его транспорт.
+///
+/// Всё внутри потока с рантаймом: `LanRunner` заводит задачи, а состояние
+/// рукопожатия из `snow` не обещает `Send`.
+async fn start(
+    invite_uri: &str,
+    port: u16,
+    peer_addr: Option<std::net::SocketAddr>,
+) -> Result<(CompanionDriver<LanRunner>, CompanionHandle, CompanionEvents, Linked), RatatoskError> {
+    let invite = PairingInvite::from_uri(invite_uri.trim()).map_err(|_| {
+        RatatoskError::internal("ссылка сопряжения не годится: ждётся ratatosk:v0:pair:…")
+    })?;
+    let client = CompanionClient::from_invite(&invite, Box::new(OsEntropy));
+    let phone_ik = client.phone_ik();
+    let desktop_ik = client.ik();
+    let linked_parts = (client.device_id().to_vec(), client.phone_name().to_owned());
+
+    // Маяк объявляется от **ключа сопряжения**, а не от какой-то своей
+    // личности: телефон ищет в эфире именно его (§5.1), и другого способа
+    // набрать десктоп у него нет — соединения односторонние (5ц).
+    let config = LanConfig { enabled: true, port, discovery: true };
+    let mut lan = LanRunner::start(config, desktop_ik).await.map_err(RatatoskError::internal)?;
+    let port = lan.port();
+    if let Some(addr) = peer_addr {
+        lan.note_address(phone_ik, addr);
+    }
+    lan.execute(TransportCommand::SetEnabled {
+        transport: ratatosk_proto::Transport::Lan,
+        enabled: true,
+    })
+    .await
+    .map_err(RatatoskError::internal)?;
+    // Телефон объявляется от своего `IK`, и без этой строки его маяк
+    // не с чем было бы сравнить.
+    lan.execute(TransportCommand::WatchLanPeers(vec![phone_ik]))
+        .await
+        .map_err(RatatoskError::internal)?;
+
+    let (driver, handle, events) = CompanionDriver::new(client, lan);
+    let linked = Linked {
+        handle: handle.clone(),
+        device_id: linked_parts.0,
+        desktop_ik: desktop_ik.to_vec(),
+        phone_name: linked_parts.1,
+        port,
+    };
+    Ok((driver, handle, events, linked))
+}
+
+/// Гонит события компаньона в окно.
+async fn pump_events(
+    mut events: CompanionEvents,
+    observer: Arc<Mutex<Option<Arc<dyn CompanionObserver>>>>,
+) {
+    while let Some(event) = events.next().await {
+        let Some(subscriber) = observer.lock().ok().and_then(|slot| slot.clone()) else {
+            continue;
+        };
+        subscriber.on_event(translate(event));
+    }
+}
+
+/// Перевод событий компаньона в то, что видит окно.
+///
+/// Варианты перечислены поимённо: новое событие обязано сломать сборку
+/// здесь, а не тихо не дойти до клиента.
+fn translate(event: CompanionEvent) -> FfiCompanionEvent {
+    match event {
+        CompanionEvent::Linked => FfiCompanionEvent::Linked,
+        CompanionEvent::Unlinked => FfiCompanionEvent::Unlinked,
+        CompanionEvent::Wire { theirs, ours } => FfiCompanionEvent::Wire { theirs, ours },
+        CompanionEvent::Chats { chats, fresh } => {
+            FfiCompanionEvent::Chats { chats: chats.iter().map(chat_of).collect(), fresh }
+        }
+        CompanionEvent::History { chat, page, fresh } => FfiCompanionEvent::History {
+            chat_id: chat.to_vec(),
+            page: page.iter().map(message_of).collect(),
+            fresh,
+        },
+        CompanionEvent::Arrived(message) => {
+            FfiCompanionEvent::Arrived { message: message_of(&message) }
+        }
+        CompanionEvent::Status { msg_id, status } => FfiCompanionEvent::StatusChanged {
+            msg_id: msg_id.to_vec(),
+            status: crate::status_of(status_from_code(status)),
+        },
+        CompanionEvent::ChatsChanged => FfiCompanionEvent::ChatsChanged,
+        CompanionEvent::Gone { chat, msg_ids } => FfiCompanionEvent::Gone {
+            chat_id: chat.to_vec(),
+            msg_ids: msg_ids.iter().map(|id| id.to_vec()).collect(),
+        },
+        CompanionEvent::Edited(message) => {
+            FfiCompanionEvent::Edited { message: message_of(&message) }
+        }
+        CompanionEvent::Reacted { chat, msg_id, reactions } => FfiCompanionEvent::Reacted {
+            chat_id: chat.to_vec(),
+            msg_id: msg_id.to_vec(),
+            reactions: reactions.iter().map(reaction_of).collect(),
+        },
+        CompanionEvent::FileProgress { file_id, have_chunks, chunk_total, accepted } => {
+            FfiCompanionEvent::FileProgress {
+                file_id: file_id.to_vec(),
+                have_chunks,
+                chunk_total,
+                accepted,
+            }
+        }
+        CompanionEvent::FilePreview { file_id, bytes } => {
+            FfiCompanionEvent::FilePreview { file_id: file_id.to_vec(), bytes }
+        }
+        CompanionEvent::FileGone { file_id } => {
+            FfiCompanionEvent::FileGone { file_id: file_id.to_vec() }
+        }
+        CompanionEvent::FileSaved { file_id, path } => FfiCompanionEvent::FileSaved {
+            file_id: file_id.to_vec(),
+            path: path.to_string_lossy().into_owned(),
+        },
+        CompanionEvent::FilesSent { file_ids } => FfiCompanionEvent::FilesSent {
+            file_ids: file_ids.iter().map(|id| id.to_vec()).collect(),
+        },
+        CompanionEvent::FetchPaused => FfiCompanionEvent::FetchPaused,
+        CompanionEvent::FetchResumed { done, total } => {
+            FfiCompanionEvent::FetchResumed { done, total }
+        }
+        CompanionEvent::SendPaused => FfiCompanionEvent::SendPaused,
+        CompanionEvent::SendResumed { done, total } => {
+            FfiCompanionEvent::SendResumed { done, total }
+        }
+        CompanionEvent::Done => FfiCompanionEvent::Done,
+        CompanionEvent::Refused(reason) => FfiCompanionEvent::Refused { reason },
+        CompanionEvent::NotLinked => FfiCompanionEvent::NotLinked,
+    }
+}
+
+/// Код статуса с провода — в статус ядра.
+///
+/// Неизвестный код читается как «ждёт отправки», и это единственное честное
+/// прочтение: сборка телефона новее могла завести статус, которого здесь нет,
+/// а придумывать за неё «доставлено» нельзя.
+fn status_from_code(code: u8) -> ratatosk_proto::DeliveryStatus {
+    ratatosk_proto::DeliveryStatus::from_code(code)
+        .unwrap_or(ratatosk_proto::DeliveryStatus::Pending)
+}
+
+fn reaction_of(reaction: &Reaction) -> FfiCompanionReaction {
+    FfiCompanionReaction { emoji: reaction.emoji.clone(), mine: reaction.mine }
+}
+
+fn chat_of(chat: &ChatSummary) -> FfiCompanionChat {
+    FfiCompanionChat {
+        chat_id: chat.chat.to_vec(),
+        title: chat.title.clone(),
+        verified: chat.verified,
+        last_text: chat.last_text.clone(),
+        last_ms: chat.last_ms,
+    }
+}
+
+fn attachment_of(file: &Attachment) -> FfiCompanionAttachment {
+    FfiCompanionAttachment {
+        file_id: file.file_id.to_vec(),
+        name: file.name.clone(),
+        size_bytes: file.size_bytes,
+        chunk_total: file.chunk_total,
+        have_chunks: file.have_chunks,
+        accepted: file.accepted,
+        has_preview: file.has_preview,
+    }
+}
+
+fn message_of(message: &Message) -> FfiCompanionMessage {
+    FfiCompanionMessage {
+        msg_id: message.msg_id.to_vec(),
+        chat_id: message.chat.to_vec(),
+        mine: message.mine,
+        body: message.text.clone(),
+        wall_ms: message.wall_ms,
+        status: message.status.map(|code| crate::status_of(status_from_code(code))),
+        reactions: message.reactions.iter().map(reaction_of).collect(),
+        edited_at_ms: message.edited_ms,
+        forwarded: message.forwarded,
+        reply_to: message.reply_to.map(|id| id.to_vec()),
+        files: message.files.iter().map(attachment_of).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Сообщение, у которого заполнено **всё**.
+    ///
+    /// Нарочно все поля разные и все непустые: перепутанные местами `chat`
+    /// и `msg_id` на пустых значениях выглядят одинаково правильными.
+    fn full_message() -> Message {
+        Message {
+            msg_id: [1u8; 16],
+            chat: [2u8; 16],
+            mine: true,
+            text: "привет".to_owned(),
+            wall_ms: 1_700_000_000_000,
+            status: Some(ratatosk_proto::DeliveryStatus::Delivered.code()),
+            reactions: vec![Reaction { mine: false, emoji: "👍".to_owned() }],
+            edited_ms: Some(1_700_000_001_000),
+            forwarded: true,
+            reply_to: Some([3u8; 16]),
+            files: vec![Attachment {
+                file_id: [4u8; 16],
+                name: "кот.jpg".to_owned(),
+                size_bytes: 9_000_000,
+                chunk_total: 9,
+                have_chunks: 4,
+                accepted: true,
+                has_preview: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn every_field_of_a_message_survives_the_boundary() {
+        let it = message_of(&full_message());
+        assert_eq!(it.msg_id, vec![1u8; 16], "идентификатор сообщения");
+        assert_eq!(it.chat_id, vec![2u8; 16], "чат — не идентификатор сообщения");
+        assert!(it.mine, "своё");
+        assert_eq!(it.body, "привет", "текст");
+        assert_eq!(it.wall_ms, 1_700_000_000_000, "метка времени");
+        assert_eq!(it.status, Some(FfiDeliveryStatus::Delivered), "статус");
+        assert_eq!(it.edited_at_ms, Some(1_700_000_001_000), "«изменено» обязано доехать");
+        assert!(it.forwarded, "«переслано» обязано доехать");
+        assert_eq!(it.reply_to, Some(vec![3u8; 16]), "ссылка ответа");
+    }
+
+    #[test]
+    fn a_reaction_crosses_as_a_flag_and_keeps_the_emoji() {
+        let it = message_of(&full_message());
+        assert_eq!(it.reactions.len(), 1);
+        assert_eq!(it.reactions[0].emoji, "👍");
+        assert!(!it.reactions[0].mine, "чужая реакция не должна стать своей");
+    }
+
+    #[test]
+    fn an_attachment_carries_both_numbers_and_the_consent() {
+        let it = message_of(&full_message());
+        let file = &it.files[0];
+        assert_eq!(file.file_id, vec![4u8; 16]);
+        assert_eq!(file.name, "кот.jpg");
+        assert_eq!(file.size_bytes, 9_000_000);
+        // Два числа, а не одно: «4 из 9» и «принято» — разные утверждения,
+        // и рисуются они по-разному.
+        assert_eq!((file.have_chunks, file.chunk_total), (4, 9));
+        assert!(file.accepted, "согласие обязано доехать отдельно от чисел");
+    }
+
+    #[test]
+    fn a_message_without_anything_optional_stays_empty() {
+        let bare = Message {
+            msg_id: [1u8; 16],
+            chat: [2u8; 16],
+            mine: false,
+            text: String::new(),
+            wall_ms: 1,
+            status: None,
+            reactions: Vec::new(),
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+            files: Vec::new(),
+        };
+        let it = message_of(&bare);
+        // Принятое сообщение статуса не имеет, и рисовать у него галочку
+        // значит утверждать то, чего протокол не говорит (§14).
+        assert_eq!(it.status, None, "у принятого статуса нет");
+        assert_eq!(it.edited_at_ms, None);
+        assert!(!it.forwarded);
+        assert_eq!(it.reply_to, None);
+        assert!(it.files.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_status_code_reads_as_waiting_to_be_sent() {
+        // Сборка телефона новее могла завести статус, которого здесь нет.
+        // Придумать за неё «доставлено» нельзя: галочка, которой никто
+        // не обещал, — ровно то, что запрещает §14.
+        assert_eq!(status_from_code(200), ratatosk_proto::DeliveryStatus::Pending);
+    }
+
+    #[test]
+    fn the_chat_summary_crosses_without_the_contacts_key() {
+        let chat = ChatSummary {
+            chat: [7u8; 16],
+            title: "Аня".to_owned(),
+            verified: true,
+            last_text: "ага".to_owned(),
+            last_ms: 5,
+        };
+        let it = chat_of(&chat);
+        assert_eq!(it.chat_id, vec![7u8; 16]);
+        assert_eq!(it.title, "Аня");
+        // Сверенность едет: показывать несверенный контакт наравне
+        // со сверенным нельзя ни на телефоне, ни на десктопе (§4.2).
+        assert!(it.verified);
+        assert_eq!((it.last_text.as_str(), it.last_ms), ("ага", 5));
+    }
+
+    #[test]
+    fn a_gone_notice_keeps_every_identifier_it_was_given() {
+        let event = CompanionEvent::Gone { chat: [9u8; 16], msg_ids: vec![[1u8; 16], [2u8; 16]] };
+        match translate(event) {
+            FfiCompanionEvent::Gone { chat_id, msg_ids } => {
+                assert_eq!(chat_id, vec![9u8; 16]);
+                assert_eq!(msg_ids, vec![vec![1u8; 16], vec![2u8; 16]], "оба, а не первый");
+            }
+            other => panic!("не то событие: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vanished_attachment_is_its_own_event_and_not_a_pair_of_zeroes() {
+        // Нулями это сообщать нельзя: пустой файл даёт ровно те же нули,
+        // и «вложения нет» сказалось бы о вложении, которое есть.
+        match translate(CompanionEvent::FileGone { file_id: [4u8; 16] }) {
+            FfiCompanionEvent::FileGone { file_id } => assert_eq!(file_id, vec![4u8; 16]),
+            other => panic!("не то событие: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_saved_file_names_the_path_it_was_written_to() {
+        let event = CompanionEvent::FileSaved {
+            file_id: [4u8; 16],
+            path: PathBuf::from("/tmp/кот.jpg"),
+        };
+        match translate(event) {
+            FfiCompanionEvent::FileSaved { file_id, path } => {
+                assert_eq!(file_id, vec![4u8; 16]);
+                assert_eq!(path, "/tmp/кот.jpg", "путь нужен, чтобы показать «лежит здесь»");
+            }
+            other => panic!("не то событие: {other:?}"),
+        }
+    }
+}

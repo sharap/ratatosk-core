@@ -221,6 +221,8 @@ enum Query {
     Message { msg_id: MsgId, reply: oneshot::Sender<Option<MessageView>> },
     /// Что известно о контактах прямо сейчас.
     Contacts { reply: oneshot::Sender<Vec<ContactStatus>> },
+    /// Сопряжённые десктопы и их состояние (§13.4).
+    Devices { reply: oneshot::Sender<Vec<DeviceStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
     ///
     /// Отдельным запросом, а не полем в [`ContactStatus`]: до тридцати двух
@@ -381,6 +383,43 @@ pub struct ContactStatus {
     pub anomalies: ratatosk_proto::session::AnomalyCounters,
 }
 
+/// Что клиент знает о сопряжённом десктопе (§13.4).
+#[derive(Debug, Clone)]
+pub struct DeviceStatus {
+    /// Идентификатор записи — им же отзывают сопряжение.
+    pub device_id: [u8; 16],
+    /// Публичная половина ключа сопряжения.
+    ///
+    /// Показывать человеку нечего — но это **адрес десктопа в эфире**: маяк
+    /// §5.1 он объявляет именно от него, и по нему же телефон его набирает.
+    /// Отдаётся наружу ради одного вопроса, на который иначе не ответить:
+    /// «телефон вообще знает, куда звонить?» Без ответа на него
+    /// не подключившийся десктоп и десктоп, которого не видно в сети,
+    /// выглядят одинаково.
+    ///
+    /// Границу UniFFI это поле не пересекает: настоящему клиенту оно
+    /// не нужно — у него mDNS, — а расширять границу ради диагностики
+    /// стенда неправильно (§13.3).
+    pub pairing_public: [u8; 32],
+    /// Метка, которую человек дал устройству при сопряжении.
+    pub label: String,
+    /// Когда сопряжено, мс.
+    pub paired_ms: u64,
+    /// Когда последний раз подключалось, мс. Ноль — ни разу.
+    pub last_seen_ms: u64,
+    /// Есть ли канал прямо сейчас.
+    ///
+    /// Показывать это обязательно, и причина в §14, пункт 5: «телефон офлайн
+    /// или разряжен — десктоп не работает». Обратное человек тоже должен
+    /// видеть с телефона: не «десктоп сломался», а «десктоп не подключён».
+    pub connected: bool,
+    /// Пора ли десктопу стереть кэш — тридцать суток без связи (§13.4).
+    ///
+    /// Считает телефон, хотя стирает десктоп: срок протокольный, и вторая
+    /// его копия в десктопном коде однажды разошлась бы с этой.
+    pub cache_expired: bool,
+}
+
 /// Что разбудило цикл. Существует только затем, чтобы решение принималось
 /// после `select!`, а не внутри его ветки.
 enum Wake {
@@ -459,6 +498,14 @@ impl DriverHandle {
     pub async fn contacts(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::Contacts { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает список сопряжённых десктопов (§13.4). `None` — драйвер
+    /// остановлен.
+    pub async fn devices(&self) -> Option<Vec<DeviceStatus>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Devices { reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -645,6 +692,13 @@ impl DriverHandle {
     pub fn contacts_blocking(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::Contacts { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает сопряжённые десктопы, блокируя вызывающий поток.
+    pub fn devices_blocking(&self) -> Option<Vec<DeviceStatus>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Devices { reply })).ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -1014,6 +1068,27 @@ impl<S: Store, R: Runner> Driver<S, R> {
                             .get(peer_ik)
                             .map(|(_, anomalies)| *anomalies)
                             .unwrap_or_default(),
+                    })
+                    .collect();
+                let _ = reply.send(found);
+            }
+            Query::Devices { reply } => {
+                let found = self
+                    .engine
+                    .paired_devices()
+                    .into_iter()
+                    .map(|device| DeviceStatus {
+                        device_id: device.device_id,
+                        pairing_public: device.pairing_public,
+                        label: device.label.clone(),
+                        paired_ms: device.paired_ms,
+                        last_seen_ms: device.last_seen_ms,
+                        connected: self.engine.device_connected(&device.device_id),
+                        // Ни разу не подключалось — кэшу нечего просрочивать.
+                        // Без этой оговорки свежесопряжённое устройство
+                        // объявлялось бы просроченным на тридцать первые
+                        // сутки от начала эпохи, то есть всегда.
+                        cache_expired: device.last_seen_ms != 0 && device.cache_expired(now_ms()),
                     })
                     .collect();
                 let _ = reply.send(found);

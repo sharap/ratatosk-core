@@ -17,8 +17,9 @@ use crate::schema;
 use crate::sql_types;
 use crate::tokens;
 use crate::{
-    FileId, Result, Store, StoreError, StoredAvatar, StoredContact, StoredContactShare, StoredFile,
-    StoredMessage, StoredOutbox, StoredReaction, StoredSession,
+    FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
+    StoredContactShare, StoredFile, StoredMessage, StoredOutbox, StoredPairedDevice,
+    StoredReaction, StoredSession,
 };
 
 /// Хранилище на SQLite.
@@ -288,6 +289,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, i64>(9)? != 0,
                 row.get::<_, i64>(10)? != 0,
+                row.get::<_, i64>(11)?,
             ))
         })?;
 
@@ -305,6 +307,7 @@ impl SqliteStore {
                 source_path,
                 accepted,
                 complete,
+                ordinal,
             ) = row?;
             let file_id: FileId =
                 file_id.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?;
@@ -336,6 +339,11 @@ impl SqliteStore {
                 source_path,
                 accepted,
                 complete,
+                // Отрицательного там взяться неоткуда — столбец пишем только
+                // мы, — но читать чужое число как своё без проверки нельзя:
+                // порченая база обязана давать отказ, а не тихий ноль.
+                ordinal: u32::try_from(ordinal)
+                    .map_err(|_| StoreError::Backend("порядок вложения вне диапазона".into()))?,
             });
         }
         Ok(found)
@@ -818,6 +826,77 @@ impl Store for SqliteStore {
         }
         Ok(found)
     }
+    fn put_paired_device(&mut self, device: &StoredPairedDevice) -> Result<()> {
+        // AAD привязывает ключ к строке: переставленный прямым доступом
+        // к файлу он не откроется, и чужое устройство не станет своим.
+        let sealed =
+            self.seal("paired_devices.pairing_key_enc", &device.device_id, &device.pairing_public)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO paired_devices
+             (device_id, label, pairing_key_enc, paired_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                &device.device_id[..],
+                &device.label,
+                sealed,
+                sql_types::to_sql(device.paired_ms),
+                sql_types::to_sql(device.last_seen_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn paired_devices(&self) -> Result<Vec<StoredPairedDevice>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT device_id, label, pairing_key_enc, paired_ms, last_seen_ms
+             FROM paired_devices ORDER BY paired_ms",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut devices = Vec::new();
+        for row in rows {
+            let (id, label, sealed, paired_ms, last_seen_ms) = row?;
+            let device_id: [u8; 16] = id
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Backend("идентификатор устройства не 16 байт".into()))?;
+            let opened = self.open_sealed("paired_devices.pairing_key_enc", &device_id, &sealed)?;
+            let pairing_public: [u8; 32] = opened
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Backend("ключ сопряжения не 32 байта".into()))?;
+            devices.push(StoredPairedDevice {
+                device_id,
+                label,
+                pairing_public,
+                paired_ms: sql_types::from_sql(paired_ms),
+                last_seen_ms: sql_types::from_sql(last_seen_ms),
+            });
+        }
+        Ok(devices)
+    }
+
+    fn delete_paired_device(&mut self, device_id: &[u8; 16]) -> Result<()> {
+        self.conn.execute("DELETE FROM paired_devices WHERE device_id = ?1", [&device_id[..]])?;
+        Ok(())
+    }
+
+    fn touch_paired_device(&mut self, device_id: &[u8; 16], now_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE paired_devices SET last_seen_ms = ?2 WHERE device_id = ?1",
+            rusqlite::params![&device_id[..], sql_types::to_sql(now_ms)],
+        )?;
+        Ok(())
+    }
+
     fn put_avatar(&mut self, owner_ik: &[u8; 32], avatar: &StoredAvatar) -> Result<()> {
         // AAD привязывает шифротекст к строке: аватарка, переставленная
         // из одной строки в другую прямым доступом к файлу, не откроется.
@@ -937,8 +1016,8 @@ impl Store for SqliteStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO files (
                  file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                 preview_enc, incoming, source_path, accepted, complete
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 preview_enc, incoming, source_path, accepted, complete, ordinal
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 &file.file_id[..],
                 &file.msg_id[..],
@@ -951,6 +1030,7 @@ impl Store for SqliteStore {
                 file.source_path.as_deref(),
                 i64::from(file.accepted),
                 i64::from(file.complete),
+                i64::from(file.ordinal),
             ],
         )?;
         Ok(())
@@ -959,7 +1039,7 @@ impl Store for SqliteStore {
     fn file(&self, file_id: &FileId) -> Result<Option<StoredFile>> {
         let mut statement = self.conn.prepare(
             "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete
+                    preview_enc, incoming, source_path, accepted, complete, ordinal
                FROM files WHERE file_id = ?1",
         )?;
         let mut found = self.read_files(&mut statement, rusqlite::params![&file_id[..]])?;
@@ -969,8 +1049,8 @@ impl Store for SqliteStore {
     fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
         let mut statement = self.conn.prepare(
             "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete
-               FROM files WHERE msg_id = ?1 ORDER BY file_id",
+                    preview_enc, incoming, source_path, accepted, complete, ordinal
+               FROM files WHERE msg_id = ?1 ORDER BY ordinal, file_id",
         )?;
         self.read_files(&mut statement, rusqlite::params![&msg_id[..]])
     }
@@ -1005,10 +1085,11 @@ impl Store for SqliteStore {
         Ok(Some(StoredContactShare { msg_id: *msg_id, ik, card_bytes }))
     }
 
-    fn accept_file(&mut self, file_id: &FileId) -> Result<bool> {
-        let affected = self
-            .conn
-            .execute("UPDATE files SET accepted = 1 WHERE file_id = ?1", [&file_id[..]])?;
+    fn set_accepted(&mut self, file_id: &FileId, accepted: bool) -> Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE files SET accepted = ?2 WHERE file_id = ?1",
+            rusqlite::params![&file_id[..], i64::from(accepted)],
+        )?;
         Ok(affected > 0)
     }
 
@@ -1052,6 +1133,140 @@ impl Store for SqliteStore {
         Ok(sql_types::from_sql(count))
     }
 
+    fn put_staged(&mut self, staged: &StagedUpload) -> Result<()> {
+        // Имя, ключ и превью — содержимое (§12), как и у обычного файла.
+        let name_enc =
+            self.seal("staged_files.name_enc", &staged.file_id, staged.name.as_bytes())?;
+        let key_enc = self.seal("staged_files.file_key_enc", &staged.file_id, &staged.key)?;
+        let preview_enc = match &staged.preview {
+            Some(bytes) => Some(self.seal("staged_files.preview_enc", &staged.file_id, bytes)?),
+            None => None,
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO staged_files (
+                 file_id, chat_id, name_enc, size_bytes, chunk_total,
+                 file_key_enc, preview_enc, started_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                &staged.file_id[..],
+                &staged.chat_id[..],
+                name_enc,
+                sql_types::to_sql(staged.size_bytes),
+                sql_types::to_sql(staged.chunk_total),
+                key_enc,
+                preview_enc,
+                sql_types::to_sql(staged.started_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn staged_uploads(&self) -> Result<Vec<StagedUpload>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_id, chat_id, name_enc, size_bytes, chunk_total,
+                    file_key_enc, preview_enc, started_ms
+               FROM staged_files ORDER BY started_ms, file_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                sql_types::from_sql(row.get(3)?),
+                sql_types::from_sql(row.get(4)?),
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                sql_types::from_sql(row.get(7)?),
+            ))
+        })?;
+
+        let mut found = Vec::new();
+        for row in rows {
+            let (
+                file_id,
+                chat_id,
+                name_enc,
+                size_bytes,
+                chunk_total,
+                key_enc,
+                preview_enc,
+                started_ms,
+            ) = row?;
+            let file_id: FileId =
+                file_id.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?;
+            let name = String::from_utf8(self.open_sealed(
+                "staged_files.name_enc",
+                &file_id,
+                &name_enc,
+            )?)
+            .map_err(|_| StoreError::Backend("имя файла не UTF-8".into()))?;
+            let key: [u8; 32] = self
+                .open_sealed("staged_files.file_key_enc", &file_id, &key_enc)?
+                .try_into()
+                .map_err(|_| StoreError::Backend("ключ файла не 32 байта".into()))?;
+            let preview = match preview_enc {
+                Some(sealed) => {
+                    Some(self.open_sealed("staged_files.preview_enc", &file_id, &sealed)?)
+                }
+                None => None,
+            };
+            found.push(StagedUpload {
+                file_id,
+                chat_id: chat_id
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("chat_id не 16 байт".into()))?,
+                name,
+                size_bytes,
+                chunk_total,
+                key,
+                preview,
+                started_ms,
+            });
+        }
+        Ok(found)
+    }
+
+    fn note_staged_chunk(&mut self, file_id: &FileId, index: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO staged_chunks (file_id, chunk_index) VALUES (?1, ?2)",
+            rusqlite::params![&file_id[..], sql_types::to_sql(index)],
+        )?;
+        Ok(())
+    }
+
+    fn staged_chunks(&self, file_id: &FileId) -> Result<Vec<u64>> {
+        let mut statement = self.conn.prepare(
+            "SELECT chunk_index FROM staged_chunks WHERE file_id = ?1 ORDER BY chunk_index",
+        )?;
+        let rows = statement.query_map([&file_id[..]], |row| row.get::<_, i64>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(sql_types::from_sql(row?));
+        }
+        Ok(found)
+    }
+
+    fn delete_staged(&mut self, file_id: &FileId) -> Result<()> {
+        // Куски уходят каскадом: внешний ключ объявлен `ON DELETE CASCADE`,
+        // и полагаться на него дешевле, чем помнить про второй запрос.
+        self.conn.execute("DELETE FROM staged_files WHERE file_id = ?1", [&file_id[..]])?;
+        Ok(())
+    }
+
+    fn staged_older_than(&self, cutoff_ms: u64) -> Result<Vec<FileId>> {
+        let mut statement =
+            self.conn.prepare("SELECT file_id FROM staged_files WHERE started_ms < ?1")?;
+        let rows =
+            statement.query_map([sql_types::to_sql(cutoff_ms)], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(
+                row?.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?,
+            );
+        }
+        Ok(found)
+    }
+
     fn next_missing_chunk(&self, file_id: &FileId, chunk_total: u64) -> Result<Option<u64>> {
         // Индексы читаются по порядку и обходятся в Rust, а не считаются в SQL.
         // Арифметики в запросах здесь нет намеренно (см. `compact`), а для
@@ -1076,7 +1291,7 @@ impl Store for SqliteStore {
     fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
         let mut statement = self.conn.prepare(
             "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete
+                    preview_enc, incoming, source_path, accepted, complete, ordinal
                FROM files WHERE complete = 0 ORDER BY file_id",
         )?;
         self.read_files(&mut statement, rusqlite::params![])

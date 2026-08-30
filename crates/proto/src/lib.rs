@@ -27,6 +27,7 @@
 
 pub mod avatar;
 pub mod card_update;
+pub mod companion;
 pub mod contact_share;
 pub mod edit;
 pub mod files;

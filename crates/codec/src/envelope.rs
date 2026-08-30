@@ -123,6 +123,26 @@ pub enum PayloadType {
     /// обновляет никогда — адреса меняет только подписанный
     /// [`PayloadType::CardUpdate`].
     ContactShare,
+    /// Запрос десктопа-компаньона к телефону (§13.4).
+    ///
+    /// **Дополнение к спецификации по форме, но не по существу:** §13.4
+    /// называет режим компаньона «локальным RPC поверх уже построенных
+    /// механизмов» и новых криптографических конструкций не вводит. Кадр
+    /// тот же, сессия та же (Noise IK), транспорт тот же — меняется только
+    /// то, что внутри. Правила — в `ratatosk_proto::companion`.
+    ///
+    /// Отдельный тип, а не текст со служебным префиксом: собеседник и
+    /// сопряжённое устройство приходят по одному проводу, и различать их
+    /// обязан разбор кадра, а не догадка по содержимому.
+    CompanionRequest,
+    /// Ответ телефона на запрос десктопа (§13.4).
+    CompanionResponse,
+    /// Новость от телефона десктопу без запроса (§13.4).
+    ///
+    /// Пришло сообщение, сменился статус, изменился список чатов. Отдельно
+    /// от ответа, потому что у неё нет и не может быть номера запроса:
+    /// её никто не спрашивал.
+    CompanionNotice,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -151,6 +171,9 @@ impl PayloadType {
             PayloadType::Reply => 14,
             PayloadType::FileRequest => 15,
             PayloadType::ContactShare => 16,
+            PayloadType::CompanionRequest => 17,
+            PayloadType::CompanionResponse => 18,
+            PayloadType::CompanionNotice => 19,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -175,6 +198,9 @@ impl PayloadType {
             14 => PayloadType::Reply,
             15 => PayloadType::FileRequest,
             16 => PayloadType::ContactShare,
+            17 => PayloadType::CompanionRequest,
+            18 => PayloadType::CompanionResponse,
+            19 => PayloadType::CompanionNotice,
             other => PayloadType::Unknown(other),
         }
     }
@@ -376,6 +402,27 @@ mod tests {
         let map = canonical::as_map(&canonical::decode(&bytes).unwrap()).unwrap().to_vec();
         assert!(canonical::get(&map, KEY_GROUP_ID).is_none());
         assert!(canonical::get(&map, KEY_FRAGMENT).is_none());
+    }
+
+    #[test]
+    fn every_known_code_round_trips() {
+        // Обход, который до сих пор делался глазами. Пропущенная ветка
+        // в `from_code` сборку не ломает — она превращает известный тип
+        // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
+        // Заметить это можно только на двух устройствах разных версий.
+        const HIGHEST: u64 = 19;
+        for code in 1..=HIGHEST {
+            let parsed = PayloadType::from_code(code);
+            assert!(
+                !matches!(parsed, PayloadType::Unknown(_)),
+                "код {code} занят, но не разбирается"
+            );
+            assert_eq!(parsed.code(), code, "код {code} разобрался не в себя");
+        }
+        assert!(
+            matches!(PayloadType::from_code(HIGHEST + 1), PayloadType::Unknown(_)),
+            "занятых кодов стало больше — поднимите HIGHEST вместе с ними"
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! симуляции (§16).
 //!
 //! Типы наружу намеренно простые: без лайфтаймов, без generic'ов, без
-//! заимствований. Kotlin и Tauri видят обычные структуры и колбэки.
+//! заимствований. Kotlin видит обычные структуры и колбэки — и на телефоне,
+//! и на десктопе: он там на Compose, то есть на той же JVM.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -36,6 +37,13 @@ use ratatosk_transport::{onion::arti::OnionRunner, Switched};
 #[cfg(any(not(feature = "tor"), not(feature = "mail")))]
 use ratatosk_transport::Disabled;
 use ratatosk_transport::{LanConfig, LanRunner, Transports};
+
+/// Второй экран телефона (§13.4) — отдельным объектом.
+///
+/// Модуль, а не второй крейт: планшет на Android бывает и аккаунтом,
+/// и компаньоном, и двумя нативными библиотеками в одном приложении
+/// это обошлось бы дороже, чем неиспользуемым SQLite на десктопе.
+pub mod companion;
 
 uniffi::setup_scaffolding!();
 
@@ -310,9 +318,14 @@ pub enum FfiEvent {
     },
     /// Ход передачи файла (§10.2).
     ///
-    /// Приходит на каждый принятый чанк и на завершение. `total` равен нулю
-    /// только в одном случае — файл отклонён и убран; тогда клиенту надо
-    /// перечитать сообщение, вложения у него больше нет.
+    /// Приходит на каждый принятый чанк и на завершение.
+    ///
+    /// Прежде здесь стояло, что `total` равен нулю только у отклонённого
+    /// файла и клиенту тогда надо перечитать сообщение. **Это было неверно
+    /// дважды.** Пустой файл — ноль байт, законный файл — даёт ровно те же
+    /// нули при завершении сборки, и клиенту говорилось «вложения нет»
+    /// о вложении, которое есть. А отклонённый файл теперь называет себя
+    /// сам: [`FfiEvent::FileGone`].
     FileProgress {
         /// Какой файл.
         file_id: Vec<u8>,
@@ -320,6 +333,15 @@ pub enum FfiEvent {
         received: u64,
         /// Всего чанков.
         total: u64,
+    },
+    /// Вложения больше нет: от него отказались, и всё убрано.
+    ///
+    /// Строку вложения надо **убрать**, а не обнулить в ней числа. Само
+    /// сообщение при этом остаётся: текст к отвергнутой картинке никуда
+    /// не делся.
+    FileGone {
+        /// Какого вложения.
+        file_id: Vec<u8>,
     },
     /// Текст из §14, который клиент обязан показать дословно.
     HonestNotice {
@@ -389,6 +411,30 @@ pub enum FfiEvent {
         crowded: bool,
         /// Поедут ли почтой файлы.
         carries_files: bool,
+    },
+    /// Сопряжение заведено — вот ссылка для QR (§13.4).
+    ///
+    /// **Показать обязательно и сразу.** Секретная половина ключа живёт
+    /// только в этой ссылке: телефон её не хранит, повторить событие нечем.
+    /// Не показали — сопряжение придётся заводить заново, а прежняя запись
+    /// останется в списке мёртвой.
+    PairingReady {
+        /// Какое устройство.
+        device_id: Vec<u8>,
+        /// Ссылка `ratatosk:v0:pair:…` — прямо в QR.
+        uri: String,
+    },
+    /// Сопряжение отозвано (§13.4).
+    PairingRevoked {
+        /// Какое устройство.
+        device_id: Vec<u8>,
+    },
+    /// Десктоп подключился или отключился (§13.4).
+    DeviceLink {
+        /// Какое устройство.
+        device_id: Vec<u8>,
+        /// Есть ли сейчас канал.
+        connected: bool,
     },
 }
 
@@ -572,6 +618,23 @@ pub struct FfiAnomalies {
     pub handshake_replay: u64,
     /// Всего.
     pub total: u64,
+}
+
+/// Сопряжённый десктоп в том виде, в каком его показывает UI (§13.4).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPairedDevice {
+    /// Идентификатор записи — им же отзывают сопряжение.
+    pub device_id: Vec<u8>,
+    /// Метка, которую человек дал устройству при сопряжении.
+    pub label: String,
+    /// Когда сопряжено, мс.
+    pub paired_ms: u64,
+    /// Когда последний раз подключалось, мс. Ноль — ни разу.
+    pub last_seen_ms: u64,
+    /// Есть ли канал прямо сейчас.
+    pub connected: bool,
+    /// Пора ли десктопу стереть кэш — тридцать суток без связи (§13.4).
+    pub cache_expired: bool,
 }
 
 /// Контакт в том виде, в каком его показывает UI.
@@ -902,7 +965,7 @@ struct Opened {
     own_ik: [u8; 32],
 }
 
-/// Клиент ядра — то, что держит Kotlin или Tauri.
+/// Клиент ядра — то, что держит Kotlin.
 ///
 /// Ядро живёт на собственном потоке с рантаймом, и это не деталь реализации,
 /// а следствие двух вещей сразу: методы через UniFFI синхронные, а состояние
@@ -1499,7 +1562,17 @@ impl RatatoskClient {
     /// ([`RatatoskClient::set_auto_accept_bytes`]). Согласие переживает
     /// перезапуск: спрашивать дважды об одном файле незачем.
     pub fn accept_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
-        self.command(Command::AcceptFile { file_id: to_msg_id(&file_id)? })
+        self.command(Command::AcceptFile { file_id: to_file_id(&file_id)? })
+    }
+
+    /// Перестаёт качать входящий файл, не отказываясь от него.
+    ///
+    /// Приехавшее остаётся, предложение живёт, и `accept_file` продолжит
+    /// с того же места (§10.2). Показывать это надо именно так — «остановлено,
+    /// продолжить», — а не «отменено»: человек, прочитавший «отменено»,
+    /// не станет продолжать то, что считает потерянным.
+    pub fn pause_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::PauseFile { file_id: to_file_id(&file_id)? })
     }
 
     /// Отказывается от входящего файла.
@@ -1508,7 +1581,7 @@ impl RatatoskClient {
     /// не уходит ничего: отказ — решение о своей памяти, а не сообщение о себе.
     /// Он увидит только, что чанки перестали запрашивать.
     pub fn decline_file(&self, file_id: Vec<u8>) -> Result<(), RatatoskError> {
-        self.command(Command::DeclineFile { file_id: to_msg_id(&file_id)? })
+        self.command(Command::DeclineFile { file_id: to_file_id(&file_id)? })
     }
 
     /// Отправляет в чат карточку контакта (§4.1, дополнение).
@@ -1604,7 +1677,7 @@ impl RatatoskClient {
     ///
     /// `None` — такого вложения нет: не приезжало, отклонено или удалено.
     pub fn open_file(&self, file_id: Vec<u8>) -> Result<Option<Arc<FfiFileReader>>, RatatoskError> {
-        let file_id = to_msg_id(&file_id)?;
+        let file_id = to_file_id(&file_id)?;
         let found = self
             .opened
             .handle
@@ -1618,7 +1691,7 @@ impl RatatoskClient {
     /// Отдельным вызовом, как и аватарка: до 32 КиБ на файл, и тащить их
     /// в каждый показ списка чата незачем.
     pub fn preview_of(&self, file_id: Vec<u8>) -> Result<Option<Vec<u8>>, RatatoskError> {
-        let file_id = to_msg_id(&file_id)?;
+        let file_id = to_file_id(&file_id)?;
         let found = self
             .opened
             .handle
@@ -1821,6 +1894,48 @@ impl RatatoskClient {
             .collect())
     }
 
+    /// Список сопряжённых десктопов (§13.4).
+    pub fn devices(&self) -> Result<Vec<FfiPairedDevice>, RatatoskError> {
+        let found = self
+            .opened
+            .handle
+            .devices_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found
+            .into_iter()
+            .map(|d| FfiPairedDevice {
+                device_id: d.device_id.to_vec(),
+                label: d.label,
+                paired_ms: d.paired_ms,
+                last_seen_ms: d.last_seen_ms,
+                connected: d.connected,
+                cache_expired: d.cache_expired,
+            })
+            .collect())
+    }
+
+    /// Заводит сопряжение с десктопом и отдаёт ссылку для QR (§13.4).
+    ///
+    /// Ссылка приходит **событием** [`FfiEvent::PairingReady`], а не отсюда,
+    /// и это не неудобство ради стройности. Команда пересекает границу
+    /// в одну сторону (§13.3): ядро исполняет её в своём потоке, и ответ
+    /// у него один на все команды. Клиенту всё равно надо слушать события —
+    /// подключение десктопа придёт тем же путём.
+    ///
+    /// **Показать ссылку обязательно и сразу.** Секрет живёт только в ней:
+    /// телефон его не хранит, и повторить событие нечем.
+    pub fn pair_device(&self, label: String) -> Result<(), RatatoskError> {
+        self.command(Command::PairDevice { label })
+    }
+
+    /// Отзывает сопряжение (§13.4).
+    ///
+    /// Сессия рвётся немедленно: отозванный десктоп перестаёт быть узнаваемым
+    /// в тот же шаг ядра, а не после того, как допишет начатое.
+    pub fn revoke_pairing(&self, device_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::RevokePairing { device_id: to_device_id(&device_id)? })
+    }
+
     /// Последние сообщения чата в порядке HLC (§9.1).
     pub fn messages(&self, chat_id: Vec<u8>, limit: u32) -> Result<Vec<FfiMessage>, RatatoskError> {
         let chat = to_chat(&chat_id)?;
@@ -2013,6 +2128,24 @@ fn to_ik(bytes: &[u8]) -> Result<[u8; 32], RatatoskError> {
 
 fn to_msg_id(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
     bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор сообщения не 16 байт"))
+}
+
+/// Разбирает идентификатор сопряжённого устройства (§13.4).
+///
+/// Отдельно от `to_msg_id`, хотя длина та же: слова в отказе читает человек,
+/// и «идентификатор сообщения не 16 байт» на экране списка устройств
+/// отправляет искать поломку не туда.
+fn to_device_id(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
+    bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор устройства не 16 байт"))
+}
+
+/// Разбирает идентификатор вложения (§10).
+///
+/// По той же причине, что и `to_device_id`: длина та же, а слова разные.
+/// До этой поставки здесь звался `to_msg_id`, и человек, приложивший
+/// не тот идентификатор к `accept_file`, читал про сообщение.
+fn to_file_id(bytes: &[u8]) -> Result<[u8; 16], RatatoskError> {
+    bytes.try_into().map_err(|_| RatatoskError::internal("идентификатор вложения не 16 байт"))
 }
 
 /// Переводит вердикт §5.4 через границу.
@@ -2541,6 +2674,7 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::FileProgress { file_id, received, total } => {
             FfiEvent::FileProgress { file_id: file_id.to_vec(), received, total }
         }
+        Event::FileGone { file_id } => FfiEvent::FileGone { file_id: file_id.to_vec() },
         Event::HonestNotice { text } => FfiEvent::HonestNotice { text: text.to_owned() },
         Event::CommandRefused { reason } => FfiEvent::CommandRefused { reason },
         Event::MailAccountReady { address } => FfiEvent::MailAccountReady { address },
@@ -2554,6 +2688,15 @@ fn translate(event: Event) -> Option<FfiEvent> {
                 crowded,
                 carries_files,
             }
+        }
+        Event::PairingReady { device_id, uri } => {
+            FfiEvent::PairingReady { device_id: device_id.to_vec(), uri }
+        }
+        Event::PairingRevoked { device_id } => {
+            FfiEvent::PairingRevoked { device_id: device_id.to_vec() }
+        }
+        Event::DeviceLink { device_id, connected } => {
+            FfiEvent::DeviceLink { device_id: device_id.to_vec(), connected }
         }
     })
 }
@@ -2718,6 +2861,23 @@ pub fn max_files_per_message() -> u32 {
 #[must_use]
 pub fn max_preview_bytes() -> u32 {
     u32::try_from(ratatosk_proto::files::PREVIEW_LIMIT_BYTES).unwrap_or(u32::MAX)
+}
+
+/// Наибольшая длина текста сообщения в **байтах**.
+///
+/// Одно число на всё: и на сообщение без вложений, и на подпись к десяти
+/// файлам с превью. Выведено из худшего случая, поэтому у простого текста
+/// остаётся неиспользованный запас, — но правило одно, и применить его
+/// не то нельзя.
+///
+/// **Считать надо байты, а не символы.** Кириллица в UTF-8 идёт по два байта
+/// на букву, эмодзи по четыре: счётчик символов в поле ввода обманул бы
+/// человека вдвое или вчетверо. В Kotlin это `text.toByteArray().size`,
+/// а не `text.length`.
+#[uniffi::export]
+#[must_use]
+pub fn max_text_bytes() -> u32 {
+    u32::try_from(ratatosk_proto::files::MAX_TEXT_BYTES).unwrap_or(u32::MAX)
 }
 
 /// Порог автоматического приёма файлов по умолчанию.

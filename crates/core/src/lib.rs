@@ -19,6 +19,7 @@ pub mod accounts;
 pub mod companion;
 pub mod engine;
 pub mod entropy;
+pub mod frames;
 pub mod honest;
 pub mod io;
 pub mod reader;
@@ -27,8 +28,23 @@ pub mod vault;
 #[cfg(feature = "driver")]
 pub mod driver;
 
+/// Среда вокруг терминала компаньона (§13.4).
+///
+/// За тем же признаком, что и [`driver`]: ей нужны и tokio, и транспорт,
+/// а симуляция (§16) собирается без обоих.
+#[cfg(feature = "driver")]
+pub mod companion_driver;
+
 pub use accounts::{
     tor_path_beside, write_onion_keystore, Account, AccountError, AccountId, Registry, TorLayout,
+};
+pub use companion::{
+    Cache, ClientEffect, ClientEvent, ClientInput, CompanionClient, OutgoingItem, PairedDevice,
+    DESKTOP_CACHE_CHATS, DESKTOP_CACHE_PER_CHAT, DESKTOP_CACHE_TTL_MS,
+};
+#[cfg(feature = "driver")]
+pub use companion_driver::{
+    CompanionCommand, CompanionDriver, CompanionEvent, CompanionEvents, CompanionHandle,
 };
 pub use engine::{Contact, Engine, EngineError, SelfAddresses, MAX_LOCAL_NAME_CHARS};
 pub use entropy::{Entropy, OsEntropy, SeededEntropy};

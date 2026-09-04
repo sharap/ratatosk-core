@@ -46,7 +46,10 @@ pub use companion::{
 pub use companion_driver::{
     CompanionCommand, CompanionDriver, CompanionEvent, CompanionEvents, CompanionHandle,
 };
-pub use engine::{Contact, Engine, EngineError, ExportScope, SelfAddresses, MAX_LOCAL_NAME_CHARS};
+pub use engine::{
+    Contact, Engine, EngineError, ExportScope, GroupMember, GroupState, SelfAddresses,
+    MAX_GROUP_TITLE_CHARS, MAX_LOCAL_NAME_CHARS,
+};
 pub use entropy::{Entropy, OsEntropy, SeededEntropy};
 pub use io::{
     ArchiveKey, ChatId, Command, Effect, Event, Exported, Input, Merged, OutgoingFile, Swept,

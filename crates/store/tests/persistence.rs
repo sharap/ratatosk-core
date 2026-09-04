@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use ratatosk_crdt::Hlc;
-use ratatosk_store::{SqliteStore, Store, StoredContact, StoredMessage};
+use ratatosk_store::{
+    MemoryStore, SqliteStore, Store, StoredContact, StoredGroup, StoredGroupAvatar,
+    StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredSenderChain,
+};
 use zeroize::Zeroizing;
 
 /// Свой временный путь вместо зависимости ради одной функции.
@@ -1766,4 +1769,796 @@ fn a_changed_index_format_rebuilds_everything() {
         1,
         "индекс чужого формата обязан быть построен заново"
     );
+}
+
+// --- Группы (§11) ---------------------------------------------------------
+
+fn group(byte: u8, title: &str, created_ms: u64) -> StoredGroup {
+    StoredGroup {
+        chat_id: [byte; 16],
+        owner_ik: [byte.wrapping_add(100); 32],
+        title: title.to_owned(),
+        // Метка нулевая: заготовка про хранение, а не про порядок,
+        // а тесты порядка ставят её сами.
+        title_wall: 0,
+        title_logical: 0,
+        created_ms,
+    }
+}
+
+fn op(member: u8, wall: u64, removed: bool) -> StoredMembershipOp {
+    StoredMembershipOp {
+        member_ik: [member; 32],
+        tag_wall: wall,
+        tag_logical: 0,
+        tag_actor: [1u8; 32],
+        tag_uniq: [member; 8],
+        removed,
+    }
+}
+
+#[test]
+fn a_group_survives_reopening_with_its_title() {
+    let db = TempDb::new("group");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.group(&[7u8; 16]).unwrap().unwrap();
+    assert_eq!(found.title, "у костра");
+    assert_eq!(found.owner_ik, [107u8; 32]);
+    assert_eq!(found.created_ms, 1_000);
+}
+
+#[test]
+fn the_group_title_is_not_in_the_file() {
+    // Как человек назвал круг знакомых — сведение того же рода, что текст
+    // сообщения (§12), и на диске его быть не должно.
+    let db = TempDb::new("group-plain");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "капибары у костра", 1_000)).unwrap();
+    }
+
+    // WAL сливается в основной файл при закрытии соединения; читаем оба
+    // на случай, если что-то осталось.
+    let mut bytes = std::fs::read(&db.0).unwrap_or_default();
+    bytes.extend(std::fs::read(db.0.with_extension("db-wal")).unwrap_or_default());
+    let haystack = String::from_utf8_lossy(&bytes);
+    assert!(!haystack.contains("капибары"), "название группы лежит в файле открытым текстом");
+}
+
+#[test]
+fn a_wrong_key_does_not_open_the_group_title() {
+    let db = TempDb::new("group-key");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(2)).unwrap();
+    assert!(store.group(&[7u8; 16]).is_err(), "чужой ключ не должен открывать название");
+}
+
+#[test]
+fn a_repeated_put_renames_the_group_but_keeps_its_owner() {
+    // Владелец у группы один и на всю жизнь (§11.2): смена его здесь
+    // означала бы, что право исключать переехало молча.
+    let db = TempDb::new("group-owner");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    let mut renamed = group(7, "у большого костра", 5_000);
+    renamed.owner_ik = [3u8; 32];
+    store.put_group(&renamed).unwrap();
+
+    let found = store.group(&[7u8; 16]).unwrap().unwrap();
+    assert_eq!(found.title, "у большого костра", "название обязано обновиться");
+    assert_eq!(found.owner_ik, [107u8; 32], "владелец обязан остаться прежним");
+    assert_eq!(found.created_ms, 1_000, "время заведения обязано остаться прежним");
+}
+
+#[test]
+fn a_group_can_arrive_after_the_first_message_of_that_chat() {
+    // Строку чата заводит приход сообщения — с `kind = 0` и пустым
+    // владельцем. Сведение о группе может доехать вторым, и оно обязано
+    // лечь в ту же строку.
+    let db = TempDb::new("group-late");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    let mut said = message(1, 100);
+    said.chat_id = [7u8; 16];
+    store.put_message(&said).unwrap();
+    assert!(store.group(&[7u8; 16]).unwrap().is_none(), "группы пока нет");
+
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    let found = store.group(&[7u8; 16]).unwrap().unwrap();
+    assert_eq!(found.owner_ik, [107u8; 32], "владелец обязан встать в пустое место");
+    assert_eq!(store.messages(&[7u8; 16], 10, None).unwrap().len(), 1, "сообщение на месте");
+}
+
+#[test]
+fn a_chat_that_is_not_a_group_is_not_listed_as_one() {
+    let db = TempDb::new("group-only");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+
+    let listed = store.groups().unwrap();
+    assert_eq!(listed.len(), 1, "чат 1:1 не группа");
+    assert_eq!(listed[0].chat_id, [7u8; 16]);
+}
+
+#[test]
+fn groups_come_back_in_one_and_the_same_order() {
+    // §16 требует воспроизводимости, а она держится на том, что порядок
+    // чтения задан целиком, без опоры на порядок вставки.
+    let db = TempDb::new("group-order");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_group(&group(9, "третья", 3_000)).unwrap();
+    store.put_group(&group(2, "первая", 1_000)).unwrap();
+    store.put_group(&group(5, "вторая", 2_000)).unwrap();
+
+    let titles: Vec<String> = store.groups().unwrap().into_iter().map(|g| g.title).collect();
+    assert_eq!(titles, vec!["первая", "вторая", "третья"]);
+}
+
+#[test]
+fn membership_ops_survive_reopening_and_a_tombstone_never_lifts() {
+    let db = TempDb::new("membership");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+        store.put_membership(&[7u8; 16], &[op(1, 10, false), op(2, 11, false)]).unwrap();
+        // Удаление, а следом — то же добавление вторым заходом: в OR-Set
+        // это обычное дело, и оно не должно снимать надгробие.
+        store.put_membership(&[7u8; 16], &[op(2, 11, true)]).unwrap();
+        store.put_membership(&[7u8; 16], &[op(2, 11, false)]).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let ops = store.membership(&[7u8; 16]).unwrap();
+    assert_eq!(ops.len(), 2, "повтор той же метки не заводит новую строку");
+    assert_eq!(ops[0], op(1, 10, false));
+    assert_eq!(ops[1], op(2, 11, true), "надгробие обязано остаться стоять");
+}
+
+#[test]
+fn membership_ops_come_back_in_one_and_the_same_order() {
+    let db = TempDb::new("membership-order");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+
+    store.put_membership(&[7u8; 16], &[op(3, 30, false), op(1, 10, false)]).unwrap();
+    store.put_membership(&[7u8; 16], &[op(2, 20, false)]).unwrap();
+
+    let walls: Vec<u64> =
+        store.membership(&[7u8; 16]).unwrap().iter().map(|o| o.tag_wall).collect();
+    assert_eq!(walls, vec![10, 20, 30]);
+}
+
+#[test]
+fn a_sender_chain_survives_reopening_with_its_number() {
+    // Ключ и номер врозь бессмысленны: ключ говорит, чем расшифровать,
+    // номер — какое место в цепочке.
+    let db = TempDb::new("chain");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+        store
+            .put_sender_chain(
+                &[7u8; 16],
+                &StoredSenderChain {
+                    member_ik: [1u8; 32],
+                    chain: [42u8; 32],
+                    counter: 0,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .put_sender_chain(
+                &[7u8; 16],
+                &StoredSenderChain {
+                    member_ik: [1u8; 32],
+                    chain: [43u8; 32],
+                    counter: 7,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+    assert_eq!(found.chain, [43u8; 32], "цепочка обязана обновиться");
+    assert_eq!(found.counter, 7, "номер обязан приехать вместе с ключом");
+    assert_eq!(store.sender_chains(&[7u8; 16]).unwrap().len(), 1, "обновление, а не вторая строка");
+}
+
+#[test]
+fn a_sender_chain_belongs_to_one_group_and_one_member() {
+    let db = TempDb::new("chain-scope");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store.put_group(&group(8, "у другого", 2_000)).unwrap();
+
+    let mine = StoredSenderChain {
+        member_ik: [1u8; 32],
+        chain: [42u8; 32],
+        counter: 3,
+        skipped: Vec::new(),
+    };
+    store.put_sender_chain(&[7u8; 16], &mine).unwrap();
+
+    assert!(store.sender_chain(&[8u8; 16], &[1u8; 32]).unwrap().is_none(), "другая группа");
+    assert!(store.sender_chain(&[7u8; 16], &[2u8; 32]).unwrap().is_none(), "другой участник");
+    assert_eq!(store.sender_chains(&[7u8; 16]).unwrap(), vec![mine]);
+    assert!(store.sender_chains(&[8u8; 16]).unwrap().is_empty());
+}
+
+#[test]
+fn a_chain_moved_to_another_row_does_not_open() {
+    // AAD привязывает шифротекст к паре «чат, участник»: переставленная
+    // прямым доступом к файлу цепочка не открывается.
+    let db = TempDb::new("chain-aad");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 3,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute(
+            "UPDATE sender_chains SET member_ik = ?1 WHERE member_ik = ?2",
+            rusqlite::params![&[2u8; 32][..], &[1u8; 32][..]],
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert!(
+        store.sender_chain(&[7u8; 16], &[2u8; 32]).is_err(),
+        "переставленная строка не открывается"
+    );
+}
+
+#[test]
+fn a_forgotten_group_takes_its_membership_and_chains_with_it() {
+    // Каскад по внешнему ключу: состав и ключи отправителей — часть группы,
+    // и переживать её они не должны.
+    let db = TempDb::new("group-forget");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store.put_membership(&[7u8; 16], &[op(1, 10, false)]).unwrap();
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 0,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        raw.execute("DELETE FROM chats WHERE chat_id = ?1", [&[7u8; 16][..]]).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert!(store.group(&[7u8; 16]).unwrap().is_none());
+    assert!(store.membership(&[7u8; 16]).unwrap().is_empty());
+    assert!(store.sender_chains(&[7u8; 16]).unwrap().is_empty());
+}
+
+fn block(n: u8, author: u8, bytes: &str, received_ms: u64) -> StoredMembershipBlock {
+    StoredMembershipBlock {
+        block_id: [n; 16],
+        author_ik: [author; 32],
+        bytes: bytes.as_bytes().to_vec(),
+        received_ms,
+    }
+}
+
+#[test]
+fn membership_blocks_survive_reopening_in_the_order_they_arrived() {
+    let db = TempDb::new("blocks");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+        store.put_membership_block(&[7u8; 16], &block(2, 20, "второй", 200)).unwrap();
+        store.put_membership_block(&[7u8; 16], &block(1, 10, "первый", 100)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.membership_blocks(&[7u8; 16]).unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0], block(1, 10, "первый", 100), "порядок задан приёмом, а не вставкой");
+    assert_eq!(found[1], block(2, 20, "второй", 200));
+}
+
+#[test]
+fn the_same_block_arriving_twice_does_not_replace_its_bytes() {
+    // Тот же блок законно приходит вторым транспортом (§9.2). Перезапись
+    // означала бы, что байты, над которыми стоит подпись, можно подменить,
+    // назвав прежний идентификатор, — а идентификатор и есть их хэш.
+    let db = TempDb::new("blocks-twice");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+
+    store.put_membership_block(&[7u8; 16], &block(1, 10, "настоящий", 100)).unwrap();
+    let mut forged = block(1, 10, "подменённый", 900);
+    forged.author_ik = [99u8; 32];
+    store.put_membership_block(&[7u8; 16], &forged).unwrap();
+
+    let found = store.membership_blocks(&[7u8; 16]).unwrap();
+    assert_eq!(found.len(), 1, "повтор не заводит вторую строку");
+    assert_eq!(found[0], block(1, 10, "настоящий", 100), "и не подменяет первую");
+}
+
+#[test]
+fn membership_blocks_belong_to_one_group() {
+    let db = TempDb::new("blocks-scope");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store.put_group(&group(8, "у другого", 2_000)).unwrap();
+
+    store.put_membership_block(&[7u8; 16], &block(1, 10, "первый", 100)).unwrap();
+    assert_eq!(store.membership_blocks(&[7u8; 16]).unwrap().len(), 1);
+    assert!(store.membership_blocks(&[8u8; 16]).unwrap().is_empty());
+}
+
+#[test]
+fn a_forgotten_group_takes_its_blocks_with_it() {
+    let db = TempDb::new("blocks-forget");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store.put_membership_block(&[7u8; 16], &block(1, 10, "первый", 100)).unwrap();
+    drop(store);
+
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        raw.execute("DELETE FROM chats WHERE chat_id = ?1", [&[7u8; 16][..]]).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert!(store.membership_blocks(&[7u8; 16]).unwrap().is_empty());
+}
+
+#[test]
+fn a_skipped_cache_survives_reopening_and_is_not_in_the_file() {
+    // Кэш пропущенных ключей — ключевой материал: выброси его при
+    // перезапуске, и всё, что уже в пути, не откроется (§11.1).
+    let db = TempDb::new("skipped");
+    let secret = b"skipped key material \xd0\xba\xd1\x8d\xd1\x88";
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+        store
+            .put_sender_chain(
+                &[7u8; 16],
+                &StoredSenderChain {
+                    member_ik: [1u8; 32],
+                    chain: [42u8; 32],
+                    counter: 9,
+                    skipped: secret.to_vec(),
+                },
+            )
+            .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+    assert_eq!(found.skipped, secret, "кэш пережил перезапуск целиком");
+    assert_eq!(found.counter, 9, "и номер вместе с ним");
+    drop(store);
+
+    let mut bytes = std::fs::read(&db.0).unwrap_or_default();
+    bytes.extend(std::fs::read(db.0.with_extension("db-wal")).unwrap_or_default());
+    assert!(!bytes.windows(secret.len()).any(|w| w == secret), "кэш ключей лежит в файле открытым");
+}
+
+#[test]
+fn an_empty_skipped_cache_comes_back_empty() {
+    // У своей цепочки пропусков не бывает по построению. Пустое значение
+    // и NULL здесь одно и то же, и различать их незачем.
+    let db = TempDb::new("skipped-none");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 0,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let found = store.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+    assert!(found.skipped.is_empty());
+    assert_eq!(store.sender_chains(&[7u8; 16]).unwrap()[0].skipped, Vec::<u8>::new());
+}
+
+#[test]
+fn a_new_chain_wipes_the_cache_that_belonged_to_the_old_one() {
+    // Пропуски относятся ровно к тому состоянию цепочки, из которого
+    // выведены. Переживи они смену ключа — открывали бы номера цепочки,
+    // которой больше нет.
+    let db = TempDb::new("skipped-wipe");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 5,
+                skipped: b"old".to_vec(),
+            },
+        )
+        .unwrap();
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [43u8; 32],
+                counter: 0,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let found = store.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+    assert_eq!(found.chain, [43u8; 32]);
+    assert!(found.skipped.is_empty(), "кэш ушёл вместе с прежним ключом");
+}
+
+#[test]
+fn a_cache_moved_to_another_row_does_not_open() {
+    // AAD у кэша тот же, что у самой цепочки: пара «чат, участник».
+    // Переставленный прямым доступом к файлу кэш не открывается.
+    let db = TempDb::new("skipped-aad");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "у костра", 1_000)).unwrap();
+    store
+        .put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 3,
+                skipped: b"cache".to_vec(),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    {
+        let raw = rusqlite::Connection::open(&db.0).unwrap();
+        raw.execute(
+            "UPDATE sender_chains SET member_ik = ?1 WHERE member_ik = ?2",
+            rusqlite::params![&[2u8; 32][..], &[1u8; 32][..]],
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert!(store.sender_chain(&[7u8; 16], &[2u8; 32]).is_err());
+}
+
+/// Гоняет проверку названия по **обеим** реализациям хранилища.
+///
+/// Расхождение здесь означало бы, что симуляция §16 проверяет не то, что
+/// работает на устройстве: правило «только вперёд» записано двумя разными
+/// способами — условием в SQL и сравнением в памяти, — и совпадать они
+/// обязаны до последнего случая.
+fn title_moves_forward_on<S: Store>(name: &str, store: &mut S) {
+    let mut first = group(7, "у костра", 100);
+    first.title_wall = 10;
+    store.put_group(&first).expect("завели");
+
+    let mut newer = first.clone();
+    newer.title = "у большого костра".to_owned();
+    newer.title_wall = 20;
+    store.put_group(&newer).expect("новее");
+    assert_eq!(
+        store.group(&first.chat_id).expect("чтение").expect("есть").title,
+        "у большого костра",
+        "{name}: свежее применяется"
+    );
+
+    let mut older = first.clone();
+    older.title = "устаревшее".to_owned();
+    older.title_wall = 5;
+    store.put_group(&older).expect("старее");
+    let after = store.group(&first.chat_id).expect("чтение").expect("есть");
+    assert_eq!(after.title, "у большого костра", "{name}: старое не затирает новое");
+    assert_eq!(after.title_wall, 20, "{name}: и метка остаётся свежей");
+
+    // Равные часы — спор решает логическая часть метки (§9.1).
+    let mut same_wall = first.clone();
+    same_wall.title = "тем же мигом, но позже".to_owned();
+    same_wall.title_wall = 20;
+    same_wall.title_logical = 3;
+    store.put_group(&same_wall).expect("тот же миг");
+    let after = store.group(&first.chat_id).expect("чтение").expect("есть");
+    assert_eq!(after.title, "тем же мигом, но позже", "{name}: счётчик решает ничью");
+    assert_eq!(after.title_logical, 3, "{name}");
+
+    // И обратно: тот же миг, счётчик меньше — не применяется.
+    let mut behind = first.clone();
+    behind.title = "тем же мигом, но раньше".to_owned();
+    behind.title_wall = 20;
+    behind.title_logical = 1;
+    store.put_group(&behind).expect("тот же миг, раньше");
+    assert_eq!(
+        store.group(&first.chat_id).expect("чтение").expect("есть").title,
+        "тем же мигом, но позже",
+        "{name}: меньший счётчик не побеждает"
+    );
+}
+
+#[test]
+fn a_group_title_only_moves_forward_in_the_file() {
+    let db = TempDb::new("group-title-forward");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    title_moves_forward_on("файл", &mut store);
+}
+
+#[test]
+fn a_group_title_only_moves_forward_in_memory() {
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    title_moves_forward_on("память", &mut store);
+}
+
+#[test]
+fn a_group_title_tag_survives_reopening() {
+    // Метка нужна после перезапуска не меньше, чем до: очередь §5.4
+    // переживает процесс, и переименование, пролежавшее в ней ночь,
+    // сравнивается уже с поднятой с диска меткой.
+    let db = TempDb::new("group-title-tag");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        let mut with_tag = group(7, "у костра", 1_000);
+        with_tag.title_wall = 42;
+        with_tag.title_logical = 7;
+        store.put_group(&with_tag).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.group(&[7u8; 16]).unwrap().unwrap();
+    assert_eq!((found.title_wall, found.title_logical), (42, 7));
+    assert_eq!(found.title, "у костра", "и само название на месте");
+}
+
+fn png(byte: u8) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.push(byte);
+    bytes
+}
+
+/// Гоняет проверку аватарки группы по **обеим** реализациям хранилища.
+///
+/// Причина та же, что у названия: правило «только вперёд» записано двумя
+/// разными способами — условием в SQL и сравнением в памяти, — и разойдись
+/// они, симуляция §16 проверяла бы не то, что работает на устройстве.
+fn group_avatar_moves_forward_on<S: Store>(name: &str, store: &mut S) {
+    let chat = [7u8; 16];
+    store.put_group(&group(7, "у костра", 100)).expect("группа");
+
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(1), avatar_wall: 10, avatar_logical: 0 },
+        )
+        .expect("поставили");
+    assert_eq!(
+        store.group_avatar(&chat).expect("чтение").expect("есть").bytes,
+        png(1),
+        "{name}: картинка легла"
+    );
+
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(2), avatar_wall: 20, avatar_logical: 0 },
+        )
+        .expect("новее");
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(3), avatar_wall: 5, avatar_logical: 0 },
+        )
+        .expect("старее");
+    let after = store.group_avatar(&chat).expect("чтение").expect("есть");
+    assert_eq!(after.bytes, png(2), "{name}: старое не затирает новое");
+    assert_eq!(after.avatar_wall, 20, "{name}: и метка остаётся свежей");
+
+    // Равные часы — спор решает логическая часть метки (§9.1).
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(4), avatar_wall: 20, avatar_logical: 3 },
+        )
+        .expect("тот же миг");
+    assert_eq!(
+        store.group_avatar(&chat).expect("чтение").expect("есть").bytes,
+        png(4),
+        "{name}: счётчик решает ничью"
+    );
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(5), avatar_wall: 20, avatar_logical: 1 },
+        )
+        .expect("тот же миг, раньше");
+    assert_eq!(
+        store.group_avatar(&chat).expect("чтение").expect("есть").bytes,
+        png(4),
+        "{name}: меньший счётчик не побеждает"
+    );
+
+    // Снятие — такое же значение, как картинка, и метку оно двигает.
+    // Строка при этом обязана остаться: без неё опоздавшая копия прежней
+    // картинки легла бы обратно, потому что сравнивать было бы не с чем.
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: Vec::new(), avatar_wall: 30, avatar_logical: 0 },
+        )
+        .expect("сняли");
+    let after = store.group_avatar(&chat).expect("чтение").expect("строка осталась");
+    assert!(after.bytes.is_empty(), "{name}: картинки нет");
+    assert_eq!(after.avatar_wall, 30, "{name}: у снятия своя метка");
+
+    store
+        .put_group_avatar(
+            &chat,
+            &StoredGroupAvatar { bytes: png(6), avatar_wall: 25, avatar_logical: 0 },
+        )
+        .expect("опоздавшая");
+    assert!(
+        store.group_avatar(&chat).expect("чтение").expect("есть").bytes.is_empty(),
+        "{name}: опоздавшая картинка не воскресает после снятия"
+    );
+
+    // Метка читается и без байтов — этим вопросом живёт список чатов.
+    assert_eq!(store.group_avatar_stamp(&chat).expect("метка"), Some((30, 0)), "{name}");
+    assert_eq!(
+        store.group_avatar_stamp(&[9u8; 16]).expect("метка"),
+        None,
+        "{name}: у группы без картинки метки нет вовсе"
+    );
+}
+
+#[test]
+fn a_group_avatar_only_moves_forward_in_the_file() {
+    let db = TempDb::new("group-avatar-forward");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    group_avatar_moves_forward_on("файл", &mut store);
+}
+
+#[test]
+fn a_group_avatar_only_moves_forward_in_memory() {
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    group_avatar_moves_forward_on("память", &mut store);
+}
+
+#[test]
+fn a_group_avatar_survives_reopening() {
+    // Картинка шифруется, и ключ AAD привязан к строке: перепутай мы
+    // ярлык или идентификатор чата при чтении, она не открылась бы —
+    // а заметно это только после закрытия и открытия файла заново.
+    let db = TempDb::new("group-avatar-reopen");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(7, "у костра", 1_000)).unwrap();
+        store
+            .put_group_avatar(
+                &[7u8; 16],
+                &StoredGroupAvatar { bytes: png(9), avatar_wall: 42, avatar_logical: 7 },
+            )
+            .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.group_avatar(&[7u8; 16]).unwrap().unwrap();
+    assert_eq!(found.bytes, png(9));
+    assert_eq!((found.avatar_wall, found.avatar_logical), (42, 7));
+}
+
+/// Гоняет каскад удаления чата по **обеим** реализациям хранилища.
+fn a_deleted_chat_takes_the_group_with_it_on<S: Store>(name: &str, store: &mut S) {
+    store.put_group(&group(7, "у костра", 100)).expect("группа");
+    store
+        .put_group_avatar(
+            &[7u8; 16],
+            &StoredGroupAvatar { bytes: png(1), avatar_wall: 10, avatar_logical: 0 },
+        )
+        .expect("картинка");
+    store.delete_chat(&[7u8; 16]).expect("удаление чата");
+
+    assert_eq!(store.group_avatar(&[7u8; 16]).expect("чтение"), None, "{name}: картинка ушла");
+    assert_eq!(store.group(&[7u8; 16]).expect("чтение"), None, "{name}: и сама группа тоже");
+    assert!(store.membership(&[7u8; 16]).expect("чтение").is_empty(), "{name}: и состав");
+    assert!(store.sender_chains(&[7u8; 16]).expect("чтение").is_empty(), "{name}: и цепочки");
+}
+
+#[test]
+fn a_deleted_chat_takes_the_group_with_it_in_the_file() {
+    // Внешний ключ на `chats` с каскадом — в файловой базе, руками —
+    // в памяти. Осиротевшая картинка это переписка, пережившая собственное
+    // удаление, и она обязана уйти в обеих реализациях одинаково.
+    let db = TempDb::new("group-avatar-cascade");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    a_deleted_chat_takes_the_group_with_it_on("файл", &mut store);
+}
+
+#[test]
+fn a_deleted_chat_takes_the_group_with_it_in_memory() {
+    // Найдено при заведении `group_avatars`: в памяти удаление чата
+    // не сносило **ничего** группового, и подъём после удаления
+    // в симуляции (§16) проверялся не тот, что на устройстве.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    a_deleted_chat_takes_the_group_with_it_on("память", &mut store);
 }

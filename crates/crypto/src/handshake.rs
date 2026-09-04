@@ -224,24 +224,36 @@ const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEAD: usize = 1 + 8 + 32 + 8 + 32 + 8 + 32 + 8 + 4;
 
 /// Чтение снимка без паник на обрезанном входе.
-struct Cursor<'a> {
+///
+/// `pub(crate)`, потому что снимков в крейте два: сессия здесь и приёмная
+/// sender-цепочка в [`crate::ratchet`]. Правило «хвост означает расхождение
+/// разбора с записью» обязано быть у них одно, а два одинаковых курсора
+/// однажды разъехались бы на этом правиле.
+pub(crate) struct Cursor<'a> {
     rest: &'a [u8],
 }
 
 impl<'a> Cursor<'a> {
-    const fn new(bytes: &'a [u8]) -> Cursor<'a> {
+    /// Курсор по началу среза.
+    pub(crate) const fn new(bytes: &'a [u8]) -> Cursor<'a> {
         Cursor { rest: bytes }
     }
 
-    const fn is_empty(&self) -> bool {
+    /// Не осталось ли непрочитанного.
+    ///
+    /// Хвост в снимке означает, что разбор разошёлся с записью, и оба
+    /// вызывающих обязаны этим кончать.
+    pub(crate) const fn is_empty(&self) -> bool {
         self.rest.is_empty()
     }
 
-    fn byte(&mut self) -> Result<u8> {
+    /// Один байт — версия формата.
+    pub(crate) fn byte(&mut self) -> Result<u8> {
         Ok(self.take::<1>()?[0])
     }
 
-    fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
+    /// Ровно `N` байт. Обрезанный вход даёт отказ, а не панику.
+    pub(crate) fn take<const N: usize>(&mut self) -> Result<[u8; N]> {
         if self.rest.len() < N {
             return Err(CryptoError::BadKeyMaterial);
         }

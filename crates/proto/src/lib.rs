@@ -34,6 +34,7 @@ pub mod files;
 pub mod forward;
 pub mod fragment;
 pub mod group;
+pub mod group_action;
 pub mod mail;
 pub mod reaction;
 pub mod receipts;
@@ -47,7 +48,11 @@ pub use card_update::UpdateError;
 pub use edit::{EditError, MAX_EDIT_AGE_MS};
 pub use forward::MAX_FORWARD_IDS;
 pub use fragment::Reassembler;
-pub use group::{Group, GroupError, MAX_GROUP_MEMBERS};
+pub use group::{
+    Group, GroupError, GroupMessage, Intro, LeaveConsequences, Roster, JOIN_DISCLOSURE,
+    MAX_GROUP_MEMBERS,
+};
+pub use group_action::{Action, ActionError};
 pub use reaction::{ReactionError, MAX_REACTION_BYTES};
 pub use receipts::{DeliveryStatus, Receipt};
 pub use reply::ReplyError;

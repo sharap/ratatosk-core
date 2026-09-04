@@ -1590,3 +1590,377 @@ fn a_device_session_does_not_outlive_a_restart() {
     let (frames, _) = split(effects);
     assert!(addressed_to(frames, desktop.ik()).is_empty(), "отвечать нечем");
 }
+
+// --- Группы на втором экране (провод 16) ----------------------------------
+
+/// Заводит группу с одним приглашённым и отдаёт её идентификатор.
+///
+/// Кадры приглашения никуда не едут: собеседника в этом файле нет,
+/// а проверяется здесь то, что телефон **показывает** десктопу.
+fn with_group<S: Store>(phone: &mut Engine<S>, now_ms: u64, peer_ik: [u8; 32]) -> [u8; 16] {
+    let effects = phone
+        .step(now_ms, Input::Command(Command::CreateGroup { title: "у костра".to_owned() }))
+        .expect("группа заведена");
+    let mut chat = None;
+    for effect in &effects {
+        if let Effect::Notify(Event::GroupCreated { chat: found, .. }) = effect {
+            chat = Some(*found);
+        }
+    }
+    let chat = chat.expect("о заведении обязано прийти событие");
+    phone
+        .step(now_ms + 10, Input::Command(Command::InviteToGroup { chat, peer_ik }))
+        .expect("приглашение");
+    chat
+}
+
+#[test]
+fn a_group_message_reaches_the_desktop_signed_with_its_author() {
+    // То, ради чего провод и поднят до шестнадцатого: в группе «не своё»
+    // означает одного из тридцати двух, и без подписи десктоп рисовал бы
+    // их всех одинаково безымянными.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    phone
+        .step(1_300, Input::Command(Command::SendText { chat, text: "все у костра?".into() }))
+        .expect("слово в группу");
+
+    let Response::History(page) =
+        ask(&mut phone, &mut desktop, 1_400, &Request::History { chat, limit: 10, before: None })
+    else {
+        panic!("на просьбу об истории обязана прийти страница");
+    };
+    let mine = page.last().expect("сообщение на месте");
+    assert!(mine.mine);
+    assert_eq!(
+        mine.author.as_deref(),
+        Some("телефон"),
+        "своё сообщение в группе подписано своим именем: себя в контактах нет, \
+         и десктоп, искавший бы подпись сам, не нашёл бы её именно у хозяина"
+    );
+}
+
+#[test]
+fn a_message_between_two_people_carries_no_signature() {
+    // `None` означает «выводится из `mine`», а не «неизвестно»: имя
+    // собеседника уже стоит заголовком чата, и подпись под каждой строкой
+    // повторяла бы его на весь экран. Байты за это платились бы в каждой
+    // строке страницы.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    phone
+        .step(1_200, Input::Command(Command::SendText { chat, text: "привет".into() }))
+        .expect("слово");
+
+    let Response::History(page) =
+        ask(&mut phone, &mut desktop, 1_300, &Request::History { chat, limit: 10, before: None })
+    else {
+        panic!("на просьбу об истории обязана прийти страница");
+    };
+    assert_eq!(page.last().expect("сообщение").author, None);
+}
+
+#[test]
+fn the_desktop_asks_for_the_roster_and_gets_names_without_keys() {
+    // §13.4: `IK` границу устройства не пересекает. Участник назван
+    // идентификатором своего личного чата — тем самым, каким десктоп
+    // адресует переписку двоих, и им же ему можно написать.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    let Response::Members { members } =
+        ask(&mut phone, &mut desktop, 1_300, &Request::Members { chat })
+    else {
+        panic!("на просьбу о составе обязан прийти состав");
+    };
+    assert_eq!(members.len(), 2);
+
+    let me = members.iter().find(|m| m.mine).expect("себя обязано быть видно");
+    assert_eq!(me.chat, Engine::<MemoryStore>::chat_id_for(&phone.own_card().ik));
+    assert_eq!(me.name, "телефон", "имя считает телефон: своей карточки в контактах нет");
+
+    let other = members.iter().find(|m| !m.mine).expect("и гостя тоже");
+    assert_eq!(other.chat, Engine::<MemoryStore>::chat_id_for(&peer_ik));
+    assert_eq!(other.name, "сосед");
+}
+
+#[test]
+fn a_roster_of_a_one_to_one_chat_is_empty_and_not_a_refusal() {
+    // Состав переписки двоих — это её заголовок, и спрашивать его незачем.
+    // Но отказом отвечать тут не на что: десктоп нарисует пустоту, а не
+    // строку с ошибкой, которую человеку нечем объяснить (§14).
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    let Response::Members { members } =
+        ask(&mut phone, &mut desktop, 1_200, &Request::Members { chat })
+    else {
+        panic!("на просьбу о составе обязан прийти состав, а не отказ");
+    };
+    assert!(members.is_empty());
+}
+
+#[test]
+fn a_group_avatar_crosses_the_wire_like_a_face_does() {
+    // Просьба та же, что о лице контакта, и это не экономия на видах:
+    // снаружи это один вопрос — «что рисовать в кружке этого чата».
+    // Правила показа при этом разные: у лица §4.2, у картинки группы
+    // никакого (`proto::avatar`), и §4.2 здесь не применяется нарочно.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[7u8; 64]);
+    phone
+        .step(1_300, Input::Command(Command::SetGroupAvatar { chat, bytes: png.clone() }))
+        .expect("аватарка группы");
+
+    let Response::Chats(chats) = ask(&mut phone, &mut desktop, 1_400, &Request::Chats) else {
+        panic!("на просьбу о чатах обязан прийти список");
+    };
+    let group = chats.iter().find(|c| c.chat == chat).expect("группа в списке");
+    assert!(group.is_group);
+    assert_ne!(group.avatar_ms, 0, "метка обязана быть: по ней десктоп и решает спросить");
+
+    let Response::Avatar { bytes, avatar_ms } =
+        ask(&mut phone, &mut desktop, 1_500, &Request::Avatar { chat: Some(chat) })
+    else {
+        panic!("на просьбу об аватарке обязана прийти аватарка");
+    };
+    assert_eq!(bytes, Some(png));
+    assert_eq!(avatar_ms, group.avatar_ms, "метка одна и берётся из той же строки");
+}
+
+#[test]
+fn a_removed_group_avatar_reads_as_nothing_to_show() {
+    // Снятие обязано доехать до второго экрана: иначе там навсегда
+    // осталось бы прежнее лицо — то самое молчание, которое §14 запрещает
+    // на обоих экранах.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[7u8; 64]);
+    phone
+        .step(1_300, Input::Command(Command::SetGroupAvatar { chat, bytes: png }))
+        .expect("аватарка");
+    phone
+        .step(1_400, Input::Command(Command::SetGroupAvatar { chat, bytes: Vec::new() }))
+        .expect("снятие");
+
+    let Response::Chats(chats) = ask(&mut phone, &mut desktop, 1_500, &Request::Chats) else {
+        panic!("на просьбу о чатах обязан прийти список");
+    };
+    let group = chats.iter().find(|c| c.chat == chat).expect("группа в списке");
+    assert_eq!(group.avatar_ms, 0, "ноль означает «показывать нечего»");
+
+    let Response::Avatar { bytes, avatar_ms } =
+        ask(&mut phone, &mut desktop, 1_600, &Request::Avatar { chat: Some(chat) })
+    else {
+        panic!("на просьбу об аватарке обязан прийти ответ, а не отказ");
+    };
+    assert_eq!(bytes, None);
+    assert_eq!(avatar_ms, 0);
+}
+
+// --- Распоряжение группой со второго экрана (провод 17) -------------------
+
+#[test]
+fn the_desktop_creates_a_group_and_gets_its_identifier_back() {
+    // Идентификатор возвращается **ответом**, а не выуживается из
+    // перечитанного списка чатов: у группы он случаен, а названия
+    // повторяются — десктоп однажды открыл бы не ту.
+    let (mut phone, mut desktop, _) = paired(1_000);
+
+    let Response::GroupCreated { chat } = ask(
+        &mut phone,
+        &mut desktop,
+        1_100,
+        &Request::CreateGroup { title: "  у костра  ".into() },
+    ) else {
+        panic!("на просьбу завести группу обязан прийти её идентификатор");
+    };
+
+    let state = phone.groups().get(&chat).expect("группа заведена на телефоне");
+    assert_eq!(state.title, "у костра", "подрезает телефон — тем же правилом, что и у себя");
+    assert_eq!(state.group.owner, phone.own_card().ik, "заводивший и есть создатель");
+}
+
+#[test]
+fn a_group_created_from_the_desktop_is_refused_without_a_name() {
+    // Отказ приезжает **словами**: человек за ноутбуком нажал кнопку
+    // и обязан узнать почему (§14). Правило одно на оба экрана — то же
+    // `on_create_group`, что и у команды с телефона.
+    let (mut phone, mut desktop, _) = paired(1_000);
+
+    let answer =
+        ask(&mut phone, &mut desktop, 1_100, &Request::CreateGroup { title: "   ".into() });
+    let Response::Refused(reason) = answer else {
+        panic!("пустое название обязано отказать словами, а не завести полугруппу");
+    };
+    assert!(!reason.is_empty());
+    assert!(phone.groups().is_empty(), "отказ не оставляет полугруппы");
+}
+
+#[test]
+fn the_desktop_invites_by_the_personal_chat_of_the_member() {
+    // §13.4: `IK` границу не пересекает, и назвать человека десктоп может
+    // только идентификатором его личного чата. Разворачивает его обратно
+    // телефон — тем же соответствием, которым находит чат по контакту.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_200, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+
+    let member = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    assert_eq!(
+        ask(&mut phone, &mut desktop, 1_300, &Request::InviteToGroup { chat, member }),
+        Response::Done
+    );
+    assert_eq!(
+        phone.groups().get(&chat).expect("группа").group.members().count(),
+        2,
+        "состав вырос"
+    );
+}
+
+#[test]
+fn inviting_someone_we_do_not_know_is_refused_in_words() {
+    // Чужой идентификатор в поле «кого» — не повод уронить шаг ядра
+    // и не повод молчать: десктоп мог отстать от списка контактов.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_100, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+
+    let answer =
+        ask(&mut phone, &mut desktop, 1_200, &Request::InviteToGroup { chat, member: [9u8; 16] });
+    assert!(matches!(answer, Response::Refused(_)), "неизвестный чат — отказ словами");
+}
+
+#[test]
+fn the_roster_marks_the_owner_and_that_is_how_the_desktop_learns_its_rights() {
+    // Без этого признака окно рисовало бы «исключить» и «переименовать»
+    // там, где телефон ответит отказом, — то есть предлагало бы действие,
+    // которого нет.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_200, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+    let member = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    ask(&mut phone, &mut desktop, 1_300, &Request::InviteToGroup { chat, member });
+
+    let Response::Members { members } =
+        ask(&mut phone, &mut desktop, 1_400, &Request::Members { chat })
+    else {
+        panic!("на просьбу о составе обязан прийти состав");
+    };
+    let me = members.iter().find(|m| m.mine).expect("себя видно");
+    assert!(me.owner, "мы завели эту группу — значит вправе ею распоряжаться");
+    let other = members.iter().find(|m| !m.mine).expect("и гостя тоже");
+    assert!(!other.owner, "приглашённый создателем не становится");
+}
+
+#[test]
+fn the_desktop_renames_the_group_and_changes_its_avatar() {
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_100, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+
+    assert_eq!(
+        ask(
+            &mut phone,
+            &mut desktop,
+            1_200,
+            &Request::RenameGroup { chat, title: "у ручья".into() }
+        ),
+        Response::Done
+    );
+    assert_eq!(phone.groups().get(&chat).expect("группа").title, "у ручья");
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[7u8; 64]);
+    assert_eq!(
+        ask(&mut phone, &mut desktop, 1_300, &Request::SetGroupAvatar { chat, bytes: png.clone() }),
+        Response::Done
+    );
+    assert_eq!(phone.group_avatar_of(&chat).expect("чтение"), Some(png));
+
+    // Пустые байты — «снять», а не пустая просьба.
+    assert_eq!(
+        ask(&mut phone, &mut desktop, 1_400, &Request::SetGroupAvatar { chat, bytes: Vec::new() }),
+        Response::Done
+    );
+    assert_eq!(phone.group_avatar_of(&chat).expect("чтение"), None);
+}
+
+#[test]
+fn a_group_avatar_that_is_not_an_image_is_refused_in_words() {
+    // Правило берётся у `avatar::check` на телефоне — тем же обработчиком,
+    // что и у команды с телефона. Провод меряет только длину: формат
+    // проверяет тот, кто пишет на диск.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_100, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+
+    let answer = ask(
+        &mut phone,
+        &mut desktop,
+        1_200,
+        &Request::SetGroupAvatar {
+            chat, bytes: "это не картинка".as_bytes().to_vec()
+        },
+    );
+    assert!(matches!(answer, Response::Refused(_)));
+    assert_eq!(phone.group_avatar_of(&chat).expect("чтение"), None);
+}
+
+#[test]
+fn the_desktop_leaves_the_group_and_the_chat_stays() {
+    // Уход из разговора не стирает сказанное: группа остаётся в списке
+    // чатов, а признак `joined` говорит, что писать в неё больше нельзя.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let Response::GroupCreated { chat } =
+        ask(&mut phone, &mut desktop, 1_100, &Request::CreateGroup { title: "у костра".into() })
+    else {
+        panic!("группа обязана завестись");
+    };
+
+    assert_eq!(ask(&mut phone, &mut desktop, 1_200, &Request::LeaveGroup { chat }), Response::Done);
+
+    let Response::Chats(chats) = ask(&mut phone, &mut desktop, 1_300, &Request::Chats) else {
+        panic!("на просьбу о чатах обязан прийти список");
+    };
+    let group = chats.iter().find(|c| c.chat == chat).expect("группа осталась в списке");
+    assert!(!group.joined, "а состоять мы перестали");
+
+    // И распоряжаться ею больше нельзя — тем же правилом, что на телефоне.
+    let answer = ask(
+        &mut phone,
+        &mut desktop,
+        1_400,
+        &Request::RenameGroup { chat, title: "у ручья".into() },
+    );
+    assert!(matches!(answer, Response::Refused(_)), "вышедший создатель распоряжаться не вправе");
+}

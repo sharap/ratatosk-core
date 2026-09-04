@@ -56,10 +56,14 @@ SEARCH_TOKEN = "ratatosk v0 search-token"
 DEVICE_KEY = "ratatosk v0 device-key"
 COMPANION_DEVICE = "ratatosk v0 companion-device"
 COMPANION_CACHE = "ratatosk v0 companion-cache"
+COMPANION_REVOKED = "ratatosk v0 companion-revoked"
+COMPANION_ONION = "ratatosk v0 companion-onion"
+GROUP_BLOCK = "ratatosk v0 group-block"
 
 ALL_CONTEXTS = [IK, SK, BEACON, SESSION_ID, ROOT, CHAIN_A, CHAIN_B, MSG,
                 CHAIN, FILE, SENDER_CHAIN, SENDER_MSG, SEARCH_TOKEN, DEVICE_KEY,
-                COMPANION_DEVICE, COMPANION_CACHE]
+                COMPANION_DEVICE, COMPANION_CACHE, COMPANION_REVOKED,
+                COMPANION_ONION, GROUP_BLOCK]
 
 # --- входные данные ---------------------------------------------------------
 #

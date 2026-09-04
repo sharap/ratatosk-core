@@ -137,7 +137,15 @@ pub const MAX_GONE_IDS: usize = 256;
 /// которая до этого была пуста. Телефон постарше её не читает вовсе,
 /// десктоп постарше не шлёт — обе стороны остаются при локальной сети,
 /// как и были.
-pub const WIRE_VERSION: u32 = 13;
+/// Четырнадцать — группы в списке чатов: поле [`ChatSummary::is_group`].
+/// Появилось, а не сменило форму, — как и метка аватарки в десятке: сборка
+/// версии 13 разберёт список как прежде, просто сочтёт все чаты личными.
+///
+/// Признак нужен ровно затем, что без него десктоп нарисовал бы группе
+/// «не проверен»: у группы сверки нет и быть не может (§4.2 — про людей),
+/// а `verified` у неё поэтому всегда `false`. Вывести одно из другого
+/// нельзя: несверенный контакт выглядит точно так же.
+pub const WIRE_VERSION: u32 = 17;
 
 /// Наибольшее число сообщений в одной просьбе десктопа.
 ///
@@ -275,6 +283,12 @@ const KEY_ACCEPTED: u64 = 29;
 const KEY_WIRE: u64 = 30;
 const KEY_PREVIEW: u64 = 31;
 const KEY_AVATAR_MS: u64 = 32;
+const KEY_IS_GROUP: u64 = 33;
+const KEY_JOINED: u64 = 34;
+const KEY_AUTHOR: u64 = 35;
+const KEY_MEMBERS: u64 = 36;
+const KEY_MEMBER: u64 = 37;
+const KEY_OWNER: u64 = 38;
 
 // Виды запроса, ответа и новости нумеруются **каждый в своей области**,
 // и имена это называют вслух. Сперва все три набора звались `KIND_*`,
@@ -311,6 +325,13 @@ const REQUEST_FILE_PREVIEW: u64 = 21;
 const REQUEST_STAGED: u64 = 22;
 const REQUEST_AVATAR: u64 = 23;
 const REQUEST_SET_AVATAR: u64 = 24;
+const REQUEST_MEMBERS: u64 = 25;
+const REQUEST_CREATE_GROUP: u64 = 26;
+const REQUEST_INVITE: u64 = 27;
+const REQUEST_EVICT: u64 = 28;
+const REQUEST_RENAME_GROUP: u64 = 29;
+const REQUEST_SET_GROUP_AVATAR: u64 = 30;
+const REQUEST_LEAVE_GROUP: u64 = 31;
 
 /// Коды видов ответа — своя нумерация, не общая с запросами.
 const RESPONSE_CHATS: u64 = 1;
@@ -323,6 +344,8 @@ const RESPONSE_FILE_OFFER: u64 = 7;
 const RESPONSE_FILE_PREVIEW: u64 = 8;
 const RESPONSE_STAGED: u64 = 9;
 const RESPONSE_AVATAR: u64 = 10;
+const RESPONSE_MEMBERS: u64 = 11;
+const RESPONSE_GROUP_CREATED: u64 = 12;
 
 /// Коды видов новости — тоже своя.
 const NOTICE_MESSAGE: u64 = 1;
@@ -862,6 +885,90 @@ pub enum Request {
         /// Байты картинки; пусто — снять.
         bytes: Vec<u8>,
     },
+    /// Состав группы (§11.2).
+    ///
+    /// **Отдельной просьбой, а не полем списка чатов**, и по той же
+    /// арифметике, что у аватарок: до тридцати двух участников на группу,
+    /// а список чатов читается на каждый показ экрана. Состав же нужен
+    /// одному окну — тому, где открыты сведения о группе.
+    ///
+    /// У личного чата ответ пуст, и это не ошибка вызывающего: состав
+    /// переписки двоих — это её заголовок, и спрашивать его незачем.
+    /// Отказом отвечать тут не на что.
+    Members {
+        /// Какая группа.
+        chat: ChatId,
+    },
+    /// Завести группу (§11).
+    ///
+    /// # Идентификатор возвращается ответом, а не приезжает событием
+    ///
+    /// На телефоне `create_group` его не возвращает: команда уходит
+    /// в очередь, и ответить ей нечем — идентификатор приходит событием
+    /// `GroupCreated`. Здесь дело иначе: просьба исполняется телефоном
+    /// **синхронно**, внутри одного шага ядра, и к моменту сборки ответа
+    /// идентификатор уже есть. Отдать его — честнее, чем заставить десктоп
+    /// перечитать список чатов и угадывать, какая из групп новая: названия
+    /// повторяются.
+    ///
+    /// **Предупреждение §11.5 проводом не едет.** Его текст —
+    /// `group_join_notice()` в тех же биндингах, что у окна: это константа,
+    /// а не сведение о телефоне. Показать его обязательно **до** нажатия,
+    /// и следит за этим окно — телефон отказать за него не может, потому
+    /// что не знает, показали ли.
+    CreateGroup {
+        /// Как назвать. Подрежет по краям телефон, как и при заведении с него.
+        title: String,
+    },
+    /// Позвать в группу (§11.2).
+    ///
+    /// Приглашать вправе **любой** участник, а не только создатель.
+    InviteToGroup {
+        /// Куда зовут.
+        chat: ChatId,
+        /// Кого — идентификатором его **личного** чата.
+        member: ChatId,
+    },
+    /// Исключить из группы (§11.2). Только создатель.
+    ///
+    /// **Предупреждение §11.4 проводом не едет** — по той же причине, что
+    /// и §11.5: его текст `eviction_notice()` лежит в биндингах окна.
+    /// Сказать надо до, а не после: исключённый сохранит доступ к прошлой
+    /// переписке, и отменить это нельзя ничем.
+    EvictFromGroup {
+        /// Откуда.
+        chat: ChatId,
+        /// Кого — идентификатором его **личного** чата.
+        member: ChatId,
+    },
+    /// Переименовать группу. Только создатель.
+    RenameGroup {
+        /// Какую.
+        chat: ChatId,
+        /// Как назвать.
+        title: String,
+    },
+    /// Сменить аватарку группы. Только создатель.
+    ///
+    /// Пустые байты — «снять», и это законное значение, а не пустая
+    /// просьба: так же устроена команда телефона и [`Request::SetMyAvatar`].
+    SetGroupAvatar {
+        /// Какой группе.
+        chat: ChatId,
+        /// Байты картинки; пусто — снять.
+        bytes: Vec<u8>,
+    },
+    /// Выйти из группы.
+    ///
+    /// **Предупреждений здесь два, и оба проводом не едут**: `leave_notice()`
+    /// всякому, а создателю вдобавок `owner_leave_notice()` — после его
+    /// ухода группу нельзя ни переименовать, ни исключить из неё, ни сменить
+    /// ей картинку. Создатель ли человек, окно знает по составу: это
+    /// строка, у которой [`Member::mine`] и [`Member::owner`] разом.
+    LeaveGroup {
+        /// Из какой.
+        chat: ChatId,
+    },
 }
 
 /// Что десктоп говорит о себе в первом сообщении рукопожатия (§13.4).
@@ -958,6 +1065,10 @@ pub struct ChatSummary {
     ///
     /// Едет сюда, потому что показывать несверенный контакт наравне
     /// со сверенным нельзя ни на телефоне, ни на десктопе.
+    ///
+    /// **У группы всегда `false`, и это не «не сверена».** Сверяют людей,
+    /// а не круги знакомых; отличить одно от другого позволяет
+    /// [`ChatSummary::is_group`], и только он.
     pub verified: bool,
     /// Последнее сообщение — текстом, для строки под именем.
     pub last_text: String,
@@ -984,6 +1095,35 @@ pub struct ChatSummary {
     /// а «показывать лицо только сверенному» — ровно оно. Десктоп, решивший
     /// иначе, байтов всё равно не получит.
     pub avatar_ms: u64,
+    /// Группа это или разговор с человеком (§11).
+    ///
+    /// Нужен одному: не рисовать группе пометку о сверке. Вывести это
+    /// из `verified = false` нельзя — так же выглядит и несверенный
+    /// контакт, а путать «сверять нечего» с «не сверен» §4.2 не разрешает.
+    ///
+    /// Аватарка у группы **на этом проводе** не едет: `avatar_ms` у неё
+    /// всегда ноль. Не потому, что её не бывает — на телефоне бывает
+    /// (§11 + дополнение), — а потому, что поля под неё здесь пока нет.
+    /// Это следующий провод, и до него десктоп рисует группе заглушку.
+    pub is_group: bool,
+    /// Состоим ли мы в этом чате сейчас (§11).
+    ///
+    /// **У разговора с человеком всегда `true`**: из переписки с ним
+    /// не выходят — её удаляют, и тогда чата в списке нет вовсе.
+    /// Осмысленно поле только у группы, но едет оно у всех: развилка
+    /// «читать это поле или не читать» на стороне десктопа — лишний
+    /// способ прочесть не то.
+    ///
+    /// `false` покрывает два случая, и различать их десктопу незачем:
+    /// мы вышли сами и нас исключили. Показывать надо одно и то же —
+    /// переписку **без поля ввода**. Без этого признака десктоп предлагал
+    /// бы писать туда, где телефон откажет, и человек увидел бы ошибку
+    /// вместо серой строки.
+    ///
+    /// Вывести его из [`ChatSummary::is_group`] и состава нельзя:
+    /// состава здесь нет вовсе — §13.4 возит на десктоп то, что рисуют,
+    /// а не состояние протокола.
+    pub joined: bool,
 }
 
 /// Реакция на сообщение в том виде, в каком её видит десктоп.
@@ -1112,6 +1252,30 @@ pub struct Message {
     /// Считает телефон: сравнение с собственным `IK` — протокольное знание,
     /// а `IK` границу не пересекает.
     pub mine: bool,
+    /// Как подписать автора — или `None`, если подпись выводится из `mine`.
+    ///
+    /// **`None` означает «выводится», а не «неизвестно».** В переписке двоих
+    /// автор исчерпывается признаком «своё ли»: не своё — значит собеседника,
+    /// а его имя уже стоит заголовком чата, и подпись под каждой строкой
+    /// повторяла бы его на весь экран. В группе так нельзя — «не своё» там
+    /// означает одного из тридцати двух, — и потому `Some` приходит ровно
+    /// у групповых сообщений.
+    ///
+    /// **Имя, а не ключ.** §13.4 обещает, что `IK` границу устройства
+    /// не пересекает, и подпись это обещание не отменяет: имя считает
+    /// телефон (`Engine::message_author`) — местное имя (§4.1) вытесняет имя
+    /// из карточки, а участник, чья карточка ещё не доехала (§11.5),
+    /// подписывается началом отпечатка. Пустой строки здесь не бывает.
+    ///
+    /// Своё сообщение в группе тоже подписано — своим именем из карточки:
+    /// себя в списке контактов нет, и десктоп, искавший бы подпись сам,
+    /// не нашёл бы её именно у хозяина телефона. Показать вместо имени «вы»
+    /// — дело окна, для этого у него `mine`.
+    ///
+    /// Отсутствие поля читается как `None`: сборка телефона постарше подписи
+    /// не шлёт, и групповой чат на десктопе выглядит как раньше — безымянным,
+    /// но работающим.
+    pub author: Option<String>,
     /// Текст.
     pub text: String,
     /// Физическая часть метки (§9.1).
@@ -1253,6 +1417,65 @@ pub enum Response {
         /// Метка этой аватарки; `0` — показывать нечего.
         avatar_ms: u64,
     },
+    /// Состав группы (§11.2).
+    ///
+    /// Про какую группу — знает **просьба**, а не ответ: соотносит их
+    /// номер, а второе поле с тем же смыслом однажды разошлось бы с первым.
+    /// Так же устроены ответы про превью и про лицо.
+    Members {
+        /// Участники; пусто у личного чата и у неизвестной группы.
+        members: Vec<Member>,
+    },
+    /// Группа заведена — вот чем её открыть.
+    ///
+    /// Идентификатор случаен и человеку неизвестен, а названия
+    /// повторяются: заставь мы десктоп искать новую группу в перечитанном
+    /// списке чатов — он однажды открыл бы не ту.
+    GroupCreated {
+        /// Идентификатор заведённой группы.
+        chat: ChatId,
+    },
+}
+
+/// Участник группы в том виде, в каком его показывает десктоп (§11.2).
+///
+/// # Ключа здесь нет, и адресуется участник иначе
+///
+/// §13.4 обещает, что `IK` границу устройства не пересекает, и ради этого
+/// же обещания `peer_ik` был убран из списка чатов. Взамен участник назван
+/// **идентификатором своего личного чата** — тем самым, каким десктоп уже
+/// адресует переписку двоих. Ничего нового о человеке это не сообщает:
+/// такой идентификатор десктоп и так видит у каждой строки списка чатов.
+///
+/// Пользы от него сразу две. Написать участнику лично десктоп умеет **без
+/// единой новой просьбы** — `SendText` в этот чат. И право распоряжаться
+/// составом, когда оно появится, будет адресоваться тем же, чем всё
+/// остальное на этом проводе.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    /// Идентификатор личного чата с ним — им же ему и пишут.
+    pub chat: ChatId,
+    /// Как его назвать. Пустым не бывает: у безымянного — начало отпечатка.
+    pub name: String,
+    /// Это хозяин телефона.
+    ///
+    /// Считает телефон, а не десктоп поиском себя в списке: своей карточки
+    /// в контактах нет, и десктоп показал бы хозяина «неизвестным
+    /// участником» — ровно так, как это уже случилось у клиента телефона.
+    pub mine: bool,
+    /// Это создатель группы (§11.2).
+    ///
+    /// **Единственное, чем десктоп узнаёт свои права.** Исключать,
+    /// переименовывать и менять картинку вправе только создатель;
+    /// без этого признака окно рисовало бы кнопки, на которые телефон
+    /// отвечает отказом, — то есть предлагало бы действие, которого нет.
+    /// «Я ли создатель» читается как строка, у которой `mine && owner`.
+    ///
+    /// **Выход создателя этот признак не снимает — он уносит его из
+    /// списка целиком.** Состав держит тех, кто состоит **сейчас**, и
+    /// ушедшего создателя в нём нет вовсе. Исход верный: распоряжаться
+    /// он и вправду больше не может, а вернувшись — снова сможет.
+    pub owner: bool,
 }
 
 /// Что телефон говорит десктопу без запроса.
@@ -1559,8 +1782,70 @@ pub fn request_payload(id: u64, request: &Request) -> Value {
                 fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
             }
         }
+        Request::Members { chat } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_MEMBERS.into())));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+        }
+        Request::CreateGroup { title } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(REQUEST_CREATE_GROUP.into()),
+            ));
+            fields.push((Value::Integer(KEY_TITLE.into()), Value::Text(title.clone())));
+        }
+        Request::InviteToGroup { chat, member } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_INVITE.into())));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            fields.push((Value::Integer(KEY_MEMBER.into()), Value::Bytes(member.to_vec())));
+        }
+        Request::EvictFromGroup { chat, member } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_EVICT.into())));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            fields.push((Value::Integer(KEY_MEMBER.into()), Value::Bytes(member.to_vec())));
+        }
+        Request::RenameGroup { chat, title } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(REQUEST_RENAME_GROUP.into()),
+            ));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            fields.push((Value::Integer(KEY_TITLE.into()), Value::Text(title.clone())));
+        }
+        Request::SetGroupAvatar { chat, bytes } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(REQUEST_SET_GROUP_AVATAR.into()),
+            ));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            // Ключ едет всегда, включая пустые байты: здесь пусто — это
+            // «снять», а не «поля нет». То же решение, что у своей аватарки.
+            fields.push((Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())));
+        }
+        Request::LeaveGroup { chat } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(REQUEST_LEAVE_GROUP.into()),
+            ));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+        }
     }
     Value::Map(fields)
+}
+
+/// Разбирает название группы из просьбы.
+///
+/// Предел — тот же [`crate::group::MAX_GROUP_TITLE_BYTES`], что и у
+/// представления группы, и проверяется он **здесь**: длину называет та
+/// сторона провода, и «название в мегабайт» — это запрос памяти телефона,
+/// а не ошибка человека за ноутбуком.
+///
+/// Пустоту здесь не проверяем: её отвергнет телефон тем же правилом, что
+/// и для своей команды, и ответит словами (§14). Второе такое условие
+/// рядом однажды разошлось бы с первым.
+fn title_from(map: &[(Value, Value)]) -> Result<String, CodecError> {
+    let title = canonical::as_text(canonical::require(map, KEY_TITLE)?)?;
+    crate::group::check_title_fits(title)?;
+    Ok(title.to_owned())
 }
 
 /// Кодирует список идентификаторов.
@@ -1756,6 +2041,41 @@ pub fn request_from_payload(value: &Value) -> Result<(u64, Request), CodecError>
                 None => None,
             },
         },
+        REQUEST_MEMBERS => Request::Members {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+        },
+        REQUEST_CREATE_GROUP => Request::CreateGroup { title: title_from(map)? },
+        REQUEST_INVITE => Request::InviteToGroup {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+            member: canonical::as_array::<16>(canonical::require(map, KEY_MEMBER)?)?,
+        },
+        REQUEST_EVICT => Request::EvictFromGroup {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+            member: canonical::as_array::<16>(canonical::require(map, KEY_MEMBER)?)?,
+        },
+        REQUEST_RENAME_GROUP => Request::RenameGroup {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+            title: title_from(map)?,
+        },
+        REQUEST_SET_GROUP_AVATAR => {
+            let Value::Bytes(bytes) = canonical::require(map, KEY_BYTES)? else {
+                return Err(CodecError::TypeMismatch);
+            };
+            // Предел — здесь же, и по той же причине, что у своей аватарки:
+            // «картинка на мегабайт» — это запрос памяти телефона. Формат
+            // не проверяется: `avatar::check` на телефоне сделает это перед
+            // записью, и второе такое условие рядом однажды разошлось бы.
+            if bytes.len() > crate::avatar::MAX_AVATAR_BYTES {
+                return Err(CodecError::TypeMismatch);
+            }
+            Request::SetGroupAvatar {
+                chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+                bytes: bytes.clone(),
+            }
+        }
+        REQUEST_LEAVE_GROUP => Request::LeaveGroup {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+        },
         _ => return Err(CodecError::TypeMismatch),
     };
     Ok((id, request))
@@ -1873,8 +2193,74 @@ pub fn response_payload(id: u64, response: &Response) -> Value {
             fields.push((Value::Integer(KEY_INDEX.into()), Value::Integer((*index).into())));
             fields.push((Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())));
         }
+        Response::GroupCreated { chat } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(RESPONSE_GROUP_CREATED.into()),
+            ));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+        }
+        Response::Members { members } => {
+            fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_MEMBERS.into())));
+            // Ключ едет всегда, включая пустой список: пусто — это ответ
+            // «участников нет» (личный чат, неизвестная группа), а не
+            // «поля не было». Десктоп по нему рисует пустоту, а не ждёт.
+            fields.push((
+                Value::Integer(KEY_MEMBERS.into()),
+                Value::Array(members.iter().map(member_value).collect()),
+            ));
+        }
     }
     Value::Map(fields)
+}
+
+/// Кодирует участника группы.
+fn member_value(member: &Member) -> Value {
+    Value::Map(vec![
+        (Value::Integer(KEY_CHAT.into()), Value::Bytes(member.chat.to_vec())),
+        (Value::Integer(KEY_TITLE.into()), Value::Text(member.name.clone())),
+        (Value::Integer(KEY_MINE.into()), Value::Bool(member.mine)),
+        (Value::Integer(KEY_OWNER.into()), Value::Bool(member.owner)),
+    ])
+}
+
+/// Разбирает список участников.
+///
+/// Предел — тот же [`crate::group::MAX_GROUP_MEMBERS`], что и у состава
+/// на проводе контактов, и проверяется он **здесь**: длину называет та
+/// сторона провода, и «тысяча участников» — это запрос памяти, а не состав.
+///
+/// # Errors
+///
+/// Значение не той формы или участников больше предела.
+fn members_from_value(value: &Value) -> Result<Vec<Member>, CodecError> {
+    let Value::Array(items) = value else { return Err(CodecError::TypeMismatch) };
+    if items.len() > crate::group::MAX_GROUP_MEMBERS {
+        return Err(CodecError::TypeMismatch);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let map = canonical::as_map(item)?;
+        let Value::Bool(mine) = canonical::require(map, KEY_MINE)? else {
+            return Err(CodecError::TypeMismatch);
+        };
+        // Признак создателя необязателен на чтении: сборка телефона,
+        // не знавшая распоряжения группой, его не шлёт. «Не сказали» —
+        // значит не создатель, и это безопасная сторона: окно спрячет
+        // кнопки, которых у него всё равно нет.
+        let owner = match canonical::get(map, KEY_OWNER) {
+            Some(Value::Bool(owner)) => *owner,
+            Some(_) => return Err(CodecError::TypeMismatch),
+            None => false,
+        };
+        out.push(Member {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+            name: canonical::as_text(canonical::require(map, KEY_TITLE)?)?.to_owned(),
+            mine: *mine,
+            owner,
+        });
+    }
+    Ok(out)
 }
 
 /// Разбирает нагрузку ответа.
@@ -1978,6 +2364,12 @@ pub fn response_from_payload(value: &Value) -> Result<(u64, Response), CodecErro
             }
             Response::Avatar { bytes, avatar_ms }
         }
+        RESPONSE_MEMBERS => Response::Members {
+            members: members_from_value(canonical::require(map, KEY_MEMBERS)?)?,
+        },
+        RESPONSE_GROUP_CREATED => Response::GroupCreated {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+        },
         RESPONSE_FILE_CHUNK => {
             let Value::Bytes(bytes) = canonical::require(map, KEY_BYTES)? else {
                 return Err(CodecError::TypeMismatch);
@@ -2166,6 +2558,8 @@ pub fn chat_value(chat: &ChatSummary) -> Value {
         (Value::Integer(KEY_TEXT.into()), Value::Text(chat.last_text.clone())),
         (Value::Integer(KEY_WALL_MS.into()), Value::Integer(chat.last_ms.into())),
         (Value::Integer(KEY_AVATAR_MS.into()), Value::Integer(chat.avatar_ms.into())),
+        (Value::Integer(KEY_IS_GROUP.into()), Value::Bool(chat.is_group)),
+        (Value::Integer(KEY_JOINED.into()), Value::Bool(chat.joined)),
     ])
 }
 
@@ -2193,6 +2587,26 @@ pub fn chat_from_value(value: &Value) -> Result<ChatSummary, CodecError> {
         avatar_ms: match canonical::get(map, KEY_AVATAR_MS) {
             Some(value) => canonical::as_u64(value)?,
             None => 0,
+        },
+        // Тем же правилом и по той же причине: телефон версии 13 этого
+        // ключа не несёт, и требовать его значило бы не разобрать весь
+        // список из-за поля, без которого всё остальное работает.
+        // «Не сказали» здесь означает «личный чат» — так вёл себя телефон
+        // до появления групп, и так он поведёт себя дальше.
+        is_group: match canonical::get(map, KEY_IS_GROUP) {
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(CodecError::TypeMismatch),
+            None => false,
+        },
+        // И снова тем же правилом. «Не сказали» здесь означает **`true`**,
+        // а не `false`: телефон версии 14 выхода из группы ещё не знал,
+        // и при нём мы состояли во всех чатах, которые он присылал.
+        // Умолчание `false` спрятало бы поле ввода во всей переписке
+        // на старом телефоне — регрессия из-за поля, которого он не обещал.
+        joined: match canonical::get(map, KEY_JOINED) {
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(CodecError::TypeMismatch),
+            None => true,
         },
     })
 }
@@ -2347,6 +2761,12 @@ pub fn message_value(message: &Message) -> Value {
     if let Some(status) = message.status {
         fields.push((Value::Integer(KEY_STATUS.into()), Value::Integer(status.into())));
     }
+    // Подпись автора опускается там, где она выводится из `mine`, — то есть
+    // в переписке двоих, а это подавляющее большинство строк. Платить за неё
+    // байтами в каждой строке страницы незачем.
+    if let Some(author) = &message.author {
+        fields.push((Value::Integer(KEY_AUTHOR.into()), Value::Text(author.clone())));
+    }
     // Пустой список тоже опускается — и это не та же экономия, что у статуса.
     // Реакций нет у подавляющего большинства сообщений, а страница возит их
     // сотню: пустой массив на каждое сообщение — байты в кадре за «ничего».
@@ -2397,6 +2817,12 @@ pub fn message_from_value(value: &Value) -> Result<Message, CodecError> {
             Some(value) => Some(
                 u8::try_from(canonical::as_u64(value)?).map_err(|_| CodecError::TypeMismatch)?,
             ),
+            None => None,
+        },
+        // Отсутствие поля — «выводится из `mine`»: сборка постарше подписи
+        // не шлёт, и групповой чат у неё безымянный, но работающий.
+        author: match canonical::get(map, KEY_AUTHOR) {
+            Some(value) => Some(canonical::as_text(value)?.to_owned()),
             None => None,
         },
         reactions: match canonical::get(map, KEY_REACTIONS) {
@@ -2472,7 +2898,14 @@ mod tests {
     /// они ради истории и ради того, чтобы правка последней строки на месте
     /// бросалась в глаза. Проверяется последняя: она обязана назвать
     /// [`WIRE_VERSION`] и сойтись с тем, что кодировщики строят сейчас.
-    const WIRE_SHAPES: [(u32, u64); 2] = [(12, 0x1ef3_4b21_4945_d1f1), (13, 0x9bba_1505_7b0f_b8ed)];
+    const WIRE_SHAPES: [(u32, u64); 6] = [
+        (12, 0x1ef3_4b21_4945_d1f1),
+        (13, 0x9bba_1505_7b0f_b8ed),
+        (14, 0x6558_a89b_8e4a_6268),
+        (15, 0xeb40_6934_8f4a_321b),
+        (16, 0x24f9_5140_8600_1018),
+        (17, 0x40cc_2f5a_fbe3_14fa),
+    ];
 
     /// FNV-1a — та же, что сторожит замороженные миграции.
     ///
@@ -2554,6 +2987,13 @@ mod tests {
             Request::Hello => "Hello",
             Request::Avatar { .. } => "Avatar",
             Request::SetMyAvatar { .. } => "SetMyAvatar",
+            Request::Members { .. } => "Members",
+            Request::CreateGroup { .. } => "CreateGroup",
+            Request::InviteToGroup { .. } => "InviteToGroup",
+            Request::EvictFromGroup { .. } => "EvictFromGroup",
+            Request::RenameGroup { .. } => "RenameGroup",
+            Request::SetGroupAvatar { .. } => "SetGroupAvatar",
+            Request::LeaveGroup { .. } => "LeaveGroup",
         }
     }
 
@@ -2570,6 +3010,8 @@ mod tests {
             Response::Staged { .. } => "Staged",
             Response::FilePreview { .. } => "FilePreview",
             Response::Avatar { .. } => "Avatar",
+            Response::Members { .. } => "Members",
+            Response::GroupCreated { .. } => "GroupCreated",
         }
     }
 
@@ -2599,6 +3041,10 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: true,
+            // Подпись автора — как у группового сообщения: у образца
+            // необязательные поля заполнены все, иначе их ключи в форму
+            // не попадут.
+            author: Some("Оля с работы".into()),
             text: "текст".into(),
             wall_ms: 1_700_000_000_000,
             status: Some(3),
@@ -2671,6 +3117,16 @@ mod tests {
             Request::Avatar { chat: None },
             Request::Avatar { chat: Some(chat) },
             Request::SetMyAvatar { bytes: vec![0x89, b'P', b'N', b'G'] },
+            Request::Members { chat },
+            Request::CreateGroup { title: "у костра".into() },
+            Request::InviteToGroup { chat, member: [4u8; 16] },
+            Request::EvictFromGroup { chat, member: [4u8; 16] },
+            Request::RenameGroup { chat, title: "у большого костра".into() },
+            // Оба вида: пустые байты — «снять», и ключ у них едет тот же,
+            // а вот длина в форме разная.
+            Request::SetGroupAvatar { chat, bytes: vec![0x89, b'P', b'N', b'G'] },
+            Request::SetGroupAvatar { chat, bytes: Vec::new() },
+            Request::LeaveGroup { chat },
         ]
     }
 
@@ -2682,6 +3138,8 @@ mod tests {
                 verified: true,
                 last_text: "до встречи".into(),
                 last_ms: 1_700_000_000_000,
+                is_group: false,
+                joined: true,
                 avatar_ms: 1_700_000_000_001,
             }]),
             Response::History(vec![full_message()]),
@@ -2703,6 +3161,20 @@ mod tests {
             Response::FilePreview { bytes: None },
             Response::Avatar { bytes: Some(vec![0x89, b'P', b'N', b'G']), avatar_ms: 42 },
             Response::Avatar { bytes: None, avatar_ms: 0 },
+            // Два участника, а не один: `mine` едет всегда, но образец
+            // с одним значением не отличил бы `true` от `false` в форме.
+            Response::Members {
+                members: vec![
+                    Member { chat: [6u8; 16], name: "я".into(), mine: true, owner: true },
+                    Member {
+                        chat: [7u8; 16], name: "гость".into(), mine: false, owner: false
+                    },
+                ],
+            },
+            // Пустой состав — тоже законный ответ (личный чат), и ключ
+            // в нём едет: пусто это ответ, а не отсутствие поля.
+            Response::Members { members: Vec::new() },
+            Response::GroupCreated { chat: [8u8; 16] },
         ]
     }
 
@@ -2788,6 +3260,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_group_in_the_chat_list_is_not_an_unverified_contact() {
+        // Ради этого признак и заведён. У группы `verified` всегда `false`,
+        // и без `is_group` десктоп нарисовал бы ей «не сверен» — то, чего
+        // §4.2 про круг знакомых не говорит.
+        let group = ChatSummary {
+            chat: [7u8; 16],
+            title: "у костра".into(),
+            verified: false,
+            is_group: true,
+            joined: true,
+            last_text: "привет".into(),
+            last_ms: 5,
+            avatar_ms: 0,
+        };
+        assert_eq!(chat_from_value(&chat_value(&group)).unwrap(), group);
+
+        let stranger = ChatSummary { is_group: false, ..group.clone() };
+        assert_ne!(
+            chat_value(&group),
+            chat_value(&stranger),
+            "два чата, неразличимые по `verified`, обязаны различаться на проводе"
+        );
     }
 
     #[test]
@@ -3349,6 +3846,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: "вот файл".into(),
             wall_ms: 1,
             status: None,
@@ -3539,6 +4037,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: "текст на месте".into(),
             wall_ms: 1,
             status: None,
@@ -3566,6 +4065,8 @@ mod tests {
             verified: true,
             last_text: "до встречи".into(),
             last_ms: 7,
+            is_group: false,
+            joined: true,
             avatar_ms: 0,
         };
         let Value::Map(map) = chat_value(&chat) else {
@@ -3593,6 +4094,8 @@ mod tests {
             verified: true,
             last_text: "до встречи".into(),
             last_ms: 1_700_000_000_000,
+            is_group: false,
+            joined: true,
             avatar_ms: 1_700_000_000_001,
         }];
         let history = vec![
@@ -3600,6 +4103,7 @@ mod tests {
                 msg_id: [3u8; 16],
                 chat: [1u8; 16],
                 mine: true,
+                author: None,
                 text: "моё".into(),
                 wall_ms: 10,
                 status: Some(4),
@@ -3613,6 +4117,7 @@ mod tests {
                 msg_id: [4u8; 16],
                 chat: [1u8; 16],
                 mine: false,
+                author: None,
                 text: "чужое".into(),
                 wall_ms: 20,
                 status: None,
@@ -3672,6 +4177,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: "чужое".into(),
             wall_ms: 1,
             status: None,
@@ -3697,6 +4203,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: "без реакций".into(),
             wall_ms: 1,
             status: None,
@@ -3739,6 +4246,100 @@ mod tests {
             ..bare
         };
         assert_eq!(message_from_value(&through_cbor(&message_value(&adorned))).unwrap(), adorned);
+    }
+
+    #[test]
+    fn an_author_travels_and_a_bare_message_costs_no_bytes() {
+        // Подпись едет только там, где её нельзя вывести, — то есть
+        // в группе. В переписке двоих ключ не должен появляться вовсе:
+        // страница возит сотню сообщений, и байты за «выводится из mine»
+        // платятся в каждой строке.
+        let bare = Message { author: None, ..full_message() };
+        let value = message_value(&bare);
+        let map = canonical::as_map(&value).unwrap();
+        assert!(
+            canonical::get(map, KEY_AUTHOR).is_none(),
+            "подпись, которая выводится, обязана не ездить вовсе"
+        );
+        assert_eq!(message_from_value(&value).unwrap().author, None);
+
+        let signed = Message { author: Some("Оля с работы".into()), ..full_message() };
+        assert_eq!(
+            message_from_value(&through_cbor(&message_value(&signed))).unwrap().author.as_deref(),
+            Some("Оля с работы"),
+            "а в группе — обязана доехать целиком"
+        );
+    }
+
+    #[test]
+    fn a_message_from_a_phone_without_authors_still_reads() {
+        // Ровно то, ради чего поле необязательное: сборка телефона
+        // постарше подписи не шлёт, и групповой чат у неё выглядит
+        // как раньше — безымянным, но работающим. Потребуй мы ключ,
+        // страница с такого телефона не разобралась бы вовсе.
+        let older = Value::Map(vec![
+            (Value::Integer(KEY_MSG_ID.into()), Value::Bytes(vec![1u8; 16])),
+            (Value::Integer(KEY_CHAT.into()), Value::Bytes(vec![2u8; 16])),
+            (Value::Integer(KEY_MINE.into()), Value::Bool(false)),
+            (Value::Integer(KEY_TEXT.into()), Value::Text("привет".into())),
+            (Value::Integer(KEY_WALL_MS.into()), Value::Integer(1.into())),
+        ]);
+        let back = message_from_value(&older).unwrap();
+        assert_eq!(back.author, None);
+        assert_eq!(back.text, "привет", "а всё остальное на месте");
+    }
+
+    #[test]
+    fn a_roster_crosses_the_wire_with_names_and_no_keys() {
+        // Ключа у участника нет и быть не должно (§13.4). Назван он
+        // идентификатором своего личного чата — тем самым, каким десктоп
+        // уже адресует переписку двоих, и им же ему можно написать.
+        let members = vec![
+            Member { chat: [6u8; 16], name: "я".into(), mine: true, owner: true },
+            Member { chat: [7u8; 16], name: "гость".into(), mine: false, owner: false },
+        ];
+        let back = response_from_payload(&through_cbor(&response_payload(
+            9,
+            &Response::Members { members: members.clone() },
+        )))
+        .unwrap();
+        assert_eq!(back, (9, Response::Members { members }));
+    }
+
+    #[test]
+    fn an_empty_roster_is_an_answer_and_not_a_missing_field() {
+        // Пустой состав — законный ответ: так отвечает личный чат.
+        // Пропусти мы ключ, десктоп не отличил бы «участников нет»
+        // от «поля не прислали» и ждал бы вечно.
+        let value = response_payload(1, &Response::Members { members: Vec::new() });
+        let map = canonical::as_map(&value).unwrap();
+        assert!(canonical::get(map, KEY_MEMBERS).is_some(), "ключ едет и пустым");
+        assert_eq!(
+            response_from_payload(&through_cbor(&value)).unwrap().1,
+            Response::Members { members: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn a_roster_longer_than_the_group_can_hold_is_refused() {
+        // Длину называет та сторона провода: «тысяча участников» —
+        // это запрос памяти, а не состав. Предел берётся у §11.3,
+        // а не пишется здесь заново.
+        let too_many = (0..=crate::group::MAX_GROUP_MEMBERS)
+            .map(|n| {
+                Value::Map(vec![
+                    (Value::Integer(KEY_CHAT.into()), Value::Bytes(vec![n as u8; 16])),
+                    (Value::Integer(KEY_TITLE.into()), Value::Text("гость".into())),
+                    (Value::Integer(KEY_MINE.into()), Value::Bool(false)),
+                ])
+            })
+            .collect();
+        let value = Value::Map(vec![
+            (Value::Integer(KEY_ID.into()), Value::Integer(1.into())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_MEMBERS.into())),
+            (Value::Integer(KEY_MEMBERS.into()), Value::Array(too_many)),
+        ]);
+        assert!(response_from_payload(&value).is_err());
     }
 
     #[test]
@@ -3825,6 +4426,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: "текст на месте".into(),
             wall_ms: 1,
             status: None,
@@ -3847,6 +4449,7 @@ mod tests {
                 msg_id: [1u8; 16],
                 chat: [2u8; 16],
                 mine: false,
+                author: None,
                 text: "пришло".into(),
                 wall_ms: 5,
                 status: None,
@@ -3867,6 +4470,7 @@ mod tests {
                 msg_id: [1u8; 16],
                 chat: [2u8; 16],
                 mine: true,
+                author: None,
                 text: "поправлено".into(),
                 wall_ms: 9,
                 status: Some(2),
@@ -3955,6 +4559,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: String::new(),
             wall_ms: 0,
             status: None,
@@ -4018,6 +4623,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: true,
+            author: None,
             text: "текст".into(),
             wall_ms: 4,
             status: None,
@@ -4185,9 +4791,10 @@ mod tests {
 
     #[test]
     fn a_chat_list_from_an_older_phone_still_parses() {
-        // Метка появилась в версии 10, и телефон версии 9 её не шлёт.
-        // Потребовав ключ, мы не разобрали бы **весь список чатов**
-        // из-за поля, без которого всё остальное работает.
+        // Метка появилась в версии 10, признак группы — в четырнадцатой,
+        // членство — в пятнадцатой, и телефон постарше не шлёт ничего
+        // из этого. Потребовав ключ, мы не разобрали бы **весь список
+        // чатов** из-за поля, без которого всё остальное работает.
         let older = Value::Map(vec![
             (Value::Integer(KEY_CHAT.into()), Value::Bytes(vec![1u8; 16])),
             (Value::Integer(KEY_TITLE.into()), Value::Text("Алиса".into())),
@@ -4197,6 +4804,54 @@ mod tests {
         ]);
         let chat = chat_from_value(&older).expect("список чатов версии 9 обязан разобраться");
         assert_eq!(chat.avatar_ms, 0, "нет метки — значит показывать нечего");
+        assert!(!chat.is_group, "не сказали — значит личный чат, как было до групп");
+        // **`true`, а не `false`.** Умолчание здесь не «пусто», а «как было»:
+        // телефон версии 14 выхода из группы не знал, и при нём мы состояли
+        // во всех чатах, которые он присылал. Поставь мы `false` — поле
+        // ввода исчезло бы во **всей** переписке на старом телефоне.
+        assert!(chat.joined, "не сказали — значит состоим, как было до выхода");
+    }
+
+    #[test]
+    fn a_group_we_left_is_told_apart_from_one_we_are_in() {
+        // Ради этого поле и заведено: без него десктоп предлагал бы писать
+        // туда, где телефон откажет, и человек увидел бы ошибку вместо
+        // серой строки.
+        let inside = ChatSummary {
+            chat: [3u8; 16],
+            title: "у костра".into(),
+            verified: false,
+            last_text: "все тут?".into(),
+            last_ms: 7,
+            avatar_ms: 0,
+            is_group: true,
+            joined: true,
+        };
+        let outside = ChatSummary { joined: false, ..inside.clone() };
+        assert_ne!(
+            through_cbor(&chat_value(&inside)),
+            through_cbor(&chat_value(&outside)),
+            "два чата, неразличимые ничем другим, обязаны различаться на проводе"
+        );
+        assert!(!chat_from_value(&chat_value(&outside)).expect("разбор").joined);
+    }
+
+    #[test]
+    fn a_one_to_one_chat_is_always_joined() {
+        // Из переписки с человеком не выходят: её удаляют, и тогда чата
+        // в списке нет вовсе. Развилки «читать поле или не читать» у десктопа
+        // поэтому нет — лишний способ прочесть не то.
+        let chat = ChatSummary {
+            chat: [1u8; 16],
+            title: "Алиса".into(),
+            verified: true,
+            last_text: "привет".into(),
+            last_ms: 5,
+            avatar_ms: 9,
+            is_group: false,
+            joined: true,
+        };
+        assert!(chat_from_value(&chat_value(&chat)).expect("разбор").joined);
     }
 
     #[test]

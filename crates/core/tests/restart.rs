@@ -1280,3 +1280,159 @@ fn the_announced_card_survives_a_restart() {
         .expect("смена адреса");
     assert_eq!(engine.own_card().version, 3);
 }
+
+#[test]
+fn a_group_survives_restart_with_its_title_owner_and_membership() {
+    let db = TempDb::new("group");
+    let db_key = Zeroizing::new([7u8; 32]);
+
+    let (chat, mine) = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+
+        let effects = engine
+            .step(1_000, Input::Command(Command::CreateGroup { title: "у костра".to_owned() }))
+            .expect("группа заведена");
+        let chat = effects
+            .iter()
+            .find_map(|e| match e {
+                ratatosk_core::Effect::Notify(ratatosk_core::Event::GroupCreated {
+                    chat, ..
+                }) => Some(*chat),
+                _ => None,
+            })
+            .expect("событие о заведении");
+        (chat, engine.own_card().ik)
+    };
+
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    let state = engine.groups().get(&chat).expect("группа поднялась с диска");
+    assert_eq!(state.title, "у костра");
+    assert_eq!(state.created_ms, 1_000, "время заведения — то, а не время подъёма");
+    assert_eq!(state.group.owner, mine);
+    assert_eq!(state.group.members().copied().collect::<Vec<_>>(), vec![mine]);
+}
+
+#[test]
+fn a_restored_owner_keeps_exactly_one_membership_tag() {
+    // Ловушка, ради которой у `Group` есть `restore` отдельно от `create`.
+    // Позови подъём `create`, у создателя оказалось бы две метки добавления:
+    // поднятая из истории и выдуманная прямо сейчас. Вторую не гасит ни одно
+    // удаление — их писали, видя только первую, — и создатель стал бы
+    // неисключаемым после первого же перезапуска.
+    //
+    // Видно это только по истории: состав в обоих случаях один и тот же.
+    let db = TempDb::new("group-tag");
+    let db_key = Zeroizing::new([8u8; 32]);
+
+    let chat = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(1_000, Input::Command(Command::CreateGroup { title: "у костра".to_owned() }))
+            .expect("группа заведена")
+            .iter()
+            .find_map(|e| match e {
+                ratatosk_core::Effect::Notify(ratatosk_core::Event::GroupCreated {
+                    chat, ..
+                }) => Some(*chat),
+                _ => None,
+            })
+            .expect("событие о заведении")
+    };
+
+    let before = {
+        let store = db.open(&db_key);
+        store.membership(&chat).expect("история состава")
+    };
+    assert_eq!(before.len(), 1);
+
+    // Три подъёма подряд: метка не размножается ни на одном.
+    for _ in 0..3 {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+    }
+
+    let store = db.open(&db_key);
+    assert_eq!(
+        store.membership(&chat).expect("история состава"),
+        before,
+        "подъём не имеет права дописывать историю состава"
+    );
+}
+
+#[test]
+fn a_group_copy_stays_silent_across_a_restart() {
+    // Молчаливость групповой копии (§11.3, §14) жила только в памяти:
+    // поднимая очередь с диска, ядро ставило `silent: false` всем подряд.
+    // Значит перезапуск превращал копию в обычную доставку — со сроком
+    // ответа, с ожиданием квитанции, которой не будет, и со статусом,
+    // которого у группового сообщения быть не может.
+    //
+    // Теперь признак **выводится из кадра**, и второго экземпляра этого
+    // факта нет вовсе. Проверяется по настоящему файлу: в памяти очередь
+    // не переживает процесс и проверить тут нечего.
+    let db = TempDb::new("group-silent");
+    let db_key = Zeroizing::new([7u8; 32]);
+    let (card_bytes, peer_ik) = peer_card();
+
+    let (chat, msg_id) = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .expect("контакт");
+        let effects = engine
+            .step(1_100, Input::Command(Command::CreateGroup { title: "у костра".to_owned() }))
+            .expect("группа");
+        let chat = effects
+            .iter()
+            .find_map(|e| match e {
+                ratatosk_core::Effect::Notify(ratatosk_core::Event::GroupCreated {
+                    chat, ..
+                }) => Some(*chat),
+                _ => None,
+            })
+            .expect("о заведении обязано прийти событие");
+        engine
+            .step(1_200, Input::Command(Command::InviteToGroup { chat, peer_ik }))
+            .expect("приглашение");
+        engine
+            .step(1_300, Input::Command(Command::SendText { chat, text: "все тут?".to_owned() }))
+            .expect("сказано");
+        let msg_id = engine.store().messages(&chat, 10, None).expect("хранилище")[0].msg_id;
+        assert_eq!(
+            engine.store().message(&msg_id).expect("хранилище").expect("оно").status,
+            None,
+            "до перезапуска статуса нет"
+        );
+        (chat, msg_id)
+    };
+
+    // Новый процесс: та же база, то же сообщение, очередь поднимается с диска.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём с диска");
+    let _ = engine.startup_effects();
+    engine.step(2_000, Input::Command(Command::NetworkChanged)).expect("сеть переключилась");
+
+    assert!(engine.groups().contains_key(&chat), "группа поднялась");
+    assert_eq!(
+        engine.store().message(&msg_id).expect("хранилище").expect("оно").status,
+        None,
+        "и после перезапуска статуса у групповой копии нет"
+    );
+}

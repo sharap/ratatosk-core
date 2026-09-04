@@ -18,14 +18,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ratatosk_codec::{ContactCard, Envelope, PayloadType, Value};
-use ratatosk_crdt::{DedupWindow, Hlc, HlcClock, MsgId};
+use ratatosk_crdt::{ActorId, DedupWindow, Hlc, HlcClock, MsgId, OrSet, OrSetOp, Tag};
 use ratatosk_crypto::aead;
 use ratatosk_crypto::handshake::{
     Accepted, HandshakeOutcome, Initiator, PendingHandshake, Responder,
 };
+use ratatosk_crypto::ratchet::SenderChain;
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
 use ratatosk_proto::companion;
 use ratatosk_proto::fragment::Reassembler;
+use ratatosk_proto::group::{self, Group, GroupId};
 use ratatosk_proto::mail::{AccountUrl, MailAccount, Secret};
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{
@@ -33,8 +35,9 @@ use ratatosk_proto::transport_policy::{
 };
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{
-    Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredMessage,
-    StoredPairedDevice, Task,
+    Blobs, FileId, Schedule, Store, StoredContactShare, StoredFile, StoredGroup,
+    StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredPairedDevice,
+    StoredSenderChain, Task,
 };
 use ratatosk_wire::unpad;
 
@@ -131,6 +134,15 @@ const LAN_DISCOVERY_GRACE_MS: u64 = 3_000;
 /// хватает на «Аня с курсов вязания» с запасом.
 pub const MAX_LOCAL_NAME_CHARS: usize = 64;
 
+/// Наибольшая длина названия группы, в символах Unicode.
+///
+/// Та же величина и та же причина, что у [`MAX_LOCAL_NAME_CHARS`]: поле пишет
+/// клиент, и без потолка одна опечатка в цикле кладёт в хранилище мегабайты.
+/// Держать их порознь незачем — оба это «как человек назвал строку в списке
+/// чатов», и разойдясь, они однажды объяснили бы человеку два разных предела
+/// для одного и того же поля ввода.
+pub const MAX_GROUP_TITLE_CHARS: usize = MAX_LOCAL_NAME_CHARS;
+
 /// Сколько неотправленных сообщений помнить до появления сети.
 ///
 /// Список живёт в памяти и потому ограничен: очередь, растущая без предела,
@@ -138,6 +150,21 @@ pub const MAX_LOCAL_NAME_CHARS: usize = 64;
 /// в самолёте», а не край. Про то, что список **не переживает перезапуск**,
 /// сказано в `FFI.md` прямо: обещать больше, чем сделано, §14 запрещает.
 const MAX_DEFERRED: usize = 200;
+
+/// Сколько групповых кадров помнить до появления самой группы (§9.2).
+///
+/// Вступление — четыре кадра плюс по кадру на изменение состава за жизнь
+/// группы. Шестьдесят четыре — это «вступаю в группу с долгой историей,
+/// и почта переставила всё разом», а не край. Переполнение выбрасывает
+/// самый старый: свежий кадр относится к тому, что происходит сейчас.
+const MAX_PENDING_GROUP: usize = 64;
+
+/// Срок, который выдаётся молчаливой копии (см. `Delivery::silent`).
+///
+/// Он не нужен никому: попытка закрыта до того, как метка сработает,
+/// и владельца у неё не найдётся. Величина взята большой нарочно —
+/// чтобы такие метки не будили процесс.
+const SILENT_TIMER_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Отказ ядра.
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +232,53 @@ pub enum EngineError {
     /// Сопряжение с десктопом не заведено (§13.4).
     #[error("сопряжение: {0}")]
     Pairing(#[from] ratatosk_proto::companion::PairingError),
+    /// Обращение к неизвестной группе (§11).
+    ///
+    /// Отдельно от [`EngineError::UnknownPeer`] по той же причине, по какой
+    /// от него отделён [`EngineError::UnknownDevice`]: списки разные, и
+    /// «такой группы нет» человек чинит не тем, чем «такого контакта нет».
+    #[error("группа неизвестна")]
+    UnknownGroup,
+    /// Мы сами не состоим в этой группе (§11.2).
+    ///
+    /// Приглашать может любой **участник**. Исключённый — уже не участник,
+    /// и его приглашение остальные всё равно не применят: блок от того,
+    /// кого в составе нет, ничего не значит. Отказ здесь избавляет
+    /// от кадров, которые никуда не приведут.
+    #[error("вы не состоите в этой группе")]
+    NotInGroup,
+    /// Исключить самого себя нельзя — для этого есть выход.
+    ///
+    /// Отказ сохранился и после того, как `LeaveGroup` появилась, и это
+    /// не педантизм. У исключения правило §11.2 «только создатель»,
+    /// у выхода правила нет вовсе; прими исключение себя как выход, и
+    /// создатель уходил бы одной командой, а остальные — другой, хотя
+    /// делают они одно и то же. Отказ называет нужную команду, а не
+    /// запрещает намерение.
+    #[error("исключение — не для себя: чтобы уйти, есть выход из группы")]
+    CannotEvictSelf,
+    /// Приглашаемый уже в составе.
+    ///
+    /// Отказ, а не тихий повтор: OR-Set принял бы вторую метку добавления
+    /// молча, и двойное нажатие рассылало бы блок всем участникам заново.
+    /// Вернуть **исключённого** это не мешает — исключённый в составе
+    /// не числится.
+    #[error("этот человек уже в группе")]
+    AlreadyInGroup,
+    /// Групповая операция не разрешена правилами §11.2 или §11.3.
+    #[error("группа: {0}")]
+    Group(#[from] ratatosk_proto::GroupError),
+    /// Название группы пустое.
+    ///
+    /// Отказ, а не пустая строка в списке. У контакта имя бывает пустым
+    /// законно — его задаёт собеседник, и на этот случай есть отпечаток
+    /// (`title_of`). Название группы задаёт **этот** человек, и запасного
+    /// имени у группы нет: чат без названия нельзя выбрать в списке.
+    #[error("у группы должно быть название")]
+    GroupTitleEmpty,
+    /// Название группы длиннее [`MAX_GROUP_TITLE_CHARS`].
+    #[error("название группы длиннее {MAX_GROUP_TITLE_CHARS} символов")]
+    GroupTitleTooLong,
     /// Обращение к неизвестному сопряжённому устройству (§13.4).
     ///
     /// Отдельно от [`EngineError::UnknownPeer`], и не ради стройности:
@@ -340,6 +414,93 @@ pub struct Contact {
     /// и столбец `created_ms` означал на деле «когда контакт трогали».
     /// Никто этого не замечал ровно потому, что наружу поле не отдавалось.
     pub added_ms: u64,
+}
+
+/// Групповой кадр, которому пока некуда лечь.
+///
+/// Хранится **разобранным конвертом**, а не байтами кадра: кадр уже открыт
+/// и проверен транспортом, повторять эту работу при разборе очереди незачем.
+/// Подпись внутри при этом остаётся непроверенной — её проверяет разбор,
+/// а он и будет вызван заново.
+///
+/// Конверт целиком, а не одна нагрузка, и это не запас: у группового
+/// сообщения `msg_id` и метка HLC лежат **в конверте**, и под ними оно
+/// ложится в историю у всех участников. Сохрани мы одну нагрузку —
+/// отложенное сообщение пришлось бы переписывать новым номером, то есть
+/// оно перестало бы быть тем же сообщением.
+#[derive(Debug, Clone)]
+struct PendingGroup {
+    chat: ChatId,
+    envelope: Envelope,
+    peer_ik: [u8; 32],
+}
+
+/// Участник группы в том виде, в каком его рисуют (§11).
+///
+/// Ключ **и** имя **и** признак «это я»: по отдельности ни одного из трёх
+/// клиенту не хватает. По ключу берётся лицо и открывается карточка, имя
+/// считает ядро по §4.1, а «это я» из ключа выводится сравнением
+/// с собственным — то самое протокольное знание, которое §13.3 держит
+/// ниже границы.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    /// Публичный `IK`.
+    pub ik: [u8; 32],
+    /// Как его назвать. Пустым не бывает: у безымянного — начало отпечатка.
+    pub name: String,
+    /// Это мы сами.
+    ///
+    /// Считается ядром, а не клиентом: своей карточки в списке контактов
+    /// нет, и клиент, искавший имя перебором, показывал хозяина телефона
+    /// неизвестным участником.
+    pub mine: bool,
+}
+
+/// Что ядро знает о группе (§11).
+///
+/// Состав отдельно от названия, и это не стройность ради стройности.
+/// Состав — CRDT: он сливается по правилам OR-Set и приезжает подписанными
+/// блоками от участников. Название в v1 не сливается никак — §11 не описывает
+/// ни его рассылки, ни разрешения одновременных переименований, — и лежит
+/// оно поэтому не в [`Group`], а рядом.
+#[derive(Debug, Clone)]
+pub struct GroupState {
+    /// Состав и владелец (§11.2).
+    pub group: Group,
+    /// Как её назвал создатель.
+    ///
+    /// Название **общее**: его выдаёт создатель при заведении, оно едет
+    /// новичку во вводном блоке (§11.5), а переименование расходится
+    /// действием `Rename` по тем же каналам, что и слова. Менять его
+    /// вправе только создатель — оттого и «назвал создатель», а не
+    /// «назвал человек».
+    pub title: String,
+    /// Метка названия (§9.1) — при какой отметке его поставили.
+    ///
+    /// Существует ради одного: **не дать старому названию затереть
+    /// новое**. Переименования одного человека законно приходят
+    /// в обратном порядке (§9.2), и без метки последним побеждало бы
+    /// то, что дольше ехало.
+    ///
+    /// Нулевая метка означает «названию её не выдавали» — так у групп,
+    /// заведённых сборкой без переименования, и любое настоящее
+    /// переименование их обгонит.
+    pub title_hlc: Hlc,
+    /// Метка аватарки (§9.1) — при какой отметке её поставили.
+    ///
+    /// Отдельная от [`GroupState::title_hlc`], хотя ставит обе один
+    /// человек: название и картинка меняются порознь, и общая метка
+    /// означала бы, что смена картинки отвергает опоздавшее
+    /// переименование — и наоборот.
+    ///
+    /// Сами байты в памяти не держатся: до тридцати двух килобайт на
+    /// группу, а нужны они на один показ. Метки хватает, чтобы решить,
+    /// класть ли пришедшую картинку, не читая лежащую.
+    ///
+    /// Нулевая метка означает «картинки не ставили никогда».
+    pub avatar_hlc: Hlc,
+    /// Когда заведена, мс.
+    pub created_ms: u64,
 }
 
 /// Почему попытка доставки не удалась.
@@ -498,6 +659,23 @@ struct Delivery {
     /// место в очереди ожидающих. Порядок отправки после долгого офлайна
     /// обязан совпадать с порядком, в котором человек писал.
     queued_ms: u64,
+    /// Копия группового сообщения: попытка кончается записью в сокет.
+    ///
+    /// **Почему у неё не бывает ни квитанции, ни статуса.** Копия едет
+    /// каждому участнику (§11.3), и все копии носят **один** номер конверта:
+    /// сообщение-то одно. Квитанция называет именно его — значит первая же
+    /// пришедшая закрыла бы все тридцать две записи разом и объявила
+    /// сообщение доставленным всем, кому оно ещё едет. Один значок
+    /// на тридцать двух получателей §14 не разрешает.
+    ///
+    /// Поэтому такая копия не ждёт ответа: `arm_send` не заводит ей срока,
+    /// попытка закрывается сразу, и в очередь она не попадает вовсе.
+    ///
+    /// Цена названа честно: групповое сообщение, потерянное ненадёжным
+    /// прямым каналом, теряется молча — у 1:1 его вытянул бы откат
+    /// по сроку (§5.4). «Доставлено пятерым из семи» это другая работа,
+    /// и она не сделана.
+    silent: bool,
     /// Пробовали ли уже переустановить сессию из-за молчания.
     ///
     /// Ровно один раз на сообщение. Без ограничения два узла с расходящимся
@@ -524,6 +702,31 @@ pub struct Engine<S: Store> {
     rekey: RekeyPolicy,
     contacts: BTreeMap<[u8; 32], Contact>,
     by_chat: BTreeMap<ChatId, [u8; 32]>,
+    /// Групповые кадры, приехавшие раньше самой группы (§9.2).
+    ///
+    /// Почта переставляет письма, и четыре кадра вступления — представление,
+    /// состав, карточки, ключи — приезжают в любом порядке. Отбросить
+    /// пришедшее раньше представления значило бы потерять состав у того,
+    /// кому не повезло с порядком, и заметить это можно было бы только
+    /// по чужому сообщению, которое некому приписать.
+    ///
+    /// В памяти и с потолком: перезапуск их теряет, и это честная цена —
+    /// пригласивший расскажет всё заново при следующем изменении состава.
+    /// Потолок нужен затем же, зачем он у `deferred`: список, растущий
+    /// без предела, на телефоне кончается убитым процессом.
+    pending_group: Vec<PendingGroup>,
+    /// Группы по идентификатору чата (§11).
+    ///
+    /// Рядом с `by_chat`, а не внутри: `by_chat` отвечает на вопрос «чей
+    /// это чат 1:1», и у группы ответа на него нет. Идентификатор чата
+    /// при этом один на оба вида — иначе хранилищу пришлось бы держать две
+    /// таблицы сообщений.
+    ///
+    /// Состав живёт в памяти, потому что каждое решение по нему —
+    /// «кому рассылать», «можно ли исключать» — принимается на каждое
+    /// сообщение. На диске лежат **операции**, а не свёрнутый состав
+    /// (`Store::membership`), и подъём собирает это поле из них.
+    groups: BTreeMap<ChatId, GroupState>,
     pending: Vec<OutgoingHandshake>,
     outbox: Vec<Delivery>,
     next_timer_token: u64,
@@ -776,6 +979,8 @@ impl<S: Store> Engine<S> {
             rekey: RekeyPolicy::default(),
             contacts: BTreeMap::new(),
             by_chat: BTreeMap::new(),
+            pending_group: Vec::new(),
+            groups: BTreeMap::new(),
             pending: Vec::new(),
             outbox: Vec::new(),
             next_timer_token: 1,
@@ -950,13 +1155,22 @@ impl<S: Store> Engine<S> {
         let mut progress: Vec<([u8; 16], u64, u64)> = Vec::new();
         let mut gone_files: Vec<[u8; 16]> = Vec::new();
         let mut avatars: Vec<[u8; 32]> = Vec::new();
+        let mut group_avatars: Vec<ChatId> = Vec::new();
 
         for effect in effects {
             let Effect::Notify(event) = effect else { continue };
             match event {
                 Event::ContactAdded { .. }
                 | Event::ContactChanged { .. }
-                | Event::ContactRemoved { .. } => chats_changed = true,
+                | Event::ContactRemoved { .. }
+                // Группа — такая же строка в списке чатов, как контакт (§11).
+                // Заведение добавляет её, смена состава меняет — а вот что
+                // именно, десктоп спросит сам: список приезжает целиком.
+                | Event::GroupCreated { .. }
+                | Event::GroupMembershipChanged { .. }
+                // Переименование меняет ровно то, что видно в списке, —
+                // заголовок строки.
+                | Event::GroupRenamed { .. } => chats_changed = true,
                 Event::MessagesDeleted { chat, msg_ids } => gone.push((*chat, msg_ids.clone())),
                 Event::MessageEdited { msg_id, .. } => edited.push(*msg_id),
                 // Последняя за шаг побеждает: приход чанка и сборка файла
@@ -992,6 +1206,15 @@ impl<S: Store> Engine<S> {
                         avatars.push(*peer_ik);
                     }
                 }
+                // Своей новостью, а не `ChatsChanged`: десктоп по ней
+                // перерисует один кружок, а не перечитает весь список.
+                // Та же новость, что у лица контакта, и намеренно: снаружи
+                // это один вопрос — «что рисовать в кружке этого чата».
+                Event::GroupAvatarChanged { chat } => {
+                    if !group_avatars.contains(chat) {
+                        group_avatars.push(*chat);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1015,6 +1238,16 @@ impl<S: Store> Engine<S> {
             let avatar_ms = self.store.avatar_stamp(&peer_ik).unwrap_or(None).unwrap_or(0);
             self.companion_notices.push(PendingNotice::Ready(companion::Notice::AvatarChanged {
                 chat: Some(Self::chat_id_for(&peer_ik)),
+                avatar_ms,
+            }));
+        }
+        for chat in group_avatars {
+            // §4.2 здесь нет — в отличие от лица контакта: картинку группы
+            // видят все участники (`proto::avatar`). Ноль означает
+            // «показывать нечего», и десктоп по нему сотрёт кружок.
+            let avatar_ms = self.group_avatar_stamp(&chat).unwrap_or(0);
+            self.companion_notices.push(PendingNotice::Ready(companion::Notice::AvatarChanged {
+                chat: Some(chat),
                 avatar_ms,
             }));
         }
@@ -1302,9 +1535,18 @@ impl<S: Store> Engine<S> {
             }
             Command::PairDevice { label } => self.on_pair_device(now_ms, &label),
             Command::RevokePairing { device_id } => self.on_revoke_pairing(now_ms, &device_id),
-            Command::CreateGroup { .. }
-            | Command::InviteToGroup { .. }
-            | Command::EvictFromGroup { .. } => todo!("этап 5: группы (§11)"),
+            Command::CreateGroup { title } => self.on_create_group(now_ms, &title),
+            Command::InviteToGroup { chat, peer_ik } => {
+                self.on_invite_to_group(now_ms, chat, peer_ik)
+            }
+            Command::EvictFromGroup { chat, peer_ik } => {
+                self.on_evict_from_group(now_ms, chat, peer_ik)
+            }
+            Command::LeaveGroup { chat } => self.on_leave_group(now_ms, chat),
+            Command::RenameGroup { chat, title } => self.on_rename_group(now_ms, chat, &title),
+            Command::SetGroupAvatar { chat, bytes } => {
+                self.on_set_group_avatar(now_ms, chat, &bytes)
+            }
             Command::MarkRead { chat, up_to } => self.on_mark_read(now_ms, chat, up_to),
         }
     }
@@ -1386,6 +1628,33 @@ impl<S: Store> Engine<S> {
             });
         }
 
+        // Группы (§11). Состав поднимается **операциями**, а не свёрнутым
+        // списком: на диске лежит история OR-Set, и свернуть её — работа
+        // `Group`, а не запроса. Подробности того, почему подъём зовёт
+        // `Group::restore`, а не `Group::create`, — в самой `restore`.
+        for stored in self.store.groups()? {
+            let mut group = Group::restore(stored.chat_id, stored.owner_ik);
+            for op in Self::ops_from_stored(&self.store.membership(&stored.chat_id)?) {
+                group.apply(op);
+            }
+            self.groups.insert(
+                stored.chat_id,
+                GroupState {
+                    group,
+                    title: stored.title,
+                    title_hlc: Hlc::new(stored.title_wall, stored.title_logical),
+                    // Метка картинки — отдельным вопросом, чтобы не читать
+                    // и не расшифровывать сами байты: их до тридцати двух
+                    // килобайт на группу, а при подъёме они не нужны никому.
+                    avatar_hlc: self
+                        .store
+                        .group_avatar_stamp(&stored.chat_id)?
+                        .map_or_else(Hlc::default, |(wall, logical)| Hlc::new(wall, logical)),
+                    created_ms: stored.created_ms,
+                },
+            );
+        }
+
         let stored = self.store.contacts()?;
         let restored = stored.len();
         for contact in stored {
@@ -1441,6 +1710,13 @@ impl<S: Store> Engine<S> {
                 self.store.delete_outbox(&waiting.msg_id)?;
                 continue;
             }
+            // Молчаливость **выводится из кадра**, а не поднимается
+            // из отдельного столбца. Не выводись она — перезапуск воскрешал
+            // бы групповую копию обычной: со сроком ответа, с ожиданием
+            // квитанции, которой не будет, и со статусом, которого §14
+            // не разрешает. Столбец решил бы то же самое, но завёл бы второй
+            // экземпляр одного факта — и однажды они разошлись бы.
+            let silent = Self::silent_frame(&waiting.envelope);
             self.deferred.push(Delivery {
                 msg_id: waiting.msg_id,
                 peer_ik: waiting.recipient_ik,
@@ -1449,6 +1725,7 @@ impl<S: Store> Engine<S> {
                 state: DeliveryState::AwaitingSession,
                 queued_ms: waiting.queued_ms,
                 session_reset_used: false,
+                silent,
             });
         }
 
@@ -2286,17 +2563,11 @@ impl<S: Store> Engine<S> {
         chat: ChatId,
         msg_ids: &[MsgId],
     ) -> Result<Vec<Effect>, EngineError> {
-        let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
-        let own_ik = self.identity.public().ik;
-
-        // Чьё сообщение — знает хранилище, а не клиент: он мог прислать
-        // и чужой идентификатор, и вовсе выдуманный.
-        let mut ours = Vec::new();
-        for msg_id in msg_ids.iter().take(ratatosk_proto::MAX_RETRACT_IDS) {
-            if self.store.message(msg_id)?.is_some_and(|m| m.sender_ik == own_ik) {
-                ours.push(*msg_id);
-            }
+        if self.groups.contains_key(&chat) {
+            return self.retract_group_messages(now_ms, chat, msg_ids);
         }
+        let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
+        let ours = self.own_of(chat, msg_ids)?;
 
         let mut effects = self.forget_messages(now_ms, chat, msg_ids);
         if ours.is_empty() {
@@ -2311,6 +2582,35 @@ impl<S: Store> Engine<S> {
         )?;
         effects.extend(produced);
         Ok(effects)
+    }
+
+    /// Отбирает из названного то, что **наше и в этом чате**.
+    ///
+    /// Одно место на 1:1 и на группу: правило про то, что вправе уехать
+    /// в просьбе об отзыве, а разойдись две копии — разошлось бы и то,
+    /// чем отзыв в группе отличается от отзыва в переписке.
+    ///
+    /// Чьё сообщение — знает хранилище, а не клиент: он мог прислать
+    /// и чужой идентификатор, и вовсе выдуманный.
+    ///
+    /// **И в этом чате.** Правка и ответ чат проверяли всегда, отзыв —
+    /// не проверял, и это давало утечку: назвав номер из другого разговора,
+    /// клиент попросил бы удалить его у собеседника, тем самым рассказав,
+    /// что такой номер вообще есть. В группе цена той же ошибки — тридцать
+    /// два человека вместо одного.
+    fn own_of(&self, chat: ChatId, msg_ids: &[MsgId]) -> Result<Vec<MsgId>, EngineError> {
+        let own_ik = self.identity.public().ik;
+        let mut ours = Vec::new();
+        for msg_id in msg_ids.iter().take(ratatosk_proto::MAX_RETRACT_IDS) {
+            if self
+                .store
+                .message(msg_id)?
+                .is_some_and(|m| m.sender_ik == own_ik && m.chat_id == chat)
+            {
+                ours.push(*msg_id);
+            }
+        }
+        Ok(ours)
     }
 
     /// Очищает чат у себя.
@@ -2407,76 +2707,18 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         use ratatosk_proto::files;
 
+        // Группа — первой, как и у текста: у неё записи в `by_chat` нет,
+        // а идентификаторы чатов у групп и у 1:1 живут в одном пространстве.
+        if self.groups.contains_key(&chat) {
+            return self.send_group_files(now_ms, chat, files, text);
+        }
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
-        if files.is_empty() || files.len() > files::MAX_FILES_PER_MESSAGE {
-            return Err(files::FileError::TooMany.into());
-        }
-        // Подпись считается тем же пределом, что и текст без вложений:
-        // предел один на оба случая, и выведен он как раз из худшего —
-        // десять вложений с превью плюс текст в одном кадре.
-        if !files::text_fits(text.len()) {
-            return Err(EngineError::TextTooLong);
-        }
+        let offers = self.prepare_offers(files, text)?;
 
         let msg_id = self.entropy.msg_id();
         let hlc = self.clock.now(now_ms)?;
         let own_ik = self.identity.public().ik;
-
-        // Сперва собираем предложение целиком — и только потом пишем в базу.
-        // Отказ на третьем файле не должен оставлять в истории сообщение
-        // с двумя вложениями, которых никто не просил.
-        let mut offers = Vec::with_capacity(files.len());
-        let mut records = Vec::with_capacity(files.len());
-        for file in files {
-            let size_bytes = self.blobs.size_of(&file.path)?;
-            if size_bytes > files::MAX_FILE_BYTES {
-                return Err(files::FileError::TooLarge.into());
-            }
-            let name = file
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or(files::FileError::BadName)?
-                .to_owned();
-            files::check_name(&name)?;
-            if let Some(preview) = &file.preview {
-                if !files::preview_fits(preview.len()) {
-                    return Err(files::FileError::PreviewTooLarge.into());
-                }
-            }
-
-            let file_id = self.entropy.msg_id();
-            let mut key = [0u8; 32];
-            self.entropy.fill(&mut key);
-
-            offers.push(files::FileOffer {
-                file_id,
-                name: name.clone(),
-                size_bytes,
-                key,
-                preview: file.preview.clone(),
-            });
-            records.push(StoredFile {
-                file_id,
-                msg_id,
-                name,
-                size_bytes,
-                // Порядок, в каком человек выбрал файлы: он приехал списком
-                // и другого источника у него нет.
-                ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
-                chunk_total: files::chunk_count(size_bytes),
-                key,
-                preview: file.preview.clone(),
-                incoming: false,
-                // Путь, а не байты: копировать файл ради отправки значит
-                // требовать вдвое больше места, чем у него есть.
-                source_path: Some(file.path.to_string_lossy().into_owned()),
-                // Своё отправляем, ничего не спрашивая.
-                accepted: true,
-                complete: true,
-            });
-        }
-        files::check_offers(&offers).map_err(EngineError::File)?;
+        let records = Self::records_for(&offers, files, msg_id);
 
         self.remember(&StoredMessage {
             msg_id,
@@ -2504,6 +2746,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            silent: false,
         })?;
 
         // Само предложение уедет любой ступенью §5.4, а чанки — той, которую
@@ -2595,6 +2838,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            silent: false,
         })
     }
 
@@ -3246,6 +3490,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            silent: false,
         })?;
         // Предупреждение одно на сообщение — по первому файлу, которому
         // не хватило канала. Второе про то же самое ничего не добавляет:
@@ -3311,6 +3556,28 @@ impl<S: Store> Engine<S> {
         Ok(vec![Effect::Notify(Event::FileGone { file_id })])
     }
 
+    /// Кто прислал предложение этого файла.
+    ///
+    /// **Одно место на три вопроса**, и все три про одно: у кого просить
+    /// чанки, от кого их принимать и чью незаконченную передачу возобновлять
+    /// при появлении собеседника. Раньше на все три отвечал чат, выведенный
+    /// из ключа (`chat_id_for`), — и в группе не отвечал ни на один: там
+    /// идентификатор чата из ключа не выводится вовсе.
+    ///
+    /// Ответ здесь строже прежнего и верен для обоих случаев: чанки есть
+    /// только у того, кто прислал предложение, потому что пересылки в v1
+    /// нет (§11.3). В переписке двоих это тот же самый собеседник, так что
+    /// для 1:1 ничего не меняется.
+    ///
+    /// `None` — сообщения нет: копию удалили раньше, чем доехало вложение.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn offerer_of(&self, file: &StoredFile) -> Result<Option<[u8; 32]>, EngineError> {
+        Ok(self.store.message(&file.msg_id)?.map(|m| m.sender_ik))
+    }
+
     /// Просит собеседника продолжить (или начать) передачу файла.
     ///
     /// Просьба уходит тем же каналом, каким поедут чанки, — его выбирает
@@ -3337,10 +3604,13 @@ impl<S: Store> Engine<S> {
         file: &StoredFile,
         stalled: bool,
     ) -> Result<Vec<Effect>, EngineError> {
-        let chat = self.store.message(&file.msg_id)?.map(|m| m.chat_id);
-        let Some(peer_ik) = chat.and_then(|chat| self.by_chat.get(&chat).copied()) else {
+        let Some(peer_ik) = self.offerer_of(file)? else { return Ok(Vec::new()) };
+        if peer_ik == self.identity.public().ik {
+            // Своё же вложение. Сюда не приходят — просят только за
+            // входящим, — но правило дешевле привычки: просьба к самому
+            // себе ушла бы в очередь и не вернулась бы никогда.
             return Ok(Vec::new());
-        };
+        }
         let next = self.store.next_missing_chunk(&file.file_id, file.chunk_total)?;
         let Some(next) = next else {
             // Просить нечего — всё на месте. Такое бывает у пустого файла
@@ -3348,14 +3618,29 @@ impl<S: Store> Engine<S> {
             return self.finish_file(file);
         };
         let Some(via) = self.file_channel(&peer_ik, file.size_bytes) else {
-            // Просить некого: канала нет вовсе, либо остался один почтовый,
-            // а файл для почты слишком велик (§10.3). Молчать здесь и значило
-            // «вечную загрузку»: срок молчания не заводится (ниже), спросить
-            // снова нечем, и файл остаётся на нуле процентов без единого
-            // слова.
+            // Канала нет: либо не с чем разговаривать вовсе, либо остался
+            // один почтовый, а файл для почты слишком велик (§10.3).
+            let mut effects =
+                vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })];
+
+            // **И просим рукопожатие, если проситься есть куда.**
             //
-            // Возобновит передачу появление канала — `resume_files`.
-            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
+            // Раньше здесь стояло только «ждём», а в расчёте было на то,
+            // что сессию построит кто-то другой. Оно и построит — но лишь
+            // если человек что-нибудь **напишет**: очередь доставки (§5.4)
+            // сама зовёт `ensure_handshake`, а приём файла не звал никого.
+            // Отсюда поломка, которая ни на что не похожа: сообщения ходят,
+            // файлы стоят, и «чинится» это первым же отправленным словом.
+            //
+            // Срок молчания при этом не заводится, и это не забывчивость:
+            // сессия, когда появится, сама позовёт `resume_files` — оба
+            // места установки сессии это делают. Заведи мы здесь ещё
+            // и таймер, он взводил бы сам себя, пока собеседника нет.
+            if let Some(route) = self.file_route(&peer_ik, file.size_bytes) {
+                let (started, _) = self.ensure_handshake(peer_ik, route)?;
+                effects.extend(started);
+            }
+            return Ok(effects);
         };
         if via == Transport::Mail && self.mail_limits.crowded() {
             // Свой ящик кончается. Просить чанки некуда — они в него
@@ -3425,6 +3710,234 @@ impl<S: Store> Engine<S> {
         Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
     }
 
+    /// Проверяет вложения и готовит предложения (§10.1).
+    ///
+    /// Одно место на 1:1 и на группу: пределы числа файлов, длины имени,
+    /// размера и превью — те же, и разойдись они, в группе стало бы можно
+    /// послать то, чего нельзя в переписке двоих.
+    ///
+    /// **Сперва собирается всё, потом пишется в базу.** Отказ на третьем
+    /// файле не должен оставлять в истории сообщение с двумя вложениями,
+    /// которых никто не просил, — поэтому проверки и генерация ключей
+    /// живут здесь, до первой записи.
+    ///
+    /// Ключ у каждого файла свой и случайный. Это не мелочь: чанк
+    /// шифруется ключом, выведенным из `file_key ‖ index`, с нулевым
+    /// nonce (§10.1), и это безопасно ровно до тех пор, пока один ключ
+    /// не использован дважды для разного содержимого. Повторная отправка
+    /// того же файла — новое предложение с новым ключом.
+    ///
+    /// # Errors
+    ///
+    /// [`ratatosk_proto::files::FileError`] на любом из пределов;
+    /// [`EngineError::TextTooLong`] на подписи.
+    fn prepare_offers(
+        &mut self,
+        files: &[OutgoingFile],
+        text: &str,
+    ) -> Result<Vec<ratatosk_proto::files::FileOffer>, EngineError> {
+        use ratatosk_proto::files;
+
+        if files.is_empty() || files.len() > files::MAX_FILES_PER_MESSAGE {
+            return Err(files::FileError::TooMany.into());
+        }
+        // Подпись считается тем же пределом, что и текст без вложений:
+        // предел один на оба случая, и выведен он как раз из худшего —
+        // десять вложений с превью плюс текст в одном кадре.
+        if !files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
+
+        let mut offers = Vec::with_capacity(files.len());
+        for file in files {
+            let size_bytes = self.blobs.size_of(&file.path)?;
+            if size_bytes > files::MAX_FILE_BYTES {
+                return Err(files::FileError::TooLarge.into());
+            }
+            let name = file
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(files::FileError::BadName)?
+                .to_owned();
+            files::check_name(&name)?;
+            if let Some(preview) = &file.preview {
+                if !files::preview_fits(preview.len()) {
+                    return Err(files::FileError::PreviewTooLarge.into());
+                }
+            }
+
+            let file_id = self.entropy.msg_id();
+            let mut key = [0u8; 32];
+            self.entropy.fill(&mut key);
+            offers.push(files::FileOffer {
+                file_id,
+                name,
+                size_bytes,
+                key,
+                preview: file.preview.clone(),
+            });
+        }
+        files::check_offers(&offers).map_err(EngineError::File)?;
+        Ok(offers)
+    }
+
+    /// Собирает записи хранилища по готовым предложениям.
+    ///
+    /// Выведено из предложений, а не собрано вторым проходом: разойдись
+    /// они хоть в одном поле — `file_id`, ключе, размере, — получатель
+    /// просил бы одно, а отдавали бы ему другое.
+    ///
+    /// `paths` идёт рядом, потому что путь к исходнику наружу не едет:
+    /// он есть только у отправителя и в предложении ему делать нечего.
+    fn records_for(
+        offers: &[ratatosk_proto::files::FileOffer],
+        paths: &[OutgoingFile],
+        msg_id: MsgId,
+    ) -> Vec<StoredFile> {
+        offers
+            .iter()
+            .zip(paths)
+            .enumerate()
+            .map(|(at, (offer, file))| StoredFile {
+                file_id: offer.file_id,
+                msg_id,
+                name: offer.name.clone(),
+                size_bytes: offer.size_bytes,
+                // Порядок, в каком человек выбрал файлы: он приехал списком
+                // и другого источника у него нет.
+                ordinal: u32::try_from(at).unwrap_or(u32::MAX),
+                chunk_total: ratatosk_proto::files::chunk_count(offer.size_bytes),
+                key: offer.key,
+                preview: offer.preview.clone(),
+                incoming: false,
+                // Путь, а не байты: копировать файл ради отправки значит
+                // требовать вдвое больше места, чем у него есть.
+                source_path: Some(file.path.to_string_lossy().into_owned()),
+                // Своё отправляем, ничего не спрашивая.
+                accepted: true,
+                complete: true,
+            })
+            .collect()
+    }
+
+    /// Отправляет файлы в группу (§10 поверх §11.3).
+    ///
+    /// # Групповым становится только предложение
+    ///
+    /// Чанк шифруется ключом из `file_key ‖ index` (§10.1) — **не
+    /// сессионным**, — и потому его байты у всех участников одни и те же
+    /// уже сейчас. Групповой обёртки им не нужно: каждый участник просит
+    /// их сам и получает по своему 1:1-каналу, ровно как в переписке
+    /// двоих. Отсюда весь объём работы: групповым едет одно предложение,
+    /// пятым видом действия.
+    ///
+    /// # Цена названа: копий чанков столько же, сколько участников
+    ///
+    /// Файл в группе на семь человек — семь потоков. Уменьшить это в v1
+    /// нечем: §11.3 запрещает список получателей, потому что он раскрыл
+    /// бы состав почтовому серверу.
+    fn send_group_files(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        files: &[OutgoingFile],
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let offers = self.prepare_offers(files, text)?;
+        let action = ratatosk_proto::group_action::Action::Files {
+            caption: text.to_owned(),
+            offers: offers.clone(),
+        };
+        // Кадр собирается до записи в базу: сборка вправе отказать —
+        // цепочки может не быть, нас могли исключить, — и записи о файлах,
+        // оставшиеся после отказа, человек видел бы вечно отправляющимися.
+        let (msg_id, hlc, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+        let records = Self::records_for(&offers, files, msg_id);
+
+        self.remember(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: self.identity.public().ik,
+            hlc,
+            body: text.as_bytes().to_vec(),
+            received_ms: now_ms,
+            // Статуса нет, как и у всякой групповой копии: один значок
+            // на тридцать двух получателей §14 не разрешает.
+            status: None,
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+        for record in &records {
+            self.store.put_file(record)?;
+        }
+
+        let mut effects = self.fan_out_group(now_ms, chat, msg_id, &bytes)?;
+        // §10.3 дословно, и спрашивается **про каждый файл отдельно**:
+        // предел почты про размер, и в одном сообщении может уехать
+        // и фотография, которая поедет почтой, и видео, которое будет ждать.
+        //
+        // Про участников спрашивается «есть ли хоть один, кому сейчас
+        // не увезти»: событие несёт только `file_id`, имени получателя
+        // в нём нет. Сказать «ждёт» один раз честнее, чем промолчать, —
+        // и честнее, чем семь одинаковых строк на семерых.
+        let me = self.identity.public().ik;
+        let members: Vec<[u8; 32]> = match self.groups.get(&chat) {
+            Some(state) => state.group.recipients(&me),
+            None => Vec::new(),
+        };
+        for record in &records {
+            if members.iter().any(|m| self.file_channel(m, record.size_bytes).is_none()) {
+                effects
+                    .push(Effect::Notify(Event::FileWaitsForChannel { file_id: record.file_id }));
+            }
+        }
+        Ok(effects)
+    }
+
+    /// Заводит записи о принятых вложениях и отдаёт их.
+    ///
+    /// Одно место на 1:1 и на группу: порядок вложений, порог автоприёма
+    /// и признак «пустой файл собран сразу» обязаны совпадать, иначе
+    /// в группе вложение вело бы себя не так, как в переписке.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn record_offers(
+        &mut self,
+        msg_id: MsgId,
+        offers: Vec<ratatosk_proto::files::FileOffer>,
+    ) -> Result<Vec<StoredFile>, EngineError> {
+        let mut records = Vec::with_capacity(offers.len());
+        for offer in offers {
+            let chunk_total = ratatosk_proto::files::chunk_count(offer.size_bytes);
+            let record = StoredFile {
+                file_id: offer.file_id,
+                msg_id,
+                name: offer.name,
+                size_bytes: offer.size_bytes,
+                // Порядок предложений в конверте — он же порядок, в каком
+                // их выбрал отправитель. Своего мнения у получателя тут нет.
+                ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
+                chunk_total,
+                key: offer.key,
+                preview: offer.preview,
+                incoming: true,
+                source_path: None,
+                // Порог — настройка, а не правило: `None` означает «спрашивать
+                // всегда», и это законный выбор человека.
+                accepted: ratatosk_proto::files::auto_accept(offer.size_bytes, self.auto_accept),
+                // Пустой файл собран в тот же миг: чанков у него нет.
+                complete: chunk_total == 0,
+            };
+            self.store.put_file(&record)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     /// Пришло предложение файлов.
     ///
     /// Сообщение с подписью ложится в историю обычным путём — с событием и
@@ -3468,31 +3981,7 @@ impl<S: Store> Engine<S> {
             return Ok(effects);
         }
 
-        let mut records = Vec::with_capacity(offers.len());
-        for offer in offers {
-            let chunk_total = ratatosk_proto::files::chunk_count(offer.size_bytes);
-            let record = StoredFile {
-                file_id: offer.file_id,
-                msg_id: envelope.msg_id,
-                name: offer.name,
-                size_bytes: offer.size_bytes,
-                // Порядок предложений в конверте — он же порядок, в каком
-                // их выбрал отправитель. Своего мнения у получателя тут нет.
-                ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
-                chunk_total,
-                key: offer.key,
-                preview: offer.preview,
-                incoming: true,
-                source_path: None,
-                // Порог — настройка, а не правило: `None` означает «спрашивать
-                // всегда», и это законный выбор человека.
-                accepted: ratatosk_proto::files::auto_accept(offer.size_bytes, self.auto_accept),
-                // Пустой файл собран в тот же миг: чанков у него нет.
-                complete: chunk_total == 0,
-            };
-            self.store.put_file(&record)?;
-            records.push(record);
-        }
+        let records = self.record_offers(envelope.msg_id, offers)?;
 
         for record in records {
             if record.complete {
@@ -3517,10 +4006,20 @@ impl<S: Store> Engine<S> {
         let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
         // Отдаём только своё и только тому, кому отправляли: просьба про чужой
         // файл — попытка вычитать переписку, которой у собеседника нет.
-        if file.incoming
-            || self.store.message(&file.msg_id)?.map(|m| m.chat_id)
-                != Some(Self::chat_id_for(&peer_ik))
-        {
+        //
+        // В группе «кому отправляли» — это **состав** (§11.3): копия ушла
+        // каждому участнику, и просить вправе каждый. Проверка та же
+        // по смыслу, но спрашивает у состава, а не у `chat_id_for`:
+        // у группы идентификатор чата из ключа не выводится вовсе.
+        let owner_of = self.store.message(&file.msg_id)?.map(|m| m.chat_id);
+        let may_ask = match owner_of {
+            Some(chat) => match self.groups.get(&chat) {
+                Some(state) => state.group.contains(&peer_ik),
+                None => chat == Self::chat_id_for(&peer_ik),
+            },
+            None => false,
+        };
+        if file.incoming || !may_ask {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
         }
@@ -3529,7 +4028,13 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
 
-        let position = self.sending.iter().position(|s| s.file_id == file_id);
+        // **По паре «файл и получатель», а не по одному файлу.** В группе
+        // один и тот же файл просят несколько участников, и каждый идёт
+        // по нему в своём темпе: у одного прямой канал, у другого почта
+        // с минутным кругом. Одно окно на всех означало бы, что просьба
+        // второго отматывает отправку первому.
+        let position =
+            self.sending.iter().position(|s| s.file_id == file_id && s.peer_ik == peer_ik);
         let sending = match position {
             Some(at) => {
                 let sending = &mut self.sending[at];
@@ -3562,19 +4067,31 @@ impl<S: Store> Engine<S> {
         };
 
         if sending.acked_upto >= file.chunk_total {
-            // Получатель сказал, что у него всё. Больше этой передаче ничего
-            // не нужно.
-            self.sending.retain(|s| s.file_id != file_id);
+            // Получатель сказал, что у него всё. Больше **этой** передаче
+            // ничего не нужно — а остальным участникам группы ещё нужно,
+            // и их окна остаются.
+            self.sending.retain(|s| s.file_id != file_id || s.peer_ik != peer_ik);
             return Ok(Vec::new());
         }
-        self.pump_file(now_ms, &file)
+        self.pump_file(now_ms, &file, peer_ik)
     }
 
-    /// Досылает чанки, пока окно не закрылось.
-    fn pump_file(&mut self, now_ms: u64, file: &StoredFile) -> Result<Vec<Effect>, EngineError> {
+    /// Досылает чанки одному получателю, пока его окно не закрылось.
+    ///
+    /// Получатель назван явно: в группе у одного файла их несколько, и
+    /// у каждого своя дорога. Досылать «всем сразу» здесь нельзя — окно
+    /// меряется подтверждениями, а они приходят порознь.
+    fn pump_file(
+        &mut self,
+        now_ms: u64,
+        file: &StoredFile,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
         use ratatosk_proto::files;
 
-        let Some(index) = self.sending.iter().position(|s| s.file_id == file.file_id) else {
+        let Some(index) =
+            self.sending.iter().position(|s| s.file_id == file.file_id && s.peer_ik == peer_ik)
+        else {
             return Ok(Vec::new());
         };
         let sending = self.sending[index];
@@ -3634,6 +4151,9 @@ impl<S: Store> Engine<S> {
             if sealed.is_empty() {
                 // Молчать нельзя: передача встанет, и человек будет думать,
                 // что она идёт.
+                //
+                // Окна убираются **у всех** получателей, а не только
+                // у этого: исходник пропал не для кого-то одного.
                 self.sending.retain(|s| s.file_id != file.file_id);
                 effects.push(Effect::Notify(Event::HonestNotice {
                     text: crate::honest::FILE_SOURCE_GONE,
@@ -3650,7 +4170,9 @@ impl<S: Store> Engine<S> {
             effects.push(Effect::Send { peer_ik: sending.peer_ik, via, frame, handoff: None });
             next += 1;
         }
-        if let Some(slot) = self.sending.iter_mut().find(|s| s.file_id == file.file_id) {
+        if let Some(slot) =
+            self.sending.iter_mut().find(|s| s.file_id == file.file_id && s.peer_ik == peer_ik)
+        {
             slot.sent_upto = next;
         }
         Ok(effects)
@@ -3671,11 +4193,18 @@ impl<S: Store> Engine<S> {
 
         let (file_id, index, sealed) = files::chunk_from_payload(&envelope.payload)?;
         let Some(file) = self.store.file(&file_id)? else { return Ok(Vec::new()) };
-        if !file.incoming
-            || !file.accepted
-            || self.store.message(&file.msg_id)?.map(|m| m.chat_id)
-                != Some(Self::chat_id_for(&peer_ik))
-        {
+        // Чанк принимается **только от того, кто предложил файл**.
+        //
+        // Раньше здесь сверялся чат: у 1:1 он выводится из ключа, и это
+        // было то же самое. В группе — нет: идентификатор чата из ключа
+        // не выводится, и сверка не сходилась бы никогда, то есть чанки
+        // группового вложения отвергались бы как мусор все до одного.
+        //
+        // Правило про отправителя вдобавок **строже** прежнего и верно
+        // для обоих случаев: чанки есть только у того, кто прислал
+        // предложение, — пересылки в v1 нет (§11.3). Оно же зеркалит
+        // `ask_for_file`: просим у отправителя, у него же и принимаем.
+        if !file.incoming || !file.accepted || self.offerer_of(&file)? != Some(peer_ik) {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
         }
@@ -3790,7 +4319,6 @@ impl<S: Store> Engine<S> {
     /// перезапуска — своего состояния передачи у получателя нет, всё нужное
     /// лежит в базе.
     fn resume_files(&mut self, now_ms: u64, peer_ik: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
-        let chat = Self::chat_id_for(&peer_ik);
         let unfinished: Vec<StoredFile> = self
             .store
             .unfinished_files()?
@@ -3800,7 +4328,10 @@ impl<S: Store> Engine<S> {
 
         let mut effects = Vec::new();
         for file in unfinished {
-            if self.store.message(&file.msg_id)?.map(|m| m.chat_id) != Some(chat) {
+            // Тем же правилом, что и приём чанка: возобновляем то, что
+            // предлагал **этот** участник. Раньше сверялся чат, и групповое
+            // вложение не возобновлялось никогда.
+            if self.offerer_of(&file)? != Some(peer_ik) {
                 continue;
             }
             effects.extend(self.ask_for_file(now_ms, &file, true)?);
@@ -4275,6 +4806,12 @@ impl<S: Store> Engine<S> {
         msg_id: MsgId,
         text: &str,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Группа — первой, как и у отправки текста: идентификаторы чатов
+        // у групп и у 1:1 живут в одном пространстве, а записи `by_chat`
+        // у группы нет вовсе.
+        if self.groups.contains_key(&chat) {
+            return self.edit_group_message(now_ms, chat, msg_id, text);
+        }
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
         ratatosk_proto::edit::check(text)?;
         // Правка едет своим кадром, и предел у неё тот же: иначе сообщение,
@@ -4370,6 +4907,9 @@ impl<S: Store> Engine<S> {
         msg_id: MsgId,
         emoji: &str,
     ) -> Result<Vec<Effect>, EngineError> {
+        if self.groups.contains_key(&chat) {
+            return self.react_in_group(now_ms, chat, msg_id, emoji);
+        }
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
         // Проверка та же, что и на приёме: отправить то, что сами не приняли
         // бы, — верный способ развести две стороны.
@@ -4638,18 +5178,45 @@ impl<S: Store> Engine<S> {
         let availability = self.availability_of(peer_ik).ok()?;
         let mut attempt = Attempt::new();
         while let Some(Decision::Use(transport)) = attempt.next(availability) {
-            if !ratatosk_proto::files::may_send_over(size_bytes, transport) {
-                continue;
-            }
-            // Второе, что отсекает почту, — предел письма у **своего**
-            // сервера. Чанк едет письмом на полтора мебибайта; сервер,
-            // объявивший `SIZE` меньше, отверг бы каждый, и передача
-            // начиналась бы заново вечно. Пока предел неизвестен, почта
-            // проходит: молчащий сервер не должен быть хуже скупого.
-            if transport == Transport::Mail && !self.mail_limits.carries_file_chunks() {
+            if !self.file_may_ride(transport, size_bytes) {
                 continue;
             }
             if self.sessions.for_peer(peer_ik, transport).is_some() {
+                return Some(transport);
+            }
+        }
+        None
+    }
+
+    /// Годится ли такой транспорт для чанков такого размера.
+    ///
+    /// Одно правило на два вопроса — «куда слать сейчас» ([`Engine::
+    /// file_channel`]) и «куда проситься, если сессии ещё нет»
+    /// ([`Engine::file_route`]). Разойдись они, второй звал бы рукопожатие
+    /// на канал, которым файл всё равно не поедет.
+    ///
+    /// Почту отсекает не только §10.3, но и предел письма у **своего**
+    /// сервера: чанк едет письмом на полтора мебибайта, и сервер,
+    /// объявивший `SIZE` меньше, отверг бы каждый — передача начиналась бы
+    /// заново вечно. Пока предел неизвестен, почта проходит: молчащий
+    /// сервер не должен быть хуже скупого.
+    fn file_may_ride(&self, transport: Transport, size_bytes: u64) -> bool {
+        if !ratatosk_proto::files::may_send_over(size_bytes, transport) {
+            return false;
+        }
+        !(transport == Transport::Mail && !self.mail_limits.carries_file_chunks())
+    }
+
+    /// Каким каналом файл поехал бы, **будь** там сессия.
+    ///
+    /// Отличается от [`Engine::file_channel`] ровно тем, что не смотрит
+    /// на сессии: нужен он затем, чтобы понять, о каком рукопожатии
+    /// просить. Возвращает первый годный по §5.4, а не первый с сессией.
+    fn file_route(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<Transport> {
+        let availability = self.availability_of(peer_ik).ok()?;
+        let mut attempt = Attempt::new();
+        while let Some(Decision::Use(transport)) = attempt.next(availability) {
+            if self.file_may_ride(transport, size_bytes) {
                 return Some(transport);
             }
         }
@@ -4890,6 +5457,55 @@ impl<S: Store> Engine<S> {
             return Ok(None);
         }
         Ok(self.store.avatar(peer_ik)?.map(|a| a.bytes))
+    }
+
+    /// Аватарка группы — или `None`, если её нет.
+    ///
+    /// **Сверки здесь нет, и это не забытая проверка.** У лица контакта
+    /// показ ограничен §4.2 (см. [`Engine::avatar_of`]): подставленное
+    /// чужое лицо покупает самозванцу доверие мимо всех предупреждений.
+    /// Картинка группы такого заявления не делает — она отвечает не на
+    /// вопрос «кто этот человек», а на вопрос «какой это разговор»,
+    /// и рядом с ней стоит название, которое мы показываем несверенным
+    /// без оговорок. Полное рассуждение — в `ratatosk_proto::avatar`.
+    ///
+    /// Участников группы ядро заводит несверенными (§11.5), так что
+    /// правило §4.2 здесь означало бы «картинки почти никогда нет» —
+    /// поведение, которого человеку не объяснить (§14).
+    ///
+    /// Пустые байты на диске — «создатель снял картинку»; наружу это
+    /// то же `None`, что и «не ставили». Разница нужна только сравнению
+    /// меток, а ему видна метка.
+    ///
+    /// # Errors
+    ///
+    /// Ошибка хранилища.
+    pub fn group_avatar_of(&self, chat: &ChatId) -> Result<Option<Vec<u8>>, EngineError> {
+        if !self.groups.contains_key(chat) {
+            return Ok(None);
+        }
+        Ok(self.store.group_avatar(chat)?.map(|a| a.bytes).filter(|bytes| !bytes.is_empty()))
+    }
+
+    /// Метка аватарки группы — или `0`, если показывать нечего.
+    ///
+    /// **Метка, а не признак «есть картинка».** Булево на смену не
+    /// реагирует, и клиент показывал бы прежнее лицо до перезапуска —
+    /// та же причина, по какой метка едет и на проводе компаньона.
+    ///
+    /// Ноль означает ровно «показывать нечего», и покрывает он два
+    /// случая: картинку не ставили и картинку сняли. У снятой метка
+    /// на диске есть — она нужна сравнению, — но наружу эти два случая
+    /// неразличимы, потому что рисуют по ним одно и то же.
+    ///
+    /// # Errors
+    ///
+    /// Ошибка хранилища.
+    pub fn group_avatar_stamp(&self, chat: &ChatId) -> Result<u64, EngineError> {
+        if !self.store.has_group_avatar(chat)? {
+            return Ok(0);
+        }
+        Ok(self.groups.get(chat).map_or(0, |state| state.avatar_hlc.wall_ms))
     }
 
     /// Своя аватарка.
@@ -5326,6 +5942,23 @@ impl<S: Store> Engine<S> {
         }
     }
 
+    /// Чей это личный чат — по идентификатору, приехавшему с десктопа.
+    ///
+    /// **Единственное место, где десктоп называет человека.** §13.4 не
+    /// пускает `IK` через границу устройства, и участник на том проводе
+    /// назван идентификатором своего личного чата (`companion::Member`).
+    /// Разворачивает его обратно телефон — тем же соответствием, которым
+    /// он и так находит чат по контакту.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownPeer`] — такого чата у нас нет. Отказ приедет
+    /// словами (§14): «его нет в контактах» человек за ноутбуком поймёт,
+    /// а тишину — нет.
+    fn peer_of_chat(&self, chat: ChatId) -> Result<[u8; 32], EngineError> {
+        self.by_chat.get(&chat).copied().ok_or(EngineError::UnknownPeer)
+    }
+
     fn try_serve_companion(
         &mut self,
         now_ms: u64,
@@ -5514,6 +6147,22 @@ impl<S: Store> Engine<S> {
                 Ok(companion::Response::Done)
             }
             companion::Request::Avatar { chat } => {
+                // Группа спрашивается тем же видом просьбы, что и человек,
+                // и это не экономия на видах: снаружи это один вопрос —
+                // «что рисовать в кружке этого чата». Развилка здесь,
+                // потому что правила показа у них разные: у лица контакта
+                // §4.2, у картинки группы никакого (`proto::avatar`).
+                if let Some(chat) = chat.filter(|chat| self.groups.contains_key(chat)) {
+                    let bytes = self.group_avatar_of(&chat)?;
+                    return Ok(companion::Response::Avatar {
+                        avatar_ms: if bytes.is_some() {
+                            self.group_avatar_stamp(&chat)?
+                        } else {
+                            0
+                        },
+                        bytes,
+                    });
+                }
                 let owner = match chat {
                     Some(chat) => self.by_chat.get(&chat).copied(),
                     None => Some(self.identity.public().ik),
@@ -5533,7 +6182,2142 @@ impl<S: Store> Engine<S> {
                 };
                 Ok(companion::Response::Avatar { bytes, avatar_ms })
             }
+            // Дальше — распоряжение группой со второго экрана (§11).
+            // Каждая ветка зовёт **тот же самый обработчик**, что и команда
+            // с телефона, и это здесь то же главное, что у правок:
+            // «исключать вправе только создатель», «выйти вправе всякий»,
+            // «название непустое и не длиннее предела» — решения §11.2
+            // принимаются в одном месте. Скопируй мы сюда хоть одно —
+            // и второй экран однажды разрешил бы то, чего не разрешает
+            // первый, причём молча.
+            //
+            // Два обязательных предупреждения (§11.5 при заведении, §11.4
+            // при исключении) здесь **не проверяются и приехать не могут**:
+            // это тексты, а не сведения, и живут они в биндингах того окна,
+            // где нажимают кнопку. Телефон не знает, показали ли их, и
+            // сделать вид, что знает, было бы хуже, чем не знать.
+            companion::Request::CreateGroup { title } => {
+                let effects_here = self.on_create_group(now_ms, &title)?;
+                // Идентификатор берётся из уже собранного события, а не
+                // считается заново: у группы он случаен, и второй источник
+                // означал бы второе случайное число.
+                let chat = effects_here.iter().find_map(|effect| match effect {
+                    Effect::Notify(Event::GroupCreated { chat, .. }) => Some(*chat),
+                    _ => None,
+                });
+                effects.extend(effects_here);
+                match chat {
+                    Some(chat) => Ok(companion::Response::GroupCreated { chat }),
+                    // Недостижимо: `on_create_group` либо отказывает, либо
+                    // порождает это событие. Отвечать `Done` было бы хуже
+                    // отказа — десктоп решил бы, что группа заведена, и не
+                    // нашёл бы её.
+                    None => Ok(companion::Response::Refused(
+                        "группа заведена, но её идентификатор не вернулся — сообщите об этом"
+                            .to_owned(),
+                    )),
+                }
+            }
+            companion::Request::InviteToGroup { chat, member } => {
+                let peer_ik = self.peer_of_chat(member)?;
+                effects.extend(self.on_invite_to_group(now_ms, chat, peer_ik)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::EvictFromGroup { chat, member } => {
+                let peer_ik = self.peer_of_chat(member)?;
+                effects.extend(self.on_evict_from_group(now_ms, chat, peer_ik)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::RenameGroup { chat, title } => {
+                effects.extend(self.on_rename_group(now_ms, chat, &title)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::SetGroupAvatar { chat, bytes } => {
+                effects.extend(self.on_set_group_avatar(now_ms, chat, &bytes)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::LeaveGroup { chat } => {
+                effects.extend(self.on_leave_group(now_ms, chat)?);
+                Ok(companion::Response::Done)
+            }
+            companion::Request::Members { chat } => {
+                // Имя и признак «это я» считает телефон — той же функцией,
+                // что и для своего UI. Десктоп искал бы имя перебором
+                // и не нашёл бы **себя**: своей карточки в контактах нет.
+                //
+                // Участник назван идентификатором своего личного чата:
+                // §13.4 не пускает `IK` через эту границу, а такой
+                // идентификатор десктоп и так видит у каждой строки списка
+                // чатов. Заодно им же он умеет написать участнику лично —
+                // без единой новой просьбы.
+                let owner = self.groups.get(&chat).map(|state| state.group.owner);
+                let members = self
+                    .group_members(&chat)
+                    .into_iter()
+                    .map(|member| companion::Member {
+                        chat: Self::chat_id_for(&member.ik),
+                        name: member.name,
+                        mine: member.mine,
+                        // Права десктопа читаются отсюда и больше ниоткуда:
+                        // §11.2 разрешает исключать, переименовывать
+                        // и менять картинку только создателю, и без этого
+                        // признака окно рисовало бы кнопки, на которые
+                        // телефон отвечает отказом.
+                        owner: owner == Some(member.ik),
+                    })
+                    .collect();
+                Ok(companion::Response::Members { members })
+            }
         }
+    }
+
+    // --- Группы (§11) ---------------------------------------------------
+
+    /// Заводит группу с одним участником — собой (§11).
+    ///
+    /// Кадров отсюда не уезжает ни одного, и это не недоделка. Группа
+    /// в момент заведения состоит из создателя: рассказывать о ней некому,
+    /// пока в неё не позвали. Состав и ключи отправителей поедут
+    /// приглашением (§11.5) — там же, где появится первый получатель.
+    ///
+    /// Что ложится на диск сразу и почему все три вещи вместе:
+    ///
+    /// * **сама группа** — иначе перезапуск между заведением и первым
+    ///   приглашением стёр бы её молча;
+    /// * **операция добавления себя** — это первая запись истории состава,
+    ///   и та самая метка, которую увидят приглашённые. Выведи её заново
+    ///   при подъёме — она разошлась бы с их копией;
+    /// * **свой ключ отправителя** — он случаен (§11.1), то есть невыводим.
+    ///   Потеряв его до первого сообщения, мы завели бы новый, а участники,
+    ///   успевшие получить прежний, читали бы пустоту.
+    fn on_create_group(&mut self, now_ms: u64, title: &str) -> Result<Vec<Effect>, EngineError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(EngineError::GroupTitleEmpty);
+        }
+        if title.chars().count() > MAX_GROUP_TITLE_CHARS {
+            return Err(EngineError::GroupTitleTooLong);
+        }
+
+        // Идентификатор случаен — тем же источником и с тем же допущением,
+        // что `msg_id` (§9.1): шестнадцать байт из `entropy` не совпадут
+        // с чужими. Для 1:1 идентификатор выводится из `IK` (`chat_id_for`),
+        // и совпадение группы с будущим контактом здесь тоже исключается
+        // только этим допущением, не проверкой: проверить нечего — контакта
+        // ещё нет.
+        let chat: GroupId = self.entropy.msg_id();
+        let me = self.identity.public().ik;
+        let at = self.fresh_tag(now_ms, me)?;
+
+        let group = Group::create(chat, me, at);
+        // Свой ключ отправителя — тоже случайный, и по той же причине,
+        // по какой он вообще существует: цепочка §11.1 обязана начинаться
+        // с секрета, которого не знает никто, кроме владельца.
+        let mut chain = [0u8; 32];
+        self.entropy.fill(&mut chain);
+        let chain = SenderChain::new(zeroize::Zeroizing::new(chain));
+
+        // Название получает метку сразу: без неё первое же переименование
+        // сравнивалось бы с пустотой, а второе — с меткой первого, и
+        // «только вперёд» держалось бы на случайности.
+        let title_hlc = self.clock.now(now_ms)?;
+        self.store.put_group(&StoredGroup {
+            chat_id: chat,
+            owner_ik: me,
+            title: title.to_owned(),
+            title_wall: title_hlc.wall_ms,
+            title_logical: title_hlc.logical,
+            created_ms: now_ms,
+        })?;
+        self.store.put_sender_chain(
+            &chat,
+            &StoredSenderChain {
+                member_ik: me,
+                chain: *chain.export(),
+                counter: chain.counter(),
+                // У своей цепочки пропусков не бывает: каждый номер
+                // мы выдаём сами и по порядку.
+                skipped: Vec::new(),
+            },
+        )?;
+        // Своё добавление ложится **подписанным блоком**, а не только
+        // разложенными операциями. Отправлять его сейчас некому, а хранить
+        // надо: при первом же приглашении новичку отдают историю целиком
+        // (§11.5), и блок без подписи он принять не сможет — да и не должен.
+        self.record_own_ops(now_ms, chat, &[OrSet::prepare_add(me, at)])?;
+
+        self.groups.insert(
+            chat,
+            GroupState {
+                group,
+                title: title.to_owned(),
+                title_hlc,
+                // Картинки у новорождённой группы нет, и метки у неё тоже:
+                // ноль означает «не ставили», и первая же поставленная
+                // его обгонит.
+                avatar_hlc: Hlc::default(),
+                created_ms: now_ms,
+            },
+        );
+
+        Ok(vec![Effect::Notify(Event::GroupCreated { chat, title: title.to_owned() })])
+    }
+
+    /// Приглашает человека в группу (§11.2, §11.5).
+    ///
+    /// Отсюда уезжает больше кадров, чем от любой другой команды, и делятся
+    /// они на две несимметричные половины.
+    ///
+    /// **Прежним участникам** — то, что изменилось: подписанный блок
+    /// с добавлением, карточка новичка и наша новая цепочка отправителя.
+    ///
+    /// **Новичку** — всё, чего у него нет: история состава целиком, карточки
+    /// участников и все известные нам ключи отправителей. Спецификация
+    /// перечисляет ровно эти три вещи (§11.5), и порознь они бесполезны:
+    /// по составу не с кем говорить без карточек, а подписи блоков нечем
+    /// проверять без `SK`, который в карточке и лежит.
+    ///
+    /// # Почему цепочка меняется
+    ///
+    /// §11.5: «при вступлении каждый участник обязан начать новую
+    /// sender-цепочку». Полноценной backward secrecy это не даёт —
+    /// новичок получит и **текущие** цепочки остальных, — но ограничивает
+    /// окно: всё, что мы отправим после этой строки, выведено из секрета,
+    /// которого до приглашения не существовало.
+    ///
+    /// Цена названа честно и в `ARCHITECTURE.md` (5ву): наши сообщения,
+    /// уехавшие по старой цепочке и ещё не дошедшие, у прежних участников
+    /// не откроются — новая цепочка заменяет старую в одной строке. Пока
+    /// групповых сообщений нет, платить нечем; когда появятся, это придётся
+    /// решать в них.
+    fn on_invite_to_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if !state.group.contains(&me) {
+            return Err(EngineError::NotInGroup);
+        }
+        if state.group.contains(&peer_ik) {
+            return Err(EngineError::AlreadyInGroup);
+        }
+        // Контакт нужен не ради вежливости: без карточки ему нечем отправить
+        // даже первое рукопожатие, а без сессии — ничего из перечисленного
+        // выше. Приглашение незнакомцу было бы командой, которая заведомо
+        // ничего не делает.
+        if !self.contacts.contains_key(&peer_ik) {
+            return Err(EngineError::UnknownPeer);
+        }
+
+        let at = self.fresh_tag(now_ms, me)?;
+        // `invite` держит предел §11.3 — тридцать два участника. Проверять
+        // его здесь во второй раз значило бы завести второе место, где
+        // это число знают.
+        let op = self.groups[&chat].group.invite(peer_ik, at)?;
+        let block = self.record_own_ops(now_ms, chat, std::slice::from_ref(&op))?;
+        if let Some(state) = self.groups.get_mut(&chat) {
+            state.group.apply(op);
+        }
+
+        // Цепочка меняется **до** рассылки: и прежние участники, и новичок
+        // обязаны получить одну и ту же новую, а не разные.
+        let mine = self.rotate_sender_chain(chat)?;
+
+        let mut effects = Vec::new();
+        let cards = self.cards_by_ik()?;
+        let newcomer_card = cards.get(&peer_ik).cloned();
+        let members: Vec<[u8; 32]> =
+            self.groups[&chat].group.members().copied().filter(|m| *m != me).collect();
+
+        for member in &members {
+            if *member == peer_ik {
+                continue;
+            }
+            effects.extend(self.tell_member(
+                now_ms,
+                *member,
+                PayloadType::GroupMembership,
+                block.clone(),
+            )?);
+            if let Some(card) = newcomer_card.clone() {
+                let roster = group::Roster { group: chat, cards: vec![card] };
+                effects.extend(self.tell_member(
+                    now_ms,
+                    *member,
+                    PayloadType::GroupRoster,
+                    group::roster_value(&roster),
+                )?);
+            }
+            effects.extend(self.tell_member(
+                now_ms,
+                *member,
+                PayloadType::SenderKey,
+                group::sender_key_value(&mine),
+            )?);
+        }
+
+        effects.extend(self.hand_over_group(now_ms, chat, peer_ik, &cards)?);
+        effects.push(Effect::Notify(Event::GroupMembershipChanged { chat }));
+        Ok(effects)
+    }
+
+    /// Исключает участника (§11.2, §11.4).
+    ///
+    /// # Кто вправе
+    ///
+    /// Только создатель, и проверяет это `Group::evict` — второго места,
+    /// где знают это правило, здесь нет. Приём проверяет его отдельно
+    /// и своими руками: блок с удалением от не-создателя отвергается целиком,
+    /// потому что верить чужой проверке нечему.
+    ///
+    /// # Исключённому говорят
+    ///
+    /// Блок уезжает **и ему тоже**, хотя из состава он уже вышел. Молчание
+    /// здесь было бы худшим из решений: его клиент показывал бы живую группу,
+    /// в которой никто не отвечает, — то самое молчание, которое §14
+    /// запрещает. Узнать причину он вправе.
+    ///
+    /// # Цепочка не меняется
+    ///
+    /// При **вступлении** каждый заводит новую (§11.5); при уходе — нет,
+    /// и менять её поздно: прошлое исключённый уже прочёл. §11.4 говорит
+    /// это прямо, и `EvictionConsequences::ui_text` повторяет это человеку
+    /// дословно — исключение социальное, а не криптографическое.
+    fn on_evict_from_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        if peer_ik == me {
+            return Err(EngineError::CannotEvictSelf);
+        }
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if !state.group.contains(&me) {
+            return Err(EngineError::NotInGroup);
+        }
+        // `evict` держит оба правила §11.2 — «только создатель» и «только
+        // того, кто состоит», — и отказывает своими словами.
+        let op = state.group.evict(me, peer_ik)?;
+
+        let block = self.record_own_ops(now_ms, chat, std::slice::from_ref(&op))?;
+        if let Some(state) = self.groups.get_mut(&chat) {
+            state.group.apply(op);
+        }
+
+        // Список получателей берётся **после** применения, и в него руками
+        // добавляется исключённый: из состава он уже вышел, а сказать ему
+        // надо.
+        let mut targets: Vec<[u8; 32]> =
+            self.groups[&chat].group.members().copied().filter(|m| *m != me).collect();
+        targets.push(peer_ik);
+
+        let mut effects = Vec::new();
+        for member in targets {
+            effects.extend(self.tell_member(
+                now_ms,
+                member,
+                PayloadType::GroupMembership,
+                block.clone(),
+            )?);
+        }
+        effects.push(Effect::Notify(Event::GroupMembershipChanged { chat }));
+        Ok(effects)
+    }
+
+    /// Отдаёт новичку всё, чем группа держится (§11.5).
+    ///
+    /// Три вещи, и ни одна без остальных не работает: история состава,
+    /// карточки участников, ключи отправителей.
+    ///
+    /// **История — блоками, по кадру на блок**, а не одним свёртком. Свёрток
+    /// пришлось бы подписать нам, и новичок узнал бы ровно то, что мы
+    /// не соврали себе (5во). Плата — кадр на каждое изменение состава
+    /// за всю жизнь группы; свернёт эту историю снапшот §12, которого пока
+    /// нет, и это записано в `ARCHITECTURE.md`.
+    fn hand_over_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        newcomer: [u8; 32],
+        cards: &BTreeMap<[u8; 32], Vec<u8>>,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let mut effects = Vec::new();
+
+        for stored in self.store.membership_blocks(&chat)? {
+            let value = ratatosk_codec::canonical::decode(&stored.bytes)?;
+            effects.extend(self.tell_member(
+                now_ms,
+                newcomer,
+                PayloadType::GroupMembership,
+                value,
+            )?);
+        }
+
+        // Первым — кто создал группу, как она называется и как выглядит:
+        // без создателя не работает §11.2, без названия чат нечем показать.
+        // Вывести это из блоков честно нельзя (см. `group::Intro`).
+        //
+        // Картинка едет здесь и только здесь: переслать новичку чужое
+        // действие нельзя — мы выдали бы старой картинке метку своего
+        // конверта, и настоящая новая была бы у него отвергнута как
+        // опоздавшая (`group_action::Action::Avatar`).
+        let stored_avatar = self.store.group_avatar(&chat)?;
+        if let Some(state) = self.groups.get(&chat) {
+            let (avatar, avatar_hlc) = stored_avatar.map_or_else(
+                || (Vec::new(), Hlc::default()),
+                |a| (a.bytes, Hlc::new(a.avatar_wall, a.avatar_logical)),
+            );
+            let intro = group::Intro {
+                group: chat,
+                owner: state.group.owner,
+                title: state.title.clone(),
+                title_hlc: state.title_hlc,
+                avatar,
+                avatar_hlc,
+            };
+            let value = group::intro_value(&intro);
+            effects.extend(self.tell_member(now_ms, newcomer, PayloadType::GroupIntro, value)?);
+        }
+
+        let roster = self.roster_for(chat, newcomer, cards);
+        if !roster.cards.is_empty() {
+            effects.extend(self.tell_member(
+                now_ms,
+                newcomer,
+                PayloadType::GroupRoster,
+                group::roster_value(&roster),
+            )?);
+        }
+
+        for chain in self.store.sender_chains(&chat)? {
+            let block = group::SenderKeyBlock {
+                group: chat,
+                member: chain.member_ik,
+                chain: chain.chain,
+                counter: chain.counter,
+            };
+            effects.extend(self.tell_member(
+                now_ms,
+                newcomer,
+                PayloadType::SenderKey,
+                group::sender_key_value(&block),
+            )?);
+        }
+        Ok(effects)
+    }
+
+    /// Ставит один групповой кадр в очередь §5.4.
+    ///
+    /// Через `enqueue_request`, то есть **без строки в истории**: состав,
+    /// карточки и ключи — не сообщения, и в чате им делать нечего. Зато
+    /// им достаётся вся лестница транспортов: группа, собравшаяся почтой,
+    /// обязана собраться и через неё.
+    fn tell_member(
+        &mut self,
+        now_ms: u64,
+        member: [u8; 32],
+        payload_type: PayloadType,
+        payload: Value,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Участник, которого мы не знаем как контакт, встречается законно:
+        // его добавил кто-то другой, а карточка до нас ещё не доехала.
+        // Слать ему нечем и незачем — тот, кто его пригласил, расскажет ему
+        // всё сам.
+        if !self.contacts.contains_key(&member) {
+            return Ok(Vec::new());
+        }
+        let (_, effects) = self.enqueue_request(now_ms, member, payload_type, payload)?;
+        Ok(effects)
+    }
+
+    /// Подписывает свои операции состава, кладёт их на диск и отдаёт нагрузку.
+    ///
+    /// Три записи одним движением, и порознь их делать нельзя: разложенные
+    /// операции — то, из чего состав собирается, подписанный блок — то, чем
+    /// его доказывают новичку (§11.5), а нагрузка — то, что уедет. Разойдись
+    /// они, состав у нас и у остальных разошёлся бы молча.
+    fn record_own_ops(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        ops: &[OrSetOp<ActorId>],
+    ) -> Result<Value, EngineError> {
+        let me = self.identity.public().ik;
+        let block = group::MembershipBlock { group: chat, author: me, ops: ops.to_vec() };
+        let payload = group::signed_membership(&self.identity, &block)?;
+        let bytes = ratatosk_codec::canonical::encode(&payload)?;
+
+        self.store.put_membership(&chat, &Self::stored_from_ops(ops))?;
+        self.store.put_membership_block(
+            &chat,
+            &StoredMembershipBlock {
+                block_id: Self::block_id(&bytes),
+                author_ik: me,
+                bytes,
+                received_ms: now_ms,
+            },
+        )?;
+        Ok(payload)
+    }
+
+    /// Идентификатор подписанного блока — хэш его байт.
+    ///
+    /// По проводу не едет ни разу: это ключ строки в хранилище, и нужен он
+    /// одному — чтобы тот же блок, пришедший вторым транспортом (§9.2),
+    /// лёг в ту же строку.
+    fn block_id(bytes: &[u8]) -> [u8; 16] {
+        let full = ratatosk_crypto::kdf::derive(ratatosk_crypto::labels::GROUP_BLOCK, bytes);
+        full[..16].try_into().expect("срез длины 16")
+    }
+
+    /// Заводит новую цепочку отправителя для этой группы (§11.5).
+    ///
+    /// Не продвигает старую, а **заменяет** её случайным секретом: продвижение
+    /// вперёд знающему прежнее состояние ничего не закрывает — оно из него
+    /// и выводится. Смысл требования §11.5 в том, чтобы новичок не мог
+    /// вывести ключи прошлых сообщений, а этого достигает только новый
+    /// секрет.
+    fn rotate_sender_chain(&mut self, chat: ChatId) -> Result<group::SenderKeyBlock, EngineError> {
+        let me = self.identity.public().ik;
+        let mut fresh = [0u8; 32];
+        self.entropy.fill(&mut fresh);
+        let chain = SenderChain::new(zeroize::Zeroizing::new(fresh));
+        let stored = StoredSenderChain {
+            member_ik: me,
+            chain: *chain.export(),
+            counter: chain.counter(),
+            skipped: Vec::new(),
+        };
+        self.store.put_sender_chain(&chat, &stored)?;
+        Ok(group::SenderKeyBlock {
+            group: chat,
+            member: me,
+            chain: stored.chain,
+            counter: stored.counter,
+        })
+    }
+
+    /// Карточки участников группы, кроме одного (§11.5).
+    ///
+    /// Исключается получатель: свою карточку он знает лучше нас, а прислать
+    /// её обратно значило бы дать ему повод обновить себя же нашей копией.
+    ///
+    /// Участник, чьей карточки у нас нет, просто не попадает в список.
+    /// Так бывает законно: его добавил кто-то другой, и до нас карточка
+    /// ещё не доехала. Врать про него нечем, а молчание здесь честнее
+    /// пустой записи.
+    fn roster_for(
+        &self,
+        chat: ChatId,
+        except: [u8; 32],
+        cards: &BTreeMap<[u8; 32], Vec<u8>>,
+    ) -> group::Roster {
+        let Some(state) = self.groups.get(&chat) else {
+            return group::Roster { group: chat, cards: Vec::new() };
+        };
+        let cards = state
+            .group
+            .members()
+            .filter(|member| **member != except)
+            .filter_map(|member| cards.get(member).cloned())
+            .collect();
+        group::Roster { group: chat, cards }
+    }
+
+    /// Байты карточек: свои и всех известных контактов, по `IK`.
+    ///
+    /// **С диска, а не пересобранные из полей.** Карточка контакта хранится
+    /// теми байтами, которыми приехала (§6). Каноническое кодирование
+    /// однозначно, и пересборка почти наверняка дала бы те же байты —
+    /// «почти» тут лишнее слово: карточка чужой версии может нести поля,
+    /// которых наш разбор не знает, и пересобранная она их потеряет.
+    ///
+    /// Своя собирается здесь же: её каноническое кодирование и есть то,
+    /// что мы объявляем (§4.3), — принятых байт у неё не бывает.
+    ///
+    /// Один заход в хранилище на всё приглашение, а не по заходу
+    /// на участника: тридцать два участника — это тридцать два обхода
+    /// списка контактов.
+    fn cards_by_ik(&self) -> Result<BTreeMap<[u8; 32], Vec<u8>>, EngineError> {
+        let mut cards: BTreeMap<[u8; 32], Vec<u8>> =
+            self.store.contacts()?.into_iter().map(|c| (c.ik, c.card_bytes)).collect();
+        cards.insert(self.identity.public().ik, self.own_card().encode()?);
+        Ok(cards)
+    }
+
+    // --- Приём вступления (§11.5) ---------------------------------------
+
+    /// Разбирает групповой кадр от контакта (§11.5).
+    ///
+    /// Четыре вида, и объединяет их одно: все они относятся к группе,
+    /// которой у нас может ещё не быть. Кадр про неизвестную группу
+    /// не отбрасывается, а откладывается — почта переставляет письма (§9.2),
+    /// и порядок четырёх кадров вступления не обещан никем.
+    fn on_group_frame(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(chat) = Self::group_of_payload(envelope.payload_type, &envelope.payload) else {
+            // Нагрузка не той формы — обычный сетевой мусор (§7.3).
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+
+        let mut effects = self.dispatch_group_frame(now_ms, peer_ik, chat, envelope.clone())?;
+        // Отложенное разбирается после **любого** группового кадра, а не
+        // только после представления: карточка участника может доехать
+        // позже блока, который ею проверяется, и тогда блок становится
+        // применимым не от появления группы, а от появления контакта.
+        effects.extend(self.drain_pending_group(now_ms)?);
+        Ok(effects)
+    }
+
+    /// Какой группы этот кадр — до всякой проверки.
+    ///
+    /// Нужно, чтобы отложить кадр, ещё не зная, что с ним делать. Для блока
+    /// состава это `claims_group`: имя группы лежит внутри подписанного
+    /// куска, и верить ему до проверки нельзя ни в чём, кроме поиска.
+    fn group_of_payload(kind: PayloadType, payload: &Value) -> Option<ChatId> {
+        match kind {
+            PayloadType::GroupIntro => group::intro_from_value(payload).ok().map(|i| i.group),
+            PayloadType::GroupMessage => {
+                group::parse_message(payload).ok().map(|m| *m.claims_group())
+            }
+            PayloadType::GroupRoster => group::roster_from_value(payload).ok().map(|r| r.group),
+            PayloadType::SenderKey => group::sender_key_from_value(payload).ok().map(|k| k.group),
+            PayloadType::GroupMembership => {
+                group::parse_membership(payload).ok().map(|u| *u.claims_group())
+            }
+            _ => None,
+        }
+    }
+
+    /// Раскладывает кадр по обработчикам либо откладывает его.
+    fn dispatch_group_frame(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        chat: ChatId,
+        envelope: Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Представление заводит группу и потому обслуживается до проверки
+        // «знаем ли мы её»: оно и есть ответ на этот вопрос.
+        if envelope.payload_type == PayloadType::GroupIntro {
+            return self.on_group_intro(now_ms, peer_ik, &envelope.payload);
+        }
+        if !self.groups.contains_key(&chat) {
+            self.park_group_frame(PendingGroup { chat, envelope, peer_ik });
+            return Ok(Vec::new());
+        }
+        match envelope.payload_type {
+            PayloadType::GroupMembership => {
+                self.on_membership_block(now_ms, peer_ik, chat, &envelope)
+            }
+            PayloadType::GroupRoster => self.on_group_roster(now_ms, peer_ik, chat, &envelope),
+            PayloadType::SenderKey => self.on_sender_key(peer_ik, chat, &envelope),
+            // Сообщение и действие разбираются целиком: `msg_id` и метка
+            // HLC лежат в конверте, и без них их некуда положить.
+            PayloadType::GroupMessage => self.on_group_message(now_ms, peer_ik, &envelope),
+            PayloadType::GroupAction => self.on_group_action(now_ms, peer_ik, &envelope),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Откладывает кадр до появления группы.
+    ///
+    /// Переполнение выбрасывает **самый старый**: свежий кадр относится
+    /// к тому, что происходит сейчас, а пролежавший дольше всех, скорее
+    /// всего, относится к группе, в которую нас так и не позвали.
+    ///
+    /// Возраст здесь — это **место в очереди**, и времени прихода кадр
+    /// не носит. Носил бы — у одного и того же возраста стало бы два
+    /// представления, читаемых порознь, и разошлись бы они молча.
+    fn park_group_frame(&mut self, frame: PendingGroup) {
+        if self.pending_group.len() >= MAX_PENDING_GROUP {
+            self.pending_group.remove(0);
+        }
+        self.pending_group.push(frame);
+    }
+
+    /// Разбирает отложенное, что стало применимым.
+    ///
+    /// **Условие продолжения — укоротившаяся очередь, а не непустой заход**,
+    /// и это не оптимизация. Разбор вправе положить кадр обратно: блок,
+    /// автора которого мы всё ещё не знаем, откладывается снова. Повторяй
+    /// мы обход по признаку «нашлось, что разбирать» — тот же блок брался
+    /// бы и возвращался вечно, и шаг ядра не кончился бы никогда.
+    ///
+    /// Повтор при этом нужен: в одной очереди могут лежать блок и карточка,
+    /// которой он проверяется, и разобранные в неудачном порядке они
+    /// разошлись бы на один заход. Второй круг это чинит, а свойство
+    /// «очередь укоротилась» его завершает — расти она не может, кадры
+    /// в неё возвращаются только те, что из неё же и взяты.
+    fn drain_pending_group(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
+        let mut effects = Vec::new();
+        loop {
+            let before = self.pending_group.len();
+            let ready: Vec<PendingGroup> = self
+                .pending_group
+                .iter()
+                .filter(|frame| self.groups.contains_key(&frame.chat))
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                return Ok(effects);
+            }
+            self.pending_group.retain(|frame| !self.groups.contains_key(&frame.chat));
+            for frame in ready {
+                effects.extend(self.dispatch_group_frame(
+                    now_ms,
+                    frame.peer_ik,
+                    frame.chat,
+                    frame.envelope,
+                )?);
+            }
+            if self.pending_group.len() >= before {
+                return Ok(effects);
+            }
+        }
+    }
+
+    /// Принимает представление группы — и заводит её у себя (§11.5).
+    ///
+    /// **Только если группы ещё нет.** Владелец не меняется никогда (§11.2):
+    /// принять второе представление значило бы позволить любому участнику
+    /// переписать право исключать. Название тоже своё — рассылки
+    /// переименований v1 не описывает, и второе представление затёрло бы
+    /// то, что человек уже видит в списке.
+    ///
+    /// Своей цепочки отправителя у нас в новой группе нет — её здесь
+    /// и заводим, и тут же рассылаем: без неё наши сообщения никому
+    /// не откроются. Это та самая «новая цепочка при вступлении» (§11.5),
+    /// вид со стороны вступающего.
+    fn on_group_intro(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        payload: &Value,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Ok(intro) = group::intro_from_value(payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        if self.groups.contains_key(&intro.group) {
+            return Ok(Vec::new());
+        }
+
+        self.store.put_group(&StoredGroup {
+            chat_id: intro.group,
+            owner_ik: intro.owner,
+            title: intro.title.clone(),
+            // Метка приехала вместе с названием. Поставь мы здесь свою —
+            // переименование, случившееся до нашего вступления и доехавшее
+            // после, было бы отвергнуто как устаревшее.
+            title_wall: intro.title_hlc.wall_ms,
+            title_logical: intro.title_hlc.logical,
+            created_ms: now_ms,
+        })?;
+        self.groups.insert(
+            intro.group,
+            GroupState {
+                // `restore`, а не `create`: состав придёт операциями,
+                // и выдуманная здесь метка владельца сделала бы его
+                // неисключаемым (см. `Group::restore`).
+                group: Group::restore(intro.group, intro.owner),
+                title: intro.title.clone(),
+                title_hlc: intro.title_hlc,
+                // Картинка кладётся ниже, своим правилом: здесь метка
+                // нулевая, чтобы это правило было **одно** на все три
+                // дороги — свою смену, чужую и вводный блок.
+                avatar_hlc: Hlc::default(),
+                created_ms: now_ms,
+            },
+        );
+        // Картинка приехала вместе с меткой, и метка ложится та, что
+        // приехала: поставь мы свою, настоящая новая была бы отвергнута
+        // как опоздавшая. Негодные байты сюда не доходят — их отбросил
+        // разбор представления, не сорвав вступления.
+        if intro.avatar_hlc != Hlc::default() {
+            self.apply_group_avatar(intro.group, &intro.avatar, intro.avatar_hlc)?;
+        }
+
+        let mut effects =
+            vec![Effect::Notify(Event::GroupCreated { chat: intro.group, title: intro.title })];
+        // Ключ заводится сразу, а рассылается тем, кого мы уже знаем.
+        // Состав в этот миг обычно пуст — блоки ещё не разобраны, — и
+        // остальным он уедет из разбора отложенного, когда они появятся.
+        let mine = self.rotate_sender_chain(intro.group)?;
+        effects.extend(self.announce_sender_key(now_ms, intro.group, &mine)?);
+        Ok(effects)
+    }
+
+    /// Переименовывает группу.
+    ///
+    /// **Дополнение к спецификации:** §11 рассылки названия не описывает.
+    ///
+    /// # Вправе только создатель
+    ///
+    /// Правило §11.2 расширено по смыслу, а не сломано: создатель
+    /// распоряжается тем, что относится ко всей группе — удалением
+    /// из состава и её именем, — а участники только ростом состава.
+    ///
+    /// Цена названа вслух в `LeaveConsequences::owner_text`: создатель,
+    /// вышедший из группы, уносит с собой и это.
+    ///
+    /// # Порядок: сперва кадр, потом своё
+    ///
+    /// Метка названия берётся **из собранного конверта**, а не считается
+    /// отдельно. Посчитай мы её здесь заново — у нас название легло бы
+    /// на одну метку, у остальных на другую, и следующее переименование
+    /// одни приняли бы, а другие отвергли. Ровно то же решение, что
+    /// у реакции.
+    fn on_rename_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        title: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let title = title.trim();
+        // Те же два предела, что при заведении, и в том же порядке:
+        // человек нажал кнопку и обязан узнать почему (§14).
+        if title.is_empty() {
+            return Err(EngineError::GroupTitleEmpty);
+        }
+        if title.chars().count() > MAX_GROUP_TITLE_CHARS {
+            return Err(EngineError::GroupTitleTooLong);
+        }
+
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if state.group.owner != me {
+            return Err(group::GroupError::NotOwner.into());
+        }
+        // Состоим ли — не спрашиваем: спросит сборка кадра, и её отказ
+        // (`NotInGroup`) точнее. Вышедший создатель попадёт именно сюда.
+        let action = ratatosk_proto::group_action::Action::Rename { title: title.to_owned() };
+        let (msg_id, hlc, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+
+        self.apply_rename(chat, title, hlc)?;
+        let mut effects = self.fan_out_group(now_ms, chat, msg_id, &bytes)?;
+        effects.push(Effect::Notify(Event::GroupRenamed { chat, title: title.to_owned() }));
+        Ok(effects)
+    }
+
+    /// Кладёт новое название — если оно новее того, что лежит.
+    ///
+    /// **Одно место на своё переименование и на чужое.** Сравнение стоит
+    /// и здесь, и в `INSERT` хранилища, и это не лишнее: в память оно
+    /// кладёт то же, что на диск, а хранилище отвечает за то, что переживёт
+    /// перезапуск. Разъедься они — после перезапуска название менялось бы
+    /// само.
+    ///
+    /// Отдаёт `true`, если название действительно сменилось: по этому
+    /// признаку решается, говорить ли о нём наружу.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn apply_rename(&mut self, chat: ChatId, title: &str, at: Hlc) -> Result<bool, EngineError> {
+        let Some(state) = self.groups.get(&chat) else { return Ok(false) };
+        if at < state.title_hlc {
+            // Опоздавшее переименование (§9.2). Молча: это не порча
+            // и не нападение, а обогнавшая его копия того же человека.
+            return Ok(false);
+        }
+        let owner = state.group.owner;
+        let created_ms = state.created_ms;
+        self.store.put_group(&StoredGroup {
+            chat_id: chat,
+            owner_ik: owner,
+            title: title.to_owned(),
+            title_wall: at.wall_ms,
+            title_logical: at.logical,
+            created_ms,
+        })?;
+        if let Some(state) = self.groups.get_mut(&chat) {
+            state.title = title.to_owned();
+            state.title_hlc = at;
+        }
+        Ok(true)
+    }
+
+    /// Меняет аватарку группы (§11 + дополнение).
+    ///
+    /// # Вправе только создатель
+    ///
+    /// То же правило, что у названия, и та же причина: он распоряжается
+    /// тем, что относится ко всей группе. Цена названа вслух в
+    /// `LeaveConsequences::owner_text` — вышедший создатель уносит с собой
+    /// и это.
+    ///
+    /// # Порядок: сперва кадр, потом своё
+    ///
+    /// Метка берётся **из собранного конверта**, ровно как у
+    /// переименования. Посчитай мы её здесь заново — картинка легла бы
+    /// у нас на одну метку, у остальных на другую, и следующую смену
+    /// одни приняли бы, а другие отвергли.
+    ///
+    /// # Правила §4.2 здесь нет
+    ///
+    /// Картинка уходит **всем** участникам, сверенным и нет. Полное
+    /// рассуждение — в `ratatosk_proto::avatar`; коротко: она отвечает
+    /// не на вопрос «кто этот человек», а на вопрос «какой это разговор»,
+    /// и участников группы ядро заводит несверенными (§11.5).
+    fn on_set_group_avatar(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        bytes: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Предел и сигнатура — те же, что у своего лица, и проверяются
+        // до всего остального: человек нажал кнопку и обязан узнать
+        // почему (§14).
+        ratatosk_proto::avatar::check(bytes)?;
+
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if state.group.owner != me {
+            return Err(group::GroupError::NotOwner.into());
+        }
+        // Состоим ли — спросит сборка кадра, и её отказ (`NotInGroup`)
+        // точнее: вышедший создатель ушёл сам.
+        let action = ratatosk_proto::group_action::Action::Avatar { bytes: bytes.to_vec() };
+        let (msg_id, hlc, frame) = self.seal_group_action(now_ms, chat, &action)?;
+
+        self.apply_group_avatar(chat, bytes, hlc)?;
+        let mut effects = self.fan_out_group(now_ms, chat, msg_id, &frame)?;
+        effects.push(Effect::Notify(Event::GroupAvatarChanged { chat }));
+        Ok(effects)
+    }
+
+    /// Кладёт аватарку группы — если она новее той, что лежит.
+    ///
+    /// **Одно место на свою смену, на чужую и на ту, что приехала
+    /// с вводным блоком**, ровно как у названия. Сравнение стоит и здесь,
+    /// и в `INSERT` хранилища: в память оно кладёт то же, что на диск,
+    /// а разъедься они — после перезапуска картинка менялась бы сама.
+    ///
+    /// Отдаёт `true`, если картинка действительно сменилась: по этому
+    /// признаку решается, говорить ли о ней наружу.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn apply_group_avatar(
+        &mut self,
+        chat: ChatId,
+        bytes: &[u8],
+        at: Hlc,
+    ) -> Result<bool, EngineError> {
+        let Some(state) = self.groups.get(&chat) else { return Ok(false) };
+        if at < state.avatar_hlc {
+            // Опоздавшая копия (§9.2) — своя же, обогнанная по дороге.
+            // Молча: это не порча и не нападение.
+            return Ok(false);
+        }
+        self.store.put_group_avatar(
+            &chat,
+            &ratatosk_store::StoredGroupAvatar {
+                bytes: bytes.to_vec(),
+                avatar_wall: at.wall_ms,
+                avatar_logical: at.logical,
+            },
+        )?;
+        if let Some(state) = self.groups.get_mut(&chat) {
+            state.avatar_hlc = at;
+        }
+        Ok(true)
+    }
+
+    /// Выходит из группы.
+    ///
+    /// **Дополнение к спецификации:** §11.2 выхода не описывает. Изнутри
+    /// протокола это та же операция состава, что исключение, — разнятся они
+    /// только тем, кто её подписал, и потому правило приёма проверяет
+    /// именно это (см. [`Engine::on_membership_block`]).
+    ///
+    /// # Блок уезжает всем, включая тех, кого мы уже не увидим
+    ///
+    /// Получателей берём **до** применения: после него нас в составе нет,
+    /// а сказать надо всем, кто был. Не скажи мы — остальные продолжали бы
+    /// слать нам копии каждого слова, а мы бы их выбрасывали. Тихий выход
+    /// стоил бы им трафика, а нам — молчаливого расхождения составов.
+    ///
+    /// # Цепочка не меняется, и это то же решение, что у §11.4
+    ///
+    /// Ротация нужна при **вступлении** (§11.5) — она закрывает окно перед
+    /// новичком. Уход окна не открывает: прошлое ушедший уже прочёл, и
+    /// менять ключи поздно. Ровно то же сказано про исключение.
+    fn on_leave_group(&mut self, now_ms: u64, chat: ChatId) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        let op = state.group.leave(me)?;
+        let targets: Vec<[u8; 32]> = state.group.members().copied().filter(|m| *m != me).collect();
+
+        let block = self.record_own_ops(now_ms, chat, std::slice::from_ref(&op))?;
+        if let Some(state) = self.groups.get_mut(&chat) {
+            state.group.apply(op);
+        }
+
+        let mut effects = Vec::new();
+        for member in targets {
+            effects.extend(self.tell_member(
+                now_ms,
+                member,
+                PayloadType::GroupMembership,
+                block.clone(),
+            )?);
+        }
+        effects.push(Effect::Notify(Event::GroupMembershipChanged { chat }));
+        Ok(effects)
+    }
+
+    /// Принимает подписанное изменение состава (§11.2).
+    ///
+    /// Подпись проверяется **известным** ключом — тем, что лежит в карточке
+    /// автора, а не тем, что назван в блоке. Ключ из самого сообщения
+    /// подтверждал бы только владение каким-то ключом; ровно от этой ошибки
+    /// бережётся и `card_update`.
+    ///
+    /// Автор, которого мы не знаем, — законный случай: его карточка едет
+    /// отдельным кадром и может опоздать. Блок откладывается, а не
+    /// отбрасывается.
+    fn on_membership_block(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        chat: ChatId,
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let payload = &envelope.payload;
+        let Ok(unchecked) = group::parse_membership(payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        let author = *unchecked.claims_author();
+        let Some(known) = self.public_identity_of(&author)? else {
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(Vec::new());
+        };
+        let Ok(block) = unchecked.verify(&known) else {
+            // Подпись не сошлась — это уже не опоздание, а подделка либо
+            // порча. Аномалия считается тому, кто принёс.
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+
+        // §11.2: **исключать может только создатель.** Приглашать — любой
+        // участник, и потому одной подписи для добавления довольно; для
+        // удаления — нет.
+        //
+        // Проверка стоит **до записи на диск**, и это не мелочь. Ляг такой
+        // блок в историю — он применился бы на следующем же подъёме, минуя
+        // всякую проверку, и участник, исключённый кем попало, исчез бы
+        // после перезапуска.
+        //
+        // Блок отвергается целиком, а не по операции: смешанный блок
+        // от не-создателя это нарушение §11.2 его автором, а разбирать
+        // такой по частям значит завести правило, которого в спецификации
+        // нет.
+        //
+        // **И одно исключение — выход.** Дополнение к спецификации: удалить
+        // себя вправе кто угодно, и подписать это за другого нельзя, потому
+        // что удаляемый обязан совпасть с автором блока. Ослаблением
+        // правила §11.2 это не является: власть над **чужим** членством
+        // осталась там же, где была.
+        //
+        // Само правило живёт в `group::removal_allowed`, а не здесь.
+        // Здесь его нельзя было проверить иначе как двумя узлами, сессией
+        // и подделанным блоком — то есть не проверял никто.
+        let owner = self.groups[&chat].group.owner;
+        if !group::removal_allowed(author, owner, &block.ops) {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        }
+
+        let bytes = ratatosk_codec::canonical::encode(payload)?;
+        self.store.put_membership_block(
+            &chat,
+            &StoredMembershipBlock {
+                block_id: Self::block_id(&bytes),
+                author_ik: author,
+                bytes,
+                received_ms: now_ms,
+            },
+        )?;
+        self.store.put_membership(&chat, &Self::stored_from_ops(&block.ops))?;
+
+        let me = self.identity.public().ik;
+        let before: BTreeSet<[u8; 32]> = self.groups[&chat].group.members().copied().collect();
+        if let Some(state) = self.groups.get_mut(&chat) {
+            for op in block.ops {
+                state.group.apply(op);
+            }
+        }
+        let after: BTreeSet<[u8; 32]> = self.groups[&chat].group.members().copied().collect();
+        if before == after {
+            // Блок применился, но состав тот же: повтор вторым транспортом
+            // (§9.2) либо добавление, уже погашенное известным нам
+            // удалением. Рассказывать об этом нечего.
+            return Ok(Vec::new());
+        }
+
+        let mut effects = vec![Effect::Notify(Event::GroupMembershipChanged { chat })];
+        // §11.5: «при вступлении каждый участник обязан начать новую
+        // sender-цепочку». Обязан **каждый**, а не только пригласивший, —
+        // иначе окно, которое требование ограничивает, не закрывается
+        // ни у кого, кроме него. Уход участника цепочку не меняет: менять
+        // её поздно, прошлое он уже прочёл (§11.4).
+        if after.difference(&before).any(|who| *who != me) {
+            let mine = self.rotate_sender_chain(chat)?;
+            effects.extend(self.announce_sender_key(now_ms, chat, &mine)?);
+        }
+        Ok(effects)
+    }
+
+    /// Принимает карточки участников (§11.5).
+    ///
+    /// Заводит их **несверенными контактами** (§4.2), и это ровно то, о чём
+    /// предупреждает `group::JOIN_DISCLOSURE`: вступление раскрывает адреса
+    /// друг друга. Иначе с ними не поговорить — контакт здесь не только
+    /// знакомство, но и то, куда слать.
+    ///
+    /// Список принимается только от участника: иначе любой контакт пополнял
+    /// бы наш список знакомых, не спросив.
+    fn on_group_roster(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        chat: ChatId,
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Ok(roster) = group::roster_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        // Отправитель ещё не значится участником — и это, скорее всего,
+        // не самозванец, а порядок: блоки состава могли отстать от списка
+        // (§9.2). Кадр откладывается, а не отбрасывается; чужой так и
+        // пролежит до вытеснения, потому что участником не станет.
+        if !self.groups[&chat].group.contains(&peer_ik) {
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(Vec::new());
+        }
+
+        let me = self.identity.public().ik;
+        let mut effects = Vec::new();
+        for card_bytes in roster.cards {
+            // Карточка чужой сборки может не разобраться — это не повод
+            // выбросить остальные: список собирал не тот, кто её написал.
+            let Ok(card) = ContactCard::decode(&card_bytes) else { continue };
+            let who = card.value().ik;
+            if who == me {
+                continue;
+            }
+            // **Знакомый пропускается целиком, и это не экономия.**
+            // `add_contact` ставит `verified` по своему аргументу, а не
+            // сохраняет прежнее значение, — значит список карточек снял бы
+            // сверку §4.2 с человека, которого мы сверяли голосом. Обновлять
+            // карточку знакомого есть кому: §4.3 везёт её **подписанной**,
+            // и неподписанный список не вправе её вытеснять.
+            //
+            // Тем же приёмом бережётся приём рукопожатия: там `add_contact`
+            // зовут только для незнакомца.
+            if self.contacts.contains_key(&who) {
+                continue;
+            }
+            // `met_in_person: false` — сверки здесь нет и быть не может.
+            // За карточку ручается пригласивший, а поручительство сверкой
+            // голосом не является (§4.2).
+            effects.extend(self.add_contact(now_ms, &card_bytes, false)?);
+        }
+        Ok(effects)
+    }
+
+    /// Принимает ключ отправителя участника (§11.1, §11.5).
+    ///
+    /// **Кто вправе его называть.** Любой участник группы: при вступлении
+    /// ключи всех отдаёт пригласивший (§11.5), и требовать, чтобы каждый
+    /// назвал свой сам, значило бы сделать вступление невозможным, пока
+    /// не соберутся все.
+    ///
+    /// Подменить чужой ключ участник при этом может — и ничего этим
+    /// не добивается, кроме порчи: групповое сообщение **подписано** `SK`
+    /// отправителя (§11.1), и с подменённой цепочкой оно просто не откроется.
+    /// Выдать себя за другого подменой ключа нельзя; ради этого подпись
+    /// в §11.1 и стоит.
+    ///
+    /// Времени не принимает, и это не упущение: цепочка ложится на диск
+    /// без отметки о моменте, а откладывание кадра меряет возраст местом
+    /// в очереди (см. [`Engine::park_group_frame`]). Взять `now_ms` «на
+    /// всякий случай» значило бы завести довод в пользу того, чтобы
+    /// однажды им что-нибудь отметить.
+    fn on_sender_key(
+        &mut self,
+        peer_ik: [u8; 32],
+        chat: ChatId,
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Ok(block) = group::sender_key_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        // Про **свою** цепочку чужого мнения не бывает: она наша, и принять
+        // его значило бы забыть, чем мы подписываем.
+        if block.member == self.identity.public().ik {
+            return Ok(Vec::new());
+        }
+        // Та же причина, что у списка карточек: ключи законно обгоняют
+        // состав. Кадр откладывается до появления обоих в составе.
+        let state = &self.groups[&chat];
+        if !state.group.contains(&peer_ik) || !state.group.contains(&block.member) {
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(Vec::new());
+        }
+        self.store.put_sender_chain(
+            &chat,
+            &StoredSenderChain {
+                member_ik: block.member,
+                chain: block.chain,
+                counter: block.counter,
+                // Новая цепочка приходит **без** кэша, и это не потеря,
+                // а смысл: пропуски относились к прежнему состоянию,
+                // и пережив его смену, они открывали бы номера цепочки,
+                // которой больше нет.
+                skipped: Vec::new(),
+            },
+        )?;
+        Ok(Vec::new())
+    }
+
+    /// Рассылает свою цепочку отправителя всем известным участникам.
+    fn announce_sender_key(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        mine: &group::SenderKeyBlock,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        let members: Vec<[u8; 32]> =
+            self.groups[&chat].group.members().copied().filter(|m| *m != me).collect();
+        let mut effects = Vec::new();
+        for member in members {
+            effects.extend(self.tell_member(
+                now_ms,
+                member,
+                PayloadType::SenderKey,
+                group::sender_key_value(mine),
+            )?);
+        }
+        Ok(effects)
+    }
+
+    /// Личность участника, какой мы её знаем, — для проверки подписи.
+    ///
+    /// `None` означает «его карточки у нас нет», а не «подпись не сошлась»:
+    /// карточка едет отдельным кадром и вправе опоздать.
+    fn public_identity_of(
+        &self,
+        who: &[u8; 32],
+    ) -> Result<Option<ratatosk_crypto::PublicIdentity>, EngineError> {
+        if *who == self.identity.public().ik {
+            return Ok(Some(self.identity.public()));
+        }
+        let Some(contact) = self.contacts.get(who) else { return Ok(None) };
+        Ok(Some(ratatosk_crypto::PublicIdentity::from_bytes(contact.card.ik, contact.card.sk)?))
+    }
+
+    // --- Сообщения в группе (§11.1, §11.3) -------------------------------
+
+    /// Отправляет сообщение в группу.
+    ///
+    /// # Одно сообщение, тридцать две копии
+    ///
+    /// Конверт собирается **один** — с одним `msg_id` и одной меткой HLC, —
+    /// и его байты уезжают каждому участнику по его 1:1-каналу (§11.3).
+    /// Отсюда то, ради чего sender key вообще нужен: у всех получателей
+    /// это буквально одно и то же сообщение, а не тридцать два похожих.
+    ///
+    /// # Почему у него нет статуса доставки
+    ///
+    /// Один значок на тридцать двух получателей — обещание, которого
+    /// протокол не даёт. «Доставлено» после того, как дошло одному, — ложь;
+    /// «не доставлено» после того, как не дошло одному, — тоже. §14 запрещает
+    /// и то и другое, а «доставлено пятерым из семи» это уже другая работа,
+    /// и она не сделана.
+    ///
+    /// Держится это на одном поле — [`Delivery::silent`]: такая копия
+    /// не ждёт квитанции, её попытка закрывается записью в сокет, и в очередь
+    /// §5.4 она не попадает. Статуса, стало быть, взяться неоткуда.
+    ///
+    /// Первая написанная версия обходилась без поля — разводила номер записи
+    /// в очереди и номер конверта, — и это была ошибка: квитанцию адресуют
+    /// **номеру конверта**, и разведя их, попытка по прямому каналу
+    /// не закрывалась бы никогда.
+    fn send_group_text(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Отказ до записи в историю: сообщение, легшее в базу и не
+        // собравшееся в кадр, человек видел бы у себя вечно ждущим отправки.
+        if !ratatosk_proto::files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if !state.group.contains(&me) {
+            return Err(EngineError::NotInGroup);
+        }
+
+        // Цепочка продвигается **до** отправки и тут же ложится на диск.
+        // Уроните процесс между продвижением и записью — и следующий запуск
+        // выдаст тот же номер второй раз, то есть тот же ключ на другой
+        // текст. Это худшее, что может случиться с потоковым шифром.
+        let stored = self.store.sender_chain(&chat, &me)?.ok_or(EngineError::UnknownGroup)?;
+        let mut chain = SenderChain::resume(zeroize::Zeroizing::new(stored.chain), stored.counter);
+        let (counter, message_key) = chain.next();
+        self.store.put_sender_chain(
+            &chat,
+            &StoredSenderChain {
+                member_ik: me,
+                chain: *chain.export(),
+                counter: chain.counter(),
+                skipped: Vec::new(),
+            },
+        )?;
+
+        let sealed = ratatosk_crypto::group::seal_message(
+            &message_key,
+            &chat,
+            &me,
+            counter,
+            text.as_bytes(),
+        )?;
+        let payload = group::signed_message(
+            &self.identity,
+            &group::GroupMessage { group: chat, sender: me, counter, sealed },
+        )?;
+
+        let hlc = self.clock.now(now_ms)?;
+        let msg_id = self.entropy.msg_id();
+        let envelope = Envelope::new(msg_id, hlc, PayloadType::GroupMessage, payload);
+        let bytes = envelope.encode()?;
+
+        self.remember(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: me,
+            hlc,
+            body: text.as_bytes().to_vec(),
+            received_ms: now_ms,
+            // Статуса нет, и это не «ещё не проставили»: см. выше.
+            status: None,
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+
+        self.fan_out_group(now_ms, chat, msg_id, &bytes)
+    }
+
+    /// Молчалива ли доставка такого кадра (см. [`Delivery::silent`]).
+    ///
+    /// Признак — **тип нагрузки**, и только он: молчаливы ровно те кадры,
+    /// что едут копией каждому участнику группы (§11.3). Нечитаемый кадр
+    /// считается обычным: это состояние «мы не знаем», а обычная доставка
+    /// из двух — та, что ничего не ломает.
+    fn silent_frame(bytes: &[u8]) -> bool {
+        let Ok(raw) = Envelope::decode(bytes) else { return false };
+        Self::is_group_copy(raw.into_parts().1.payload_type)
+    }
+
+    /// Едет ли кадр такого типа копией каждому участнику группы (§11.3).
+    ///
+    /// Одно место на два следствия, и оба про одно и то же обещание.
+    /// Такая копия не растит статус доставки и не получает квитанции:
+    /// один значок на тридцать двух получателей §14 не разрешает.
+    ///
+    /// Список типов здесь **один**. Держи его в двух местах — и новый
+    /// групповой тип завёлся бы в одном, а во втором про него забыли:
+    /// отправитель получил бы квитанцию, которой не ждёт, а она нашла бы
+    /// строку в истории и выставила ей статус, которого у неё быть
+    /// не может. Ровно это и случилось бы с ответом в группе.
+    const fn is_group_copy(payload_type: PayloadType) -> bool {
+        matches!(payload_type, PayloadType::GroupMessage | PayloadType::GroupAction)
+    }
+
+    /// Ставит в очередь §5.4 одну копию группового сообщения.
+    ///
+    /// Копия **молчаливая**: срока ответа ей не заводится, попытка
+    /// закрывается записью в сокет, статуса у неё нет. Почему именно так —
+    /// в [`Delivery::silent`].
+    fn send_group_copy(
+        &mut self,
+        now_ms: u64,
+        msg_id: MsgId,
+        member: [u8; 32],
+        envelope: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        if !self.contacts.contains_key(&member) {
+            // Участник, чьей карточки у нас нет: его добавил кто-то другой,
+            // а карточка до нас не доехала. Слать нечем.
+            return Ok(Vec::new());
+        }
+        self.enqueue(Delivery {
+            // Номер конверта, а не свой: сообщение одно, и в истории у всех
+            // участников оно лежит под этим номером. Спутать записи очереди
+            // между собой это не даст — молчаливая копия в очередь
+            // не попадает вовсе (см. `silent`).
+            msg_id,
+            peer_ik: member,
+            envelope: envelope.to_vec(),
+            attempt: Attempt::new(),
+            state: DeliveryState::AwaitingSession,
+            queued_ms: now_ms,
+            session_reset_used: false,
+            // Выводится из кадра, а не проставляется здесь словом `true`.
+            // Проставь мы его руками, у одного факта стало бы два источника:
+            // этот и `silent_frame`, которым та же копия поднимается после
+            // перезапуска. Совпадать они обязаны всегда — значит источник
+            // должен быть один.
+            silent: Self::silent_frame(envelope),
+        })
+    }
+
+    /// Поднимает приёмную цепочку участника из того, что лежит на диске.
+    ///
+    /// Пустой кэш — обычное дело, а не отказ: так выглядит цепочка, по которой
+    /// ещё ничего не переставлялось, и первое же сообщение от нового участника
+    /// приходит именно так.
+    ///
+    /// Испорченный кэш стоит позиции: цепочка поднимается с записанного места,
+    /// а пропуски теряются. Это честнее отказа — потерять хвосты хуже, чем
+    /// потерять всю переписку с человеком, — и заметнее тишины: следующие
+    /// сообщения открываются как ни в чём не бывало.
+    fn inbox_of(stored: &StoredSenderChain) -> ratatosk_crypto::ratchet::SenderInbox {
+        use ratatosk_crypto::ratchet::SenderInbox;
+        let fresh = || SenderInbox::resume(zeroize::Zeroizing::new(stored.chain), stored.counter);
+        if stored.skipped.is_empty() {
+            return fresh();
+        }
+        SenderInbox::restore(&stored.skipped).unwrap_or_else(|_| fresh())
+    }
+
+    // --- Действия в группе: правка, отзыв, реакция, ответ ----------------
+
+    /// Собирает кадр группового действия.
+    ///
+    /// Продвигает цепочку отправителя, запечатывает действие её ключом,
+    /// подписывает и складывает конверт. Наружу отдаёт номер конверта,
+    /// метку и байты — всё, что вызывающему нужно, чтобы записать своё
+    /// у себя и разослать копии.
+    ///
+    /// # Почему это отдельно от рассылки
+    ///
+    /// Из-за ответа. Ответ — новое сообщение, и в историю оно ложится
+    /// **под номером конверта**: так у всех участников это одна и та же
+    /// строка (§11.3). Значит номер обязан быть известен до рассылки,
+    /// а порядок «сначала записать, потом отправить» — тот же, что
+    /// у обычного сообщения: упавший между двумя шагами процесс оставит
+    /// сказанное в истории, а не только в проводе.
+    ///
+    /// # Номер цепочки тратится и на реакцию
+    ///
+    /// Цепочка — это порядок, в котором участник что-то делал. Пропуск
+    /// в ней у получателя означает «кадр потерялся»; не трать действия
+    /// номер, и он не отличил бы «реакцию не довезли» от «реакции
+    /// не было».
+    fn seal_group_action(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        action: &ratatosk_proto::group_action::Action,
+    ) -> Result<(MsgId, Hlc, Vec<u8>), EngineError> {
+        let me = self.identity.public().ik;
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if !state.group.contains(&me) {
+            return Err(EngineError::NotInGroup);
+        }
+
+        // Цепочка продвигается **до** отправки и тут же ложится на диск —
+        // ровно по той же причине, что у сообщения: уроните процесс между
+        // продвижением и записью, и следующий запуск выдаст тот же номер
+        // второй раз, то есть тот же ключ на другое содержимое.
+        let stored = self.store.sender_chain(&chat, &me)?.ok_or(EngineError::UnknownGroup)?;
+        let mut chain = SenderChain::resume(zeroize::Zeroizing::new(stored.chain), stored.counter);
+        let (counter, message_key) = chain.next();
+        self.store.put_sender_chain(
+            &chat,
+            &StoredSenderChain {
+                member_ik: me,
+                chain: *chain.export(),
+                counter: chain.counter(),
+                skipped: Vec::new(),
+            },
+        )?;
+
+        let plain =
+            ratatosk_codec::canonical::encode(&ratatosk_proto::group_action::payload(action))?;
+        // `seal_action`, а не `seal_message`: тип нагрузки лежит в конверте,
+        // а конверт подписью не покрыт, и разделитель в AAD не даёт выдать
+        // действие за сообщение подменой одного числа по дороге.
+        let sealed =
+            ratatosk_crypto::group::seal_action(&message_key, &chat, &me, counter, &plain)?;
+        let payload = group::signed_message(
+            &self.identity,
+            &group::GroupMessage { group: chat, sender: me, counter, sealed },
+        )?;
+
+        let hlc = self.clock.now(now_ms)?;
+        let msg_id = self.entropy.msg_id();
+        let envelope = Envelope::new(msg_id, hlc, PayloadType::GroupAction, payload);
+        Ok((msg_id, hlc, envelope.encode()?))
+    }
+
+    /// Рассылает готовый групповой кадр — по копии каждому участнику (§11.3).
+    ///
+    /// Одно место на сообщение и на действие. Разведи их по двум циклам,
+    /// и однажды одно из них стало бы обходить состав иначе.
+    fn fan_out_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        bytes: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        let recipients = match self.groups.get(&chat) {
+            Some(state) => state.group.recipients(&me),
+            None => return Err(EngineError::UnknownGroup),
+        };
+        let mut effects = Vec::new();
+        for member in recipients {
+            effects.extend(self.send_group_copy(now_ms, msg_id, member, bytes)?);
+        }
+        Ok(effects)
+    }
+
+    /// Правит своё сообщение в группе.
+    ///
+    /// Правила — те же, что один на один, и берутся оттуда же: пустая правка
+    /// это удаление, править можно только своё, окно — неделя по местным
+    /// часам. Разница ровно одна: кадр уезжает копией каждому участнику,
+    /// а не одному собеседнику.
+    fn edit_group_message(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        ratatosk_proto::edit::check(text)?;
+        if !ratatosk_proto::files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
+        let own_ik = self.identity.public().ik;
+        let message = self
+            .store
+            .message(&msg_id)?
+            .filter(|m| m.sender_ik == own_ik && m.chat_id == chat)
+            .ok_or(ratatosk_proto::EditError::NotYours)?;
+        if !ratatosk_proto::edit::within_window(message.received_ms, now_ms) {
+            return Err(ratatosk_proto::EditError::TooLate.into());
+        }
+
+        let trimmed = text.trim();
+        let action =
+            ratatosk_proto::group_action::Action::Edit { target: msg_id, text: trimmed.to_owned() };
+        // Кадр собирается **до** правки у себя: сборка вправе отказать —
+        // цепочки может не быть, — и правка, применённая у себя и никуда
+        // не уехавшая, разошлась бы с тем, что видят остальные.
+        let (frame_id, _, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+
+        let mut effects = Vec::new();
+        if self.store.edit_message(&msg_id, trimmed.as_bytes(), now_ms)? {
+            effects.push(Effect::Notify(Event::MessageEdited { chat, msg_id }));
+        }
+        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        Ok(effects)
+    }
+
+    /// Отзывает свои сообщения в группе.
+    ///
+    /// Чьё сообщение — знает хранилище, а не клиент: он мог прислать и чужой
+    /// идентификатор, и вовсе выдуманный. У себя при этом убирается **всё
+    /// названное**, включая чужое: у себя человек вправе стереть что угодно,
+    /// и просьба к другим — отдельное действие с отдельным правилом.
+    fn retract_group_messages(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_ids: &[MsgId],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let ours = self.own_of(chat, msg_ids)?;
+
+        let mut effects = self.forget_messages(now_ms, chat, msg_ids);
+        if ours.is_empty() {
+            return Ok(effects);
+        }
+        let action = ratatosk_proto::group_action::Action::Retract { targets: ours };
+        let (frame_id, _, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        Ok(effects)
+    }
+
+    /// Ставит или снимает свою реакцию в группе.
+    fn react_in_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        emoji: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        ratatosk_proto::reaction::check(emoji)?;
+        if self.store.message(&msg_id)?.is_none_or(|m| m.chat_id != chat) {
+            return Ok(Vec::new());
+        }
+
+        let action = ratatosk_proto::group_action::Action::Reaction {
+            target: msg_id,
+            emoji: emoji.to_owned(),
+        };
+        let (frame_id, hlc, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+
+        // Метка берётся **из кадра**, а не считается второй раз: у всех
+        // участников реакция обязана лечь на ту же метку, иначе опоздавшая
+        // копия у одного пересилит, а у другого нет (§9.2).
+        let own_ik = self.identity.public().ik;
+        self.store.put_reaction(&ratatosk_store::StoredReaction {
+            msg_id,
+            author_ik: own_ik,
+            emoji: emoji.to_owned(),
+            hlc,
+        })?;
+        let mut effects =
+            vec![Effect::Notify(Event::ReactionChanged { chat, msg_id, author_ik: own_ik })];
+        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        Ok(effects)
+    }
+
+    /// Отвечает на сообщение в группе.
+    ///
+    /// Ответ — новое сообщение, и в историю он ложится под номером конверта:
+    /// у всех участников это одна и та же строка. По проводу едет ссылка,
+    /// а не цитата — цитату каждый рисует из своей копии.
+    fn reply_in_group(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        reply_to: MsgId,
+        text: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        ratatosk_proto::reply::check(text)?;
+        if !ratatosk_proto::files::text_fits(text.len()) {
+            return Err(EngineError::TextTooLong);
+        }
+        if self.store.message(&reply_to)?.is_none_or(|m| m.chat_id != chat) {
+            return Err(ratatosk_proto::ReplyError::TargetMissing.into());
+        }
+
+        let trimmed = text.trim();
+        let action = ratatosk_proto::group_action::Action::Reply {
+            target: reply_to,
+            text: trimmed.to_owned(),
+        };
+        let (msg_id, hlc, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+
+        self.remember(&StoredMessage {
+            msg_id,
+            chat_id: chat,
+            sender_ik: self.identity.public().ik,
+            hlc,
+            body: trimmed.as_bytes().to_vec(),
+            received_ms: now_ms,
+            // Статуса нет, и это не «ещё не проставили»: один значок
+            // на тридцать двух получателей — обещание, которого протокол
+            // не даёт (§14). То же самое, что у группового сообщения.
+            status: None,
+            edited_ms: None,
+            forwarded: false,
+            reply_to: Some(reply_to),
+        })?;
+        self.fan_out_group(now_ms, chat, msg_id, &bytes)
+    }
+
+    /// Открывает групповой кадр: подпись, ключ отправителя, тело.
+    ///
+    /// Одно место на сообщение и на действие. Всё, что до открытого текста,
+    /// у них совпадает дословно: кто принёс, кто в составе, чем проверить
+    /// подпись, откуда взять ключ, что делать с пропущенным номером. Разводить
+    /// это по двум функциям значило бы завести две копии §11.5 — и одна
+    /// из них однажды стала бы проверять на одно меньше.
+    ///
+    /// Опасение не отвлечённое: в этой самой функции уже был **лишний**
+    /// экземпляр проверки — дедупликация, продублированная поверх той, что
+    /// делает вызывающий, — и стоил он четырёх упавших тестов на два узла.
+    ///
+    /// `None` означает «дальше делать нечего», и причин у него четыре:
+    /// кадр отложен до появления группы, ключа или карточки; кадр отброшен
+    /// как порча; номер уже пройден; тип нагрузки не групповой. Различать
+    /// их вызывающему незачем — во всех четырёх случаях читать нечего.
+    ///
+    /// # Что здесь происходит с цепочкой
+    ///
+    /// Номер расходуется **до** того, как содержимое разобрано, и это
+    /// правильно: номер потратил отправитель, а не мы. Кадр, который
+    /// не разобрался, не возвращает цепочку назад — иначе следующий номер
+    /// выдал бы тот же ключ на другое содержимое.
+    fn open_group_frame(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Option<(ChatId, ActorId, zeroize::Zeroizing<Vec<u8>>)>, EngineError> {
+        let Ok(unchecked) = group::parse_message(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        };
+        let chat = *unchecked.claims_group();
+        let sender = *unchecked.claims_sender();
+
+        // Группы нет — откладываем: кадр вправе обогнать вступление (§9.2),
+        // и выбросив его, мы потеряли бы первое сказанное слово.
+        if !self.groups.contains_key(&chat) {
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(None);
+        }
+        // Пересылать чужое в v1 некому: копию каждому шлёт сам отправитель
+        // (§11.3). Значит принёсший обязан быть отправителем, и оба обязаны
+        // быть в составе.
+        if peer_ik != sender || !self.groups[&chat].group.contains(&sender) {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        }
+
+        let Some(known) = self.public_identity_of(&sender)? else {
+            // Карточка отправителя ещё не доехала — проверить подпись нечем.
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(None);
+        };
+        let counter = unchecked.claims_counter();
+        let Ok(message) = unchecked.verify(&known) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        };
+
+        let Some(stored) = self.store.sender_chain(&chat, &sender)? else {
+            // Ключа отправителя ещё нет: он едет отдельным кадром (§11.5).
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(None);
+        };
+        let mut inbox = Self::inbox_of(&stored);
+        let Ok(key) = inbox.peek(counter) else {
+            // Номер уже пройден либо ушёл слишком далеко вперёд. Первое —
+            // повтор вторым транспортом (§9.2), и дедупликация съела бы его
+            // всё равно; второе — §7.3.
+            return Ok(None);
+        };
+        // AAD выбирается **типом нагрузки**, и в этом весь смысл разделителя:
+        // тип лежит в конверте, конверт подписью не покрыт, и участник вправе
+        // переслать нашу копию соседу, поменяв тип. С чужим AAD тег
+        // не сойдётся, и до разбора дело не дойдёт.
+        let opened = match envelope.payload_type {
+            PayloadType::GroupMessage => {
+                ratatosk_crypto::group::open_message(&key, &chat, &sender, counter, &message.sealed)
+            }
+            PayloadType::GroupAction => {
+                ratatosk_crypto::group::open_action(&key, &chat, &sender, counter, &message.sealed)
+            }
+            // Сюда зовут только эти два типа. Третий — ошибка ядра, а не
+            // собеседника, и аномалию за неё считать не на кого.
+            _ => return Ok(None),
+        };
+        let Ok(body) = opened else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        };
+        inbox.commit(counter, now_ms)?;
+        // **Позиция пишется вместе с кэшем**, и это не аккуратность.
+        // Позицию отдают новичку при вступлении (§11.5); оставь мы здесь ту,
+        // с которой начали, новичок получил бы ключ, открывающий всё
+        // сказанное до него, — ровно то, чего §11.5 обещает не допускать.
+        let (chain, next) = inbox.position();
+        self.store.put_sender_chain(
+            &chat,
+            &StoredSenderChain {
+                member_ik: sender,
+                chain: *chain,
+                counter: next,
+                skipped: inbox.export().to_vec(),
+            },
+        )?;
+        Ok(Some((chat, sender, body)))
+    }
+
+    /// Принимает сообщение в группе (§11.1).
+    fn on_group_message(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some((chat, sender, body)) = self.open_group_frame(now_ms, peer_ik, envelope)? else {
+            return Ok(Vec::new());
+        };
+
+        // **Дедупликации здесь нет, и это не забывчивость.** Окно §9.2
+        // проверяет вызывающий — `on_frame`, до всякого разбора нагрузки,
+        // и одинаково для всех типов. Проверить второй раз значило бы
+        // объявить повтором **своё же** сообщение: первый заход уже отметил
+        // его номер, и второй нашёл бы его отмеченным.
+        //
+        // Так и было написано сперва, и стоило это четырёх упавших тестов
+        // на два узла: сообщение не доходило вовсе, а отправитель получал
+        // на него «доставлено» — квитанцию, которую вызывающий шлёт как раз
+        // на повтор.
+        self.remember(&StoredMessage {
+            msg_id: envelope.msg_id,
+            chat_id: chat,
+            sender_ik: sender,
+            hlc: envelope.hlc,
+            body: body.to_vec(),
+            received_ms: now_ms,
+            // У принятого статуса нет вовсе — там нечему расти.
+            status: None,
+            edited_ms: None,
+            forwarded: false,
+            reply_to: None,
+        })?;
+        Ok(vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })])
+    }
+
+    /// Принимает действие в группе: правку, отзыв, реакцию, ответ.
+    ///
+    /// # Незнакомый вид — не аномалия
+    ///
+    /// Вид действия лежит внутри шифротекста, и сборка поновее вправе
+    /// завести пятый. Посчитай мы это порчей, счётчик аномалий (§7.3) рос бы
+    /// на честном соседе, и кончилось бы это отключением того, кто ничего
+    /// не нарушал. Порча — это когда вид **знаком**, а полей нет; вот она
+    /// аномалия и есть.
+    fn on_group_action(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some((chat, sender, plain)) = self.open_group_frame(now_ms, peer_ik, envelope)? else {
+            return Ok(Vec::new());
+        };
+        let Ok(value) = ratatosk_codec::canonical::decode(&plain) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        match ratatosk_proto::group_action::from_payload(&value) {
+            Ok(action) => self.apply_group_action(now_ms, chat, sender, envelope, &action),
+            Err(ratatosk_proto::ActionError::UnknownKind) => Ok(Vec::new()),
+            Err(ratatosk_proto::ActionError::Malformed) => {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Применяет разобранное действие к истории.
+    ///
+    /// Правила те же, что один на один, и по той же причине: распорядиться
+    /// не своим нельзя. Проверяет их **получатель**, а не отправитель —
+    /// иначе достаточно прислать чужой идентификатор. В группе цена ошибки
+    /// выше: правку принял бы каждый участник, и слова в чужой истории
+    /// переписались бы у всех сразу.
+    ///
+    /// `sender` здесь совпадает с тем, кто кадр принёс: [`Engine::
+    /// open_group_frame`] это уже проверил, и аномалия ложится на него.
+    fn apply_group_action(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        sender: ActorId,
+        envelope: &Envelope,
+        action: &ratatosk_proto::group_action::Action,
+    ) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::group_action::Action;
+
+        match action {
+            Action::Rename { title } => {
+                // **Только создатель** (§11.2, расширенное по смыслу).
+                // Проверка на приёме, а не только у отправителя: иначе
+                // достаточно собрать кадр чужой сборкой — ровно тот же
+                // довод, что у `group::removal_allowed`.
+                if sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner) {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                // Метка — из конверта: она же разрешает спор у реакций,
+                // и второго источника у неё нет.
+                if !self.apply_rename(chat, title, envelope.hlc)? {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![Effect::Notify(Event::GroupRenamed { chat, title: title.clone() })])
+            }
+            Action::Avatar { bytes } => {
+                // **Только создатель**, и проверка та же и там же, что
+                // у переименования: собрать кадр чужой сборкой ничто
+                // не мешает, а картинка в группе видна всем.
+                if sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner) {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                // Байты проверены разбором действия (`avatar::check`) —
+                // здесь второй проверки нет нарочно: разойдись они, в группе
+                // стало бы можно то, чего нельзя один на один.
+                //
+                // Метка — из конверта, как у переименования: пересылки
+                // этого действия не бывает, новичку картинка достаётся
+                // вводным блоком.
+                if !self.apply_group_avatar(chat, bytes, envelope.hlc)? {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![Effect::Notify(Event::GroupAvatarChanged { chat })])
+            }
+            Action::Files { caption, offers } => {
+                // Сообщение с вложениями — и оно же строка в истории,
+                // под номером конверта: у всех участников это одна и та же
+                // строка (§11.3). Подпись к вложениям — её текст.
+                self.remember(&StoredMessage {
+                    msg_id: envelope.msg_id,
+                    chat_id: chat,
+                    sender_ik: sender,
+                    hlc: envelope.hlc,
+                    body: caption.as_bytes().to_vec(),
+                    received_ms: now_ms,
+                    status: None,
+                    edited_ms: None,
+                    forwarded: false,
+                    reply_to: None,
+                })?;
+                // Записи о файлах — только если сообщение действительно
+                // легло. `put_message` молча ничего не пишет, если
+                // на идентификатор стоит надгробие (§9.2), и вложения
+                // легли бы тогда к удалённому сообщению: в чате их
+                // не видно, а чанки качались бы, занимая ящик и трафик
+                // ради того, что человек уже стёр. Та же проверка и та же
+                // причина, что у 1:1 (`on_file_offer`).
+                if self.store.message(&envelope.msg_id)?.is_none() {
+                    return Ok(Vec::new());
+                }
+                let records = self.record_offers(envelope.msg_id, offers.clone())?;
+
+                let mut effects =
+                    vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })];
+                for record in records {
+                    if record.complete {
+                        effects.extend(self.finish_file(&record)?);
+                    } else if record.accepted {
+                        // Просьба уедет **отправителю предложения**, а не
+                        // «собеседнику чата»: чанки есть только у него.
+                        effects.extend(self.ask_for_file(now_ms, &record, true)?);
+                    }
+                }
+                Ok(effects)
+            }
+            Action::Edit { target, text } => {
+                // Правка про сообщение, которого нет, — не ошибка: копия
+                // могла быть удалена раньше или не дойти вовсе.
+                let Some(message) = self.store.message(target)? else { return Ok(Vec::new()) };
+                if message.sender_ik != sender || message.chat_id != chat {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                // Срок — по **своим** часам: физическая компонента метки
+                // приходит от отправителя (§9.1), и доверять ей в проверке,
+                // которая его же и ограничивает, нельзя.
+                if !ratatosk_proto::edit::within_window(message.received_ms, now_ms) {
+                    return Ok(Vec::new());
+                }
+                if self.store.edit_message(target, text.as_bytes(), now_ms)? {
+                    return Ok(vec![Effect::Notify(Event::MessageEdited {
+                        chat,
+                        msg_id: *target,
+                    })]);
+                }
+                Ok(Vec::new())
+            }
+            Action::Retract { targets } => {
+                let mut gone = Vec::new();
+                for target in targets {
+                    let Some(message) = self.store.message(target)? else { continue };
+                    if message.sender_ik != sender || message.chat_id != chat {
+                        // Попытка распорядиться не своим — аномалия сессии,
+                        // а не «формат не тот».
+                        self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                        continue;
+                    }
+                    if self.store.tombstone_message(target, now_ms)? {
+                        gone.push(*target);
+                    }
+                }
+                if gone.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Ok(vec![Effect::Notify(Event::MessagesDeleted { chat, msg_ids: gone })])
+            }
+            Action::Reaction { target, emoji } => {
+                // Реагировать участник вправе на что угодно **в этой группе** —
+                // и на своё, и на чужое. Реакция на сообщение из другого чата
+                // означала бы, что нам прислали идентификатор, которого знать
+                // не должны.
+                let Some(message) = self.store.message(target)? else { return Ok(Vec::new()) };
+                if message.chat_id != chat {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                // §9.1: свежее не затирается старым. Сравнивается с записью
+                // **как есть**, включая снятие: иначе опоздавшая реакция
+                // вернула бы то, что участник убрал.
+                if self
+                    .store
+                    .reaction(target, &sender)?
+                    .is_some_and(|known| known.hlc >= envelope.hlc)
+                {
+                    return Ok(Vec::new());
+                }
+                self.store.put_reaction(&ratatosk_store::StoredReaction {
+                    msg_id: *target,
+                    author_ik: sender,
+                    emoji: emoji.clone(),
+                    hlc: envelope.hlc,
+                })?;
+                Ok(vec![Effect::Notify(Event::ReactionChanged {
+                    chat,
+                    msg_id: *target,
+                    author_ik: sender,
+                })])
+            }
+            Action::Reply { target, text } => {
+                // Цель **из другого чата** — ссылку снимаем: показать её
+                // значило бы нарисовать цитату из разговора, к которому
+                // эта группа отношения не имеет. Цель, которой нет вовсе, —
+                // дело обычное: ответ законно обгоняет то, на что отвечает
+                // (§9.2), и ссылка обязана дождаться.
+                //
+                // Само сообщение при этом остаётся в обоих случаях: выбросив
+                // его, мы потеряли бы сказанное из-за неудачной ссылки.
+                let reply_to = match self.store.message(target)? {
+                    Some(known) if known.chat_id != chat => {
+                        self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                        None
+                    }
+                    _ => Some(*target),
+                };
+                self.remember(&StoredMessage {
+                    msg_id: envelope.msg_id,
+                    chat_id: chat,
+                    sender_ik: sender,
+                    hlc: envelope.hlc,
+                    body: text.as_bytes().to_vec(),
+                    received_ms: now_ms,
+                    status: None,
+                    edited_ms: None,
+                    forwarded: false,
+                    reply_to,
+                })?;
+                Ok(vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })])
+            }
+        }
+    }
+
+    /// Группы, какими их знает ядро (§11).
+    ///
+    /// Отдаётся всё состояние, а не список названий: клиенту нужен и состав
+    /// (кого показывать в шапке), и владелец (рисовать ли «исключить»).
+    #[must_use]
+    pub fn groups(&self) -> &BTreeMap<ChatId, GroupState> {
+        &self.groups
+    }
+
+    /// Свежая метка для операции состава (§11.2).
+    ///
+    /// `uniq` берётся из `entropy`, а не из счётчика: метка обязана быть
+    /// уникальной **между устройствами**, а счётчик у каждого свой и начался
+    /// бы с нуля. Восемь случайных байт разводят и повторное приглашение
+    /// одного человека внутри одной метки HLC — ровно то, ради чего поле
+    /// в `Tag` и заведено.
+    fn fresh_tag(&mut self, now_ms: u64, actor: ActorId) -> Result<Tag, EngineError> {
+        let hlc = self.clock.now(now_ms)?;
+        let mut uniq = [0u8; 8];
+        self.entropy.fill(&mut uniq);
+        Ok(Tag::new(hlc, actor, uniq))
+    }
+
+    /// Раскладывает операции состава в строки хранилища.
+    ///
+    /// Одно добавление — одна строка. Одно **удаление** — по строке
+    /// на каждую погашенную им метку, и это не потеря: удаление и есть набор
+    /// надгробий над теми метками, которые автор видел (§11.2). Строка,
+    /// помеченная `removed`, значит «эта метка добавления погашена», и все
+    /// вместе они восстанавливают ту же операцию обратно.
+    fn stored_from_ops(ops: &[OrSetOp<ActorId>]) -> Vec<StoredMembershipOp> {
+        let mut rows = Vec::new();
+        for op in ops {
+            match op {
+                OrSetOp::Add { elem, tag } => rows.push(Self::stored_op(*elem, tag, false)),
+                OrSetOp::Remove { elem, observed } => {
+                    rows.extend(observed.iter().map(|tag| Self::stored_op(*elem, tag, true)));
+                }
+            }
+        }
+        rows
+    }
+
+    fn stored_op(member_ik: ActorId, tag: &Tag, removed: bool) -> StoredMembershipOp {
+        StoredMembershipOp {
+            member_ik,
+            tag_wall: tag.hlc.wall_ms,
+            tag_logical: tag.hlc.logical,
+            tag_actor: tag.actor,
+            tag_uniq: tag.uniq,
+            removed,
+        }
+    }
+
+    /// Собирает строки хранилища обратно в операции.
+    ///
+    /// **Добавления идут первыми, удаления следом**, и порядок здесь не
+    /// вкусовщина. `OrSet::apply` гасит метку, только если она уже добавлена,
+    /// — а надгробие кладёт в любом случае, потому что добавление вправе
+    /// прийти после удаления (§9.2). То есть обратный порядок дал бы тот же
+    /// состав; прямой выбран за то, что он повторяет порядок, в котором
+    /// операции происходили на самом деле.
+    ///
+    /// Удаления одного участника собираются в **одну** операцию: врозь они
+    /// дали бы столько же надгробий, но `OrSet` пересчитывал бы состав на
+    /// каждое, а смысл у них общий — «этого убрали».
+    fn ops_from_stored(rows: &[StoredMembershipOp]) -> Vec<OrSetOp<ActorId>> {
+        let mut ops = Vec::new();
+        let mut removals: BTreeMap<ActorId, BTreeSet<Tag>> = BTreeMap::new();
+        for row in rows {
+            let tag =
+                Tag::new(Hlc::new(row.tag_wall, row.tag_logical), row.tag_actor, row.tag_uniq);
+            // Добавление кладётся и для погашенной метки: без него надгробию
+            // было бы нечего гасить, а состав после подъёма зависел бы
+            // от того, дошло ли до нас само добавление.
+            ops.push(OrSet::prepare_add(row.member_ik, tag));
+            if row.removed {
+                removals.entry(row.member_ik).or_default().insert(tag);
+            }
+        }
+        ops.extend(removals.into_iter().map(|(elem, observed)| OrSetOp::Remove { elem, observed }));
+        ops
     }
 
     /// Список чатов для десктопа (§13.4).
@@ -5568,6 +8352,40 @@ impl<S: Store> Engine<S> {
                 } else {
                     0
                 },
+                is_group: false,
+                // Из переписки с человеком не выходят: её удаляют, и тогда
+                // чата в списке нет вовсе.
+                joined: true,
+            });
+        }
+
+        // Группы — тем же списком и в том же порядке. Отдельного списка
+        // у десктопа нет и не надо: чат есть чат, и различают их два
+        // признака — те, что едут рядом.
+        let me = self.identity.public().ik;
+        for (chat, state) in &self.groups {
+            let last = self.store.messages(chat, 1, None)?;
+            let (last_text, last_ms) = last.last().map_or_else(
+                || (String::new(), 0),
+                |m| (String::from_utf8_lossy(&m.body).into_owned(), m.hlc.wall_ms),
+            );
+            out.push(companion::ChatSummary {
+                chat: *chat,
+                title: state.title.clone(),
+                // Сверяют людей, а не круги знакомых. Ноль и `false` здесь
+                // не «нечего показать пока», а «нечего показывать вовсе»,
+                // и отличить одно от другого десктопу позволяет `is_group`.
+                verified: false,
+                last_text,
+                last_ms,
+                // Правило «показывать нечего» одно и живёт в ядре: ноль
+                // здесь означает и «картинки не ставили», и «сняли».
+                avatar_ms: self.group_avatar_stamp(chat)?,
+                is_group: true,
+                // Единственное место, где этот признак бывает `false`.
+                // Считает его телефон, а не десктоп по составу: состава
+                // десктоп не видит вовсе (§13.4).
+                joined: state.group.contains(&me),
             });
         }
         // Свежие сверху — тот же порядок, в каком чаты показывает телефон.
@@ -5589,7 +8407,94 @@ impl<S: Store> Engine<S> {
         if !contact.card.display_name.trim().is_empty() {
             return contact.card.display_name.clone();
         }
+        Self::short_label(peer_ik)
+    }
+
+    /// Как назвать того, у кого имени нет: начало отпечатка.
+    ///
+    /// Одно место на два случая — контакт без имени и участник группы,
+    /// чья карточка ещё не доехала. Разойдись они, один и тот же человек
+    /// подписывался бы в списке контактов иначе, чем под своим сообщением.
+    fn short_label(peer_ik: &[u8; 32]) -> String {
         peer_ik[..4].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Как подписать автора сообщения — если это вообще нужно.
+    ///
+    /// # `None` означает «выводится из `mine`», а не «неизвестно»
+    ///
+    /// В переписке двоих автор исчерпывается признаком «своё ли»: не своё —
+    /// значит собеседника, а его имя уже стоит заголовком чата. Подписывать
+    /// там каждую строку значит повторять одно и то же на весь экран.
+    ///
+    /// В группе так нельзя: «не своё» — это один из тридцати двух, и без
+    /// имени сообщение не читается вовсе. Поэтому здесь `Some` ровно
+    /// у групп, и это утверждение о том, **выводимо ли** имя, а не о том,
+    /// известно ли оно.
+    ///
+    /// # Неизвестного автора не бывает
+    ///
+    /// Участник, чья карточка ещё не доехала (§11.5), подписывается началом
+    /// отпечатка — тем же, каким подписан безымянный контакт. Пустой строки
+    /// или `None` здесь не возвращается никогда: «имя не приехало» и «имя
+    /// выводится из `mine`» — разные вещи, и путать их на границе нельзя.
+    ///
+    /// # Своё имя берётся из своей карточки
+    ///
+    /// Себя в списке контактов нет, и без этого собственное сообщение
+    /// в группе подписывалось бы отпечатком. Что показать вместо имени —
+    /// «вы» или имя, — решает клиент: у него для этого есть `mine`.
+    #[must_use]
+    pub fn message_author(&self, chat: &ChatId, sender_ik: &[u8; 32]) -> Option<String> {
+        if !self.groups.contains_key(chat) {
+            return None;
+        }
+        Some(self.name_of(sender_ik))
+    }
+
+    /// Как назвать человека по ключу — кем бы он ни был.
+    ///
+    /// **Одно место на три случая**, и третий тут главный: себя в списке
+    /// контактов нет, и всякий, кто ищет имя по ключу перебором контактов,
+    /// не находит там **себя**. Своё имя берётся из своей карточки; чужое —
+    /// по §4.1 (местное вытесняет карточное); незнакомое — началом
+    /// отпечатка.
+    ///
+    /// На этом уже спотыкались дважды: сперва подпись автора сообщения,
+    /// потом список участников группы, где клиент показывал хозяина
+    /// телефона «неизвестным пользователем». Ошибка одна и та же, и потому
+    /// правило теперь одно.
+    fn name_of(&self, peer_ik: &[u8; 32]) -> String {
+        if *peer_ik == self.identity.public().ik {
+            let own = self.own_card().display_name;
+            return if own.trim().is_empty() { Self::short_label(peer_ik) } else { own };
+        }
+        match self.contacts.get(peer_ik) {
+            Some(contact) => Self::title_of(contact, peer_ik),
+            None => Self::short_label(peer_ik),
+        }
+    }
+
+    /// Состав группы в том виде, в каком его рисуют.
+    ///
+    /// Отдаётся списком записей, а не ключей, и это то же решение, что
+    /// у заголовка чата: имя считает ядро (§4.1 и §11.5 живут здесь),
+    /// а «это я» — тем более. Клиент, получавший голые ключи, искал имя
+    /// перебором контактов и **себя там не находил**: своей карточки
+    /// в контактах нет, и хозяин телефона показывался неизвестным.
+    ///
+    /// Пустой список означает, что группы нет вовсе.
+    #[must_use]
+    pub fn group_members(&self, chat: &ChatId) -> Vec<GroupMember> {
+        let me = self.identity.public().ik;
+        match self.groups.get(chat) {
+            Some(state) => state
+                .group
+                .members()
+                .map(|ik| GroupMember { ik: *ik, name: self.name_of(ik), mine: *ik == me })
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Страница истории чата для десктопа.
@@ -5651,6 +8556,13 @@ impl<S: Store> Engine<S> {
             msg_id: message.msg_id,
             chat: message.chat_id,
             mine: message.sender_ik == self.identity.public().ik,
+            // Подпись автора — той же функцией, что и для своего UI, а не
+            // вторым правилом рядом. `None` означает «выводится из `mine`»
+            // (переписка двоих), `Some` приходит у групповых сообщений.
+            // Имя, а не ключ: §13.4 не пускает `IK` через эту границу,
+            // а имя считать десктоп всё равно не смог бы — своей карточки
+            // в контактах нет, и хозяин телефона вышел бы «неизвестным».
+            author: self.message_author(&message.chat_id, &message.sender_ik),
             // Потерянные байты — не повод потерять сообщение: тело пришло
             // из сети и могло быть каким угодно, а десктоп ждёт текст.
             text: String::from_utf8_lossy(&message.body).into_owned(),
@@ -5880,6 +8792,13 @@ impl<S: Store> Engine<S> {
         chat: ChatId,
         text: &str,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Группа — первой: идентификаторы чатов у групп и у 1:1 живут
+        // в одном пространстве, и спутать их нельзя. У группы `by_chat`
+        // записи нет вовсе, так что порядок здесь про ясность, а не про
+        // разрешение неоднозначности.
+        if self.groups.contains_key(&chat) {
+            return self.send_group_text(now_ms, chat, text);
+        }
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
         self.send_own_text(now_ms, chat, peer_ik, text, TextKind::Plain)
     }
@@ -5898,6 +8817,9 @@ impl<S: Store> Engine<S> {
         reply_to: MsgId,
         text: &str,
     ) -> Result<Vec<Effect>, EngineError> {
+        if self.groups.contains_key(&chat) {
+            return self.reply_in_group(now_ms, chat, reply_to, text);
+        }
         let peer_ik = *self.by_chat.get(&chat).ok_or(EngineError::UnknownPeer)?;
         // Та же функция, что зовёт граница UniFFI, — правило одно и записано
         // в одном месте. Разница только в моменте: там раньше, здесь наверняка.
@@ -5957,6 +8879,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            silent: false,
         })
     }
 
@@ -5984,6 +8907,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            silent: false,
         })?;
         Ok((msg_id, effects))
     }
@@ -6053,6 +8977,31 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
 
+    /// Объявляет статус доставки — если он этой доставке вообще положен.
+    ///
+    /// **Молчаливой копии не положен никогда** (см. [`Delivery::silent`]),
+    /// и проверка стоит здесь, а не у трёх вызывающих. Все три — про один
+    /// исход, «уехать не вышло»: транспорты кончились, запись вытеснили
+    /// из очереди ожидающих, контакт удалили. Раньше `silent` учитывался
+    /// только в `arm_send`, то есть **после** того, как транспорт нашёлся, —
+    /// и групповое сообщение участнику, до которого нет канала, получало
+    /// статус, которого у него быть не может: один значок на тридцать двух
+    /// получателей (§14).
+    ///
+    /// Своей строки в истории у молчаливой копии обычно и нет — но у ответа
+    /// в группе она есть, потому что ответ это сообщение. На нём дыра
+    /// и открылась.
+    fn note_status_of(
+        &mut self,
+        delivery: &Delivery,
+        status: DeliveryStatus,
+    ) -> Result<Vec<Effect>, EngineError> {
+        if delivery.silent {
+            return Ok(Vec::new());
+        }
+        self.note_status(delivery.msg_id, status)
+    }
+
     /// Пробует следующий транспорт по §5.4.
     ///
     /// Строгая последовательность, а не гонка: [`Attempt`] выдаёт очередной
@@ -6088,7 +9037,7 @@ impl<S: Store> Engine<S> {
                 } else {
                     DeliveryStatus::Undeliverable
                 };
-                effects.extend(self.note_status(delivery.msg_id, status)?);
+                effects.extend(self.note_status_of(delivery, status)?);
                 return Ok(effects);
             }
         };
@@ -6134,6 +9083,19 @@ impl<S: Store> Engine<S> {
     /// после этого могло не уйти вовсе, а человек уже видел «отправлено».
     fn arm_send(&mut self, delivery: &mut Delivery, transport: Transport) -> (Option<u64>, Effect) {
         let timer = self.allocate_timer();
+        if delivery.silent {
+            // Копия группового сообщения ответа не ждёт: квитанции у него
+            // нет и быть не может (см. [`Delivery::silent`]). Попытка
+            // закрывается здесь же, и в очередь запись не попадает —
+            // `enqueue` кладёт туда только незакрытые.
+            //
+            // Срок всё равно выдаётся: вернуть эффект обязаны, а лишняя
+            // метка безвредна — сработав, она не найдёт владельца
+            // и будет отброшена, ровно как опоздавшая.
+            delivery.attempt.succeed();
+            delivery.state = DeliveryState::InFlight { via: transport, timer };
+            return (None, Effect::SetTimer { after_ms: SILENT_TIMER_MS, token: timer });
+        }
         let (after_ms, handoff) = if transport.is_direct() {
             (delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS), None)
         } else {
@@ -6815,7 +9777,7 @@ impl<S: Store> Engine<S> {
             // никто больше не вернётся, значит соврать на экране.
             let evicted = self.deferred.remove(0);
             self.store.delete_outbox(&evicted.msg_id)?;
-            effects.extend(self.note_status(evicted.msg_id, DeliveryStatus::Undeliverable)?);
+            effects.extend(self.note_status_of(&evicted, DeliveryStatus::Undeliverable)?);
         }
 
         // На диск — до того, как объявлен статус. Обещание, которого нет
@@ -6850,7 +9812,7 @@ impl<S: Store> Engine<S> {
             // некому, и обещание надо снять — вместе с записью на диске.
             if !self.contacts.contains_key(&delivery.peer_ik) {
                 self.store.delete_outbox(&delivery.msg_id)?;
-                effects.extend(self.note_status(delivery.msg_id, DeliveryStatus::Undeliverable)?);
+                effects.extend(self.note_status_of(&delivery, DeliveryStatus::Undeliverable)?);
                 continue;
             }
             // Запись на диске остаётся до подтверждения: попытка может опять
@@ -7129,6 +10091,13 @@ impl<S: Store> Engine<S> {
             // дочитал до этого места (§9.4), то и говорить надо «прочитано»:
             // водяной знак прочтения не даст отправить эту квитанцию второй
             // раз, и без ответа здесь отправитель никогда бы о ней не узнал.
+            // У групповой копии квитанций нет вовсе (§11.3): одна
+            // на тридцать двух получателей ничего не значит, и §14 такого
+            // обещания не разрешает. Отправитель её и не ждёт — попытка
+            // у него закрылась записью в сокет.
+            if Self::is_group_copy(envelope.payload_type) {
+                return Ok(Vec::new());
+            }
             let chat = Self::chat_id_for(&peer_ik);
             let receipt = if self.read_upto.get(&chat).is_some_and(|edge| *edge >= envelope.hlc) {
                 Receipt::Read
@@ -7305,8 +10274,24 @@ impl<S: Store> Engine<S> {
                 self.outbox.retain(|d| !msg_ids.contains(&d.msg_id));
                 Ok(effects)
             }
-            PayloadType::GroupMembership | PayloadType::SenderKey => {
-                todo!("этап 5: группы (§11)")
+            PayloadType::GroupMembership
+            | PayloadType::SenderKey
+            | PayloadType::GroupRoster
+            | PayloadType::GroupIntro => self.on_group_frame(now_ms, peer_ik, &envelope),
+            PayloadType::GroupMessage => {
+                let mut effects = self.on_group_message(now_ms, peer_ik, &envelope)?;
+                // Разбор отложенного — тем же приёмом, что у прочих
+                // групповых кадров: сообщение могло открыть дорогу другому,
+                // пришедшему раньше своей группы.
+                effects.extend(self.drain_pending_group(now_ms)?);
+                Ok(effects)
+            }
+            PayloadType::GroupAction => {
+                let mut effects = self.on_group_action(now_ms, peer_ik, &envelope)?;
+                // Разбор отложенного — как и у сообщения: действие могло
+                // открыть дорогу кадру, пришедшему раньше своей группы.
+                effects.extend(self.drain_pending_group(now_ms)?);
+                Ok(effects)
             }
             PayloadType::CardUpdate => self.on_card_update(now_ms, peer_ik, &envelope),
             // Компаньон (§13.4) едет по тем же кадрам и той же сессии,

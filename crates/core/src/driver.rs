@@ -134,6 +134,18 @@ pub struct MessageView {
     pub files: Vec<FileView>,
     /// Присланная карточка контакта, если это сообщение — она.
     pub shared_contact: Option<SharedContactView>,
+    /// Как подписан автор — или `None`, если подпись выводится из `mine`.
+    ///
+    /// `Some` ровно в группах: там «не своё» означает одного из тридцати
+    /// двух, и без имени сообщение не читается. В переписке двоих имя
+    /// собеседника уже стоит заголовком чата, и повторять его у каждой
+    /// строки незачем.
+    ///
+    /// Считает **ядро** (`Engine::message_author`), а не клиент: местное
+    /// имя (§4.1) вытесняет имя из карточки, а участник, чья карточка ещё
+    /// не доехала, подписывается началом отпечатка. Правило одно и живёт
+    /// в одном месте.
+    pub author: Option<String>,
 }
 
 /// Присланная карточка контакта вместе с тем, что о ней уже известно.
@@ -244,6 +256,8 @@ enum Query {
     Contacts { reply: oneshot::Sender<Vec<ContactStatus>> },
     /// Сопряжённые десктопы и их состояние (§13.4).
     Devices { reply: oneshot::Sender<Vec<DeviceStatus>> },
+    /// Группы и их состав (§11).
+    Groups { reply: oneshot::Sender<Vec<GroupStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
     ///
     /// Отдельным запросом, а не полем в [`ContactStatus`]: до тридцати двух
@@ -252,6 +266,14 @@ enum Query {
     /// [`Event::AvatarChanged`] — а своё по [`Event::OwnAvatarChanged`],
     /// потому что сменить его вправе и сопряжённый десктоп (§13.4).
     Avatar { owner: Option<[u8; 32]>, reply: oneshot::Sender<Option<Vec<u8>>> },
+    /// Аватарка группы (§11 + дополнение).
+    ///
+    /// Отдельным запросом от [`Query::Avatar`], хотя оба отдают картинку:
+    /// у той ключ — `IK` человека, у этой — идентификатор чата, и правило
+    /// показа у них разное. У лица контакта оно ограничено §4.2, у группы
+    /// такого правила нет вовсе (`ratatosk_proto::avatar` объясняет, почему).
+    /// Сведи их в один запрос — и однажды одно правило подменило бы другое.
+    GroupAvatar { chat: ChatId, reply: oneshot::Sender<Option<Vec<u8>>> },
 }
 
 /// Своя карточка в том виде, в каком её показывают человеку.
@@ -405,6 +427,58 @@ pub struct ContactStatus {
     pub anomalies: ratatosk_proto::session::AnomalyCounters,
 }
 
+/// Что клиент знает о группе (§11).
+///
+/// Плоская: `Group` — тип протокольного слоя, и отдавать его наружу значило бы
+/// пустить решения о составе выше границы §13.3. Наружу едет то, что рисуют:
+/// название, состав, и два признака — «создатель ли мы» (§11.2) и «состоим
+/// ли сейчас», — уже посчитанные, а не выведенные клиентом из сравнения
+/// ключей.
+#[derive(Debug, Clone)]
+pub struct GroupStatus {
+    /// Идентификатор чата.
+    pub chat: ChatId,
+    /// Название.
+    pub title: String,
+    /// Когда заведена, мс.
+    pub created_ms: u64,
+    /// Состав — записями, а не ключами.
+    ///
+    /// Имя и признак «это я» считает ядро: своей карточки в списке
+    /// контактов нет, и клиент, искавший имя по ключу перебором, показывал
+    /// хозяина телефона неизвестным участником.
+    ///
+    /// Мы в списке есть, **пока состоим**: вышли — и нас в нём нет,
+    /// как и у остальных.
+    pub members: Vec<crate::engine::GroupMember>,
+    /// Создатель ли мы.
+    ///
+    /// Выходом **не снимается**: вернувшись, создатель снова сможет
+    /// исключать. Поэтому «показывать ли исключить» — это `mine && joined`,
+    /// а не `mine`.
+    pub mine: bool,
+    /// Состоим ли мы в группе сейчас.
+    ///
+    /// Считается ядром, а не клиентом по поиску своего ключа в `members`:
+    /// правило одно и живёт в одном месте (§13.3). До появления выхода
+    /// клиент выводил это косвенно — и выводил бы неверно у группы, где
+    /// нас нет, но история осталась.
+    ///
+    /// `false` покрывает два случая, и различать их клиенту незачем:
+    /// мы вышли сами и нас исключили. Показывать надо одно и то же —
+    /// переписку без поля ввода.
+    pub joined: bool,
+    /// Метка аватарки группы; `0` — показывать нечего.
+    ///
+    /// **Метка, а не признак «есть картинка».** Булево на смену картинки
+    /// не реагирует, и клиент показывал бы прежнее лицо до перезапуска —
+    /// та же причина, по какой метка едет и на проводе компаньона.
+    ///
+    /// Байты спрашиваются отдельно (`group_avatar`): до тридцати двух
+    /// килобайт на группу, а список чатов читается на каждый показ экрана.
+    pub avatar_ms: u64,
+}
+
 /// Что клиент знает о сопряжённом десктопе (§13.4).
 #[derive(Debug, Clone)]
 pub struct DeviceStatus {
@@ -528,6 +602,13 @@ impl DriverHandle {
     pub async fn contacts(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::Contacts { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает группы (§11). `None` — драйвер остановлен.
+    pub async fn groups(&self) -> Option<Vec<GroupStatus>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Groups { reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -804,6 +885,13 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает группы, блокируя вызывающий поток.
+    pub fn groups_blocking(&self) -> Option<Vec<GroupStatus>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Groups { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает аватарку, блокируя вызывающий поток.
     ///
     /// `owner` — `None` для своей. Внешний `None` означает «драйвер
@@ -811,6 +899,16 @@ impl DriverHandle {
     pub fn avatar_blocking(&self, owner: Option<[u8; 32]>) -> Option<Option<Vec<u8>>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::Avatar { owner, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает аватарку группы, блокируя вызывающий поток.
+    ///
+    /// Внешний `None` означает «драйвер остановлен», внутренний —
+    /// «картинки нет или её сняли».
+    pub fn group_avatar_blocking(&self, chat: ChatId) -> Option<Option<Vec<u8>>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::GroupAvatar { chat, reply })).ok()?;
         answer.blocking_recv().ok()
     }
 }
@@ -1079,7 +1177,13 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     let reactions = store.reactions(&message.msg_id).unwrap_or_default();
                     let files = Self::file_views(store, &message.msg_id);
                     let shared_contact = self.shared_contact_view(&message.msg_id);
-                    MessageView { message, reactions, files, shared_contact }
+                    MessageView {
+                        author: self.engine.message_author(&message.chat_id, &message.sender_ik),
+                        message,
+                        reactions,
+                        files,
+                        shared_contact,
+                    }
                 });
                 let _ = reply.send(found);
             }
@@ -1131,7 +1235,15 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         let reactions = store.reactions(&msg_id).unwrap_or_default();
                         let files = Self::file_views(store, &msg_id);
                         let shared_contact = self.shared_contact_view(&msg_id);
-                        Some(MessageView { message, reactions, files, shared_contact })
+                        Some(MessageView {
+                            author: self
+                                .engine
+                                .message_author(&message.chat_id, &message.sender_ik),
+                            message,
+                            reactions,
+                            files,
+                            shared_contact,
+                        })
                     })
                     .collect();
                 let _ = reply.send(found);
@@ -1150,6 +1262,12 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 // единственное честное поведение: показать нечего в обоих
                 // случаях, а ронять список чатов из-за картинки нельзя.
                 let _ = reply.send(found.unwrap_or_default());
+            }
+            Query::GroupAvatar { chat, reply } => {
+                // Та же честность, что и у лица контакта: отказ хранилища
+                // здесь неотличим от «картинки нет», и показать в обоих
+                // случаях нечего.
+                let _ = reply.send(self.engine.group_avatar_of(&chat).unwrap_or_default());
             }
             Query::Contacts { reply } => {
                 // Список собирается в два прохода, и не по прихоти: сессии
@@ -1232,6 +1350,28 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     .collect();
                 let _ = reply.send(found);
             }
+            Query::Groups { reply } => {
+                let me = self.engine.own_card().ik;
+                let found = self
+                    .engine
+                    .groups()
+                    .iter()
+                    .map(|(chat, state)| GroupStatus {
+                        chat: *chat,
+                        title: state.title.clone(),
+                        created_ms: state.created_ms,
+                        members: self.engine.group_members(chat),
+                        mine: state.group.owner == me,
+                        joined: state.group.contains(&me),
+                        // Правило «показывать нечего» живёт в ядре, одним
+                        // местом (§13.3). Отказ хранилища здесь означает
+                        // ноль — то есть «картинки нет»: это честнее, чем
+                        // уронить список групп из-за украшения.
+                        avatar_ms: self.engine.group_avatar_stamp(chat).unwrap_or(0),
+                    })
+                    .collect();
+                let _ = reply.send(found);
+            }
         }
     }
 
@@ -1252,7 +1392,13 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let reactions = store.reactions(&message.msg_id).unwrap_or_default();
                 let files = Self::file_views(store, &message.msg_id);
                 let shared_contact = self.shared_contact_view(&message.msg_id);
-                MessageView { message, reactions, files, shared_contact }
+                MessageView {
+                    author: self.engine.message_author(&message.chat_id, &message.sender_ik),
+                    message,
+                    reactions,
+                    files,
+                    shared_contact,
+                }
             })
             .collect()
     }

@@ -24,7 +24,7 @@ use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_crypto::handshake::{Initiator, PendingHandshake};
 use ratatosk_crypto::{Identity, Session};
 use ratatosk_proto::companion::{
-    self, ChatSummary, DeviceId, Message, Notice, PairingInvite, Request, Response,
+    self, ChatSummary, DeviceId, Member, Message, Notice, PairingInvite, Request, Response,
 };
 use ratatosk_wire::FrameType;
 
@@ -730,6 +730,30 @@ pub enum ClientEvent {
         msg_id: MsgId,
         /// Новый код статуса.
         status: u8,
+    },
+    /// Состав группы (§11.2).
+    ///
+    /// Кэша у него нет намеренно, в отличие от списка чатов и лица:
+    /// состав нужен одному окну — тому, где открыты сведения о группе, —
+    /// и открывают его, уже будучи на связи. Показывать там запомненный
+    /// вчерашний состав без пометки было бы тем же врущим экраном, ради
+    /// которого заведён признак `fresh`, а заводить ради одного окна
+    /// третью запись в снимке — плата не по товару.
+    Members {
+        /// Какой группы. Из ответа не берётся: его там нет — соотносит
+        /// просьбу и ответ номер.
+        chat: [u8; 16],
+        /// Участники; пусто у личного чата.
+        members: Vec<Member>,
+    },
+    /// Группа заведена — вот чем её открыть (§11).
+    ///
+    /// Идентификатор приезжает **ответом**, а не выуживается из
+    /// перечитанного списка чатов: у группы он случаен, а названия
+    /// повторяются, и окно однажды открыло бы не ту.
+    GroupCreated {
+        /// Идентификатор заведённой группы.
+        chat: [u8; 16],
     },
     /// Список чатов изменился — надо перечитать.
     ChatsChanged,
@@ -2337,6 +2361,17 @@ impl CompanionClient {
                 }
                 _ => ClientEvent::Ignored("аватарка в ответ на другую просьбу"),
             },
+            // Про какую группу — знает вопрос: в ответе чата нет, и это
+            // то же решение, что у превью и у лица. Состав, приехавший
+            // не на свою просьбу, показать нельзя: чужой список участников
+            // хуже отсутствующего.
+            Response::Members { members } => match &asked {
+                Request::Members { chat } => ClientEvent::Members { chat: *chat, members },
+                _ => ClientEvent::Ignored("состав в ответ на другую просьбу"),
+            },
+            // Здесь ответ несёт идентификатор сам: спрашивать было нечего —
+            // группы до этой просьбы не существовало.
+            Response::GroupCreated { chat } => ClientEvent::GroupCreated { chat },
         };
         earlier.push(ClientEffect::Show(shown));
         earlier
@@ -2465,6 +2500,8 @@ mod tests {
             verified: true,
             last_text: "было".into(),
             last_ms: u64::from(chat),
+            is_group: false,
+            joined: true,
             avatar_ms: 0,
         }
     }
@@ -2479,6 +2516,7 @@ mod tests {
             msg_id: [id; 16],
             chat: [chat; 16],
             mine: false,
+            author: None,
             text: text.to_owned(),
             wall_ms: at,
             status: None,
@@ -2524,6 +2562,7 @@ mod tests {
                 msg_id: [u8::try_from(n % 251).unwrap_or(0); 16],
                 chat: [1u8; 16],
                 mine: false,
+                author: None,
                 text: format!("{n}"),
                 wall_ms: n as u64,
                 status: None,
@@ -2760,6 +2799,7 @@ mod tests {
                     msg_id: [u8::try_from(n % 251).unwrap_or(0); 16],
                     chat: [1u8; 16],
                     mine: false,
+                    author: None,
                     text: format!("{n}"),
                     wall_ms: n as u64,
                     status: None,

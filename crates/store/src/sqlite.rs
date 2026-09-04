@@ -18,8 +18,9 @@ use crate::sql_types;
 use crate::tokens;
 use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
-    StoredContactShare, StoredFile, StoredMessage, StoredOutbox, StoredPairedDevice,
-    StoredReaction, StoredSession,
+    StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
+    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredReaction,
+    StoredSenderChain, StoredSession,
 };
 
 /// Хранилище на SQLite.
@@ -103,6 +104,69 @@ impl SqliteStore {
         key.extend_from_slice(msg_id);
         key.extend_from_slice(author_ik);
         key
+    }
+
+    /// Ключ строки цепочки отправителя: чат, затем участник.
+    ///
+    /// Пары мало по той же причине, что и у реакций: одна половина ключа
+    /// повторяется у многих строк, и AAD, собранный из неё одной, разрешил
+    /// бы переставить шифротекст между ними прямым доступом к файлу.
+    fn chain_row_key(chat_id: &[u8; 16], member_ik: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(chat_id.len() + member_ik.len());
+        key.extend_from_slice(chat_id);
+        key.extend_from_slice(member_ik);
+        key
+    }
+
+    /// Собирает группу из прочитанной строки, расшифровывая название.
+    fn group_row(
+        &self,
+        chat_id: [u8; 16],
+        owner: &[u8],
+        sealed: &[u8],
+        created_ms: i64,
+        title_wall: i64,
+        title_logical: i64,
+    ) -> Result<StoredGroup> {
+        let owner_ik: [u8; 32] = owner
+            .try_into()
+            .map_err(|_| StoreError::Backend("ключ владельца не 32 байта".into()))?;
+        let opened = self.open_sealed("chats.title_enc", &chat_id, sealed)?;
+        let title = String::from_utf8(opened)
+            .map_err(|_| StoreError::Backend("название группы не UTF-8".into()))?;
+        Ok(StoredGroup {
+            chat_id,
+            owner_ik,
+            title,
+            title_wall: sql_types::from_sql(title_wall),
+            // Логическая часть HLC — 32 бита; в базе она лежит целым
+            // со знаком, и обрезка невозможна: больше `u32::MAX` туда
+            // не кладётся.
+            title_logical: u32::try_from(sql_types::from_sql(title_logical)).unwrap_or(u32::MAX),
+            created_ms: sql_types::from_sql(created_ms),
+        })
+    }
+
+    /// Собирает цепочку из прочитанной строки, расшифровывая состояние.
+    fn chain_row(
+        &self,
+        chat_id: &[u8; 16],
+        member_ik: [u8; 32],
+        sealed: &[u8],
+        counter: i64,
+        skipped: Option<&[u8]>,
+    ) -> Result<StoredSenderChain> {
+        let row_key = Self::chain_row_key(chat_id, &member_ik);
+        let opened = self.open_sealed("sender_chains.chain_enc", &row_key, sealed)?;
+        let chain: [u8; 32] = opened
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Backend("состояние цепочки не 32 байта".into()))?;
+        let skipped = match skipped {
+            Some(bytes) => self.open_sealed("sender_chains.skipped_enc", &row_key, bytes)?,
+            None => Vec::new(),
+        };
+        Ok(StoredSenderChain { member_ik, chain, counter: sql_types::from_sql(counter), skipped })
     }
 
     fn seal(&self, column: &str, row_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -1006,6 +1070,343 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn put_group(&mut self, group: &StoredGroup) -> Result<()> {
+        let sealed = self.seal("chats.title_enc", &group.chat_id, group.title.as_bytes())?;
+        self.conn.execute(
+            // `kind = 1` ставится и при обновлении: строку чата мог завести
+            // приход сообщения (`kind = 0`, владелец пуст), и группа тогда
+            // приходит в уже существующую строку.
+            //
+            // Владелец — `coalesce`: пустое место заполняется, занятое
+            // не трогается. Первое нужно ровно для того случая выше, второе
+            // — правило §11.2: владелец у группы один и на всю жизнь.
+            //
+            // `created_ms` не обновляется по той же причине: если строка
+            // завелась сообщением, чат для этого устройства начался тогда,
+            // а не в тот момент, когда до него добралось сведение о группе.
+            //
+            // Название и его метка обновляются **вместе и только вперёд**:
+            // условие сравнивает пару «часы, счётчик» с той, что уже лежит.
+            // Два переименования одного человека законно приходят в обратном
+            // порядке (§9.2), и без этого условия старое затёрло бы новое.
+            // Сравнение стоит в SQL, а не в ядре, ровно затем, чтобы «читать
+            // и писать» не разъезжались между чтением и записью.
+            "INSERT INTO chats (chat_id, kind, owner_ik, title_enc, created_ms,
+                                title_wall, title_logical)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               kind = 1,
+               owner_ik = coalesce(chats.owner_ik, excluded.owner_ik),
+               title_enc = CASE
+                 WHEN (excluded.title_wall, excluded.title_logical)
+                      >= (chats.title_wall, chats.title_logical)
+                 THEN excluded.title_enc ELSE chats.title_enc END,
+               title_wall = max(chats.title_wall, excluded.title_wall),
+               title_logical = CASE
+                 WHEN excluded.title_wall > chats.title_wall THEN excluded.title_logical
+                 WHEN excluded.title_wall = chats.title_wall
+                      THEN max(chats.title_logical, excluded.title_logical)
+                 ELSE chats.title_logical END",
+            rusqlite::params![
+                &group.chat_id[..],
+                &group.owner_ik[..],
+                sealed,
+                sql_types::to_sql(group.created_ms),
+                sql_types::to_sql(group.title_wall),
+                sql_types::to_sql(u64::from(group.title_logical))
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn group(&self, chat_id: &[u8; 16]) -> Result<Option<StoredGroup>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT owner_ik, title_enc, created_ms, title_wall, title_logical FROM chats
+                  WHERE chat_id = ?1 AND kind = 1 AND owner_ik IS NOT NULL",
+                [&chat_id[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+
+        let Some((owner, sealed, created_ms, wall, logical)) = found else { return Ok(None) };
+        Ok(Some(self.group_row(*chat_id, &owner, &sealed, created_ms, wall, logical)?))
+    }
+
+    fn groups(&self) -> Result<Vec<StoredGroup>> {
+        let mut stmt = self.conn.prepare(
+            // Порядок — по времени заведения, затем по идентификатору:
+            // §16 требует воспроизводимости, а она держится на том, что
+            // порядок чтения задан целиком, без опоры на порядок вставки.
+            "SELECT chat_id, owner_ik, title_enc, created_ms, title_wall, title_logical
+               FROM chats
+              WHERE kind = 1 AND owner_ik IS NOT NULL
+              ORDER BY created_ms, chat_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut groups = Vec::new();
+        for row in rows {
+            let (id, owner, sealed, created_ms, wall, logical) = row?;
+            let chat_id: [u8; 16] = id
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Backend("идентификатор чата не 16 байт".into()))?;
+            groups.push(self.group_row(chat_id, &owner, &sealed, created_ms, wall, logical)?);
+        }
+        Ok(groups)
+    }
+
+    fn put_membership(&mut self, chat_id: &[u8; 16], ops: &[StoredMembershipOp]) -> Result<()> {
+        // Одной транзакцией: пачка операций приходит одним блоком состава
+        // (§11.2), и половина пачки на диске — это состав, которого никто
+        // не объявлял.
+        let tx = self.conn.transaction()?;
+        for op in ops {
+            tx.execute(
+                // Ключ строки — вся метка целиком, и повтор той же операции
+                // безвреден. `max` на надгробии делает погашение
+                // односторонним: удаление, дошедшее раньше добавления
+                // (а в OR-Set это обычное дело), не отменяется тем, что
+                // добавление доехало вторым.
+                "INSERT INTO group_members
+                   (chat_id, member_ik, tag_wall, tag_logical, tag_actor, tag_uniq, removed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(chat_id, member_ik, tag_wall, tag_logical, tag_actor, tag_uniq)
+                 DO UPDATE SET removed = max(group_members.removed, excluded.removed)",
+                rusqlite::params![
+                    &chat_id[..],
+                    &op.member_ik[..],
+                    sql_types::to_sql(op.tag_wall),
+                    i64::from(op.tag_logical),
+                    &op.tag_actor[..],
+                    &op.tag_uniq[..],
+                    i64::from(op.removed)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn membership(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipOp>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_ik, tag_wall, tag_logical, tag_actor, tag_uniq, removed
+               FROM group_members WHERE chat_id = ?1
+              ORDER BY tag_wall, tag_logical, tag_actor, tag_uniq, member_ik",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+
+        let mut ops = Vec::new();
+        for row in rows {
+            let (member, tag_wall, tag_logical, actor, uniq, removed) = row?;
+            ops.push(StoredMembershipOp {
+                member_ik: member
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("ключ участника не 32 байта".into()))?,
+                tag_wall: sql_types::from_sql(tag_wall),
+                tag_logical: u32::try_from(tag_logical).unwrap_or(0),
+                tag_actor: actor
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("ключ автора метки не 32 байта".into()))?,
+                tag_uniq: uniq
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("разводящие байты не 8 байт".into()))?,
+                removed: removed != 0,
+            });
+        }
+        Ok(ops)
+    }
+
+    fn put_membership_block(
+        &mut self,
+        chat_id: &[u8; 16],
+        block: &StoredMembershipBlock,
+    ) -> Result<()> {
+        self.conn.execute(
+            // `DO NOTHING`, а не `DO UPDATE`: тот же блок законно приходит
+            // вторым транспортом (§9.2). Перезапись означала бы, что байты,
+            // над которыми стоит подпись, можно подменить, назвав прежний
+            // идентификатор, — а идентификатор и есть их хэш.
+            "INSERT INTO group_blocks (chat_id, block_id, author_ik, block_bytes, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, block_id) DO NOTHING",
+            rusqlite::params![
+                &chat_id[..],
+                &block.block_id[..],
+                &block.author_ik[..],
+                &block.bytes[..],
+                sql_types::to_sql(block.received_ms)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn membership_blocks(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipBlock>> {
+        let mut stmt = self.conn.prepare(
+            // Порядок приёма, затем идентификатор: он задан целиком,
+            // без опоры на порядок вставки, — по той же причине, что
+            // у состава (§16).
+            "SELECT block_id, author_ik, block_bytes, received_ms FROM group_blocks
+              WHERE chat_id = ?1 ORDER BY received_ms, block_id",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+
+        let mut blocks = Vec::new();
+        for row in rows {
+            let (id, author, bytes, received_ms) = row?;
+            blocks.push(StoredMembershipBlock {
+                block_id: id
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("идентификатор блока не 16 байт".into()))?,
+                author_ik: author
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("ключ автора не 32 байта".into()))?,
+                bytes,
+                received_ms: sql_types::from_sql(received_ms),
+            });
+        }
+        Ok(blocks)
+    }
+
+    fn put_sender_chain(&mut self, chat_id: &[u8; 16], chain: &StoredSenderChain) -> Result<()> {
+        let row_key = Self::chain_row_key(chat_id, &chain.member_ik);
+        let sealed = self.seal("sender_chains.chain_enc", &row_key, &chain.chain)?;
+        // Пусто — значит NULL, а не пустой блоб: «пропусков нет» и «пропуски
+        // записаны как ноль байт» это одно и то же, и хранить для этого
+        // отдельное значение незачем.
+        let skipped = if chain.skipped.is_empty() {
+            None
+        } else {
+            Some(self.seal("sender_chains.skipped_enc", &row_key, &chain.skipped)?)
+        };
+        self.conn.execute(
+            // Ключ, номер и кэш обновляются одним оператором и порознь
+            // никогда не пишутся: разойдись ключ с номером — сообщение
+            // расшифруется, а место в цепочке окажется не то; переживи кэш
+            // смену ключа — он открывал бы номера от цепочки, которой
+            // больше нет.
+            "INSERT INTO sender_chains (chat_id, member_ik, chain_enc, counter, skipped_enc)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, member_ik) DO UPDATE SET
+               chain_enc = excluded.chain_enc,
+               counter = excluded.counter,
+               skipped_enc = excluded.skipped_enc",
+            rusqlite::params![
+                &chat_id[..],
+                &chain.member_ik[..],
+                sealed,
+                sql_types::to_sql(chain.counter),
+                skipped
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn sender_chain(
+        &self,
+        chat_id: &[u8; 16],
+        member_ik: &[u8; 32],
+    ) -> Result<Option<StoredSenderChain>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT chain_enc, counter, skipped_enc FROM sender_chains
+                  WHERE chat_id = ?1 AND member_ik = ?2",
+                rusqlite::params![&chat_id[..], &member_ik[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+
+        let Some((sealed, counter, skipped)) = found else { return Ok(None) };
+        Ok(Some(self.chain_row(chat_id, *member_ik, &sealed, counter, skipped.as_deref())?))
+    }
+
+    fn sender_chains(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredSenderChain>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT member_ik, chain_enc, counter, skipped_enc FROM sender_chains
+              WHERE chat_id = ?1 ORDER BY member_ik",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })?;
+
+        let mut chains = Vec::new();
+        for row in rows {
+            let (member, sealed, counter, skipped) = row?;
+            let member_ik: [u8; 32] = member
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Backend("ключ участника не 32 байта".into()))?;
+            chains.push(self.chain_row(
+                chat_id,
+                member_ik,
+                &sealed,
+                counter,
+                skipped.as_deref(),
+            )?);
+        }
+        Ok(chains)
+    }
+
     fn remember_revocation(&mut self, pairing_public: &[u8; 32], revoked_ms: u64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO revoked_devices (pairing_public, revoked_ms) VALUES (?1, ?2)
@@ -1111,6 +1512,121 @@ impl Store for SqliteStore {
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
         self.conn.execute("DELETE FROM avatars WHERE owner_ik = ?1", [&owner_ik[..]])?;
         Ok(())
+    }
+
+    fn put_group_avatar(&mut self, chat_id: &[u8; 16], avatar: &StoredGroupAvatar) -> Result<()> {
+        // Пустые байты кладутся **пустым блобом**, а не шифротекстом
+        // из нонса и тега: снятая картинка обязана быть отличима от лежащей
+        // по одной длине столбца — иначе «есть ли что показывать»
+        // не ответить, не расшифровав тридцать два килобайта.
+        //
+        // Утечки здесь нет сверх той, что уже есть: строка существует —
+        // значит картинку когда-то ставили, и это того же рода сведение,
+        // что и `kind = 1` рядом.
+        //
+        // AAD привязывает шифротекст к строке — как у лица контакта:
+        // картинка, переставленная из одной группы в другую прямым доступом
+        // к файлу, не откроется.
+        let sealed = if avatar.bytes.is_empty() {
+            Vec::new()
+        } else {
+            self.seal("group_avatars.avatar_enc", chat_id, &avatar.bytes)?
+        };
+        self.conn.execute(
+            // Слово в слово то же сравнение, что у названия группы в `chats`,
+            // и по той же причине: две смены картинки законно приходят
+            // в обратном порядке (§9.2), а решать между ними должна метка,
+            // а не порядок прихода. Байты и метка обновляются вместе —
+            // разъедься они, у группы оказалась бы новая метка при старой
+            // картинке, и настоящая новая была бы отвергнута навсегда.
+            "INSERT INTO group_avatars (chat_id, avatar_enc, avatar_wall, avatar_logical)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               avatar_enc = CASE
+                 WHEN (excluded.avatar_wall, excluded.avatar_logical)
+                      >= (group_avatars.avatar_wall, group_avatars.avatar_logical)
+                 THEN excluded.avatar_enc ELSE group_avatars.avatar_enc END,
+               avatar_wall = max(group_avatars.avatar_wall, excluded.avatar_wall),
+               avatar_logical = CASE
+                 WHEN excluded.avatar_wall > group_avatars.avatar_wall
+                      THEN excluded.avatar_logical
+                 WHEN excluded.avatar_wall = group_avatars.avatar_wall
+                      THEN max(group_avatars.avatar_logical, excluded.avatar_logical)
+                 ELSE group_avatars.avatar_logical END",
+            rusqlite::params![
+                &chat_id[..],
+                sealed,
+                sql_types::to_sql(avatar.avatar_wall),
+                sql_types::to_sql(u64::from(avatar.avatar_logical))
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn group_avatar(&self, chat_id: &[u8; 16]) -> Result<Option<StoredGroupAvatar>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT avatar_enc, avatar_wall, avatar_logical
+                 FROM group_avatars WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+
+        let Some((sealed, wall, logical)) = found else { return Ok(None) };
+        // Пустой блоб — снятая картинка; расшифровывать в нём нечего.
+        let bytes = if sealed.is_empty() {
+            Vec::new()
+        } else {
+            self.open_sealed("group_avatars.avatar_enc", chat_id, &sealed)?
+        };
+        Ok(Some(StoredGroupAvatar {
+            bytes,
+            avatar_wall: sql_types::from_sql(wall),
+            avatar_logical: u32::try_from(sql_types::from_sql(logical)).unwrap_or(u32::MAX),
+        }))
+    }
+
+    fn has_group_avatar(&self, chat_id: &[u8; 16]) -> Result<bool> {
+        // Длина столбца, а не расшифровка: пустой блоб означает снятую
+        // картинку, и это единственное, что нужно знать списку чатов.
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT length(avatar_enc) FROM group_avatars WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        Ok(found.is_some_and(|len| len > 0))
+    }
+
+    fn group_avatar_stamp(&self, chat_id: &[u8; 16]) -> Result<Option<(u64, u32)>> {
+        self.conn
+            .query_row(
+                "SELECT avatar_wall, avatar_logical FROM group_avatars WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map(|(wall, logical)| {
+                Some((
+                    sql_types::from_sql(wall),
+                    u32::try_from(sql_types::from_sql(logical)).unwrap_or(u32::MAX),
+                ))
+            })
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })
     }
 
     fn put_outbox(&mut self, entry: &StoredOutbox) -> Result<()> {

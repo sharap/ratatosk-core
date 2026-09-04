@@ -49,7 +49,9 @@ use ratatosk_core::{
     CompanionClient, CompanionCommand, CompanionDriver, CompanionEvent, CompanionEvents,
     CompanionHandle, OsEntropy,
 };
-use ratatosk_proto::companion::{Attachment, ChatSummary, Message, PairingInvite, Reaction};
+use ratatosk_proto::companion::{
+    Attachment, ChatSummary, Member, Message, PairingInvite, Reaction,
+};
 use ratatosk_transport::{Disabled, LanConfig, LanRunner, Runner, TransportCommand, Transports};
 
 /// Составной транспорт терминала: локальная сеть, свой onion, почты нет.
@@ -154,6 +156,27 @@ pub struct FfiCompanionChat {
     pub last_text: String,
     /// Когда оно было, мс.
     pub last_ms: u64,
+    /// Группа это или человек (§11).
+    ///
+    /// **Вывести это из остальных полей нельзя.** У группы `verified`
+    /// всегда `false` и `avatar_ms` всегда `0` — ровно тот же набор,
+    /// что у несверенного контакта без картинки. Без этого признака
+    /// десктоп сказал бы про группу «не сверен», а это утверждение
+    /// не про «сверьте при встрече»: оно означает «здесь есть отпечаток,
+    /// и вы его не сверили». У группы отпечатка нет и быть не может —
+    /// §11 не даёт ей идентичности, которую сверяют.
+    pub is_group: bool,
+    /// Состоим ли мы в этом чате сейчас (§11).
+    ///
+    /// **У разговора с человеком всегда `true`**: из переписки с ним
+    /// не выходят — её удаляют, и тогда чата в списке нет вовсе.
+    ///
+    /// `false` означает «показывать переписку **без поля ввода**».
+    /// Два случая — вышли сами и исключили — читаются одинаково,
+    /// и различать их незачем: делать в обоих нечего одно и то же.
+    /// Без этого признака десктоп предлагал бы писать туда, где телефон
+    /// откажет, и человек увидел бы ошибку вместо серой строки.
+    pub joined: bool,
     /// Метка аватарки; `0` — показывать нечего.
     ///
     /// **Не байты, а число**, и не для показа: список чатов приезжает
@@ -167,6 +190,38 @@ pub struct FfiCompanionChat {
     pub avatar_ms: u64,
 }
 
+/// Участник группы в том виде, в каком его показывает окно десктопа (§11.2).
+///
+/// **Ключа здесь нет.** §13.4 не пускает `IK` через границу устройства,
+/// и участник назван идентификатором своего личного чата — тем самым,
+/// каким окно уже адресует переписку двоих. По нему же ему можно написать
+/// лично: `send_text` в этот чат, без единой новой просьбы к телефону.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionMember {
+    /// Идентификатор личного чата с ним — им же ему и пишут.
+    pub chat_id: Vec<u8>,
+    /// Как его назвать. Пустым не бывает: у безымянного — начало отпечатка.
+    pub name: String,
+    /// Это хозяин телефона.
+    ///
+    /// Считает телефон, а не окно поиском себя в списке: своей карточки
+    /// в контактах нет, и окно показало бы хозяина «неизвестным
+    /// участником» — ровно так, как это уже случилось у клиента телефона.
+    pub mine: bool,
+    /// Это создатель группы (§11.2).
+    ///
+    /// **Единственное, чем окно узнаёт свои права.** Исключать,
+    /// переименовывать и менять картинку вправе только создатель:
+    /// «я ли создатель» — это строка, у которой `mine && owner`.
+    /// Без этого признака окно рисовало бы кнопки, на которые телефон
+    /// отвечает отказом, то есть предлагало бы действие, которого нет.
+    ///
+    /// Ушедшего создателя в составе нет вовсе — состав держит тех, кто
+    /// состоит сейчас. Исход верный: распоряжаться он и вправду больше
+    /// не может, а вернувшись — снова сможет.
+    pub owner: bool,
+}
+
 /// Сообщение в том виде, в каком его видит десктоп.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCompanionMessage {
@@ -177,6 +232,19 @@ pub struct FfiCompanionMessage {
     /// Своё ли. Считает телефон: сравнение с собственным `IK` — протокольное
     /// знание, и §13.3 не пускает его выше границы.
     pub mine: bool,
+    /// Как подписать автора — или `None`, если подпись выводится из `mine`.
+    ///
+    /// **`None` означает «выводится», а не «неизвестно».** В переписке
+    /// двоих автор исчерпывается признаком «своё ли»: не своё — значит
+    /// собеседника, а его имя уже стоит заголовком чата. В группе так
+    /// нельзя, и `Some` приходит ровно у групповых сообщений.
+    ///
+    /// Имя считает телефон: местное имя (§4.1) вытесняет карточное,
+    /// а участник без карточки подписывается началом отпечатка. Своё
+    /// сообщение подписано своим именем — себя в контактах нет, и окно,
+    /// искавшее бы подпись само, не нашло бы её именно у хозяина телефона.
+    /// Показать вместо имени «вы» — дело окна, для этого у него `mine`.
+    pub author: Option<String>,
     /// Текст.
     pub body: String,
     /// Физическая компонента метки порядка (§9.1), миллисекунды.
@@ -336,6 +404,26 @@ pub enum FfiCompanionEvent {
         bytes: Option<Vec<u8>>,
         /// Подтверждено ли телефоном сейчас; `false` — показанное из кэша.
         fresh: bool,
+    },
+    /// Состав группы (§11.2) — в ответ на [`RatatoskCompanion::members`].
+    ///
+    /// Признака `fresh` здесь нет, и это не пропуск: состав не кэшируется,
+    /// а значит приходит только от телефона и только сейчас. Пустой список
+    /// — законный ответ: так отвечает личный чат.
+    Members {
+        /// Какой группы.
+        chat_id: Vec<u8>,
+        /// Участники.
+        members: Vec<FfiCompanionMember>,
+    },
+    /// Группа заведена — вот чем её открыть (§11).
+    ///
+    /// Идентификатор приезжает ответом на `create_group`, а не выуживается
+    /// из перечитанного списка чатов: у группы он случаен, а названия
+    /// повторяются — окно однажды открыло бы не ту.
+    GroupCreated {
+        /// Идентификатор заведённой группы.
+        chat_id: Vec<u8>,
     },
     /// Сопряжение отозвано — этот компьютер больше не второй экран (§13.4).
     ///
@@ -873,6 +961,141 @@ impl RatatoskCompanion {
         self.ask(CompanionCommand::Avatar { chat })
     }
 
+    /// Заводит группу (§11).
+    ///
+    /// **Перед вызовом обязателен `group_join_notice()`.** §11.5 требует
+    /// сказать при создании, что участники увидят onion- и chatmail-адреса
+    /// друг друга; сказанное после — уже не предупреждение, а отменить это
+    /// нельзя ничем. Текст — свободная функция тех же биндингов: проводом
+    /// он не едет, потому что это константа, а не сведение о телефоне,
+    /// и телефон не может проверить, показали ли его.
+    ///
+    /// Идентификатор новой группы придёт событием
+    /// [`FfiCompanionEvent::GroupCreated`] — им и открывают чат.
+    ///
+    /// Пределы названия те же, что на телефоне: непустое после обрезки
+    /// краёв и не длиннее `max_group_title_chars()`. Поле ввода обязано
+    /// останавливать **до** нажатия, а не показывать отказ после.
+    ///
+    /// # Errors
+    ///
+    /// Остановленный компаньон.
+    pub fn create_group(&self, title: String) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::CreateGroup { title })
+    }
+
+    /// Зовёт человека в группу (§11.2).
+    ///
+    /// Приглашать вправе **любой** участник, а не только создатель.
+    /// Приглашаемый адресуется идентификатором своего личного чата —
+    /// тем же, каким окно ему пишет: он есть и в строке списка чатов,
+    /// и в [`FfiCompanionMember::chat_id`].
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn invite_to_group(
+        &self,
+        chat_id: Vec<u8>,
+        member_chat_id: Vec<u8>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::InviteToGroup {
+            chat: to_chat(&chat_id)?,
+            member: to_chat(&member_chat_id)?,
+        })
+    }
+
+    /// Исключает участника из группы (§11.2).
+    ///
+    /// **Только создатель** — кнопку стоит показывать, лишь когда в составе
+    /// есть строка с `mine && owner`. **Перед вызовом обязателен
+    /// `eviction_notice()`** (§11.4): исключённый сохранит доступ к прошлой
+    /// переписке, и отменить это нельзя ничем.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn evict_from_group(
+        &self,
+        chat_id: Vec<u8>,
+        member_chat_id: Vec<u8>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::EvictFromGroup {
+            chat: to_chat(&chat_id)?,
+            member: to_chat(&member_chat_id)?,
+        })
+    }
+
+    /// Переименовывает группу. Только создатель.
+    ///
+    /// Новое название приедет новостью `ChatsChanged` — список чатов
+    /// перечитывается целиком.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn rename_group(&self, chat_id: Vec<u8>, title: String) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::RenameGroup { chat: to_chat(&chat_id)?, title })
+    }
+
+    /// Ставит или снимает аватарку группы. Только создатель.
+    ///
+    /// `None` — снять. Пределы те же, что у своей: `max_avatar_bytes()`,
+    /// PNG, JPEG или WebP; масштабирует и перекодирует окно.
+    ///
+    /// **Правила §4.2 у группы нет**: картинку видят все участники,
+    /// сверенные и нет. Ответ приедет новостью
+    /// [`FfiCompanionEvent::AvatarChanged`] с `chat_id` этой группы.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn set_group_avatar(
+        &self,
+        chat_id: Vec<u8>,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::SetGroupAvatar {
+            chat: to_chat(&chat_id)?,
+            bytes: bytes.unwrap_or_default(),
+        })
+    }
+
+    /// Выходит из группы.
+    ///
+    /// **Перед вызовом обязателен `leave_notice()`**, а если выходит
+    /// создатель (в составе есть строка `mine && owner`) — ещё и
+    /// `owner_leave_notice()`: после его ухода группу нельзя ни
+    /// переименовать, ни исключить из неё, ни сменить ей картинку.
+    ///
+    /// Переписка остаётся, и группа остаётся в списке чатов: уход
+    /// из разговора не стирает сказанное. Вернуть вышедшего вправе любой
+    /// участник.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn leave_group(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::LeaveGroup { chat: to_chat(&chat_id)? })
+    }
+
+    /// Спрашивает состав группы (§11.2).
+    ///
+    /// Ответ придёт событием [`FfiCompanionEvent::Members`]. Отдельным
+    /// вызовом, а не полем списка чатов: до тридцати двух участников
+    /// на группу, а список читается на каждый показ экрана — состав же
+    /// нужен одному окну, тому, где открыты сведения о группе.
+    ///
+    /// У личного чата ответ пуст, и спрашивать его незачем: состав
+    /// переписки двоих — её заголовок.
+    ///
+    /// # Errors
+    ///
+    /// Негодный идентификатор или остановленный компаньон.
+    pub fn members(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::Members { chat: to_chat(&chat_id)? })
+    }
+
     /// Ставит или снимает **свою** аватарку (§4.2).
     ///
     /// `None` — снять. Байты готовит клиент, как и превью: масштабирование
@@ -1205,6 +1428,13 @@ fn translate(event: CompanionEvent) -> FfiCompanionEvent {
         CompanionEvent::FilePreview { file_id, bytes } => {
             FfiCompanionEvent::FilePreview { file_id: file_id.to_vec(), bytes }
         }
+        CompanionEvent::GroupCreated { chat } => {
+            FfiCompanionEvent::GroupCreated { chat_id: chat.to_vec() }
+        }
+        CompanionEvent::Members { chat, members } => FfiCompanionEvent::Members {
+            chat_id: chat.to_vec(),
+            members: members.iter().map(member_of).collect(),
+        },
         CompanionEvent::Revoked => FfiCompanionEvent::Revoked,
         CompanionEvent::Avatar { chat, bytes, fresh } => {
             FfiCompanionEvent::Avatar { chat_id: chat.map(|chat| chat.to_vec()), bytes, fresh }
@@ -1257,6 +1487,8 @@ fn chat_of(chat: &ChatSummary) -> FfiCompanionChat {
         verified: chat.verified,
         last_text: chat.last_text.clone(),
         last_ms: chat.last_ms,
+        is_group: chat.is_group,
+        joined: chat.joined,
         avatar_ms: chat.avatar_ms,
     }
 }
@@ -1273,11 +1505,21 @@ fn attachment_of(file: &Attachment) -> FfiCompanionAttachment {
     }
 }
 
+fn member_of(member: &Member) -> FfiCompanionMember {
+    FfiCompanionMember {
+        chat_id: member.chat.to_vec(),
+        name: member.name.clone(),
+        mine: member.mine,
+        owner: member.owner,
+    }
+}
+
 fn message_of(message: &Message) -> FfiCompanionMessage {
     FfiCompanionMessage {
         msg_id: message.msg_id.to_vec(),
         chat_id: message.chat.to_vec(),
         mine: message.mine,
+        author: message.author.clone(),
         body: message.text.clone(),
         wall_ms: message.wall_ms,
         status: message.status.map(|code| crate::status_of(status_from_code(code))),
@@ -1302,6 +1544,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: true,
+            author: Some("Оля с работы".to_owned()),
             text: "привет".to_owned(),
             wall_ms: 1_700_000_000_000,
             status: Some(ratatosk_proto::DeliveryStatus::Delivered.code()),
@@ -1322,11 +1565,58 @@ mod tests {
     }
 
     #[test]
+    fn a_member_crosses_the_boundary_by_his_own_chat() {
+        // Ключа у участника нет и не будет (§13.4): назван он
+        // идентификатором своего личного чата — тем самым, каким окно
+        // уже адресует переписку двоих, и им же ему можно написать.
+        let members = [
+            Member { chat: [6u8; 16], name: "я".to_owned(), mine: true, owner: true },
+            Member { chat: [7u8; 16], name: "гость".to_owned(), mine: false, owner: false },
+        ];
+        let out: Vec<FfiCompanionMember> = members.iter().map(member_of).collect();
+
+        let me = out.iter().find(|m| m.mine).expect("себя обязано быть видно");
+        assert_eq!(me.chat_id, vec![6u8; 16]);
+        assert_eq!(me.name, "я", "имя считает телефон: своей карточки в контактах нет");
+        let other = out.iter().find(|m| !m.mine).expect("и гостя тоже");
+        assert_eq!(other.chat_id, vec![7u8; 16]);
+        assert_eq!(other.name, "гость");
+    }
+
+    #[test]
+    fn the_owner_of_a_group_is_marked_in_the_roster() {
+        // Единственное, чем окно узнаёт свои права: «я ли создатель» —
+        // это строка, у которой `mine && owner`. Потеряйся признак здесь,
+        // окно рисовало бы «исключить» там, где телефон ответит отказом.
+        let members = [
+            Member { chat: [6u8; 16], name: "я".to_owned(), mine: true, owner: true },
+            Member { chat: [7u8; 16], name: "гость".to_owned(), mine: false, owner: false },
+        ];
+        let out: Vec<FfiCompanionMember> = members.iter().map(member_of).collect();
+        assert!(out.iter().any(|m| m.mine && m.owner), "создатель — это мы");
+        assert!(out.iter().any(|m| !m.mine && !m.owner), "а гость — нет");
+    }
+
+    #[test]
+    fn a_message_without_an_author_says_so_with_none() {
+        // `None` означает «выводится из `mine`», а не «неизвестно»:
+        // так приезжает переписка двоих, и подпись под каждой строкой
+        // там повторяла бы заголовок чата.
+        let one_to_one = Message { author: None, ..full_message() };
+        assert_eq!(message_of(&one_to_one).author, None);
+    }
+
+    #[test]
     fn every_field_of_a_message_survives_the_boundary() {
         let it = message_of(&full_message());
         assert_eq!(it.msg_id, vec![1u8; 16], "идентификатор сообщения");
         assert_eq!(it.chat_id, vec![2u8; 16], "чат — не идентификатор сообщения");
         assert!(it.mine, "своё");
+        assert_eq!(
+            it.author.as_deref(),
+            Some("Оля с работы"),
+            "подпись автора: без неё групповой чат на десктопе безымянный"
+        );
         assert_eq!(it.body, "привет", "текст");
         assert_eq!(it.wall_ms, 1_700_000_000_000, "метка времени");
         assert_eq!(it.status, Some(FfiDeliveryStatus::Delivered), "статус");
@@ -1362,6 +1652,7 @@ mod tests {
             msg_id: [1u8; 16],
             chat: [2u8; 16],
             mine: false,
+            author: None,
             text: String::new(),
             wall_ms: 1,
             status: None,
@@ -1397,6 +1688,8 @@ mod tests {
             verified: true,
             last_text: "ага".to_owned(),
             last_ms: 5,
+            is_group: false,
+            joined: true,
             avatar_ms: 9,
         };
         let it = chat_of(&chat);
@@ -1409,6 +1702,48 @@ mod tests {
         // Метка лица — тоже: без неё клиент возил бы по сети тридцать два
         // килобайта на контакт при каждом обновлении списка.
         assert_eq!(it.avatar_ms, 9);
+        assert!(!it.is_group);
+    }
+
+    #[test]
+    fn a_group_crosses_the_boundary_as_a_group() {
+        // Пустой `avatar_ms` и `verified = false` — набор, неотличимый
+        // от несверенного контакта без картинки. Потеряйся признак
+        // на границе — десктоп сказал бы про группу «не сверен» (§11).
+        let group = ChatSummary {
+            chat: [3u8; 16],
+            title: "У костра".to_owned(),
+            verified: false,
+            last_text: "все тут?".to_owned(),
+            last_ms: 7,
+            is_group: true,
+            joined: true,
+            avatar_ms: 0,
+        };
+        let it = chat_of(&group);
+        assert!(it.is_group, "признак группы обязан пережить границу");
+        assert!(!it.verified, "у группы нет отпечатка, который сверяют");
+        assert!(it.joined, "состоим");
+    }
+
+    #[test]
+    fn a_group_we_left_crosses_the_boundary_as_left() {
+        // Потеряйся признак здесь — десктоп предложил бы писать туда,
+        // где телефон откажет, и человек увидел бы ошибку вместо серой
+        // строки.
+        let left = ChatSummary {
+            chat: [3u8; 16],
+            title: "у костра".to_owned(),
+            verified: false,
+            last_text: "все тут?".to_owned(),
+            last_ms: 7,
+            is_group: true,
+            joined: false,
+            avatar_ms: 0,
+        };
+        let it = chat_of(&left);
+        assert!(it.is_group, "группой она быть не перестала");
+        assert!(!it.joined, "а состоять мы перестали");
     }
 
     #[test]

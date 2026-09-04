@@ -4141,3 +4141,1006 @@ fn an_overflowing_skipped_key_cache_does_not_break_the_session() {
     assert!(chat.contains(&format!("письмо {}", total - 4)), "сессия не пережила переполнение");
     assert!(chat.contains(&"здравствуй".to_string()), "история до переполнения обязана остаться");
 }
+
+#[test]
+fn an_invitation_hands_the_newcomer_the_whole_group() {
+    // Единственный тест здесь, который **не** пампит свои кадры: принимать
+    // их ядро ещё не умеет (§11.5 — следующая поставка), и провод упёрся бы
+    // в `todo!`. Два настоящих узла нужны ради живой сессии: без неё кадры
+    // ушли бы в рукопожатие, и считать было бы нечего.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = alice
+        .step(2_000, Input::Command(Command::CreateGroup { title: "у костра".into() }))
+        .expect("группа заведена")
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notify(Event::GroupCreated { chat, .. }) => Some(*chat),
+            _ => None,
+        })
+        .expect("событие о заведении");
+
+    let effects = alice
+        .step(3_000, Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("приглашение");
+    let sent = effects.iter().filter(|e| matches!(e, Effect::Send { .. })).count();
+
+    let blocks = alice.store().membership_blocks(&chat).unwrap().len();
+    let chains = alice.store().sender_chains(&chat).unwrap().len();
+    assert_eq!(blocks, 2, "заведение группы и приглашение — два изменения состава");
+    assert_eq!(
+        sent,
+        blocks + 1 + 1 + chains,
+        "история состава, представление группы, карточки и ключи отправителей (§11.5)"
+    );
+
+    // Прежним участникам ничего не уехало, и это правильно: их тут нет.
+    // Группа состоит из Алисы и новичка, а себе Алиса не пишет.
+    assert_eq!(alice.groups()[&chat].group.len(), 2);
+}
+
+/// Заводит группу и отдаёт её идентификатор.
+fn create_group(node: &mut Node, now_ms: u64, title: &str) -> [u8; 16] {
+    node.step(now_ms, Input::Command(Command::CreateGroup { title: title.into() }))
+        .expect("группа заведена")
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notify(Event::GroupCreated { chat, .. }) => Some(*chat),
+            _ => None,
+        })
+        .expect("событие о заведении")
+}
+
+#[test]
+fn a_newcomer_joins_and_learns_the_whole_group() {
+    // Половина §11.5, ради которой всё и писалось: новичок обязан узнать
+    // группу целиком — кто её создал, как называется, кто в ней и чем
+    // подписаны их сообщения.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = create_group(&mut alice, 2_000, "у костра");
+    let effects = alice
+        .step(3_000, Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("приглашение");
+    let events = pump(&mut alice, &mut bob, 3_000, effects);
+
+    let state = bob.groups().get(&chat).expect("группа доехала до новичка");
+    assert_eq!(state.title, "у костра", "название приезжает представлением");
+    assert_eq!(state.group.owner, alice.own_card().ik, "без создателя не работает §11.2");
+
+    let members: std::collections::BTreeSet<[u8; 32]> = state.group.members().copied().collect();
+    assert_eq!(
+        members,
+        std::collections::BTreeSet::from([alice.own_card().ik, bob.own_card().ik]),
+        "состав собрался из подписанных блоков, а не со слов пригласившего"
+    );
+
+    assert!(
+        events.iter().any(|e| matches!(e, Event::GroupCreated { chat: c, .. } if *c == chat)),
+        "без события в списке чатов не появится строки"
+    );
+
+    // Ключи отправителей: каждый знает свой и чужой. Без этого групповое
+    // сообщение не открыть ни в одну сторону.
+    assert_eq!(bob.store().sender_chains(&chat).unwrap().len(), 2, "новичок знает оба ключа");
+    assert_eq!(alice.store().sender_chains(&chat).unwrap().len(), 2, "и пригласивший тоже");
+
+    // Свой ключ у каждого свой: принять чужое мнение о нём значило бы
+    // забыть, чем подписываешь.
+    let bobs_own = bob.store().sender_chain(&chat, &bob.own_card().ik).unwrap().unwrap();
+    let alices_copy = alice.store().sender_chain(&chat, &bob.own_card().ik).unwrap().unwrap();
+    assert_eq!(bobs_own.chain, alices_copy.chain, "ключ Боба доехал до Алисы неизменным");
+}
+
+#[test]
+fn a_roster_never_strips_a_verified_contact() {
+    // §4.2: сверку снимает только человек. `add_contact` ставит `verified`
+    // по своему аргументу, а не сохраняет прежнее, — значит список карточек
+    // вступления снял бы сверку со знакомого, приди он без этой защиты.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    assert!(bob.contacts()[&alice.own_card().ik].verified, "знакомство при встрече сверено");
+
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = create_group(&mut alice, 2_000, "у костра");
+    let effects = alice
+        .step(3_000, Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("приглашение");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    assert!(
+        bob.contacts()[&alice.own_card().ik].verified,
+        "список карточек не вправе снимать сверку голосом"
+    );
+}
+
+/// Сводит двоих в одной группе и отдаёт её идентификатор.
+fn shared_group(alice: &mut Node, bob: &mut Node, now_ms: u64) -> [u8; 16] {
+    introduce(alice, bob);
+    let effects = send_text(alice, bob, now_ms, "привет");
+    pump(alice, bob, now_ms, effects);
+
+    let chat = create_group(alice, now_ms + 1_000, "у костра");
+    let effects = alice
+        .step(
+            now_ms + 2_000,
+            Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }),
+        )
+        .expect("приглашение");
+    pump(alice, bob, now_ms + 2_000, effects);
+    chat
+}
+
+fn group_history(node: &Node, chat: [u8; 16]) -> Vec<String> {
+    node.store()
+        .messages(&chat, 100, None)
+        .unwrap()
+        .into_iter()
+        .map(|m| String::from_utf8(m.body).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_group_message_reaches_every_member() {
+    // То, ради чего писалось всё остальное.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "все у костра?".into() }))
+        .expect("сообщение в группу");
+    let events = pump(&mut alice, &mut bob, 5_000, effects);
+
+    assert_eq!(group_history(&bob, chat), vec!["все у костра?"], "дошло");
+    assert_eq!(group_history(&alice, chat), vec!["все у костра?"], "и лежит у отправителя");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { chat: c, .. } if *c == chat)),
+        "без события чат не перерисуется"
+    );
+
+    // Ответ в ту же сторону — цепочка Боба работает так же.
+    let effects = bob
+        .step(6_000, Input::Command(Command::SendText { chat, text: "иду".into() }))
+        .expect("ответ в группу");
+    pump(&mut bob, &mut alice, 6_000, effects);
+    assert_eq!(group_history(&alice, chat), vec!["все у костра?", "иду"]);
+}
+
+#[test]
+fn a_group_message_has_the_same_id_everywhere() {
+    // Копия каждому (§11.3) — но сообщение одно: один шифротекст, один
+    // номер, одна подпись. Разойдись идентификаторы, «одно сообщение»
+    // пришлось бы склеивать из совпадения текста.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "одно и то же".into() }))
+        .expect("сообщение в группу");
+    pump(&mut alice, &mut bob, 5_000, effects);
+
+    let mine = alice.store().messages(&chat, 10, None).unwrap();
+    let theirs = bob.store().messages(&chat, 10, None).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(mine[0].msg_id, theirs[0].msg_id, "у сообщения один номер на всех");
+    assert_eq!(mine[0].hlc, theirs[0].hlc, "и одна метка порядка (§9.1)");
+    assert_eq!(theirs[0].sender_ik, alice.own_card().ik, "автор назван и проверен подписью");
+}
+
+#[test]
+fn a_group_message_carries_no_delivery_status() {
+    // Один значок на тридцать двух получателей — обещание, которого протокол
+    // не даёт (§14). «Доставлено» после того, как дошло одному, — ложь.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "без галочек".into() }))
+        .expect("сообщение в группу");
+    pump(&mut alice, &mut bob, 5_000, effects);
+
+    let mine = alice.store().messages(&chat, 10, None).unwrap();
+    assert_eq!(mine[0].status, None, "у группового сообщения статуса нет вовсе");
+
+    // А у личного — есть, и это разные вещи, а не забывчивость.
+    let effects = send_text(&mut alice, &bob, 6_000, "лично");
+    pump(&mut alice, &mut bob, 6_000, effects);
+    let direct = Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik);
+    let personal = alice.store().messages(&direct, 10, None).unwrap();
+    assert!(personal.last().unwrap().status.is_some(), "у личного статус остался");
+}
+
+#[test]
+fn the_sender_chain_advances_once_per_message() {
+    // Номер выдаётся ровно один раз: выдай его дважды, и тот же ключ ушёл бы
+    // в сеть на другом тексте. Это худшее, что бывает с потоковым шифром.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let mine = alice.own_card().ik;
+
+    let before = alice.store().sender_chain(&chat, &mine).unwrap().unwrap();
+    for n in 0..3 {
+        let effects = alice
+            .step(
+                5_000 + n * 1_000,
+                Input::Command(Command::SendText { chat, text: format!("раз {n}") }),
+            )
+            .expect("сообщение в группу");
+        pump(&mut alice, &mut bob, 5_000 + n * 1_000, effects);
+    }
+    let after = alice.store().sender_chain(&chat, &mine).unwrap().unwrap();
+    assert_eq!(after.counter, before.counter + 3, "три сообщения — три номера");
+    assert_eq!(group_history(&bob, chat).len(), 3, "и все три открылись");
+}
+
+#[test]
+fn an_eviction_reaches_the_evicted_too() {
+    // Молчание здесь было бы худшим из решений: клиент исключённого
+    // показывал бы живую группу, в которой никто не отвечает, — то самое
+    // молчание, которое запрещает §14.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::EvictFromGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("исключение");
+    let events = pump(&mut alice, &mut bob, 5_000, effects);
+
+    assert_eq!(alice.groups()[&chat].group.len(), 1, "у создателя состав убавился");
+    let theirs = bob.groups().get(&chat).expect("группа у исключённого осталась");
+    assert!(!theirs.group.contains(&bob.own_card().ik), "и он знает, что вышел из неё");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::GroupMembershipChanged { chat: c } if *c == chat)),
+        "без события шапка не перерисуется"
+    );
+}
+
+#[test]
+fn the_evicted_keeps_the_past_and_gets_nothing_new() {
+    // §11.4 дословно: «не получает новых сообщений от честных клиентов,
+    // сохраняет доступ ко всей прошлой переписке».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "до".into() }))
+        .expect("сообщение");
+    pump(&mut alice, &mut bob, 5_000, effects);
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::EvictFromGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("исключение");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    let effects = alice
+        .step(7_000, Input::Command(Command::SendText { chat, text: "после".into() }))
+        .expect("сообщение");
+    pump(&mut alice, &mut bob, 7_000, effects);
+
+    assert_eq!(group_history(&bob, chat), vec!["до"], "прошлое осталось, нового нет");
+    assert_eq!(group_history(&alice, chat), vec!["до", "после"]);
+
+    // И сам он писать в группу больше не может: писать некому и незачем.
+    assert!(matches!(
+        bob.step(8_000, Input::Command(Command::SendText { chat, text: "эй".into() })),
+        Err(ratatosk_core::EngineError::NotInGroup)
+    ));
+}
+
+// --- Действия в группе: приём --------------------------------------------
+
+/// Говорит в группе и доносит сказанное; отдаёт номер сказанного.
+fn group_say(
+    alice: &mut Node,
+    bob: &mut Node,
+    now_ms: u64,
+    chat: [u8; 16],
+    text: &str,
+) -> [u8; 16] {
+    let effects = alice
+        .step(now_ms, Input::Command(Command::SendText { chat, text: text.to_owned() }))
+        .expect("сообщение в группу");
+    pump(alice, bob, now_ms, effects);
+    alice.store().messages(&chat, 100, None).unwrap().last().unwrap().msg_id
+}
+
+#[test]
+fn an_edit_in_a_group_reaches_every_member() {
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let effects = alice
+        .step(
+            6_000,
+            Input::Command(Command::EditMessage {
+                chat, msg_id, text: "все уже у костра?".into()
+            }),
+        )
+        .expect("правка");
+    let events = pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert_eq!(group_history(&bob, chat), vec!["все уже у костра?"], "текст заменён у всех");
+    let seen = bob.store().message(&msg_id).unwrap().expect("сообщение на месте");
+    assert!(seen.edited_ms.is_some(), "молча подменить слова §14 запрещает");
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageEdited { chat: c, .. } if *c == chat)),
+        "без события чат не перерисуется"
+    );
+}
+
+#[test]
+fn an_edit_of_someone_elses_message_in_a_group_is_refused_by_the_receiver() {
+    // Проверяет **получатель**, а не отправитель: иначе достаточно прислать
+    // чужой номер, чтобы переписать слова у всех тридцати двух сразу.
+    // Здесь Боб просит Алису поправить **её** сообщение, назвав его своим.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let hers = group_say(&mut alice, &mut bob, 5_000, chat, "моё слово");
+
+    // У Боба это сообщение есть, но оно не его: команда отказывается ещё
+    // до провода — и это первая из двух проверок.
+    let refused = bob.step(
+        6_000,
+        Input::Command(Command::EditMessage { chat, msg_id: hers, text: "не моё".into() }),
+    );
+    assert!(refused.is_err(), "своё же ядро не даёт править чужое");
+    assert_eq!(group_history(&alice, chat), vec!["моё слово"], "у Алисы ничего не поменялось");
+}
+
+#[test]
+fn a_reaction_in_a_group_reaches_every_member() {
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let effects = bob
+        .step(6_000, Input::Command(Command::SetReaction { chat, msg_id, emoji: "🔥".into() }))
+        .expect("реакция");
+    pump(&mut bob, &mut alice, 6_000, effects);
+
+    let his = bob.own_card().ik;
+    let seen = alice.store().reaction(&msg_id, &his).unwrap().expect("реакция дошла");
+    assert_eq!(seen.emoji, "🔥");
+}
+
+#[test]
+fn a_later_reaction_wins_and_an_earlier_one_does_not_come_back() {
+    // §9.1: свежее не затирается старым. Снятие — такая же реакция, и
+    // опоздавшая копия не обязана вернуть то, что человек убрал.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+    let his = bob.own_card().ik;
+
+    let effects = bob
+        .step(6_000, Input::Command(Command::SetReaction { chat, msg_id, emoji: "🔥".into() }))
+        .expect("реакция");
+    pump(&mut bob, &mut alice, 6_000, effects);
+    let effects = bob
+        .step(7_000, Input::Command(Command::SetReaction { chat, msg_id, emoji: String::new() }))
+        .expect("снятие");
+    pump(&mut bob, &mut alice, 7_000, effects);
+
+    let seen = alice.store().reaction(&msg_id, &his).unwrap().expect("запись осталась");
+    assert_eq!(seen.emoji, "", "снятие доехало и пересилило");
+}
+
+#[test]
+fn a_reply_in_a_group_reaches_every_member_with_its_link() {
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let effects = bob
+        .step(
+            6_000,
+            Input::Command(Command::SendReply { chat, reply_to: msg_id, text: "иду".into() }),
+        )
+        .expect("ответ");
+    pump(&mut bob, &mut alice, 6_000, effects);
+
+    assert_eq!(group_history(&alice, chat), vec!["все у костра?", "иду"]);
+    let reply = alice
+        .store()
+        .messages(&chat, 100, None)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.msg_id != msg_id)
+        .expect("ответ дошёл");
+    assert_eq!(reply.reply_to, Some(msg_id), "по проводу едет ссылка, а не цитата");
+    assert_eq!(reply.sender_ik, bob.own_card().ik);
+    // Своя строка в истории есть, а статуса доставки у неё нет: один значок
+    // на тридцать двух получателей §14 не разрешает.
+    assert_eq!(reply.status, None);
+}
+
+#[test]
+fn a_reply_in_a_group_has_the_same_id_everywhere() {
+    // Ответ — сообщение, и у всех участников это одна и та же строка.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let effects = bob
+        .step(
+            6_000,
+            Input::Command(Command::SendReply { chat, reply_to: msg_id, text: "иду".into() }),
+        )
+        .expect("ответ");
+    pump(&mut bob, &mut alice, 6_000, effects);
+
+    let his: Vec<[u8; 16]> =
+        bob.store().messages(&chat, 100, None).unwrap().iter().map(|m| m.msg_id).collect();
+    let hers: Vec<[u8; 16]> =
+        alice.store().messages(&chat, 100, None).unwrap().iter().map(|m| m.msg_id).collect();
+    assert_eq!(his, hers, "номера совпадают у обоих");
+}
+
+#[test]
+fn a_retraction_in_a_group_removes_the_words_everywhere() {
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "зря сказал");
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::RetractMessages { chat, msg_ids: vec![msg_id] }))
+        .expect("отзыв");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert!(group_history(&bob, chat).is_empty(), "просьба выполнена");
+    assert!(group_history(&alice, chat).is_empty(), "и у себя тоже");
+}
+
+#[test]
+fn a_group_action_carries_no_delivery_status_for_its_target() {
+    // Правка не имеет своей строки в истории — но у сообщения, которое она
+    // правит, строка есть. Квитанции у групповой копии нет вовсе (§11.3),
+    // и статус на этой строке появиться не должен ни до, ни после.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    let msg_id = group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::EditMessage { chat, msg_id, text: "все тут?".into() }))
+        .expect("правка");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert_eq!(alice.store().message(&msg_id).unwrap().unwrap().status, None);
+}
+
+// --- Выход из группы ------------------------------------------------------
+
+#[test]
+fn leaving_reaches_the_others_and_stops_the_copies() {
+    // Блок уезжает **до** того, как мы применим выход у себя: получателей
+    // берём из состава, в котором мы ещё есть. Не скажи мы — остальные
+    // продолжали бы слать копии каждого слова, а мы бы их выбрасывали.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    group_say(&mut alice, &mut bob, 5_000, chat, "до");
+
+    let effects = bob.step(6_000, Input::Command(Command::LeaveGroup { chat })).expect("выход");
+    pump(&mut bob, &mut alice, 6_000, effects);
+
+    assert!(!alice.groups()[&chat].group.contains(&bob.own_card().ik), "у Алисы он вышел");
+
+    let effects = alice
+        .step(7_000, Input::Command(Command::SendText { chat, text: "после".into() }))
+        .expect("сообщение");
+    pump(&mut alice, &mut bob, 7_000, effects);
+
+    assert_eq!(group_history(&bob, chat), vec!["до"], "прошлое осталось, нового нет");
+    assert_eq!(group_history(&alice, chat), vec!["до", "после"]);
+}
+
+#[test]
+fn a_departed_member_can_be_invited_back() {
+    // Возвращает **любой** участник: приглашение в §11.2 не привилегия
+    // создателя, и выход этого не меняет.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = bob.step(6_000, Input::Command(Command::LeaveGroup { chat })).expect("выход");
+    pump(&mut bob, &mut alice, 6_000, effects);
+
+    let effects = alice
+        .step(7_000, Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("приглашение обратно");
+    pump(&mut alice, &mut bob, 7_000, effects);
+
+    assert!(alice.groups()[&chat].group.contains(&bob.own_card().ik), "вернулся");
+    let effects = alice
+        .step(8_000, Input::Command(Command::SendText { chat, text: "снова".into() }))
+        .expect("сообщение");
+    pump(&mut alice, &mut bob, 8_000, effects);
+    assert_eq!(group_history(&bob, chat).last().map(String::as_str), Some("снова"));
+}
+
+#[test]
+fn the_owner_leaving_does_not_break_the_group() {
+    // Цена выхода создателя названа вслух: исключать больше некому.
+    // Но разговор продолжается — приглашать вправе любой участник.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice.step(6_000, Input::Command(Command::LeaveGroup { chat })).expect("выход");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert!(!bob.groups()[&chat].group.contains(&alice.own_card().ik), "создатель вышел");
+    assert_eq!(bob.groups()[&chat].group.owner, alice.own_card().ik, "владение не снялось");
+    // Боб один в группе и говорить в ней вправе: копий просто некому слать.
+    assert!(bob.step(7_000, Input::Command(Command::SendText { chat, text: "эй".into() })).is_ok());
+}
+
+// --- Файлы в группе -------------------------------------------------------
+
+/// Провод на любое число узлов: кадр уходит тому, чей ключ назван.
+///
+/// [`pump`] знает ровно двоих и различает их флагом «от первого ли». Группе
+/// этого мало, и не из-за размера: **окно раздачи чанков заведено на пару
+/// «файл и получатель»**, а увидеть разницу между одним окном и двумя можно
+/// только тогда, когда получателей действительно двое.
+///
+/// Кадр адресату, которого здесь нет, отбрасывается: в составе группы могут
+/// быть участники, которых тест не изображает.
+fn pump_many(
+    nodes: &mut [&mut Node],
+    now_ms: u64,
+    from: usize,
+    effects: Vec<Effect>,
+) -> Vec<Event> {
+    let keys: Vec<[u8; 32]> = nodes.iter().map(|n| n.own_card().ik).collect();
+    let mut events = Vec::new();
+    let mut queue: VecDeque<(usize, Effect)> = effects.into_iter().map(|e| (from, e)).collect();
+    let mut timers: Vec<(usize, u64)> = Vec::new();
+
+    let mut steps = 0;
+    loop {
+        while let Some((owner, effect)) = queue.pop_front() {
+            steps += 1;
+            assert!(steps < 900, "обмен не сходится: кольцо эффектов или срок, взводящий сам себя");
+            match effect {
+                Effect::Send { peer_ik, via, frame, handoff } => {
+                    if let Some(handoff) = handoff {
+                        let produced = nodes[owner]
+                            .step(now_ms, Input::Handed { peer_ik, via, handoff })
+                            .expect("подтверждение передачи не должно отказывать");
+                        queue.extend(produced.into_iter().map(|e| (owner, e)));
+                    }
+                    let Some(target) = keys.iter().position(|k| *k == peer_ik) else {
+                        continue;
+                    };
+                    let produced = nodes[target]
+                        .step(now_ms, Input::Received { via, frame })
+                        .expect("приём кадра не должен отказывать");
+                    queue.extend(produced.into_iter().map(|e| (target, e)));
+                }
+                Effect::SetTimer { token, .. } => timers.push((owner, token)),
+                Effect::Notify(event) => events.push(event),
+                Effect::Connect { .. }
+                | Effect::SetTransportEnabled { .. }
+                | Effect::WatchLanPeers(_)
+                | Effect::SetMailAccount(_)
+                | Effect::CreateMailAccount { .. }
+                | Effect::RestartLan => {}
+            }
+        }
+        let Some((owner, token)) = timers.pop() else { break };
+        let produced = nodes[owner].step(now_ms, Input::Timer { token }).expect("таймер доставки");
+        queue.extend(produced.into_iter().map(|e| (owner, e)));
+    }
+    events
+}
+
+/// Собирает группу из троих: заводит, знакомит всех со всеми, зовёт двоих.
+fn group_of_three(alice: &mut Node, bob: &mut Node, carol: &mut Node, now_ms: u64) -> [u8; 16] {
+    introduce(alice, bob);
+    introduce(alice, carol);
+    let chat = create_group(alice, now_ms, "у костра");
+    // Ключи собираются заранее: держать заимствование гостя, пока провод
+    // берёт всех троих изменяемо, нельзя. И перезаимствование в самом
+    // вызове — `&mut *`, — иначе ссылки уехали бы в массив на первом же круге.
+    let guests = [bob.own_card().ik, carol.own_card().ik];
+    for peer_ik in guests {
+        let effects = alice
+            .step(now_ms + 100, Input::Command(Command::InviteToGroup { chat, peer_ik }))
+            .expect("приглашение");
+        pump_many(&mut [&mut *alice, &mut *bob, &mut *carol], now_ms + 100, 0, effects);
+    }
+    chat
+}
+
+#[test]
+fn a_file_in_a_group_reaches_every_member_whole() {
+    // То, ради чего заводилось окно на пару «файл и получатель». Один файл,
+    // двое просящих, у каждого своя дорога по нему: одно окно на всех
+    // означало бы, что просьба второго отматывает отправку первому,
+    // и хотя бы один из двоих собрал бы файл с дырой.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    let mut carol = node(3, "carol");
+    let chat = group_of_three(&mut alice, &mut bob, &mut carol, 1_000);
+
+    let content = payload_of(files::CHUNK_BYTES * 3 + 11);
+    alice_blobs.lock().unwrap().seed("/tmp/kot.jpg", content.clone());
+    for who in [&mut bob, &mut carol] {
+        who.step(4_000, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+
+    let effects = alice
+        .step(
+            5_000,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![OutgoingFile { path: "/tmp/kot.jpg".into(), preview: None }],
+                text: "вот кот".into(),
+            }),
+        )
+        .expect("отправка файла в группу принята");
+    pump_many(&mut [&mut alice, &mut bob, &mut carol], 5_000, 0, effects);
+
+    for who in [&bob, &carol] {
+        assert_eq!(group_history(who, chat), vec!["вот кот"], "подпись — обычное сообщение");
+        let msg_id = who.store().messages(&chat, 10, None).unwrap()[0].msg_id;
+        let attached = who.store().files_of(&msg_id).unwrap();
+        assert_eq!(attached.len(), 1, "вложение на месте");
+        let received = who.store().file(&attached[0].file_id).unwrap().unwrap();
+        assert_eq!(received.name, "kot.jpg");
+        assert!(received.complete, "файл обязан собраться до конца");
+        assert_eq!(assembled(who, &attached[0].file_id), content, "и совпасть до байта");
+    }
+}
+
+#[test]
+fn a_group_file_is_one_message_with_one_identifier() {
+    // Копия каждому (§11.3), но сообщение одно: номер конверта общий,
+    // и вложение у всех под тем же `file_id` с тем же ключом.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    let mut carol = node(3, "carol");
+    let chat = group_of_three(&mut alice, &mut bob, &mut carol, 1_000);
+
+    alice_blobs.lock().unwrap().seed("/tmp/kot.jpg", payload_of(64));
+    for who in [&mut bob, &mut carol] {
+        who.step(4_000, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    let effects = alice
+        .step(
+            5_000,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![OutgoingFile { path: "/tmp/kot.jpg".into(), preview: None }],
+                text: "вот кот".into(),
+            }),
+        )
+        .expect("отправка");
+    pump_many(&mut [&mut alice, &mut bob, &mut carol], 5_000, 0, effects);
+
+    let ids: Vec<[u8; 16]> = [&alice, &bob, &carol]
+        .iter()
+        .map(|who| who.store().messages(&chat, 10, None).unwrap()[0].msg_id)
+        .collect();
+    assert_eq!(ids[0], ids[1], "у отправителя и получателя один номер");
+    assert_eq!(ids[1], ids[2], "и у второго получателя тот же");
+
+    let keys: Vec<[u8; 32]> = [&alice, &bob, &carol]
+        .iter()
+        .map(|who| who.store().files_of(&ids[0]).unwrap()[0].key)
+        .collect();
+    assert_eq!(keys[0], keys[1], "ключ файла один на всех — иначе чанки не откроются");
+    assert_eq!(keys[1], keys[2]);
+}
+
+#[test]
+fn a_group_file_message_carries_no_delivery_status() {
+    // Такая же групповая копия, как слово: один значок на тридцать двух
+    // получателей §14 не разрешает.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    alice_blobs.lock().unwrap().seed("/tmp/kot.jpg", payload_of(64));
+    let effects = alice
+        .step(
+            5_000,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![OutgoingFile { path: "/tmp/kot.jpg".into(), preview: None }],
+                text: "вот кот".into(),
+            }),
+        )
+        .expect("отправка");
+    pump(&mut alice, &mut bob, 5_000, effects);
+
+    let msg_id = alice.store().messages(&chat, 10, None).unwrap()[0].msg_id;
+    assert_eq!(alice.store().message(&msg_id).unwrap().unwrap().status, None);
+}
+
+#[test]
+fn a_group_message_is_signed_with_the_authors_name_on_the_other_side() {
+    // То, ради чего подпись и заведена: у получателя чужое сообщение
+    // в группе обязано быть подписано именем, а не «не своё».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    group_say(&mut alice, &mut bob, 5_000, chat, "все у костра?");
+
+    let seen = bob.store().messages(&chat, 10, None).unwrap();
+    let from_alice = seen.iter().find(|m| m.sender_ik == alice.own_card().ik).expect("её слово");
+    assert_eq!(
+        bob.message_author(&chat, &from_alice.sender_ik).as_deref(),
+        Some("alice"),
+        "имя берётся из карточки, которую Боб уже знает"
+    );
+
+    // И своё — своим именем, а не отпечатком: себя в контактах нет.
+    let effects = bob
+        .step(6_000, Input::Command(Command::SendText { chat, text: "иду".into() }))
+        .expect("ответ в группу");
+    pump(&mut bob, &mut alice, 6_000, effects);
+    assert_eq!(bob.message_author(&chat, &bob.own_card().ik).as_deref(), Some("bob"));
+}
+
+#[test]
+fn a_rename_reaches_every_member() {
+    // То, ради чего рассылка и заведена: название группы у всех одно.
+    // До этой поставки каждый видел своё, и «переименовать» в UI было бы
+    // обещанием, которого §14 не позволяет.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+    assert_eq!(bob.groups().get(&chat).expect("группа доехала").title, "у костра");
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::RenameGroup { chat, title: "у ручья".into() }))
+        .expect("переименование");
+    let events = pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert_eq!(bob.groups().get(&chat).expect("группа").title, "у ручья");
+    assert_eq!(
+        bob.store().group(&chat).unwrap().expect("группа на диске").title,
+        "у ручья",
+        "у Боба название обязано пережить перезапуск, а не жить до закрытия"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::GroupRenamed { chat: c, title } if *c == chat && title == "у ручья"))
+            .count(),
+        2,
+        "по событию каждой стороне: без него список чатов не перерисуется"
+    );
+}
+
+#[test]
+fn a_member_cannot_rename_the_group() {
+    // §11.2 расширено по смыслу: создатель распоряжается тем, что относится
+    // ко всей группе, участники — только ростом состава. Один писатель
+    // означает, что метки названия не бывает вничью.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let refused =
+        bob.step(6_000, Input::Command(Command::RenameGroup { chat, title: "у ручья".into() }));
+    assert!(
+        matches!(
+            refused,
+            Err(ratatosk_core::EngineError::Group(ratatosk_proto::GroupError::NotOwner))
+        ),
+        "отказ обязан называть причину: человек нажал кнопку (§14)"
+    );
+    assert_eq!(bob.groups().get(&chat).expect("группа").title, "у костра", "и у себя тоже нет");
+    assert_eq!(alice.groups().get(&chat).expect("группа").title, "у костра");
+}
+
+#[test]
+fn a_rename_that_arrives_late_does_not_bring_the_old_name_back() {
+    // §9.2: две правки одного человека законно приезжают в обратном порядке,
+    // и кэш пропущенных ключей (§8.4) позволяет принять их именно так.
+    // Решает метка, а не порядок прихода, — иначе название группы менялось
+    // бы само по себе от одной задержки в сети.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let first = frames(
+        alice
+            .step(6_000, Input::Command(Command::RenameGroup { chat, title: "у ручья".into() }))
+            .expect("первое переименование"),
+    );
+    let second = frames(
+        alice
+            .step(7_000, Input::Command(Command::RenameGroup { chat, title: "у моря".into() }))
+            .expect("второе переименование"),
+    );
+
+    for (via, frame) in second.into_iter().chain(first) {
+        bob.step(8_000, Input::Received { via, frame }).expect("приём");
+    }
+
+    assert_eq!(
+        bob.groups().get(&chat).expect("группа").title,
+        "у моря",
+        "опоздавшее переименование не воскрешает прежнее название"
+    );
+    assert_eq!(bob.store().group(&chat).unwrap().expect("на диске").title, "у моря");
+}
+
+#[test]
+fn a_renamed_group_keeps_its_name_for_a_newcomer() {
+    // Новичок получает название **вместе с меткой** (§11.5). Приедь оно
+    // без неё — первое же переименование после его прихода одни приняли бы,
+    // а он отверг бы как опоздавшее, и разошлись бы навсегда.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::RenameGroup { chat, title: "у ручья".into() }))
+        .expect("переименование");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    introduce(&mut alice, &mut carol);
+    let effects = send_text(&mut alice, &carol, 7_000, "привет");
+    pump(&mut alice, &mut carol, 7_000, effects);
+    let effects = alice
+        .step(8_000, Input::Command(Command::InviteToGroup { chat, peer_ik: carol.own_card().ik }))
+        .expect("приглашение");
+    pump(&mut alice, &mut carol, 8_000, effects);
+
+    let seen = carol.groups().get(&chat).expect("группа доехала");
+    assert_eq!(seen.title, "у ручья", "новичок видит нынешнее название, а не первое");
+    assert_eq!(
+        seen.title_hlc,
+        alice.groups().get(&chat).expect("группа").title_hlc,
+        "и ту же метку: без неё следующее переименование он отверг бы"
+    );
+}
+
+fn png() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(&[7u8; 64]);
+    bytes
+}
+
+fn other_png() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(&[9u8; 64]);
+    bytes
+}
+
+#[test]
+fn a_group_avatar_reaches_every_member() {
+    // §4.2 здесь не применяется: Боб узнан при вступлении и потому
+    // **несверен**, а картинку получает и показывает. Правило лица
+    // контакта здесь означало бы «картинки почти никогда нет».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::SetGroupAvatar { chat, bytes: png() }))
+        .expect("аватарка");
+    let events = pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert_eq!(bob.group_avatar_of(&chat).expect("чтение"), Some(png()), "картинка доехала");
+    assert_ne!(bob.group_avatar_stamp(&chat).expect("метка"), 0, "и метка вместе с ней");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::GroupAvatarChanged { chat: c } if *c == chat))
+            .count(),
+        2,
+        "по событию каждой стороне: без него окно не перерисуется"
+    );
+}
+
+#[test]
+fn a_member_cannot_set_the_group_avatar() {
+    // То же правило, что у названия: создатель распоряжается тем, что
+    // относится ко всей группе. Один писатель — и метке не бывает ничьей.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let refused = bob.step(6_000, Input::Command(Command::SetGroupAvatar { chat, bytes: png() }));
+    assert!(
+        matches!(
+            refused,
+            Err(ratatosk_core::EngineError::Group(ratatosk_proto::GroupError::NotOwner))
+        ),
+        "отказ обязан называть причину: человек нажал кнопку (§14)"
+    );
+    assert_eq!(bob.group_avatar_of(&chat).expect("чтение"), None, "и у себя тоже не положил");
+    assert_eq!(alice.group_avatar_of(&chat).expect("чтение"), None);
+}
+
+#[test]
+fn removing_a_group_avatar_reaches_every_member() {
+    // Снятие обязано доехать: иначе у остальных навсегда осталось бы
+    // прежнее лицо — то самое молчание, которое запрещает §14.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::SetGroupAvatar { chat, bytes: png() }))
+        .expect("аватарка");
+    pump(&mut alice, &mut bob, 6_000, effects);
+    assert!(bob.group_avatar_of(&chat).expect("чтение").is_some());
+
+    let effects = alice
+        .step(7_000, Input::Command(Command::SetGroupAvatar { chat, bytes: Vec::new() }))
+        .expect("снятие");
+    pump(&mut alice, &mut bob, 7_000, effects);
+
+    assert_eq!(bob.group_avatar_of(&chat).expect("чтение"), None, "снятие доехало");
+    assert_eq!(bob.group_avatar_stamp(&chat).expect("метка"), 0, "и наружу это «нечего показать»");
+}
+
+#[test]
+fn a_late_avatar_does_not_bring_the_old_picture_back() {
+    // §9.2: две смены одного человека законно приезжают в обратном порядке,
+    // и кэш пропущенных ключей (§8.4) позволяет принять их именно так.
+    // Решает метка, а не порядок прихода.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let first = frames(
+        alice
+            .step(6_000, Input::Command(Command::SetGroupAvatar { chat, bytes: png() }))
+            .expect("первая"),
+    );
+    let second = frames(
+        alice
+            .step(7_000, Input::Command(Command::SetGroupAvatar { chat, bytes: other_png() }))
+            .expect("вторая"),
+    );
+
+    for (via, frame) in second.into_iter().chain(first) {
+        bob.step(8_000, Input::Received { via, frame }).expect("приём");
+    }
+
+    assert_eq!(
+        bob.group_avatar_of(&chat).expect("чтение"),
+        Some(other_png()),
+        "опоздавшая картинка не воскрешает прежнюю"
+    );
+}
+
+#[test]
+fn a_newcomer_gets_the_avatar_with_the_intro() {
+    // Единственная дорога картинки к новичку. Переслать ему чужое действие
+    // нельзя: пригласивший выдал бы старой картинке метку своего конверта,
+    // и настоящая новая была бы у новичка отвергнута как опоздавшая.
+    //
+    // Приглашает **Боб**, а не создатель: приглашать вправе любой участник
+    // (§11.2), и картинка обязана доехать от того, кто пригласил.
+    let (mut alice, mut bob, mut carol) = (node(1, "alice"), node(2, "bob"), node(3, "carol"));
+    let chat = shared_group(&mut alice, &mut bob, 1_000);
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::SetGroupAvatar { chat, bytes: png() }))
+        .expect("аватарка");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    introduce(&mut bob, &mut carol);
+    let effects = send_text(&mut bob, &carol, 7_000, "привет");
+    pump(&mut bob, &mut carol, 7_000, effects);
+    let effects = bob
+        .step(8_000, Input::Command(Command::InviteToGroup { chat, peer_ik: carol.own_card().ik }))
+        .expect("приглашение");
+    pump(&mut bob, &mut carol, 8_000, effects);
+
+    assert_eq!(carol.group_avatar_of(&chat).expect("чтение"), Some(png()), "новичок видит лицо");
+    assert_eq!(
+        carol.groups().get(&chat).expect("группа доехала").avatar_hlc,
+        alice.groups().get(&chat).expect("группа").avatar_hlc,
+        "и ту же метку: без неё следующая смена разошлась бы"
+    );
+}

@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 
-use ratatosk_proto::companion::{Attachment, ChatSummary, Message, Reaction, Request};
+use ratatosk_proto::companion::{Attachment, ChatSummary, Member, Message, Reaction, Request};
 use ratatosk_proto::files::{FileId, CHUNK_BYTES};
 use ratatosk_proto::Transport;
 use ratatosk_transport::{PeerAddress, Runner, TransportCommand, TransportEvent};
@@ -85,6 +85,65 @@ pub enum CompanionCommand {
         limit: u32,
         /// Перед каким сообщением.
         before: Option<[u8; 16]>,
+    },
+    /// Завести группу (§11).
+    ///
+    /// **Перед вызовом окно обязано показать `group_join_notice()`** —
+    /// §11.5 требует сказать при создании, что участники увидят адреса
+    /// друг друга. Текст лежит в биндингах окна, проводом не едет,
+    /// и телефон не знает, показали ли его: проследить может только окно.
+    CreateGroup {
+        /// Как назвать.
+        title: String,
+    },
+    /// Позвать в группу (§11.2). Вправе любой участник.
+    InviteToGroup {
+        /// Куда.
+        chat: [u8; 16],
+        /// Кого — идентификатором его **личного** чата.
+        member: [u8; 16],
+    },
+    /// Исключить из группы (§11.2). Только создатель.
+    ///
+    /// **Перед вызовом окно обязано показать `eviction_notice()`** (§11.4):
+    /// исключённый сохранит доступ к прошлой переписке, и отменить это
+    /// нельзя ничем.
+    EvictFromGroup {
+        /// Откуда.
+        chat: [u8; 16],
+        /// Кого — идентификатором его **личного** чата.
+        member: [u8; 16],
+    },
+    /// Переименовать группу. Только создатель.
+    RenameGroup {
+        /// Какую.
+        chat: [u8; 16],
+        /// Как назвать.
+        title: String,
+    },
+    /// Сменить аватарку группы. Только создатель. Пусто — снять.
+    SetGroupAvatar {
+        /// Какой группе.
+        chat: [u8; 16],
+        /// Байты картинки; пусто — снять.
+        bytes: Vec<u8>,
+    },
+    /// Выйти из группы.
+    ///
+    /// **Перед вызовом окно обязано показать `leave_notice()`**, а если
+    /// выходит создатель — ещё и `owner_leave_notice()`: после его ухода
+    /// группу нельзя ни переименовать, ни исключить из неё.
+    LeaveGroup {
+        /// Из какой.
+        chat: [u8; 16],
+    },
+    /// Спросить состав группы (§11.2).
+    ///
+    /// У личного чата ответ пуст, и это не ошибка вызывающего: состав
+    /// переписки двоих — её заголовок.
+    Members {
+        /// Какой группы.
+        chat: [u8; 16],
     },
     /// Отправить текст.
     SendText {
@@ -265,6 +324,21 @@ pub enum CompanionEvent {
         theirs: Option<u32>,
         /// Что здесь.
         ours: u32,
+    },
+    /// Группа заведена — вот чем её открыть.
+    GroupCreated {
+        /// Идентификатор заведённой группы.
+        chat: [u8; 16],
+    },
+    /// Состав группы (§11.2).
+    ///
+    /// Признака `fresh` здесь нет, и это не пропуск: состав не кэшируется
+    /// вовсе, а значит приходит только от телефона и только сейчас.
+    Members {
+        /// Какой группы.
+        chat: [u8; 16],
+        /// Участники; пусто у личного чата.
+        members: Vec<Member>,
     },
     /// Список чатов. `fresh` — подтверждён ли телефоном в этой связи.
     Chats {
@@ -713,6 +787,19 @@ impl<R: Runner> CompanionDriver<R> {
             CompanionCommand::History { chat, limit, before } => {
                 Request::History { chat, limit, before }
             }
+            CompanionCommand::Members { chat } => Request::Members { chat },
+            CompanionCommand::CreateGroup { title } => Request::CreateGroup { title },
+            CompanionCommand::InviteToGroup { chat, member } => {
+                Request::InviteToGroup { chat, member }
+            }
+            CompanionCommand::EvictFromGroup { chat, member } => {
+                Request::EvictFromGroup { chat, member }
+            }
+            CompanionCommand::RenameGroup { chat, title } => Request::RenameGroup { chat, title },
+            CompanionCommand::SetGroupAvatar { chat, bytes } => {
+                Request::SetGroupAvatar { chat, bytes }
+            }
+            CompanionCommand::LeaveGroup { chat } => Request::LeaveGroup { chat },
             CompanionCommand::SendText { chat, text } => Request::SendText { chat, text },
             CompanionCommand::SendReply { chat, reply_to, text } => {
                 Request::SendReply { chat, reply_to, text }
@@ -1137,6 +1224,14 @@ impl<R: Runner> CompanionDriver<R> {
             }
             ClientEvent::Avatar { chat, bytes, fresh } => {
                 self.tell(CompanionEvent::Avatar { chat, bytes, fresh }).await;
+                None
+            }
+            ClientEvent::Members { chat, members } => {
+                self.tell(CompanionEvent::Members { chat, members }).await;
+                None
+            }
+            ClientEvent::GroupCreated { chat } => {
+                self.tell(CompanionEvent::GroupCreated { chat }).await;
                 None
             }
             ClientEvent::AvatarChanged { chat, avatar_ms } => {

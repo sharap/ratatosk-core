@@ -16,8 +16,9 @@ use ratatosk_crdt::{Hlc, MsgId};
 use crate::compaction::{self, Task};
 use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
-    StoredContactShare, StoredFile, StoredMessage, StoredOutbox, StoredPairedDevice,
-    StoredReaction, StoredSession,
+    StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
+    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredReaction,
+    StoredSenderChain, StoredSession,
 };
 
 /// Хранилище в оперативной памяти.
@@ -37,7 +38,26 @@ pub struct MemoryStore {
     contacts: BTreeMap<[u8; 32], StoredContact>,
     sessions: BTreeMap<u64, StoredSession>,
     avatars: BTreeMap<[u8; 32], StoredAvatar>,
+    /// Аватарки групп (§11 + дополнение). Отдельно от `avatars`: ключ там
+    /// — `IK` человека, здесь — идентификатор чата, и складывать их в одну
+    /// карту значило бы объявить шестнадцать байт группы началом чьего-то
+    /// ключа.
+    group_avatars: BTreeMap<[u8; 16], StoredGroupAvatar>,
     devices: BTreeMap<[u8; 16], StoredPairedDevice>,
+    /// Группы (§11). Строка чата здесь отдельной таблицей не нужна:
+    /// в файловой базе группа и чат — одна строка, а тут чат ничем, кроме
+    /// сообщений, не представлен.
+    groups: BTreeMap<[u8; 16], StoredGroup>,
+    /// Операции состава. Ключ — метка целиком, ровно как первичный ключ
+    /// `group_members`: повтор той же операции обязан лечь в ту же ячейку.
+    /// Порядок обхода задан ключом и совпадает с `ORDER BY` файловой базы.
+    membership: BTreeMap<([u8; 16], u64, u32, [u8; 32], [u8; 8], [u8; 32]), bool>,
+    /// Подписанные блоки состава (§11.5). Ключ — чат и идентификатор блока,
+    /// ровно как первичный ключ `group_blocks`: тот же блок, пришедший
+    /// вторым транспортом, обязан лечь в ту же ячейку.
+    blocks: BTreeMap<([u8; 16], [u8; 16]), StoredMembershipBlock>,
+    /// Ключи отправителей: чат, затем участник.
+    chains: BTreeMap<([u8; 16], [u8; 32]), StoredSenderChain>,
     /// Надгробия отозванных сопряжений (§13.4): ключ сопряжения и когда.
     /// Записи об устройстве уже нет — есть только то, чем узнать его
     /// в рукопожатии, чтобы ответить причиной вместо тишины.
@@ -166,6 +186,16 @@ impl Store for MemoryStore {
             }
             self.contact_shares.remove(&msg_id);
         }
+        // Всё групповое — тем же каскадом, каким его уносит внешний ключ
+        // на `chats` в файловой базе. Найдено при заведении `group_avatars`:
+        // здесь не сносилось **ничего** группового, и удалённый чат группы
+        // на устройстве исчезал, а в симуляции (§16) оставался — то есть
+        // подъём после удаления проверялся не тот.
+        self.groups.remove(chat_id);
+        self.group_avatars.remove(chat_id);
+        self.membership.retain(|(chat, ..), _| chat != chat_id);
+        self.blocks.retain(|(chat, _), _| chat != chat_id);
+        self.chains.retain(|(chat, _), _| chat != chat_id);
         Ok(())
     }
 
@@ -353,6 +383,135 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn put_group(&mut self, group: &StoredGroup) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // Тем же правилом, что и в файловой базе: владелец и время
+        // заведения не обновляются (§11.2), а название — **только вперёд**.
+        //
+        // Сравнение пары «часы, счётчик» повторено здесь дословно, и это
+        // не дублирование ради дублирования: две реализации одного
+        // хранилища обязаны отвечать одинаково, иначе симуляция §16
+        // проверяла бы не то, что работает на устройстве. Расхождение
+        // здесь ловит `persistence.rs` — он гоняет оба.
+        match self.groups.get_mut(&group.chat_id) {
+            Some(known) => {
+                if (group.title_wall, group.title_logical)
+                    >= (known.title_wall, known.title_logical)
+                {
+                    known.title.clone_from(&group.title);
+                    known.title_wall = group.title_wall;
+                    known.title_logical = group.title_logical;
+                }
+            }
+            None => {
+                self.groups.insert(group.chat_id, group.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn group(&self, chat_id: &[u8; 16]) -> Result<Option<StoredGroup>> {
+        Ok(self.groups.get(chat_id).cloned())
+    }
+
+    fn groups(&self) -> Result<Vec<StoredGroup>> {
+        let mut found: Vec<StoredGroup> = self.groups.values().cloned().collect();
+        // Тот же порядок, что и в файловой базе: время заведения, затем
+        // идентификатор. Ключ карты — только идентификатор, поэтому
+        // пересортировать приходится явно.
+        found.sort_by_key(|group| (group.created_ms, group.chat_id));
+        Ok(found)
+    }
+
+    fn put_membership(&mut self, chat_id: &[u8; 16], ops: &[StoredMembershipOp]) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        for op in ops {
+            let key =
+                (*chat_id, op.tag_wall, op.tag_logical, op.tag_actor, op.tag_uniq, op.member_ik);
+            let known = self.membership.entry(key).or_insert(false);
+            // `max`, а не присваивание: надгробие односторонне. См. тот же
+            // оператор в файловой базе.
+            *known = *known || op.removed;
+        }
+        Ok(())
+    }
+
+    fn membership(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipOp>> {
+        let ops = self
+            .membership
+            .iter()
+            .filter(|((chat, ..), _)| chat == chat_id)
+            .map(|((_, tag_wall, tag_logical, tag_actor, tag_uniq, member_ik), removed)| {
+                StoredMembershipOp {
+                    member_ik: *member_ik,
+                    tag_wall: *tag_wall,
+                    tag_logical: *tag_logical,
+                    tag_actor: *tag_actor,
+                    tag_uniq: *tag_uniq,
+                    removed: *removed,
+                }
+            })
+            .collect();
+        Ok(ops)
+    }
+
+    fn put_membership_block(
+        &mut self,
+        chat_id: &[u8; 16],
+        block: &StoredMembershipBlock,
+    ) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // `or_insert`, а не `insert`: повтор не подменяет байты, над которыми
+        // стоит подпись. То же правило, что `DO NOTHING` в файловой базе.
+        self.blocks.entry((*chat_id, block.block_id)).or_insert_with(|| block.clone());
+        Ok(())
+    }
+
+    fn membership_blocks(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipBlock>> {
+        let mut found: Vec<StoredMembershipBlock> = self
+            .blocks
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|(_, block)| block.clone())
+            .collect();
+        // Тот же порядок, что в файловой базе: время приёма, затем
+        // идентификатор. Ключ карты — только идентификатор, поэтому
+        // пересортировать приходится явно.
+        found.sort_by_key(|block| (block.received_ms, block.block_id));
+        Ok(found)
+    }
+
+    fn put_sender_chain(&mut self, chat_id: &[u8; 16], chain: &StoredSenderChain) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.chains.insert((*chat_id, chain.member_ik), chain.clone());
+        Ok(())
+    }
+
+    fn sender_chain(
+        &self,
+        chat_id: &[u8; 16],
+        member_ik: &[u8; 32],
+    ) -> Result<Option<StoredSenderChain>> {
+        Ok(self.chains.get(&(*chat_id, *member_ik)).cloned())
+    }
+
+    fn sender_chains(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredSenderChain>> {
+        Ok(self
+            .chains
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|(_, chain)| chain.clone())
+            .collect())
+    }
+
     fn remember_revocation(&mut self, pairing_public: &[u8; 32], revoked_ms: u64) -> Result<()> {
         self.revocations.insert(*pairing_public, revoked_ms);
         Ok(())
@@ -393,6 +552,42 @@ impl Store for MemoryStore {
 
     fn avatar_stamp(&self, owner_ik: &[u8; 32]) -> Result<Option<u64>> {
         Ok(self.avatars.get(owner_ik).map(|avatar| avatar.updated_ms))
+    }
+
+    fn put_group_avatar(&mut self, chat_id: &[u8; 16], avatar: &StoredGroupAvatar) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // То же сравнение, что в `INSERT` файловой базы, и повторено оно
+        // здесь по той же причине, что у названия: разойдись две реализации
+        // одного хранилища, симуляция §16 проверяла бы не то, что работает
+        // на устройстве. Расхождение ловит `persistence.rs` — он гоняет обе
+        // одним тестом.
+        match self.group_avatars.get_mut(chat_id) {
+            Some(known) => {
+                if (avatar.avatar_wall, avatar.avatar_logical)
+                    >= (known.avatar_wall, known.avatar_logical)
+                {
+                    known.clone_from(avatar);
+                }
+            }
+            None => {
+                self.group_avatars.insert(*chat_id, avatar.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn group_avatar(&self, chat_id: &[u8; 16]) -> Result<Option<StoredGroupAvatar>> {
+        Ok(self.group_avatars.get(chat_id).cloned())
+    }
+
+    fn has_group_avatar(&self, chat_id: &[u8; 16]) -> Result<bool> {
+        Ok(self.group_avatars.get(chat_id).is_some_and(|a| !a.bytes.is_empty()))
+    }
+
+    fn group_avatar_stamp(&self, chat_id: &[u8; 16]) -> Result<Option<(u64, u32)>> {
+        Ok(self.group_avatars.get(chat_id).map(|a| (a.avatar_wall, a.avatar_logical)))
     }
 
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
@@ -900,5 +1095,176 @@ mod tests {
             Err(StoreError::Unsupported(_))
         ));
         assert!(matches!(s.export_key(), Err(StoreError::Unsupported(_))));
+    }
+
+    fn group(byte: u8, title: &str, created_ms: u64) -> StoredGroup {
+        StoredGroup {
+            chat_id: [byte; 16],
+            owner_ik: [byte.wrapping_add(100); 32],
+            title: title.to_owned(),
+            // Метка нулевая: заготовка про хранение, а не про порядок,
+            // а тесты порядка ставят её сами.
+            title_wall: 0,
+            title_logical: 0,
+            created_ms,
+        }
+    }
+
+    fn op(member: u8, wall: u64, removed: bool) -> StoredMembershipOp {
+        StoredMembershipOp {
+            member_ik: [member; 32],
+            tag_wall: wall,
+            tag_logical: 0,
+            tag_actor: [1u8; 32],
+            tag_uniq: [member; 8],
+            removed,
+        }
+    }
+
+    #[test]
+    fn a_repeated_put_renames_the_group_but_keeps_its_owner() {
+        // То же правило, что в файловой базе: владелец у группы один
+        // и на всю жизнь (§11.2).
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        let mut renamed = group(7, "у большого костра", 5_000);
+        renamed.owner_ik = [3u8; 32];
+        s.put_group(&renamed).unwrap();
+
+        let found = s.group(&[7u8; 16]).unwrap().unwrap();
+        assert_eq!(found.title, "у большого костра");
+        assert_eq!(found.owner_ik, [107u8; 32], "владелец обязан остаться прежним");
+        assert_eq!(found.created_ms, 1_000, "время заведения обязано остаться прежним");
+    }
+
+    #[test]
+    fn groups_come_back_in_one_and_the_same_order() {
+        let mut s = store();
+        s.put_group(&group(9, "третья", 3_000)).unwrap();
+        s.put_group(&group(2, "первая", 1_000)).unwrap();
+        s.put_group(&group(5, "вторая", 2_000)).unwrap();
+
+        let titles: Vec<String> = s.groups().unwrap().into_iter().map(|g| g.title).collect();
+        assert_eq!(titles, vec!["первая", "вторая", "третья"]);
+    }
+
+    #[test]
+    fn a_membership_tombstone_never_lifts() {
+        // Удаление, дошедшее раньше повторного добавления, — не редкость,
+        // а случай, ради которого OR-Set и взят.
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_membership(&[7u8; 16], &[op(1, 10, false), op(2, 11, false)]).unwrap();
+        s.put_membership(&[7u8; 16], &[op(2, 11, true)]).unwrap();
+        s.put_membership(&[7u8; 16], &[op(2, 11, false)]).unwrap();
+
+        let ops = s.membership(&[7u8; 16]).unwrap();
+        assert_eq!(ops.len(), 2, "повтор той же метки не заводит новую строку");
+        assert_eq!(ops[1], op(2, 11, true), "надгробие обязано остаться стоять");
+    }
+
+    #[test]
+    fn membership_ops_come_back_in_the_order_the_file_database_gives() {
+        // Порядок задан меткой, а не порядком записи: разойдись два
+        // хранилища здесь, симуляция §16 перестала бы быть воспроизводимой.
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_membership(&[7u8; 16], &[op(3, 30, false), op(1, 10, false)]).unwrap();
+        s.put_membership(&[7u8; 16], &[op(2, 20, false)]).unwrap();
+
+        let walls: Vec<u64> =
+            s.membership(&[7u8; 16]).unwrap().iter().map(|o| o.tag_wall).collect();
+        assert_eq!(walls, vec![10, 20, 30]);
+    }
+
+    fn block(n: u8, author: u8, bytes: &str, received_ms: u64) -> StoredMembershipBlock {
+        StoredMembershipBlock {
+            block_id: [n; 16],
+            author_ik: [author; 32],
+            bytes: bytes.as_bytes().to_vec(),
+            received_ms,
+        }
+    }
+
+    #[test]
+    fn the_same_block_arriving_twice_does_not_replace_its_bytes() {
+        // То же правило, что `DO NOTHING` в файловой базе: идентификатор
+        // блока — хэш его байт, и подменить их, назвав прежний, нельзя.
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_membership_block(&[7u8; 16], &block(1, 10, "настоящий", 100)).unwrap();
+        s.put_membership_block(&[7u8; 16], &block(1, 10, "подменённый", 900)).unwrap();
+
+        let found = s.membership_blocks(&[7u8; 16]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0], block(1, 10, "настоящий", 100));
+    }
+
+    #[test]
+    fn membership_blocks_come_back_in_the_order_the_file_database_gives() {
+        // Порядок задан приёмом, а не порядком записи: по нему блоки
+        // пересылаются новичку (§11.5), и разойдись две реализации —
+        // симуляция §16 перестала бы что-либо доказывать про продукт.
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_membership_block(&[7u8; 16], &block(3, 30, "третий", 300)).unwrap();
+        s.put_membership_block(&[7u8; 16], &block(1, 10, "первый", 100)).unwrap();
+        s.put_membership_block(&[7u8; 16], &block(2, 20, "второй", 200)).unwrap();
+
+        let times: Vec<u64> =
+            s.membership_blocks(&[7u8; 16]).unwrap().iter().map(|b| b.received_ms).collect();
+        assert_eq!(times, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn a_sender_chain_belongs_to_one_group_and_one_member() {
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_group(&group(8, "у другого", 2_000)).unwrap();
+
+        let mine = StoredSenderChain {
+            member_ik: [1u8; 32],
+            chain: [42u8; 32],
+            counter: 3,
+            skipped: Vec::new(),
+        };
+        s.put_sender_chain(&[7u8; 16], &mine).unwrap();
+
+        assert!(s.sender_chain(&[8u8; 16], &[1u8; 32]).unwrap().is_none(), "другая группа");
+        assert!(s.sender_chain(&[7u8; 16], &[2u8; 32]).unwrap().is_none(), "другой участник");
+        assert_eq!(s.sender_chains(&[7u8; 16]).unwrap(), vec![mine]);
+        assert!(s.sender_chains(&[8u8; 16]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_sender_chain_is_replaced_whole() {
+        // Ключ и номер врозь бессмысленны: разойдись они — сообщение
+        // расшифруется, а место в цепочке окажется не то.
+        let mut s = store();
+        s.put_group(&group(7, "у костра", 1_000)).unwrap();
+        s.put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [42u8; 32],
+                counter: 0,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+        s.put_sender_chain(
+            &[7u8; 16],
+            &StoredSenderChain {
+                member_ik: [1u8; 32],
+                chain: [43u8; 32],
+                counter: 7,
+                skipped: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let found = s.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+        assert_eq!((found.chain, found.counter), ([43u8; 32], 7));
+        assert_eq!(s.sender_chains(&[7u8; 16]).unwrap().len(), 1);
     }
 }

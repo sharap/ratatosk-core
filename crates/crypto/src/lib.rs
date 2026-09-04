@@ -32,6 +32,7 @@ pub mod aead;
 pub mod companion;
 pub mod error;
 pub mod file;
+pub mod group;
 pub mod handshake;
 pub mod identity;
 pub mod kdf;

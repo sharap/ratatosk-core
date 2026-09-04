@@ -440,6 +440,10 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     println!("         /decline <n> [k]  — отказаться совсем: приехавшее стирается");
     println!("         /preview <n> [k]  — превью вложения, если оно есть");
     println!("         /avatar [номер чата] — лицо контакта; без номера — своё");
+    println!("         /members <номер чата> — состав группы");
+    println!("         /newgroup <название>   /invite <группа> <контакт>");
+    println!("         /evict <группа> <контакт>   /rename <группа> <название>");
+    println!("         /gavatar <группа> [путь]   /leave <группа>");
     println!("         /setavatar [путь]    — поставить своё лицо; без пути — снять");
     println!("         /save <n> [k] <путь>   — забрать сюда;  /stop — прекратить");
     println!("         /send <путь…> [-- подпись] — отправить файлы одним сообщением");
@@ -527,13 +531,58 @@ impl Console {
                     println!("< (из памяти — телефон ещё не подтверждал)");
                 }
                 for (n, chat) in self.chats.iter().enumerate() {
-                    let mark = if chat.verified { "+" } else { " " };
+                    // У группы сверки нет и быть не может: сверяют людей,
+                    // а не круги знакомых. Показать ей пустое место рядом
+                    // с несверенными контактами значило бы сказать «не
+                    // сверена» — то, чего §4.2 про группу не говорит.
+                    // Вышедшая группа помечается отдельно от обычной:
+                    // писать в неё нельзя, и метка обязана это сказать
+                    // раньше, чем человек наберёт строку и получит отказ.
+                    let mark = if chat.is_group && !chat.joined {
+                        "x"
+                    } else if chat.is_group {
+                        "*"
+                    } else if chat.verified {
+                        "+"
+                    } else {
+                        " "
+                    };
                     // Лицо консоль не нарисует, но сказать о нём обязана:
                     // иначе `/avatar` выглядит командой, которая никогда
                     // не работает.
                     let face = if chat.avatar_ms == 0 { "" } else { "  (лицо: /avatar)" };
                     println!("< {:>2}. {mark} {}: {}{face}", n + 1, chat.title, chat.last_text);
                 }
+            }
+            CompanionEvent::GroupCreated { chat } => {
+                // Идентификатор пришёл ответом: искать новую группу
+                // в перечитанном списке нечем — названия повторяются.
+                println!("< группа заведена: {}", short(&chat));
+                println!("    /chats покажет её строкой, /open по номеру — откроет");
+            }
+            CompanionEvent::Members { chat, members } => {
+                // Ключа у участника нет (§13.4) — печатается идентификатор
+                // его личного чата: им же ему и пишут. Пометка «вы» рядом
+                // со своим: без неё хозяин телефона выглядел бы одним
+                // из чужих, как это уже случилось у клиента телефона.
+                if members.is_empty() {
+                    println!("< участников нет: это личный чат, а не группа");
+                } else {
+                    println!("< участников {}:", members.len());
+                    for member in &members {
+                        // Признак создателя печатается отдельно от «вы»:
+                        // это два разных факта, и у создателя, читающего
+                        // свой состав, верны оба сразу.
+                        println!(
+                            "    {} {}{}{}",
+                            data_encoding::HEXLOWER.encode(&member.chat),
+                            member.name,
+                            if member.mine { "  (вы)" } else { "" },
+                            if member.owner { "  (создатель)" } else { "" }
+                        );
+                    }
+                }
+                let _ = chat;
             }
             CompanionEvent::History { chat, page, fresh } => {
                 // Чат в событии, а не по памяти: `/open` могли нажать, пока
@@ -719,6 +768,34 @@ impl Console {
         Some(out)
     }
 
+    /// Номер строки `/chats` — в идентификатор чата.
+    ///
+    /// Стенд адресует чаты номерами по той же причине, по какой действует
+    /// на последнее сообщение: набирать тридцать два знака hex человек
+    /// не станет, а проверяется здесь дорога до телефона, а не разбор
+    /// строки. Настоящее окно берёт идентификаторы из списка.
+    fn chat_by_number(&self, rest: &str, usage: &str) -> Option<[u8; 16]> {
+        let n = rest.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+        match n {
+            Some(n) => Some(self.chats[n - 1].chat),
+            None => {
+                println!("< нужно: {usage} — номера печатает /chats");
+                None
+            }
+        }
+    }
+
+    /// «<номер группы> <номер контакта>» — в пару идентификаторов чатов.
+    ///
+    /// Участник и на этом проводе назван идентификатором своего личного
+    /// чата (§13.4), поэтому оба номера берутся из одного списка.
+    fn two_chats(&self, rest: &str, usage: &str) -> Option<([u8; 16], [u8; 16])> {
+        let (first, second) = rest.split_once(' ')?;
+        let chat = self.chat_by_number(first, usage)?;
+        let member = self.chat_by_number(second, usage)?;
+        Some((chat, member))
+    }
+
     /// «<номер строки> [номер вложения]» — во вложение.
     fn pick_file(&self, rest: &str) -> Option<&ratatosk_proto::companion::Attachment> {
         let words: Vec<&str> = rest.split_whitespace().collect();
@@ -876,6 +953,76 @@ impl Console {
             println!("< отправляю своё лицо: {}", bytes_text(bytes.len() as u64));
             return Some(CompanionCommand::SetAvatar { bytes });
         }
+        if let Some(rest) = line.strip_prefix("/newgroup ") {
+            let title = rest.trim();
+            if title.is_empty() {
+                println!("< нужно: /newgroup <название>");
+                return None;
+            }
+            // §11.5 требует сказать это **до** заведения. Текст берётся
+            // той же функцией, что и на телефоне: проводом он не едет,
+            // потому что это константа, а не сведение о телефоне.
+            println!("< {}", ratatosk_proto::group::JOIN_DISCLOSURE);
+            return Some(CompanionCommand::CreateGroup { title: title.to_owned() });
+        }
+        if let Some(rest) = line.strip_prefix("/invite ") {
+            let (chat, member) = self.two_chats(rest, "/invite <номер группы> <номер контакта>")?;
+            return Some(CompanionCommand::InviteToGroup { chat, member });
+        }
+        if let Some(rest) = line.strip_prefix("/evict ") {
+            let (chat, member) = self.two_chats(rest, "/evict <номер группы> <номер контакта>")?;
+            // §11.4 дословно, и тоже до действия: исключённый сохранит
+            // доступ к прошлой переписке, и отменить это нельзя.
+            println!("< {}", ratatosk_proto::group::EvictionConsequences::ui_text());
+            return Some(CompanionCommand::EvictFromGroup { chat, member });
+        }
+        if let Some(rest) = line.strip_prefix("/rename ") {
+            let (n, title) = rest.split_once(' ').unwrap_or((rest.trim(), ""));
+            let chat = self.chat_by_number(n, "/rename <номер группы> <название>")?;
+            if title.trim().is_empty() {
+                println!("< без названия: /rename <номер группы> <новое название>");
+                return None;
+            }
+            return Some(CompanionCommand::RenameGroup { chat, title: title.trim().to_owned() });
+        }
+        if let Some(rest) = line.strip_prefix("/gavatar ") {
+            let (n, path) = rest.split_once(' ').unwrap_or((rest.trim(), ""));
+            let chat = self.chat_by_number(n, "/gavatar <номер группы> [путь]")?;
+            let path = path.trim();
+            let bytes = if path.is_empty() {
+                Vec::new()
+            } else {
+                match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        println!("< не прочитать {path}: {error}");
+                        return None;
+                    }
+                }
+            };
+            return Some(CompanionCommand::SetGroupAvatar { chat, bytes });
+        }
+        if let Some(rest) = line.strip_prefix("/leave ") {
+            let chat = self.chat_by_number(rest, "/leave <номер группы>")?;
+            // Оба текста §14: второй — только создателю, но окно стенда
+            // не знает состава, пока его не спросили. Печатаются оба,
+            // и это честнее умолчания: цена ухода создателя обязана быть
+            // названа до, а не после.
+            println!("< {}", ratatosk_proto::group::LeaveConsequences::ui_text());
+            println!(
+                "< если вы создатель: {}",
+                ratatosk_proto::group::LeaveConsequences::owner_text()
+            );
+            return Some(CompanionCommand::LeaveGroup { chat });
+        }
+        if let Some(rest) = line.strip_prefix("/members ") {
+            let n = rest.trim().parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+            let Some(n) = n else {
+                println!("< нужен номер из /chats, от 1 до {}", self.chats.len());
+                return None;
+            };
+            return Some(CompanionCommand::Members { chat: self.chats[n - 1].chat });
+        }
         if line.trim() == "/avatar" {
             // Без номера — своё: себя в списке чатов нет, и спрашивается
             // оно без метки для сравнения.
@@ -1023,6 +1170,13 @@ impl Console {
             println!("<   /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
             println!("<   /accept <n> [k]   /pause <n> [k]   /decline <n> [k]");
             println!("<   /preview <n> [k]   /avatar [номер чата]   /setavatar [путь]");
+            println!("<   /members <номер чата> — состав группы");
+            println!(
+                "<   /newgroup <название>   /invite <группа> <контакт>   /evict <группа> <контакт>"
+            );
+            println!(
+                "<   /rename <группа> <название>   /gavatar <группа> [путь]   /leave <группа>"
+            );
             println!("<   /save <n> [k] <путь>   /stop");
             println!("<   /send <путь…> [-- подпись]   /sendpic <превью> <путь> [подпись]");
             println!("<   /unsend");
@@ -1350,7 +1504,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1413,6 +1567,273 @@ async fn console(
                 }
                 if line == "/devices" {
                     show_devices(&handle, &directory).await;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/say ") {
+                    // Отправка в группу — той же командой ядра, что и личное
+                    // сообщение: ветку выбирает `chat_id`, а не клиент (§13.3).
+                    // Стенду нужен отдельный ввод только потому, что он
+                    // не держит «открытый чат».
+                    let (chat, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                    match data_encoding::HEXLOWER.decode(chat.as_bytes()) {
+                        Ok(raw) if raw.len() == 16 && !text.trim().is_empty() => {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(&raw);
+                            handle
+                                .send(Command::SendText { chat: id, text: text.to_owned() })
+                                .await
+                                .ok();
+                        }
+                        _ => println!("< нужно: /say <id группы> <текст> — id печатает /groups"),
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/gedit ") {
+                    let (chat, text) = split_group(rest, "/gedit <id группы> <текст>");
+                    if let (Some(chat), false) = (chat, text.trim().is_empty()) {
+                        match last_in_group(&handle, chat, Some(own_ik)).await {
+                            Some(msg_id) => {
+                                handle
+                                    .send(Command::EditMessage {
+                                        chat,
+                                        msg_id,
+                                        text: text.to_owned(),
+                                    })
+                                    .await
+                                    .ok();
+                                println!("< правка {}", short(&msg_id));
+                            }
+                            None => println!("< в группе нет вашего сообщения"),
+                        }
+                    } else if chat.is_some() {
+                        // Пустая правка — это удаление, и у него своя команда.
+                        println!("< пустая правка — это удаление: /gretract");
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/greply ") {
+                    let (chat, text) = split_group(rest, "/greply <id группы> <текст>");
+                    if let (Some(chat), false) = (chat, text.trim().is_empty()) {
+                        match last_in_group(&handle, chat, None).await {
+                            Some(reply_to) => {
+                                handle
+                                    .send(Command::SendReply {
+                                        chat,
+                                        reply_to,
+                                        text: text.to_owned(),
+                                    })
+                                    .await
+                                    .ok();
+                                println!("< ответ на {}", short(&reply_to));
+                            }
+                            None => println!("< в группе пока нечего цитировать"),
+                        }
+                    } else if chat.is_some() {
+                        println!("< ответ без слов — не ответ: /greply <id группы> <текст>");
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/greact ") {
+                    // Без эмодзи — снятие: пустая строка и есть «снято»
+                    // (`ratatosk_proto::reaction`).
+                    let (chat, emoji) = split_group(rest, "/greact <id группы> [эмодзи]");
+                    if let Some(chat) = chat {
+                        match last_in_group(&handle, chat, None).await {
+                            Some(msg_id) => {
+                                handle
+                                    .send(Command::SetReaction {
+                                        chat,
+                                        msg_id,
+                                        emoji: emoji.trim().to_owned(),
+                                    })
+                                    .await
+                                    .ok();
+                                println!("< реакция на {}", short(&msg_id));
+                            }
+                            None => println!("< в группе пока нечего отмечать"),
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/gretract ") {
+                    let (chat, _) = split_group(rest, "/gretract <id группы>");
+                    if let Some(chat) = chat {
+                        match last_in_group(&handle, chat, Some(own_ik)).await {
+                            Some(msg_id) => {
+                                println!(
+                                    "< это просьба, а не гарантия: чужой клиент вправе её не выполнить"
+                                );
+                                handle
+                                    .send(Command::RetractMessages {
+                                        chat,
+                                        msg_ids: vec![msg_id],
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            None => println!("< в группе нет вашего сообщения"),
+                        }
+                    }
+                    continue;
+                }
+                if line == "/groups" {
+                    show_groups(&handle).await;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/rename ") {
+                    // Переименовать вправе только создатель; отказ придёт
+                    // из ядра, и печатать его здесь нечем — команды уходят
+                    // без ответа. Зато событие о смене имени придёт всем,
+                    // включая нас.
+                    let (chat, title) = split_group(rest, "/rename <id группы> <название>");
+                    if let Some(chat) = chat {
+                        if title.trim().is_empty() {
+                            println!("< без названия: /rename <id группы> <новое название>");
+                        } else {
+                            handle
+                                .send(Command::RenameGroup { chat, title: title.to_owned() })
+                                .await
+                                .ok();
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/gavatar ") {
+                    // Картинка берётся с диска, а не выдумывается: проверяются
+                    // и сигнатура формата, и предел, и оба — настоящие.
+                    // Пустой путь снимает картинку: снятие такое же действие,
+                    // как постановка, и проверять его надо ровно так же.
+                    let (chat, path) = split_group(rest, "/gavatar <id группы> [путь]");
+                    if let Some(chat) = chat {
+                        let path = path.trim();
+                        let bytes = if path.is_empty() {
+                            Some(Vec::new())
+                        } else {
+                            match std::fs::read(path) {
+                                Ok(bytes) => Some(bytes),
+                                Err(error) => {
+                                    println!("< не прочитать {path}: {error}");
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(bytes) = bytes {
+                            // Проверка здесь, а не только в ядре: команда
+                            // уходит без ответа, и отказ оттуда на стенде
+                            // выглядел бы молчанием — ровно тем, что §14
+                            // запрещает.
+                            match ratatosk_proto::avatar::check(&bytes) {
+                                Ok(()) => {
+                                    handle
+                                        .send(Command::SetGroupAvatar { chat, bytes })
+                                        .await
+                                        .ok();
+                                }
+                                Err(error) => println!("< {error}"),
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/leave ") {
+                    // Перед выходом стенд печатает то же, что обязан показать
+                    // клиент, — и предупреждение создателю, если выходит он.
+                    // Увидеть формулировку глазами полезнее, чем прочитать
+                    // её в тесте.
+                    let (chat, _) = split_group(rest, "/leave <id группы>");
+                    if let Some(chat) = chat {
+                        println!("< {}", ratatosk_proto::group::LeaveConsequences::ui_text());
+                        // `mine` у `GroupStatus` и означает «создатель ли мы»:
+                        // ради этого поле и заведено — от него зависит,
+                        // показывать ли «исключить» (§11.2).
+                        if handle
+                            .groups()
+                            .await
+                            .is_some_and(|all| all.iter().any(|g| g.chat == chat && g.mine))
+                        {
+                            println!(
+                                "< {}",
+                                ratatosk_proto::group::LeaveConsequences::owner_text()
+                            );
+                        }
+                        handle.send(Command::LeaveGroup { chat }).await.ok();
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/evict ") {
+                    // Перед исключением стенд печатает §11.4 дословно: это
+                    // ровно та формулировка, которую обязан показать клиент,
+                    // и увидеть её глазами полезнее, чем прочитать в тесте.
+                    println!("< {}", ratatosk_proto::group::EvictionConsequences::ui_text());
+                    let mut parts = rest.split_whitespace();
+                    let chat = parts.next().unwrap_or_default();
+                    let who = parts.next().unwrap_or_default();
+                    match (
+                        data_encoding::HEXLOWER.decode(chat.as_bytes()),
+                        data_encoding::HEXLOWER.decode(who.as_bytes()),
+                    ) {
+                        (Ok(chat), Ok(ik)) if chat.len() == 16 && ik.len() == 32 => {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(&chat);
+                            let mut peer_ik = [0u8; 32];
+                            peer_ik.copy_from_slice(&ik);
+                            handle.send(Command::EvictFromGroup { chat: id, peer_ik }).await.ok();
+                        }
+                        _ => println!("< нужно: /evict <id группы> <ключ участника> — оба из /groups"),
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/invite ") {
+                    // Два аргумента, второй необязателен: на стенде собеседник
+                    // обычно один, и заставлять набирать его ключ руками
+                    // значит мешать проверять то, ради чего команда написана.
+                    let mut parts = rest.split_whitespace();
+                    let chat = parts.next().unwrap_or_default();
+                    let who = parts.next();
+                    let chat = match data_encoding::HEXLOWER.decode(chat.as_bytes()) {
+                        Ok(raw) if raw.len() == 16 => {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(&raw);
+                            id
+                        }
+                        // Печатается полностью в `/groups`: у группы
+                        // идентификатор случаен, и короткой формы из журнала
+                        // не хватит.
+                        _ => {
+                            println!("< нужен полный id группы в hex (32 знака) — /groups");
+                            continue;
+                        }
+                    };
+                    let peer_ik = match who {
+                        Some(hex) => match data_encoding::HEXLOWER.decode(hex.as_bytes()) {
+                            Ok(raw) if raw.len() == 32 => {
+                                let mut ik = [0u8; 32];
+                                ik.copy_from_slice(&raw);
+                                Some(ik)
+                            }
+                            _ => {
+                                println!("< ключ участника — 64 знака hex; /who показывает его");
+                                continue;
+                            }
+                        },
+                        None => sole_contact(&handle).await,
+                    };
+                    let Some(peer_ik) = peer_ik else {
+                        println!("< некого приглашать: сперва /add <карточка>");
+                        continue;
+                    };
+                    handle.send(Command::InviteToGroup { chat, peer_ik }).await.ok();
+                    continue;
+                }
+                if let Some(title) = line.strip_prefix("/newgroup ") {
+                    // Отправлять отсюда нечего: группа в момент заведения
+                    // состоит из создателя (§11). Идентификатор придёт
+                    // событием `GroupCreated` — вывести его человеку неоткуда
+                    // больше, он случаен.
+                    handle
+                        .send(Command::CreateGroup { title: title.trim().to_owned() })
+                        .await
+                        .ok();
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix("/devaddr ") {
@@ -1865,10 +2286,21 @@ async fn console(
                                         }
                                     }
                                     None => {
-                                        println!(
-                                            "< {}",
-                                            String::from_utf8_lossy(&view.message.body)
-                                        );
+                                        // Подпись автора — только там, где
+                                        // её не вывести из «своё/чужое», то
+                                        // есть в группе. В переписке двоих
+                                        // она повторяла бы имя собеседника
+                                        // у каждой строки.
+                                        match &view.author {
+                                            Some(author) => println!(
+                                                "< {author}: {}",
+                                                String::from_utf8_lossy(&view.message.body)
+                                            ),
+                                            None => println!(
+                                                "< {}",
+                                                String::from_utf8_lossy(&view.message.body)
+                                            ),
+                                        }
                                     }
                                 }
                             }
@@ -1882,7 +2314,10 @@ async fn console(
                     | Event::ContactRemoved { .. }
                     | Event::AvatarChanged { .. }
                     | Event::OwnAvatarChanged
+                    | Event::GroupCreated { .. }
                     | Event::GroupMembershipChanged { .. }
+                    | Event::GroupRenamed { .. }
+                    | Event::GroupAvatarChanged { .. }
                     | Event::FileProgress { .. }
                     | Event::FileGone { .. }
                     // Печатается в `report`, а здесь делать нечего: ход
@@ -1938,6 +2373,96 @@ async fn sole_contact(handle: &DriverHandle) -> Option<[u8; 32]> {
 /// ничего: он значит «ни один транспорт не подошёл», а какой именно признак
 /// не сложился — видно только здесь.
 /// Сопряжённые десктопы (§13.4).
+/// Печатает группы и их состав (§11).
+/// Разбирает «`<id группы>` и остаток строки».
+///
+/// Идентификатор печатает `/groups`; стенд не держит «открытого чата»,
+/// поэтому его приходится называть каждый раз. Отказ печатается здесь же,
+/// чтобы подсказка про формат стояла рядом с разбором, а не у четырёх
+/// вызывающих.
+fn split_group<'a>(rest: &'a str, usage: &str) -> (Option<[u8; 16]>, &'a str) {
+    let (chat, tail) = rest.split_once(' ').unwrap_or((rest.trim(), ""));
+    match data_encoding::HEXLOWER.decode(chat.trim().as_bytes()) {
+        Ok(raw) if raw.len() == 16 => {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&raw);
+            (Some(id), tail)
+        }
+        _ => {
+            println!("< нужно: {usage} — id печатает /groups");
+            (None, tail)
+        }
+    }
+}
+
+/// Последнее сообщение группы — или последнее **своё**.
+///
+/// Стенд действует на последнее, а не на названный идентификатор, и это
+/// то же решение, что у `/react` в личном чате: набирать тридцать два знака
+/// hex ради смайлика человек не станет, а проверяется здесь дорога до ядра,
+/// а не разбор строки.
+///
+/// `mine` для правки и отзыва: распорядиться не своим ядро всё равно
+/// не даст, но команды уходят **без ответа**, и отказ, случившийся там,
+/// на экране не появится вовсе. Лучше сказать «нет вашего сообщения» здесь,
+/// чем молча ничего не сделать.
+///
+/// Свой ключ приходит параметром, а не спрашивается у ручки: `OwnCard`
+/// у драйвера — про адреса (§4.3), ключа в ней нет вовсе, а консоль своим
+/// ключом уже располагает.
+async fn last_in_group(
+    handle: &DriverHandle,
+    chat: [u8; 16],
+    mine: Option<[u8; 32]>,
+) -> Option<[u8; 16]> {
+    let seen = handle.messages(chat, 50).await?;
+    seen.into_iter()
+        .rev()
+        .find(|view| mine.is_none_or(|own| view.message.sender_ik == own))
+        .map(|view| view.message.msg_id)
+}
+
+async fn show_groups(handle: &DriverHandle) {
+    let Some(groups) = handle.groups().await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if groups.is_empty() {
+        println!("< групп нет: /newgroup <название>");
+        return;
+    }
+    for group in groups {
+        // Идентификатор целиком: им открывают чат, и обрезанный пришлось бы
+        // искать глазами по журналу — тем же приёмом, что у устройств.
+        // «Вышли» печатается отдельно от «создана здесь»: это два разных
+        // факта, и после выхода создателя верны оба сразу.
+        println!(
+            "< {} «{}»{}{}",
+            data_encoding::HEXLOWER.encode(&group.chat),
+            group.title,
+            if group.mine { ", создана здесь" } else { "" },
+            if group.joined { "" } else { ", вы вышли" }
+        );
+        // Метка, а не «да/нет»: по ней на стенде видно, что смена картинки
+        // доехала, — при одном и том же «есть» она обязана меняться.
+        if group.avatar_ms != 0 {
+            println!("    аватарка есть, метка {}", group.avatar_ms);
+        }
+        for member in &group.members {
+            // Ключ целиком: им исключают (`/evict`), и обрезанный пришлось бы
+            // искать глазами по журналу — то же правило, что у устройств.
+            // Рядом — имя и пометка «вы»: без неё хозяин стенда искал бы
+            // себя в составе по ключу, как это делал клиент.
+            println!(
+                "    {} {}{}",
+                data_encoding::HEXLOWER.encode(&member.ik),
+                member.name,
+                if member.mine { "  (вы)" } else { "" }
+            );
+        }
+    }
+}
+
 async fn show_devices(handle: &DriverHandle, directory: &LanDirectory) {
     let Some(devices) = handle.devices().await else {
         println!("< драйвер остановлен");
@@ -2407,8 +2932,20 @@ fn report(event: &Event) {
             // строка — единственный признак, что оно уже другое.
             println!("< своя аватарка сменилась");
         }
+        Event::GroupCreated { chat, title } => {
+            println!("< группа {} заведена: {title}", short(chat));
+        }
         Event::GroupMembershipChanged { chat } => {
             println!("< состав группы {} изменился", short(chat));
+        }
+        Event::GroupRenamed { chat, title } => {
+            println!("< группа {} теперь называется: {title}", short(chat));
+        }
+        Event::GroupAvatarChanged { chat } => {
+            // Байты в событии не едут — их спрашивают, когда рисуют.
+            // Стенд не рисует ничего, поэтому печатает только факт;
+            // «есть ли теперь картинка» видно по `/groups`.
+            println!("< у группы {} сменилась аватарка", short(chat));
         }
         Event::FileProgress { file_id, received, total } => {
             println!("< файл {}: {received}/{total}", short(file_id));
@@ -2546,6 +3083,12 @@ fn line(message: &Message) -> String {
         out.push_str(&format!("в ответ на {}: ", short(&reply_to)));
     }
     out.push_str(if message.mine { "-> " } else { "<- " });
+    // Подпись автора печатается там, где она пришла, — то есть в группе.
+    // В переписке двоих её нет вовсе: имя собеседника и так стоит
+    // в заголовке, и повторять его у каждой строки незачем.
+    if let Some(author) = &message.author {
+        out.push_str(&format!("{author}: "));
+    }
     if message.forwarded {
         out.push_str("(переслано) ");
     }

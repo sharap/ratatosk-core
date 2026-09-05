@@ -1185,6 +1185,114 @@ fn a_socket_drop_does_not_destroy_the_session() {
     assert_eq!(inbox(&bob, &alice), vec!["первое".to_string(), "второе".to_string()]);
 }
 
+/// Поднимает локальную сеть и объявляет собеседника услышанным.
+///
+/// Два шага, а не один: LAN по умолчанию **готова, но выключена** — включает
+/// её человек (§5.4), — а адресуемой ступень делает маяк §5.1, и без него
+/// отправлять некуда даже по включённой сети.
+fn lan_up(node: &mut Node, peer: &Node) {
+    node.step(
+        0,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: true,
+        }),
+    )
+    .expect("включение локальной сети");
+    node.step(0, Input::SeenOnLan { peer_ik: peer.own_card().ik }).expect("маяк");
+}
+
+#[test]
+fn a_socket_drop_does_not_take_the_lan_address_with_it() {
+    // Разбор поломки со стенда (`HANDOFF.md`, 6б). Обрыв соединения читался
+    // как «устройства в сети больше нет», и §5.4 переставал предлагать LAN
+    // собеседнику, который стоял в двух метрах. Переписка после этого шла
+    // строго в одну сторону: его кадры принимались и на них уходили
+    // квитанции, а каждое **наше** сообщение объявлялось «ждёт».
+    //
+    // Собеседник здесь без единого адреса в карточке — тогда ступень у §5.4
+    // ровно одна, и подмены доставки через onion не случится.
+    let (mut alice, mut bob) = (node(1, "alice"), bare_node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    lan_up(&mut alice, &bob);
+    lan_up(&mut bob, &alice);
+
+    let effects = send_text(&mut alice, &bob, 1_000, "первое");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["первое".to_string()]);
+
+    alice
+        .step(
+            2_000,
+            Input::ConnectionLost {
+                peer_ik: bob.own_card().ik,
+                via: ratatosk_proto::Transport::Lan,
+            },
+        )
+        .expect("обрыв не должен ронять ядро");
+
+    let effects = send_text(&mut alice, &bob, 3_000, "второе");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["первое".to_string(), "второе".to_string()],
+        "обрыв сокета — не уход из сети: адрес обязан остаться"
+    );
+}
+
+#[test]
+fn a_frame_from_the_lan_says_the_same_as_a_beacon() {
+    // Настоящий отказ соединения адрес забывает, и это правильно: адрес был,
+    // по нему не ответили. Но собеседник возвращается раньше следующего
+    // маяка §5.1 — и возвращается своими кадрами. Кадр, прошедший проверку
+    // тега, говорит о присутствии ровно то же, что маяк, и §5.4 обязан его
+    // услышать; иначе ожидающее лежит до маяка при живом канале.
+    let (mut alice, mut bob) = (node(1, "alice"), bare_node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    lan_up(&mut alice, &bob);
+    lan_up(&mut bob, &alice);
+
+    let effects = send_text(&mut alice, &bob, 1_000, "первое");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    assert_eq!(inbox(&bob, &alice), vec!["первое".to_string()]);
+
+    alice
+        .step(
+            2_000,
+            Input::ConnectFailed {
+                peer_ik: bob.own_card().ik,
+                via: ratatosk_proto::Transport::Lan,
+            },
+        )
+        .expect("отказ соединения не должен ронять ядро");
+
+    // Ступень одна, и она обезадресела: сообщение ждёт (досидев срок
+    // обнаружения, который спускает сам провод).
+    let effects = send_text(&mut alice, &bob, 3_000, "второе");
+    let events = pump(&mut alice, &mut bob, 3_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::StatusChanged { status: ratatosk_proto::DeliveryStatus::Waiting, .. }
+        )),
+        "адрес забыт — отправлять действительно некуда: {events:?}"
+    );
+    assert_eq!(inbox(&bob, &alice), vec!["первое".to_string()], "и не уехало");
+
+    // А теперь собеседник заговорил сам — по той же локальной сети.
+    let effects = send_text(&mut bob, &alice, 4_000, "я тут");
+    pump(&mut bob, &mut alice, 4_000, effects);
+
+    // Порядок в чате задаётся часами §9.1, а не порядком приёма, и сверять
+    // здесь надо не его: проверяется, что ожидавшее **уехало**.
+    let at_bob = inbox(&bob, &alice);
+    assert!(
+        at_bob.contains(&"второе".to_string()),
+        "кадр по локальной сети — то же свидетельство, что маяк: {at_bob:?}"
+    );
+    assert!(inbox(&alice, &bob).contains(&"я тут".to_string()));
+}
+
 #[test]
 fn a_peer_that_forgot_our_session_gets_a_new_one() {
     // Воспроизведение той самой жалобы: «то ходят, то не ходят, а после
@@ -2036,6 +2144,9 @@ fn a_reply_without_words_is_refused() {
 
 use ratatosk_core::OutgoingFile;
 use ratatosk_proto::files;
+// Поимённо: причина ожидания проверяется в `matches!`, и полный путь
+// внутри образца читался бы хуже самого утверждения.
+use ratatosk_proto::files::FileWait;
 use ratatosk_proto::mail::{MailAccount, Secret};
 // Здесь оно нужно поимённо: проверяется, **каким** транспортом уходит кадр,
 // и `ratatosk_proto::Transport::Lan` внутри `matches!` читается уже плохо.
@@ -2175,8 +2286,11 @@ fn a_stingy_letter_limit_keeps_files_off_the_mail() {
 
     let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. }))),
-        "сказать надо сразу: почта этот файл не увезёт: {effects:?}"
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::FileWaitsForChannel { reason: FileWait::TooBig, .. })
+        )),
+        "сказать надо сразу и по делу: почта этот файл не увезёт: {effects:?}"
     );
     pump(&mut alice, &mut bob, 1_000, effects);
 
@@ -2222,8 +2336,11 @@ fn a_mailbox_with_no_room_stops_asking_for_chunks() {
     let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
     let events = pump(&mut alice, &mut bob, 1_000, effects);
     assert!(
-        events.iter().any(|e| matches!(e, Event::FileWaitsForChannel { .. })),
-        "получателю надо сказать, что в его ящике нет места: {events:?}"
+        events
+            .iter()
+            .any(|e| matches!(e, Event::FileWaitsForChannel { reason: FileWait::MailboxFull, .. })),
+        "и сказать **чем именно** занято: это единственная причина, \
+         с которой человек может что-то сделать: {events:?}"
     );
     let file_id = only_file(&bob, &alice);
     assert!(!bob.store().file(&file_id).unwrap().unwrap().complete);
@@ -2259,7 +2376,10 @@ fn a_file_too_large_for_mail_says_it_waits_for_a_channel() {
 
     let effects = send_file(&mut alice, &bob, 1_000, "/tmp/kino.mkv");
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. }))),
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::FileWaitsForChannel { reason: FileWait::TooBig, .. })
+        )),
         "сказать надо сразу, а не когда человек заметит, что полоска стоит: {effects:?}"
     );
 
@@ -2271,8 +2391,10 @@ fn a_file_too_large_for_mail_says_it_waits_for_a_channel() {
         "само предложение обязано доехать почтой: {events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, Event::FileWaitsForChannel { .. })),
-        "и получателю тоже надо сказать, чего он ждёт: {events:?}"
+        events
+            .iter()
+            .any(|e| matches!(e, Event::FileWaitsForChannel { reason: FileWait::TooBig, .. })),
+        "и получателю тоже надо сказать, чего он ждёт — теми же словами: {events:?}"
     );
     let file_id = only_file(&bob, &alice);
     assert!(
@@ -5142,5 +5264,84 @@ fn a_newcomer_gets_the_avatar_with_the_intro() {
         carol.groups().get(&chat).expect("группа доехала").avatar_hlc,
         alice.groups().get(&chat).expect("группа").avatar_hlc,
         "и ту же метку: без неё следующая смена разошлась бы"
+    );
+}
+
+#[test]
+fn a_file_that_has_nowhere_to_go_says_so_by_name() {
+    // Самый частый случай, и самый бесполезный для отладки, пока причина
+    // не ехала: собеседника не достать ничем. Отличать его от «ящик
+    // переполнен» человеку нужно затем, что здесь от него ничего
+    // не требуется, а там — требуется.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+
+    // Карточка **без единого адреса** — законное её состояние: так
+    // выглядит знакомство, сделанное в кафе по QR, до первого `/onion`.
+    let stranger = Identity::from_seed([9u8; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: stranger.public().ik,
+        sk: stranger.public().sk,
+        onion: String::new(),
+        chatmail: String::new(),
+        display_name: "сосед".into(),
+        version: 1,
+    };
+    alice
+        .step(
+            0,
+            Input::Command(Command::AddContact {
+                card_bytes: card.encode().unwrap(),
+                met_in_person: true,
+            }),
+        )
+        .expect("контакт заведён");
+
+    alice_blobs.lock().unwrap().seed_sparse("/tmp/otchet.pdf", 4_096);
+    let chat = Engine::<MemoryStore>::chat_id_for(&card.ik);
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![OutgoingFile { path: "/tmp/otchet.pdf".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .expect("отправка");
+
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::FileWaitsForChannel { reason: FileWait::Nowhere, .. })
+        )),
+        "«канала нет вовсе» обязано называться своим именем: {effects:?}"
+    );
+}
+
+#[test]
+fn every_reason_says_something_different_to_the_human() {
+    // Тексты — то, ради чего причина и заведена: одна строка на все случаи
+    // означала «сиди и жди» даже тогда, когда человек мог освободить ящик.
+    // Совпади два текста — снаружи причины снова стали бы неразличимы.
+    let all = [
+        FileWait::Nowhere,
+        FileWait::TooBig,
+        FileWait::Handshaking,
+        FileWait::MailboxFull,
+        FileWait::Silent,
+    ];
+    for (n, one) in all.iter().enumerate() {
+        assert!(!one.text().is_empty(), "{one:?}: пустой текст показывать нельзя");
+        assert!(!one.label().is_empty(), "{one:?}: пустое имя нечего искать в выводе");
+        for other in &all[n + 1..] {
+            assert_ne!(one.text(), other.text(), "{one:?} и {other:?} говорят одно и то же");
+            assert_ne!(one.label(), other.label(), "{one:?} и {other:?} неразличимы в выводе");
+        }
+    }
+
+    // И единственная, которая требует действия, говорит об этом словами.
+    assert!(
+        FileWait::MailboxFull.text().contains("освободите"),
+        "человеку надо сказать, что сделать, — иначе причина бесполезна"
     );
 }

@@ -1620,6 +1620,12 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // транспорт с тем, на котором сообщение сейчас, — а оно к тому
             // моменту уже на следующей ступени, и второй отказ ничего
             // не сжигает.
+            //
+            // Именно **оборвалось**, а не «не удалось соединиться»: из кода
+            // ошибки эти два исхода не различить, а разница между ними —
+            // забудется ли адрес в локальной сети. Точное событие транспорт
+            // пришлёт сам ([`TransportEvent::ConnectFailed`]); гадать здесь
+            // значило бы забывать адрес по любому затыку в сокете.
             Refusal::Delivery { peer_ik, via } => Some(Input::ConnectionLost { peer_ik, via }),
             Refusal::Mailbox => Some(Input::MailAccountFailed { reason: error.to_string() }),
             Refusal::Silent => None,
@@ -1687,8 +1693,10 @@ fn translate(event: TransportEvent) -> Wake {
     let input = match event {
         TransportEvent::Received { via, frame, .. } => Input::Received { via, frame },
         TransportEvent::Connected { peer_ik, via } => Input::Connected { peer_ik, via },
-        TransportEvent::Disconnected { peer_ik, via }
-        | TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectionLost { peer_ik, via },
+        // Два разных факта, и сливать их в один вход было ошибкой: обрыв
+        // говорит о сокете, отказ соединения — о присутствии (`io.rs`).
+        TransportEvent::Disconnected { peer_ik, via } => Input::ConnectionLost { peer_ik, via },
+        TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectFailed { peer_ik, via },
         TransportEvent::SeenOnLan { peer_ik } => Input::SeenOnLan { peer_ik },
         TransportEvent::TorReady { onion } => return Wake::TorReady(onion),
         TransportEvent::TorProgress { fraction, note, blocked } => {

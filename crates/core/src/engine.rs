@@ -26,12 +26,13 @@ use ratatosk_crypto::handshake::{
 use ratatosk_crypto::ratchet::SenderChain;
 use ratatosk_crypto::{HandshakeReplayGuard, Identity, RekeyPolicy, Session};
 use ratatosk_proto::companion;
+use ratatosk_proto::files::FileWait;
 use ratatosk_proto::fragment::Reassembler;
 use ratatosk_proto::group::{self, Group, GroupId};
 use ratatosk_proto::mail::{AccountUrl, MailAccount, Secret};
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{
-    Attempt, Decision, PeerAvailability, SessionBinding, TransportSet,
+    Attempt, Decision, PeerAvailability, Reachability, SessionBinding, TransportSet,
 };
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{
@@ -503,16 +504,59 @@ pub struct GroupState {
     pub created_ms: u64,
 }
 
+/// Начало ключа — для журнала, не для человека.
+///
+/// В журнале рядом стоят кадры транспорта и решения §5.4, и без пометки,
+/// **о ком** запись, две переписки сливаются в одну ленту. Четырёх байт
+/// хватает глазам и не хватает на то, чтобы принять их за адрес.
+fn short_ik(ik: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(8);
+    for byte in &ik[..4] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Что сейчас можно сделать с чанками файла (§10.2, §10.3).
+///
+/// Отдаётся одной ходкой по лестнице §5.4: до него на неё ходили дважды,
+/// двумя функциями, обязанными совпадать в правиле «годен ли транспорт».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileRoute {
+    /// Ехать: годный транспорт с живой сессией.
+    Ready(Transport),
+    /// Годная дорога есть, сессии по ней нет — сюда и проситься.
+    Handshake(Transport),
+    /// Транспорты есть, но ни один не повезёт файл такого размера.
+    TooBig,
+    /// Дорог нет вовсе: собеседника не достать ничем.
+    Nowhere,
+}
+
 /// Почему попытка доставки не удалась.
 ///
-/// Различие не косметическое: от него зависит, жива ли сессия.
+/// Различие не косметическое: от него зависит, жива ли сессия и помним ли
+/// мы, что собеседник в локальной сети.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Failure {
-    /// Транспорт сказал прямо: соединиться не удалось или связь оборвалась.
+    /// Связь оборвалась: соединение было и кончилось.
     ///
     /// Про сессию это не говорит ничего. Собеседник мог уйти из сети на
     /// минуту; его состояние ретчета при этом никуда не делось, и наше тоже.
-    Reported,
+    ///
+    /// **И про присутствие тоже ничего.** Обрыв — событие сокета: он
+    /// случается от смены Wi-Fi-канала, от засыпания экрана, от перезапуска
+    /// приложения на той стороне. Устройство при этом стоит там же, где
+    /// стояло, — и обыкновенно звонит снова через секунду.
+    Dropped,
+    /// Соединиться не удалось: адрес был, никто не ответил.
+    ///
+    /// Единственный отказ, который что-то говорит о присутствии, — и поэтому
+    /// единственный, по которому забывается адрес в локальной сети. Сюда же
+    /// сходится выключенный транспорт: ступени §5.4 на нём больше нет.
+    Unreachable,
     /// Кадр ушёл, а квитанции в срок не пришло.
     ///
     /// Вот это уже подозрение на сессию. Запись в сокет удалась, то есть байты
@@ -1409,17 +1453,10 @@ impl<S: Store> Engine<S> {
             // Сессия переживает разрыв TCP. Закрывает её теперь только
             // молчание в ответ на отправленный кадр — см. [`Failure`].
             Input::ConnectionLost { peer_ik, via } => {
-                // У десктопа (§13.4) разрыв значит ровно то, что сказано,
-                // и ничего больше: очереди доставки у него нет, ступеней
-                // §5.4 для него нет — есть один прямой канал, и он либо
-                // есть, либо нет. Пустить это в `on_delivery_failed` нельзя
-                // не только поэтому: та функция спрашивает доступность
-                // **контакта**, а устройство контактом не является, и весь
-                // шаг ядра упал бы на `UnknownPeer`.
-                if self.devices.contains_key(&peer_ik) {
-                    return self.drop_device_link(peer_ik);
-                }
-                self.on_delivery_failed(peer_ik, via, Failure::Reported)
+                self.on_link_down(peer_ik, via, Failure::Dropped)
+            }
+            Input::ConnectFailed { peer_ik, via } => {
+                self.on_link_down(peer_ik, via, Failure::Unreachable)
             }
             Input::Handed { peer_ik, via, handoff } => self.on_handed(peer_ik, via, handoff),
             // TODO(этап 1): перерукопожатие (§8.5) и расписание уборки (§12)
@@ -2240,7 +2277,11 @@ impl<S: Store> Engine<S> {
 
         let mut effects = Vec::new();
         for peer_ik in peers {
-            effects.extend(self.on_delivery_failed(peer_ik, transport, Failure::Reported)?);
+            // Именно `Unreachable`: ступени на выключенном транспорте нет
+            // вовсе, и это ближе к «не удалось соединиться», чем к обрыву.
+            // Для LAN отсюда же забудется адрес — и правильно: слушать
+            // выключенный транспорт некому.
+            effects.extend(self.on_delivery_failed(peer_ik, transport, Failure::Unreachable)?);
         }
         Ok(effects)
     }
@@ -2764,9 +2805,11 @@ impl<S: Store> Engine<S> {
         // размер, и в одном сообщении может уехать и фотография, которая
         // поедет почтой, и видео, которое будет ждать.
         for record in &records {
-            if self.file_channel(&peer_ik, record.size_bytes).is_none() {
-                effects
-                    .push(Effect::Notify(Event::FileWaitsForChannel { file_id: record.file_id }));
+            if let Some(reason) = self.file_wait_reason(&peer_ik, record.size_bytes) {
+                effects.push(Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: record.file_id,
+                    reason,
+                }));
             }
         }
         Ok(effects)
@@ -3496,8 +3539,11 @@ impl<S: Store> Engine<S> {
         // не хватило канала. Второе про то же самое ничего не добавляет:
         // ждать всё равно одного и того же — появления собеседника.
         for offer in &offers {
-            if self.file_channel(&peer_ik, offer.size_bytes).is_none() {
-                effects.push(Effect::Notify(Event::FileWaitsForChannel { file_id: offer.file_id }));
+            if let Some(reason) = self.file_wait_reason(&peer_ik, offer.size_bytes) {
+                effects.push(Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: offer.file_id,
+                    reason,
+                }));
                 break;
             }
         }
@@ -3617,13 +3663,9 @@ impl<S: Store> Engine<S> {
             // и у передачи, которая закончилась ровно перед перезапуском.
             return self.finish_file(file);
         };
-        let Some(via) = self.file_channel(&peer_ik, file.size_bytes) else {
-            // Канала нет: либо не с чем разговаривать вовсе, либо остался
-            // один почтовый, а файл для почты слишком велик (§10.3).
-            let mut effects =
-                vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })];
-
-            // **И просим рукопожатие, если проситься есть куда.**
+        let via = match self.file_route_of(&peer_ik, file.size_bytes) {
+            FileRoute::Ready(via) => via,
+            // **Дорога есть, сессии нет — просим рукопожатие.**
             //
             // Раньше здесь стояло только «ждём», а в расчёте было на то,
             // что сессию построит кто-то другой. Оно и построит — но лишь
@@ -3636,11 +3678,27 @@ impl<S: Store> Engine<S> {
             // сессия, когда появится, сама позовёт `resume_files` — оба
             // места установки сессии это делают. Заведи мы здесь ещё
             // и таймер, он взводил бы сам себя, пока собеседника нет.
-            if let Some(route) = self.file_route(&peer_ik, file.size_bytes) {
+            FileRoute::Handshake(route) => {
+                let mut effects = vec![Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: file.file_id,
+                    reason: FileWait::Handshaking,
+                })];
                 let (started, _) = self.ensure_handshake(peer_ik, route)?;
                 effects.extend(started);
+                return Ok(effects);
             }
-            return Ok(effects);
+            FileRoute::TooBig => {
+                return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: file.file_id,
+                    reason: FileWait::TooBig,
+                })])
+            }
+            FileRoute::Nowhere => {
+                return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: file.file_id,
+                    reason: FileWait::Nowhere,
+                })])
+            }
         };
         if via == Transport::Mail && self.mail_limits.crowded() {
             // Свой ящик кончается. Просить чанки некуда — они в него
@@ -3649,7 +3707,14 @@ impl<S: Store> Engine<S> {
             // возобновит передачу либо освободившееся место (квота
             // приезжает после каждой разборки ящика), либо появление
             // прямого канала.
-            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
+            //
+            // И вот это — единственный случай, в котором человек может
+            // что-то сделать. Пока причина не ехала, ему говорили «ждёт
+            // канала», то есть «сиди и жди», — §14 такого не разрешает.
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                file_id: file.file_id,
+                reason: FileWait::MailboxFull,
+            })]);
         }
 
         let mut effects = self.send_file_frame(
@@ -3888,9 +3953,16 @@ impl<S: Store> Engine<S> {
             None => Vec::new(),
         };
         for record in &records {
-            if members.iter().any(|m| self.file_channel(m, record.size_bytes).is_none()) {
-                effects
-                    .push(Effect::Notify(Event::FileWaitsForChannel { file_id: record.file_id }));
+            // Причина берётся у **первого** участника, которому файл ехать
+            // не на чем. Строка одна на сообщение (выше сказано, почему),
+            // и одна причина в ней честнее самой мягкой из семи: человеку
+            // важно, что мешает хоть кому-то.
+            let reason = members.iter().find_map(|m| self.file_wait_reason(m, record.size_bytes));
+            if let Some(reason) = reason {
+                effects.push(Effect::Notify(Event::FileWaitsForChannel {
+                    file_id: record.file_id,
+                    reason,
+                }));
             }
         }
         Ok(effects)
@@ -4099,10 +4171,17 @@ impl<S: Store> Engine<S> {
             // Канала нет — чанкам ехать не на чем. Получатель спросит
             // снова, когда канал появится; своего расписания у отправителя нет.
             //
-            // Но сказать об этом надо: иначе у отправителя файл висит
-            // «отправляется» ровно столько, сколько собеседник вне сети,
-            // и объяснения этому нет ни на экране, ни в журнале.
-            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel { file_id: file.file_id })]);
+            // Но сказать об этом надо, и **чем именно** мешает — тоже:
+            // иначе у отправителя файл висит «отправляется» ровно столько,
+            // сколько собеседник вне сети, и объяснения этому нет ни
+            // на экране, ни в журнале.
+            let reason = self
+                .file_wait_reason(&sending.peer_ik, file.size_bytes)
+                .unwrap_or(FileWait::Nowhere);
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                file_id: file.file_id,
+                reason,
+            })]);
         };
         let source = file.source_path.clone();
         let Some(session_id) = self.sessions.for_peer(&sending.peer_ik, via) else {
@@ -4287,7 +4366,26 @@ impl<S: Store> Engine<S> {
         *attempt = attempt.saturating_add(1);
         // Срок вышел — значит за всё это время не пришло ничего. Вот теперь
         // отправителю и правда надо начать с названного номера.
-        self.ask_for_file(now_ms, &file, true)
+        let mut effects = self.ask_for_file(now_ms, &file, true)?;
+
+        // **Пятый случай, которого не было видно вовсе.** Если просьба
+        // ушла — а она ушла, раз ожидания канала среди эффектов нет, —
+        // значит канал есть, мы спросили, и в ответ тишина. Это про
+        // собеседника, а не про нашу сторону, и чинится в другом месте:
+        // «не спросили» и «спросили, молчат» выглядели на экране одинаково,
+        // то есть не выглядели никак.
+        //
+        // Своё ожидание `ask_for_file` уже назвало точнее — второй строки
+        // поверх него не надо.
+        let already_waiting =
+            effects.iter().any(|e| matches!(e, Effect::Notify(Event::FileWaitsForChannel { .. })));
+        if !already_waiting {
+            effects.push(Effect::Notify(Event::FileWaitsForChannel {
+                file_id,
+                reason: FileWait::Silent,
+            }));
+        }
+        Ok(effects)
     }
 
     /// Возобновляет незаконченные приёмы **у всех** собеседников.
@@ -5147,53 +5245,85 @@ impl<S: Store> Engine<S> {
     //
     // Дополнение к спецификации: v0.1 аватарок не описывает. Правила и пределы
     // собраны в `ratatosk_proto::avatar`, здесь — только их применение.
-
-    /// Канал, которым можно везти чанки этого файла (§10.2, §10.3).
+    /// Что сейчас можно сделать с чанками этого файла (§10.2, §10.3).
     ///
-    /// От [`Engine::direct_channel`] отличается одним: почта отсюда
-    /// не исключена. Это **расхождение со спецификацией**, сделанное
-    /// сознательно, и вот его причина.
+    /// # Одна ходка по лестнице вместо двух
     ///
-    /// §10.2 требует для чанков прямого канала, а §10.3 разрешает почте
-    /// только файлы до 20 МБ — то есть «файл одним письмом». Правило верное
-    /// для случая, когда прямой канал бывает. Но у части людей почта —
-    /// **единственный** транспорт: LAN не годится, а Tor в их сети
-    /// не поднимается. Для них буква спецификации означает «файлов нет»,
-    /// и это хуже, чем расхождение.
+    /// Здесь стояли **две** функции: `file_channel` («куда ехать сейчас»)
+    /// и `file_route` («куда проситься, если сессии нет»). Обе обходили
+    /// одну и ту же лестницу §5.4 и обязаны были совпадать в правиле
+    /// «годен ли транспорт» — о чём в комментарии и было написано, что
+    /// разойдись они, вторая звала бы рукопожатие на канал, которым файл
+    /// всё равно не поедет. Теперь ходка одна, и расходиться нечему.
     ///
-    /// Поэтому чанки едут и почтой — тем же оконным протоколом, просто
-    /// каждый чанк отдельным письмом. Почему это работает, хотя раньше было
-    /// записано, что не может: окно и подтверждения не требуют миллисекунд,
-    /// они требуют, чтобы **срок молчания был длиннее круга**
-    /// (`files::stall_ms`). Круг у почты — минуты, и срок ей отведён
-    /// получасовой. Прежнее «почтой чанки не ходят» было не выводом,
-    /// а нежеланием считать.
+    /// # И заодно — почему нельзя
     ///
-    /// Единственное, что здесь по-прежнему отсекается, — файлы, для которых
-    /// почтовый круг означает сутки ([`may_send_over`]). Такие честно ждут
-    /// прямого канала.
+    /// Обе прежние функции отвечали `None` на четыре разных случая,
+    /// и различить их снаружи было нечем. Это стоило двух потраченных
+    /// гипотез на поломке «файл не качается, потом качается сам»
+    /// и, что важнее, врало человеку: «ждёт канала» вместо «ваш ящик
+    /// переполнен» (§14).
     ///
-    /// [`may_send_over`]: ratatosk_proto::files::may_send_over
-    fn file_channel(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<Transport> {
-        let availability = self.availability_of(peer_ik).ok()?;
+    /// Порядок ответов задан лестницей: [`FileRoute::Ready`] — первый
+    /// годный транспорт **с сессией**, [`FileRoute::Handshake`] — первый
+    /// годный вообще. Именно так вели себя обе прежние функции.
+    fn file_route_of(&self, peer_ik: &[u8; 32], size_bytes: u64) -> FileRoute {
+        let Ok(availability) = self.availability_of(peer_ik) else {
+            // Собеседник неизвестен: спрашивать не о чем и не у кого.
+            return FileRoute::Nowhere;
+        };
         let mut attempt = Attempt::new();
+        let mut rideable = None;
+        let mut offered = false;
         while let Some(Decision::Use(transport)) = attempt.next(availability) {
+            offered = true;
             if !self.file_may_ride(transport, size_bytes) {
                 continue;
             }
+            if rideable.is_none() {
+                rideable = Some(transport);
+            }
             if self.sessions.for_peer(peer_ik, transport).is_some() {
-                return Some(transport);
+                return FileRoute::Ready(transport);
             }
         }
-        None
+        match (rideable, offered) {
+            (Some(transport), _) => FileRoute::Handshake(transport),
+            // Транспорты у собеседника есть, но ни один не повезёт файл
+            // такого размера. На сегодня это всегда одно: осталась почта,
+            // а файл ей не по размеру (§10.3) либо не по пределу письма.
+            (None, true) => FileRoute::TooBig,
+            (None, false) => FileRoute::Nowhere,
+        }
+    }
+
+    /// Канал, которым можно везти чанки **прямо сейчас**.
+    ///
+    /// От [`Engine::direct_channel`] отличается одним: почта отсюда
+    /// не исключена — файлы ей ходят (§10.2).
+    fn file_channel(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<Transport> {
+        match self.file_route_of(peer_ik, size_bytes) {
+            FileRoute::Ready(transport) => Some(transport),
+            _ => None,
+        }
+    }
+
+    /// Почему передача стоит — или `None`, если она не стоит.
+    ///
+    /// Одно место на все пять мест выпуска [`Event::FileWaitsForChannel`]
+    /// у **отправителя**. Переполненный свой ящик сюда не входит нарочно:
+    /// он значит «чанкам некуда лечь», а чанки ложатся в ящик того, кто
+    /// принимает. У отправки они уходят в чужой.
+    fn file_wait_reason(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<FileWait> {
+        match self.file_route_of(peer_ik, size_bytes) {
+            FileRoute::Ready(_) => None,
+            FileRoute::Handshake(_) => Some(FileWait::Handshaking),
+            FileRoute::TooBig => Some(FileWait::TooBig),
+            FileRoute::Nowhere => Some(FileWait::Nowhere),
+        }
     }
 
     /// Годится ли такой транспорт для чанков такого размера.
-    ///
-    /// Одно правило на два вопроса — «куда слать сейчас» ([`Engine::
-    /// file_channel`]) и «куда проситься, если сессии ещё нет»
-    /// ([`Engine::file_route`]). Разойдись они, второй звал бы рукопожатие
-    /// на канал, которым файл всё равно не поедет.
     ///
     /// Почту отсекает не только §10.3, но и предел письма у **своего**
     /// сервера: чанк едет письмом на полтора мебибайта, и сервер,
@@ -5205,22 +5335,6 @@ impl<S: Store> Engine<S> {
             return false;
         }
         !(transport == Transport::Mail && !self.mail_limits.carries_file_chunks())
-    }
-
-    /// Каким каналом файл поехал бы, **будь** там сессия.
-    ///
-    /// Отличается от [`Engine::file_channel`] ровно тем, что не смотрит
-    /// на сессии: нужен он затем, чтобы понять, о каком рукопожатии
-    /// просить. Возвращает первый годный по §5.4, а не первый с сессией.
-    fn file_route(&self, peer_ik: &[u8; 32], size_bytes: u64) -> Option<Transport> {
-        let availability = self.availability_of(peer_ik).ok()?;
-        let mut attempt = Attempt::new();
-        while let Some(Decision::Use(transport)) = attempt.next(availability) {
-            if self.file_may_ride(transport, size_bytes) {
-                return Some(transport);
-            }
-        }
-        None
     }
 
     /// Прямой канал к контакту, если сессия по нему есть (§5.4).
@@ -9031,6 +9145,21 @@ impl<S: Store> Engine<S> {
                 // к нему позже — «ждём, когда появится». Не смогли (очередь
                 // полна, контакта больше нет) — «не доставлено», без обещаний.
                 delivery.attempt.succeed();
+                // **Почему некуда — в журнал.** «Ждёт» на экране означает
+                // «собеседника нет в сети» (§9.4), а за этим стоят три
+                // разных «нет»: выключен, не поднят, адреса нет. Различить
+                // их по экрану было нечем — и нечем было объяснить, почему
+                // кадры по этому же LAN ходят, а отправка говорит «офлайн».
+                //
+                // Живая сессия ступень адресуемой **не делает**: у LAN
+                // адрес даёт только маяк. Если в разборе стоит
+                // `lan=адреса нет`, а кадры при этом ходят — вот оно.
+                tracing::info!(
+                    peer = %short_ik(&delivery.peer_ik),
+                    tried = ?delivery.attempt.tried(),
+                    refusal = %Reachability::of(availability).refusal(),
+                    "отправлять некуда: лестница §5.4 кончилась"
+                );
                 let (remembered, mut effects) = self.remember_undelivered(delivery)?;
                 let status = if remembered {
                     DeliveryStatus::Waiting
@@ -9546,6 +9675,12 @@ impl<S: Store> Engine<S> {
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
         effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
 
+        // Рукопожатие §8.2 аутентифицировано — значит по локальной сети
+        // к нам обратился именно этот собеседник и именно сейчас.
+        if via == Transport::Lan {
+            effects.extend(self.note_lan_presence(peer_ik)?);
+        }
+
         if is_device {
             // **Адрес десктопа — из нагрузки рукопожатия, и больше ниоткуда.**
             // Соединения односторонние (5ц): отвечаем мы не в принятое
@@ -9639,7 +9774,12 @@ impl<S: Store> Engine<S> {
         // и запись должна лечь раньше первого кадра.
         self.persist_session(session_id)?;
 
-        let mut effects = self.flush_outbox(peer_ik)?;
+        // До очереди, а не после: ответ на рукопожатие приехал по локальной
+        // сети — значит собеседник в ней есть, и §5.4 обязан узнать об этом
+        // раньше, чем `flush_outbox` начнёт выбирать ступень.
+        let mut effects =
+            if via == Transport::Lan { self.note_lan_presence(peer_ik)? } else { Vec::new() };
+        effects.extend(self.flush_outbox(peer_ik)?);
         effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
         // Мы звали — значит карточка уехала в первом сообщении. Но если
         // собеседник уже знал нас, он её отбросил: см. `push_own_card`.
@@ -9710,6 +9850,48 @@ impl<S: Store> Engine<S> {
         let timer = self.allocate_timer();
         delivery.state = DeliveryState::AwaitingDiscovery { timer };
         Some(Effect::SetTimer { after_ms: LAN_DISCOVERY_GRACE_MS, token: timer })
+    }
+
+    /// Отмечает: собеседник **сейчас** в локальной сети — по принятому кадру.
+    ///
+    /// Это не «сессия есть, значит доступен». Сессия переживает и уход
+    /// устройства из сети, и смену сети, и ровно поэтому §5.4 на неё
+    /// не опирается: «сессия есть» очень быстро начинает означать «был
+    /// вчера». Здесь другое свидетельство — кадр, **пришедший по локальной
+    /// сети и прошедший проверку тега**. Он говорит то же самое, что маяк
+    /// §5.1, только свежее, и гаснет от тех же двух событий: отказа
+    /// соединения (§5.4) и смены сети (§5.1).
+    ///
+    /// Зачем понадобилось: адрес забывался по обрыву, собеседник тут же
+    /// возвращался новым рукопожатием — и §5.4 всё равно не видел, куда
+    /// слать, потому что маяк по расписанию звучит не сразу. Обрыв больше
+    /// адрес не забывает, но одного этого мало: после **настоящего** отказа
+    /// вернувшийся собеседник иначе ждал бы маяка, продолжая слать нам
+    /// кадры (`HANDOFF.md`, 6б).
+    ///
+    /// Переход, а не факт: кадры идут потоком, и перебирать очередь на
+    /// каждом — работа впустую. То же правило, что у `Input::SeenOnLan`.
+    ///
+    /// Недокачанные файлы отсюда не возобновляются, в отличие от маяка:
+    /// канал у нас уже есть — по нему только что пришёл кадр, — и всё,
+    /// что ждало канала, спросил тот, кто его открыл (§10.2).
+    fn note_lan_presence(&mut self, peer_ik: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
+        let appeared = match self.contacts.get_mut(&peer_ik) {
+            Some(contact) => !std::mem::replace(&mut contact.availability.seen_on_lan, true),
+            // Не контакт, а своё же устройство (§13.4): ступеней §5.4 у него
+            // нет, и отмечать нечего.
+            None => return Ok(Vec::new()),
+        };
+        if !appeared {
+            return Ok(Vec::new());
+        }
+        tracing::info!(
+            peer = %short_ik(&peer_ik),
+            "адрес в локальной сети вспомнен: кадр пришёл по ней"
+        );
+        let mut effects = self.resume_discovery(peer_ik)?;
+        effects.extend(self.retry_deferred(Some(peer_ik))?);
+        Ok(effects)
     }
 
     /// Обнаружение ответило (или кончился срок) — двигаем отложенное.
@@ -9823,6 +10005,29 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Соединения с собеседником не стало: обрывом или отказом.
+    ///
+    /// Одно место на два входа, потому что дальше они расходятся ровно
+    /// в одной строке — забывать ли адрес в локальной сети, — а всё
+    /// остальное у них общее.
+    fn on_link_down(
+        &mut self,
+        peer_ik: [u8; 32],
+        via: Transport,
+        why: Failure,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // У десктопа (§13.4) разрыв значит ровно то, что сказано, и ничего
+        // больше: очереди доставки у него нет, ступеней §5.4 для него нет —
+        // есть один прямой канал, и он либо есть, либо нет. Пустить это
+        // в `on_delivery_failed` нельзя не только поэтому: та функция
+        // спрашивает доступность **контакта**, а устройство контактом
+        // не является, и весь шаг ядра упал бы на `UnknownPeer`.
+        if self.devices.contains_key(&peer_ik) {
+            return self.drop_device_link(peer_ik);
+        }
+        self.on_delivery_failed(peer_ik, via, why)
+    }
+
     /// Прямой канал отказал — переходим к следующему транспорту (§5.4).
     fn on_delivery_failed(
         &mut self,
@@ -9846,17 +10051,35 @@ impl<S: Store> Engine<S> {
         let stale_session =
             why == Failure::Silent && via.is_direct() && self.sessions.retire(&peer_ik, via);
 
-        // Адрес в локальной сети забывается только при **явном** отказе:
-        // соединиться не удалось — значит устройства там больше нет.
+        // Адрес в локальной сети забывается только при **отказе соединения**:
+        // адрес был, по нему никто не ответил — значит устройства там
+        // больше нет.
         //
-        // При молчании — наоборот, не забывается: запись в сокет удалась,
+        // При обрыве — не забывается, и это разбор живой поломки со стенда
+        // (`HANDOFF.md`, 6б). Обрыв говорит о сокете, а не о присутствии:
+        // одна неудачная запись — и §5.4 переставал предлагать LAN
+        // собеседнику, который стоял в двух метрах и через секунду сам
+        // начинал новое рукопожатие. Переписка после этого шла строго
+        // в одну сторону: его кадры мы принимали и отвечали на них
+        // квитанциями, а каждое **наше** сообщение объявлялось «ждёт».
+        //
+        // При молчании — тоже не забывается: запись в сокет удалась,
         // то есть по этому адресу кто-то слушает. Забыв его здесь, мы увели
         // бы следующую попытку с LAN на транспорты, которых может и не быть,
         // — и вместо переустановки сессии получили бы «не доставлено».
-        if why == Failure::Reported && via == Transport::Lan {
+        if why == Failure::Unreachable && via == Transport::Lan {
             if let Some(contact) = self.contacts.get_mut(&peer_ik) {
                 contact.availability.seen_on_lan = false;
             }
+            // Громко, потому что последствие тихое и долгое: пока маяк
+            // не прозвучит снова — или не придёт кадр, см. `note_lan_presence`
+            // — §5.4 не предложит LAN **ни одному** следующему сообщению.
+            // Отсрочка на обнаружение выдаётся один раз на контакт за сеанс
+            // и второй раз уже не спасёт.
+            tracing::info!(
+                peer = %short_ik(&peer_ik),
+                "адрес в локальной сети забыт: соединиться не удалось"
+            );
         }
 
         // Рукопожатие переносится первым: без сессии данные всё равно
@@ -10037,6 +10260,13 @@ impl<S: Store> Engine<S> {
         bound.session.recv.commit(counter, now_ms)?;
         self.persist_session(session_id)?;
 
+        // Тег сошёлся — значит кадр от него, и он прислал его сейчас. Для
+        // локальной сети это свидетельство присутствия не хуже маяка §5.1,
+        // и дальше по этой функции столько выходов, что события отсюда
+        // приходится нести с собой: `woken` подмешивается к каждому.
+        let mut woken =
+            if via == Transport::Lan { self.note_lan_presence(peer_ik)? } else { Vec::new() };
+
         let envelope = Envelope::decode(&plaintext)?.into_parts().1;
         // Что именно приехало. Между «кадр расшифрован» и «сообщение
         // на экране» лежит разбор нагрузки, и типов у неё полтора десятка:
@@ -10054,7 +10284,8 @@ impl<S: Store> Engine<S> {
         // нельзя вовсе: HLC — общий порядок разговора с людьми, и дать
         // терминалу двигать его вперёд значит отдать ему чужие часы.
         if self.devices.contains_key(&peer_ik) {
-            return self.on_device_frame(now_ms, via, peer_ik, &envelope);
+            woken.extend(self.on_device_frame(now_ms, via, peer_ik, &envelope)?);
+            return Ok(woken);
         }
 
         // §9.2: одно сообщение может законно прийти дважды — разными
@@ -10081,7 +10312,8 @@ impl<S: Store> Engine<S> {
         // байты лягут в то же место), а две тысячи идентификаторов на файл
         // забили бы и окно, и таблицу `dedup` тем, что никогда не понадобится.
         if envelope.payload_type == PayloadType::FileChunk {
-            return self.deliver(now_ms, via, peer_ik, envelope);
+            woken.extend(self.deliver(now_ms, via, peer_ik, envelope)?);
+            return Ok(woken);
         }
 
         let fresh = self.dedup.check(envelope.msg_id, now_ms).is_fresh()
@@ -10096,7 +10328,7 @@ impl<S: Store> Engine<S> {
             // обещания не разрешает. Отправитель её и не ждёт — попытка
             // у него закрылась записью в сокет.
             if Self::is_group_copy(envelope.payload_type) {
-                return Ok(Vec::new());
+                return Ok(woken);
             }
             let chat = Self::chat_id_for(&peer_ik);
             let receipt = if self.read_upto.get(&chat).is_some_and(|edge| *edge >= envelope.hlc) {
@@ -10104,16 +10336,18 @@ impl<S: Store> Engine<S> {
             } else {
                 Receipt::Delivered
             };
-            return self.send_receipt(now_ms, peer_ik, via, receipt, &[envelope.msg_id]);
+            woken.extend(self.send_receipt(now_ms, peer_ik, via, receipt, &[envelope.msg_id])?);
+            return Ok(woken);
         }
 
         // §9.1: метка из далёкого будущего отбрасывается вместе с сообщением.
         let Ok(_) = self.clock.observe(now_ms, envelope.hlc) else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
-            return Ok(Vec::new());
+            return Ok(woken);
         };
 
-        self.deliver(now_ms, via, peer_ik, envelope)
+        woken.extend(self.deliver(now_ms, via, peer_ik, envelope)?);
+        Ok(woken)
     }
 
     /// Кладёт принятый текст в историю и подтверждает приём.

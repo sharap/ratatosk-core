@@ -119,6 +119,56 @@ pub enum RatatoskError {
     },
 }
 
+/// Почему передача файла стоит (§10.3).
+///
+/// **Из пяти причин действия требует ровно одна.** Остальные четыре
+/// означают «файл не потерян, поедет сам»; [`FfiFileWaitReason::
+/// MailboxFull`] означает «освободите место, иначе не поедет». Показать
+/// их одинаково — соврать человеку в единственном случае, когда он может
+/// что-то сделать (§14).
+///
+/// Текст к каждой — [`file_waiting_text`]; писать свой не надо.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiFileWaitReason {
+    /// Канала нет ни одного: собеседника не достать ничем.
+    Nowhere,
+    /// Остался только почтовый канал, а файл ему не по размеру.
+    TooBig,
+    /// Дорога есть, связь устанавливается.
+    Handshaking,
+    /// Свой почтовый ящик переполнен — единственная причина, требующая
+    /// действия человека.
+    MailboxFull,
+    /// Спросили — собеседник молчит.
+    Silent,
+}
+
+/// Переводит причину наружу.
+const fn wait_reason_of(reason: ratatosk_proto::files::FileWait) -> FfiFileWaitReason {
+    use ratatosk_proto::files::FileWait;
+
+    match reason {
+        FileWait::Nowhere => FfiFileWaitReason::Nowhere,
+        FileWait::TooBig => FfiFileWaitReason::TooBig,
+        FileWait::Handshaking => FfiFileWaitReason::Handshaking,
+        FileWait::MailboxFull => FfiFileWaitReason::MailboxFull,
+        FileWait::Silent => FfiFileWaitReason::Silent,
+    }
+}
+
+/// И обратно — чтобы текст брался у ядра, а не переписывался здесь.
+const fn wait_reason_back(reason: FfiFileWaitReason) -> ratatosk_proto::files::FileWait {
+    use ratatosk_proto::files::FileWait;
+
+    match reason {
+        FfiFileWaitReason::Nowhere => FileWait::Nowhere,
+        FfiFileWaitReason::TooBig => FileWait::TooBig,
+        FfiFileWaitReason::Handshaking => FileWait::Handshaking,
+        FfiFileWaitReason::MailboxFull => FileWait::MailboxFull,
+        FfiFileWaitReason::Silent => FileWait::Silent,
+    }
+}
+
 /// Статус доставки для UI (§9.4).
 ///
 /// `Delivered` и `Read` недостижимы при почтовой доставке — это свойство
@@ -352,28 +402,31 @@ pub enum FfiEvent {
         /// Чат.
         chat_id: Vec<u8>,
     },
-    /// Файлу не на чем ехать (§10.3).
+    /// Передача файла стоит, и вот почему (§10.3).
     ///
     /// **Состояние, а не происшествие.** Показывать надо на самом файле —
     /// строкой из [`file_waiting_text`], — а не всплывающей подсказкой:
     /// подсказка исчезнет, а ждать файл будет столько, сколько собеседник
     /// вне сети.
     ///
-    /// Случаев два. Либо канала нет никакого — собеседник не в сети, почты
-    /// у него нет. Либо канал остался только почтовый, а файл для почты
-    /// слишком велик: почтой файлы ходят (по чанку в письме), но круг у неё
-    /// минутный, и сотня мегабайт — предел, за которым честнее сказать
-    /// «нужен прямой канал», чем показывать полоску, которая не сдвинется
-    /// до завтра.
+    /// **Причина приезжает вместе с событием, и её надо показывать.**
+    /// Раньше текст был один на все случаи, и это врало: «ждёт канала»
+    /// вместо «ваш почтовый ящик переполнен» — правда хуже той, которая
+    /// есть, потому что во втором случае человек может что-то сделать.
+    /// Из пяти причин действия требует ровно одна
+    /// ([`FfiFileWaitReason::MailboxFull`]), и отличить её от остальных
+    /// без этого поля нельзя.
     ///
     /// Снимает это состояние следующий [`FfiEvent::FileProgress`]: он
-    /// и означает, что канал появился и передача пошла.
+    /// и означает, что передача пошла.
     ///
     /// Прежнее имя — `FileWaitsForDirectChannel`; переименовано, когда
     /// чанки поехали почтой.
     FileWaitsForChannel {
         /// Какой файл.
         file_id: Vec<u8>,
+        /// Почему стоит — текст берётся [`file_waiting_text`].
+        reason: FfiFileWaitReason,
     },
     /// Ход передачи файла (§10.2).
     ///
@@ -3197,9 +3250,10 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::GroupAvatarChanged { chat } => {
             FfiEvent::GroupAvatarChanged { chat_id: chat.to_vec() }
         }
-        Event::FileWaitsForChannel { file_id } => {
-            FfiEvent::FileWaitsForChannel { file_id: file_id.to_vec() }
-        }
+        Event::FileWaitsForChannel { file_id, reason } => FfiEvent::FileWaitsForChannel {
+            file_id: file_id.to_vec(),
+            reason: wait_reason_of(reason),
+        },
         Event::FileProgress { file_id, received, total } => {
             FfiEvent::FileProgress { file_id: file_id.to_vec(), received, total }
         }
@@ -3296,15 +3350,20 @@ pub fn revocation_notice() -> String {
     ratatosk_core::honest::REVOCATION_NOTICE.to_string()
 }
 
-/// Что показать на файле, которому не на чем ехать (§10.3).
+/// Что показать на файле, передача которого стоит (§10.3).
 ///
-/// Текст задан спецификацией и переписыванию не подлежит: он обещает ровно
-/// то, что протокол делает, — файл уедет, когда собеседник появится в сети.
-/// «Ошибка отправки» и «загрузка…» здесь одинаково неправда.
+/// Текст задан ядром и переписыванию не подлежит: он обещает ровно то,
+/// что протокол делает. «Ошибка отправки» и «загрузка…» здесь одинаково
+/// неправда — файл не потерян и поедет сам, кроме одного случая, когда
+/// от человека что-то нужно.
+///
+/// Причину берут из [`FfiEvent::FileWaitsForChannel`]: одного текста
+/// на все пять не бывает, и попытка обойтись одним стоила двух
+/// потраченных гипотез на живой поломке.
 #[uniffi::export]
 #[must_use]
-pub fn file_waiting_text() -> String {
-    ratatosk_proto::files::waiting_for_channel_text().to_string()
+pub fn file_waiting_text(reason: FfiFileWaitReason) -> String {
+    wait_reason_back(reason).text().to_string()
 }
 
 /// Предупреждение при включении LAN (§5.1).

@@ -14,7 +14,11 @@ __pycache__/
 
 # локальные базы и ключи — не должны попадать в репозиторий никогда
 *.sqlite
+*.db
+*.db-wal
+*.db-shm
 *.sqlite-wal
 *.sqlite-shm
 /fuzz/artifacts/
 /fuzz/corpus/
+/tarball/

@@ -247,6 +247,65 @@ impl Rung {
     pub const fn rising(self) -> bool {
         self.enabled && self.addressable && !self.ready
     }
+
+    /// Почему ступень не годится — или что она годится.
+    ///
+    /// **Заведено по следу живой поломки.** «Сообщение ждёт» на экране
+    /// значит «собеседника нет в сети» (§9.4), а на деле за этим стоят три
+    /// разных «нет»: транспорт выключен человеком, транспорт ещё
+    /// не поднялся, адреса нет. Различить их по экрану было нечем — и
+    /// нечем было объяснить, почему кадры по этому же LAN ходят,
+    /// а отправка говорит «офлайн».
+    ///
+    /// Порядок проверок здесь тот же, что у [`Rung::usable`], и это
+    /// существенно: причина обязана называть **первое** препятствие,
+    /// а не любое.
+    #[must_use]
+    pub const fn state(self) -> RungState {
+        if !self.enabled {
+            RungState::Disabled
+        } else if !self.ready {
+            RungState::NotReady
+        } else if !self.addressable {
+            RungState::NoAddress
+        } else {
+            RungState::Usable
+        }
+    }
+}
+
+/// Что со ступенью §5.4 прямо сейчас.
+///
+/// Для журнала и для стенда, не для показа человеку: у человека есть
+/// статус доставки (§9.4), а это — то, чем объясняют статус себе.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RungState {
+    /// Годится: разрешена, поднята, есть куда ехать.
+    Usable,
+    /// Выключена человеком.
+    Disabled,
+    /// Разрешена, но ещё не поднялась.
+    NotReady,
+    /// Поднята, но ехать некуда: нет адреса в карточке или маяка в эфире.
+    ///
+    /// **Живая сессия сюда не считается**, и это стоит помнить, разбирая
+    /// «работает только в одну сторону»: канал, по которому кадры ходят
+    /// прямо сейчас, не делает ступень адресуемой. У LAN адрес даёт
+    /// только маяк.
+    NoAddress,
+}
+
+impl RungState {
+    /// Короткое имя для журнала.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            RungState::Usable => "годен",
+            RungState::Disabled => "выключен",
+            RungState::NotReady => "не поднят",
+            RungState::NoAddress => "адреса нет",
+        }
+    }
 }
 
 /// Куда поедет следующее сообщение этому контакту — и почему не дальше.
@@ -314,6 +373,31 @@ impl Reachability {
     #[must_use]
     pub fn route(&self) -> Option<Transport> {
         self.rungs.into_iter().find(|rung| rung.usable()).map(|rung| rung.transport)
+    }
+
+    /// Разбор по ступеням — почему отправлять некуда.
+    ///
+    /// Отдаётся строкой, потому что читать её будут в журнале рядом
+    /// с кадрами транспорта: `lan=адреса нет onion=выключен mail=адреса нет`
+    /// объясняет «ждёт» за один взгляд, а три булевых поля на ступень —
+    /// нет.
+    #[must_use]
+    pub fn refusal(&self) -> String {
+        let mut out = String::new();
+        for rung in self.rungs {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            let name = match rung.transport {
+                Transport::Lan => "lan",
+                Transport::Onion => "onion",
+                Transport::Mail => "mail",
+            };
+            out.push_str(name);
+            out.push('=');
+            out.push_str(rung.state().label());
+        }
+        out
     }
 
     /// Ступень, которая заберёт отправку, когда поднимется.
@@ -756,5 +840,74 @@ mod tests {
 
         let onion = view.rung(Transport::Onion);
         assert!(onion.usable(), "остальные ступени выключение LAN не трогает");
+    }
+
+    #[test]
+    fn a_refusal_names_the_first_obstacle_of_each_rung() {
+        // Порядок проверок тот же, что у `usable`: выключенная ступень
+        // называется выключенной, даже если у неё вдобавок нет адреса.
+        // Назови мы второе препятствие, человек чинил бы не то.
+        let mut enabled = everything();
+        enabled.set(Transport::Lan, false);
+        let peer = PeerAvailability {
+            seen_on_lan: false,
+            enabled,
+            ready: everything(),
+            has_onion: false,
+            has_chatmail: true,
+        };
+        let rungs = Reachability::of(peer);
+
+        assert_eq!(rungs.rung(Transport::Lan).state(), RungState::Disabled);
+        assert_eq!(rungs.rung(Transport::Onion).state(), RungState::NoAddress);
+        assert_eq!(rungs.rung(Transport::Mail).state(), RungState::Usable);
+        assert_eq!(rungs.refusal(), "lan=выключен onion=адреса нет mail=годен");
+    }
+
+    #[test]
+    fn a_rung_that_is_up_but_unaddressable_says_so() {
+        // Ровно тот случай, ради которого разбор и заведён: LAN разрешён
+        // и поднят, а маяка нет. Кадры по живой сессии при этом ходить
+        // могут — §5.4 на них не смотрит, и объяснить «ждёт» без этой
+        // строки было нечем.
+        let peer = PeerAvailability {
+            seen_on_lan: false,
+            has_onion: false,
+            has_chatmail: false,
+            ..full()
+        };
+        let rungs = Reachability::of(peer);
+
+        assert_eq!(rungs.rung(Transport::Lan).state(), RungState::NoAddress);
+        assert_eq!(rungs.route(), None, "отправлять некуда");
+        assert_eq!(rungs.rising(), None, "и ждать нечего: подниматься нечему");
+        assert_eq!(rungs.refusal(), "lan=адреса нет onion=адреса нет mail=адреса нет");
+    }
+
+    #[test]
+    fn a_rung_that_is_only_waiting_to_come_up_is_not_the_same_as_unaddressable() {
+        // «Tor поднимается» и «Tor некуда» — разные вещи, и разбор
+        // обязан их различать: в первом случае ждать имеет смысл.
+        let mut ready = everything();
+        ready.set(Transport::Onion, false);
+        let peer = PeerAvailability { seen_on_lan: false, ready, has_chatmail: false, ..full() };
+        let rungs = Reachability::of(peer);
+
+        assert_eq!(rungs.rung(Transport::Onion).state(), RungState::NotReady);
+        assert_eq!(rungs.rising(), Some(Transport::Onion), "эта ступень заберёт отправку");
+    }
+
+    #[test]
+    fn every_state_has_its_own_word() {
+        // Совпади два — разбор снова стал бы нечитаемым, а он ради чтения
+        // и заведён.
+        let all =
+            [RungState::Usable, RungState::Disabled, RungState::NotReady, RungState::NoAddress];
+        for (n, one) in all.iter().enumerate() {
+            assert!(!one.label().is_empty());
+            for other in &all[n + 1..] {
+                assert_ne!(one.label(), other.label(), "{one:?} и {other:?} неразличимы");
+            }
+        }
     }
 }

@@ -218,6 +218,14 @@ cargo test -p ratatosk-store --test persistence
 | `the_roster_marks_the_owner_and_that_is_how_the_desktop_learns_its_rights` (companion) | без признака окно рисовало бы кнопки, на которые телефон отвечает отказом |
 | `the_desktop_renames_the_group_and_changes_its_avatar` (companion) | пустые байты — «снять», а не пустая просьба |
 | `a_group_avatar_that_is_not_an_image_is_refused_in_words` (companion) | формат проверяет тот, кто пишет на диск; провод меряет только длину |
+| `a_file_that_has_nowhere_to_go_says_so_by_name` (pair) | «канала нет вовсе» и «ящик переполнен» — разные вещи: во втором человек может что-то сделать |
+| `every_reason_says_something_different_to_the_human` (pair) | совпади два текста — причины снова стали бы снаружи неразличимы, а ради этого всё и заведено |
+| `a_stingy_letter_limit_keeps_files_off_the_mail`, `a_mailbox_with_no_room_stops_asking_for_chunks`, `a_file_too_large_for_mail_says_it_waits_for_a_channel` (pair) | те же тесты, что и были, но теперь проверяют **причину**, а не факт ожидания |
+| `the_first_rideable_transport_with_a_session_wins` и ещё пять (стенд `/tmp/fr`) | настоящее тело `file_route_of` с заглушками лестницы: одна ходка отвечает и «куда ехать», и «куда проситься», и «почему нельзя» |
+| `a_refusal_names_the_first_obstacle_of_each_rung` (proto) | «выключен» и «адреса нет» — разные починки; назови мы второе препятствие, человек чинил бы не то |
+| `a_rung_that_is_up_but_unaddressable_says_so` (proto) | тот самый случай из живого лога: LAN поднят, маяка нет, кадры по живой сессии ходят — а §5.4 на них не смотрит |
+| `a_rung_that_is_only_waiting_to_come_up_is_not_the_same_as_unaddressable` (proto) | «Tor поднимается» и «Tor некуда» — в первом ждать имеет смысл |
+| `every_state_has_its_own_word` (proto) | совпади два — разбор снова стал бы нечитаемым |
 | `the_desktop_leaves_the_group_and_the_chat_stays` (companion) | уход не стирает сказанное, но право распоряжаться снимает |
 | `the_owner_of_a_group_is_marked_in_the_roster` (ffi, стенд границы) | «я ли создатель» — это `mine && owner` разом |
 | `every_kind_round_trips` (proto) | все шесть видов — правка, отзыв, реакция, ответ, файлы, переименование — круговой оборот открытого текста действия |
@@ -1450,6 +1458,8 @@ cargo test -p ratatosk-core --test pair
 | Тест | Что держит |
 |---|---|
 | `a_socket_drop_does_not_destroy_the_session` | разрыв TCP — событие сокета, а не сессии |
+| `a_socket_drop_does_not_take_the_lan_address_with_it` | обрыв не забывает адрес: следующее сообщение уезжает по той же LAN |
+| `a_frame_from_the_lan_says_the_same_as_a_beacon` | после настоящего отказа адрес возвращает кадр собеседника, и ожидавшее едет |
 | `a_peer_that_forgot_our_session_gets_a_new_one` | молчание в ответ на кадр приводит к новому рукопожатию, а не к тишине |
 | `a_new_session_supersedes_the_old_one_with_the_same_peer` | на контакт и семейство — ровно одна сессия |
 | `sessions_of_different_families_coexist` | вытесняется только своё семейство (§5.4) |
@@ -2397,11 +2407,11 @@ assert_eq!(sim.node(NodeId(2)).inbox.len(), 1, "сид {:#x}", sim.seed());
 сообщения.
 
 **И отдельно: открытая поломка «файл не качается, потом качается сам»**
-— HANDOFF, раздел 6а. Починка 5вб её не вылечила, то есть причина
-другая и пока неизвестна. Первый шаг, когда дойдут руки, — не новая
-догадка, а код причины у `FileWaitsForChannel`: сейчас четыре разных
-случая выглядят на экране одинаково, а пятый («спросили, но молчат»)
-не виден вовсе.
+— HANDOFF, раздел 6а. Починка 5вб её не вылечила. Код причины
+у `FileWaitsForChannel` теперь есть — пять причин, каждая со своим
+текстом и коротким именем, и стенд их печатает. Осталось **одно**:
+воспроизвести на устройствах и прочитать строку `причина:`. Дальше
+чинится в разных местах, и в HANDOFF записано, в каком именно.
 
 
 **Проверка создателя на приёме (5вг).** Ветки, отбрасывающие `Rename`
@@ -2461,6 +2471,18 @@ assert_eq!(sim.node(NodeId(2)).inbox.len(), 1, "сид {:#x}", sim.seed());
 `/tmp/record_fields.py`: у каждой сборки `Имя { … }` обязаны быть те же
 поля, что у `pub struct Имя`. Записи со «..остальное» и одноимённые
 объявления пропускаются вслух, тела `enum` — тоже.
+
+**Разводка двух исходов — свёрткой.** `/tmp/failure_wiring.py` проверяет
+всю цепочку «обрыв ≠ отказ соединения» разом: оба входа объявлены,
+`TransportEvent::Disconnected` едет в `Input::ConnectionLost`,
+а `ConnectFailed` — в `Input::ConnectFailed`; ядро связывает их
+с `Failure::Dropped` и `Failure::Unreachable`; адрес в локальной сети
+гасится ровно в трёх местах (отказ соединения, смена сети, выключенный
+LAN) и по условию `Failure::Unreachable`; `note_lan_presence` зовётся
+из трёх мест. Проверка нужна потому, что слить два исхода обратно
+в один — правка на одну строку, а стоила она переписки в одну сторону
+(`HANDOFF.md`, 6б). Обе поломки, которые она ловит, воспроизведены
+руками и восстановлены.
 
 **Стенд провода меряет форму, но не длину.** Кодек у него свой,
 через `Debug`, и байт в нём занимает не один символ: два теста,

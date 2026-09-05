@@ -206,13 +206,17 @@ impl SimNode for Node {
 
     /// Прямой канал не доставил — ядро обязано перейти к следующему
     /// транспорту (§5.4). Без этой связки откат непроверяем.
+    ///
+    /// Именно `ConnectFailed`, а не обрыв: симулятор отказывает в **связи**,
+    /// а не роняет установленный сокет. Разница видна на LAN — адрес
+    /// забывается только по первому (`io.rs`).
     fn on_send_failed(&mut self, ctx: &mut Ctx<'_>, to: NodeId, kind: TransportKind) {
         let Some((&peer_ik, _)) = self.peers.iter().find(|(_, id)| **id == to) else {
             return;
         };
         let effects = self
             .engine
-            .step(ctx.now_ms(), Input::ConnectionLost { peer_ik, via: to_proto(kind) })
+            .step(ctx.now_ms(), Input::ConnectFailed { peer_ik, via: to_proto(kind) })
             .expect("отказ транспорта не должен ронять ядро");
         self.apply(ctx, effects);
     }

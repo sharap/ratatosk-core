@@ -19,8 +19,8 @@ use crate::tokens;
 use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
     StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
-    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredReaction,
-    StoredSenderChain, StoredSession,
+    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredPendingGroup,
+    StoredReaction, StoredSenderChain, StoredSession,
 };
 
 /// Хранилище на SQLite.
@@ -154,6 +154,9 @@ impl SqliteStore {
         member_ik: [u8; 32],
         sealed: &[u8],
         counter: i64,
+        // Метка поворота одним аргументом, а не двумя: врозь они
+        // бессмысленны, а порознь переданные легко перепутать местами.
+        mark: (i64, i64),
         skipped: Option<&[u8]>,
     ) -> Result<StoredSenderChain> {
         let row_key = Self::chain_row_key(chat_id, &member_ik);
@@ -166,7 +169,17 @@ impl SqliteStore {
             Some(bytes) => self.open_sealed("sender_chains.skipped_enc", &row_key, bytes)?,
             None => Vec::new(),
         };
-        Ok(StoredSenderChain { member_ik, chain, counter: sql_types::from_sql(counter), skipped })
+        Ok(StoredSenderChain {
+            member_ik,
+            chain,
+            counter: sql_types::from_sql(counter),
+            chain_wall: sql_types::from_sql(mark.0),
+            // Логическая часть HLC — 32 бита; в базе она лежит целым
+            // со знаком, и обрезка невозможна: больше `u32::MAX` туда
+            // не кладётся.
+            chain_logical: u32::try_from(sql_types::from_sql(mark.1)).unwrap_or(u32::MAX),
+            skipped,
+        })
     }
 
     fn seal(&self, column: &str, row_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -1003,8 +1016,8 @@ impl Store for SqliteStore {
             self.seal("paired_devices.pairing_key_enc", &device.device_id, &device.pairing_public)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO paired_devices
-             (device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion, ygg)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 &device.device_id[..],
                 &device.label,
@@ -1012,6 +1025,7 @@ impl Store for SqliteStore {
                 sql_types::to_sql(device.paired_ms),
                 sql_types::to_sql(device.last_seen_ms),
                 &device.onion,
+                &device.ygg,
             ],
         )?;
         Ok(())
@@ -1019,7 +1033,7 @@ impl Store for SqliteStore {
 
     fn paired_devices(&self) -> Result<Vec<StoredPairedDevice>> {
         let mut stmt = self.conn.prepare(
-            "SELECT device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion
+            "SELECT device_id, label, pairing_key_enc, paired_ms, last_seen_ms, onion, ygg
              FROM paired_devices ORDER BY paired_ms",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1030,12 +1044,13 @@ impl Store for SqliteStore {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
             ))
         })?;
 
         let mut devices = Vec::new();
         for row in rows {
-            let (id, label, sealed, paired_ms, last_seen_ms, onion) = row?;
+            let (id, label, sealed, paired_ms, last_seen_ms, onion, ygg) = row?;
             let device_id: [u8; 16] = id
                 .as_slice()
                 .try_into()
@@ -1052,6 +1067,7 @@ impl Store for SqliteStore {
                 paired_ms: sql_types::from_sql(paired_ms),
                 last_seen_ms: sql_types::from_sql(last_seen_ms),
                 onion,
+                ygg,
             });
         }
         Ok(devices)
@@ -1066,6 +1082,14 @@ impl Store for SqliteStore {
         self.conn.execute(
             "UPDATE paired_devices SET onion = ?2 WHERE device_id = ?1",
             rusqlite::params![&device_id[..], onion],
+        )?;
+        Ok(())
+    }
+
+    fn set_device_ygg(&mut self, device_id: &[u8; 16], ygg: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE paired_devices SET ygg = ?2 WHERE device_id = ?1",
+            rusqlite::params![&device_id[..], ygg],
         )?;
         Ok(())
     }
@@ -1324,22 +1348,34 @@ impl Store for SqliteStore {
             Some(self.seal("sender_chains.skipped_enc", &row_key, &chain.skipped)?)
         };
         self.conn.execute(
-            // Ключ, номер и кэш обновляются одним оператором и порознь
-            // никогда не пишутся: разойдись ключ с номером — сообщение
-            // расшифруется, а место в цепочке окажется не то; переживи кэш
-            // смену ключа — он открывал бы номера от цепочки, которой
-            // больше нет.
-            "INSERT INTO sender_chains (chat_id, member_ik, chain_enc, counter, skipped_enc)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            // Ключ, номер, метка поворота и кэш обновляются одним оператором
+            // и порознь никогда не пишутся: разойдись ключ с номером —
+            // сообщение расшифруется, а место в цепочке окажется не то;
+            // переживи кэш смену ключа — он открывал бы номера от цепочки,
+            // которой больше нет; отстань метка от ключа — получатель
+            // принял бы опоздавшее объявление за свежее.
+            //
+            // Старшинство здесь не сравнивается, и это не забывчивость:
+            // тем же оператором пишется продвижение цепочки вперёд, у
+            // которого метка та же самая. Кто кого обгоняет, знает ядро
+            // (`Engine::on_sender_key`) — только оно отличает объявление
+            // новой цепочки от очередного шага по старой.
+            "INSERT INTO sender_chains (chat_id, member_ik, chain_enc, counter,
+                                        chain_wall, chain_logical, skipped_enc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(chat_id, member_ik) DO UPDATE SET
                chain_enc = excluded.chain_enc,
                counter = excluded.counter,
+               chain_wall = excluded.chain_wall,
+               chain_logical = excluded.chain_logical,
                skipped_enc = excluded.skipped_enc",
             rusqlite::params![
                 &chat_id[..],
                 &chain.member_ik[..],
                 sealed,
                 sql_types::to_sql(chain.counter),
+                sql_types::to_sql(chain.chain_wall),
+                sql_types::to_sql(chain.chain_logical.into()),
                 skipped
             ],
         )?;
@@ -1354,14 +1390,17 @@ impl Store for SqliteStore {
         let found = self
             .conn
             .query_row(
-                "SELECT chain_enc, counter, skipped_enc FROM sender_chains
+                "SELECT chain_enc, counter, chain_wall, chain_logical, skipped_enc
+                   FROM sender_chains
                   WHERE chat_id = ?1 AND member_ik = ?2",
                 rusqlite::params![&chat_id[..], &member_ik[..]],
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
@@ -1371,13 +1410,21 @@ impl Store for SqliteStore {
                 other => Err(StoreError::from(other)),
             })?;
 
-        let Some((sealed, counter, skipped)) = found else { return Ok(None) };
-        Ok(Some(self.chain_row(chat_id, *member_ik, &sealed, counter, skipped.as_deref())?))
+        let Some((sealed, counter, wall, logical, skipped)) = found else { return Ok(None) };
+        Ok(Some(self.chain_row(
+            chat_id,
+            *member_ik,
+            &sealed,
+            counter,
+            (wall, logical),
+            skipped.as_deref(),
+        )?))
     }
 
     fn sender_chains(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredSenderChain>> {
         let mut stmt = self.conn.prepare(
-            "SELECT member_ik, chain_enc, counter, skipped_enc FROM sender_chains
+            "SELECT member_ik, chain_enc, counter, chain_wall, chain_logical, skipped_enc
+               FROM sender_chains
               WHERE chat_id = ?1 ORDER BY member_ik",
         )?;
         let rows = stmt.query_map([&chat_id[..]], |row| {
@@ -1385,13 +1432,15 @@ impl Store for SqliteStore {
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
             ))
         })?;
 
         let mut chains = Vec::new();
         for row in rows {
-            let (member, sealed, counter, skipped) = row?;
+            let (member, sealed, counter, wall, logical, skipped) = row?;
             let member_ik: [u8; 32] = member
                 .as_slice()
                 .try_into()
@@ -1401,6 +1450,7 @@ impl Store for SqliteStore {
                 member_ik,
                 &sealed,
                 counter,
+                (wall, logical),
                 skipped.as_deref(),
             )?);
         }
@@ -1629,6 +1679,74 @@ impl Store for SqliteStore {
             })
     }
 
+    fn replace_pending_group(&mut self, frames: &[StoredPendingGroup]) -> Result<()> {
+        // Шифруется **до** сделки: `seal` берёт `&self`, а сделка занимает
+        // соединение исключительно, и внутри неё до ключа уже не дотянуться.
+        // Привязка шифра — к номеру сообщения, как у очереди отправки:
+        // это единственное, что у строки есть своего и неизменного.
+        let mut sealed = Vec::with_capacity(frames.len());
+        for frame in frames {
+            sealed.push(self.seal("pending_group.envelope_enc", &frame.msg_id, &frame.envelope)?);
+        }
+
+        // Одной сделкой: очередь, переписанная наполовину, — это потерянные
+        // кадры, а падение между двумя запросами вещь обычная.
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM pending_group", [])?;
+        for (frame, envelope_enc) in frames.iter().zip(sealed) {
+            tx.execute(
+                "INSERT INTO pending_group (place, chat_id, peer_ik, msg_id, envelope_enc)
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    i64::from(frame.place),
+                    &frame.chat_id[..],
+                    &frame.peer_ik[..],
+                    &frame.msg_id[..],
+                    envelope_enc,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn pending_group(&self) -> Result<Vec<StoredPendingGroup>> {
+        let mut statement = self.conn.prepare(
+            "SELECT place, chat_id, peer_ik, msg_id, envelope_enc
+               FROM pending_group ORDER BY place",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (place, chat_id, peer_ik, msg_id, envelope_enc) = row?;
+            let chat_id: [u8; 16] =
+                chat_id.try_into().map_err(|_| StoreError::Backend("chat_id не 16 байт".into()))?;
+            let peer_ik: [u8; 32] = peer_ik
+                .try_into()
+                .map_err(|_| StoreError::Backend("peer_ik не 32 байта".into()))?;
+            let msg_id: MsgId =
+                msg_id.try_into().map_err(|_| StoreError::Backend("msg_id не 16 байт".into()))?;
+            let envelope =
+                self.open_sealed("pending_group.envelope_enc", &msg_id, &envelope_enc)?;
+            found.push(StoredPendingGroup {
+                place: u32::try_from(place).unwrap_or(u32::MAX),
+                chat_id,
+                peer_ik,
+                msg_id,
+                envelope,
+            });
+        }
+        Ok(found)
+    }
+
     fn put_outbox(&mut self, entry: &StoredOutbox) -> Result<()> {
         // Конверт незапечатан, то есть содержит текст: шифруется как тело
         // сообщения и привязывается к своей строке.
@@ -1680,7 +1798,19 @@ impl Store for SqliteStore {
         Ok(found)
     }
 
-    fn delete_outbox(&mut self, msg_id: &MsgId) -> Result<()> {
+    fn delete_outbox(&mut self, msg_id: &MsgId, recipient_ik: &[u8; 32]) -> Result<()> {
+        // По паре, а не по номеру: первичный ключ таблицы всегда был
+        // `(msg_id, recipient_ik)`, а удаление ходило по одному номеру —
+        // и дошедшая копия группового сообщения уносила из очереди копии
+        // всех остальных участников.
+        self.conn.execute(
+            "DELETE FROM outbox WHERE msg_id = ?1 AND recipient_ik = ?2",
+            rusqlite::params![&msg_id[..], &recipient_ik[..]],
+        )?;
+        Ok(())
+    }
+
+    fn delete_outbox_all(&mut self, msg_id: &MsgId) -> Result<()> {
         self.conn.execute("DELETE FROM outbox WHERE msg_id = ?1", [&msg_id[..]])?;
         Ok(())
     }
@@ -1695,14 +1825,21 @@ impl Store for SqliteStore {
             Some(bytes) => Some(self.seal("files.preview_enc", &file.file_id, bytes)?),
             None => None,
         };
+        // **`IGNORE`, а не `REPLACE`.** Тот же файл может приехать вторым
+        // сообщением — так и выглядит пересланное вложение, — а у нас он
+        // к тому времени уже собран. `REPLACE` затёр бы `complete`
+        // и `source_path` тем, что пришло по проводу, то есть отобрал бы
+        // у человека скачанный файл ради строки, которая ничего нового
+        // не несёт. Содержимое у одного `file_id` одно; сверяет это
+        // вызывающий (`Engine::record_offers`) — ему есть что сделать
+        // с расхождением, а хранилищу нечего.
         self.conn.execute(
-            "INSERT OR REPLACE INTO files (
-                 file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                 preview_enc, incoming, source_path, accepted, complete, ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR IGNORE INTO files (
+                 file_id, name_enc, size_bytes, chunk_total, file_key_enc,
+                 preview_enc, incoming, source_path, accepted, complete
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 &file.file_id[..],
-                &file.msg_id[..],
                 name_enc,
                 sql_types::to_sql(file.size_bytes),
                 sql_types::to_sql(file.chunk_total),
@@ -1712,17 +1849,28 @@ impl Store for SqliteStore {
                 file.source_path.as_deref(),
                 i64::from(file.accepted),
                 i64::from(file.complete),
-                i64::from(file.ordinal),
             ],
         )?;
-        Ok(())
+        self.attach_file(&file.msg_id, &file.file_id, file.ordinal)
     }
 
     fn file(&self, file_id: &FileId) -> Result<Option<StoredFile>> {
+        // Сообщение здесь — **самое раннее** из тех, к которым файл приложен,
+        // и берётся оно левым присоединением: запись обязана читаться и тогда,
+        // когда связки не осталось вовсе (сообщение стёрли, а байты ещё нет).
+        // Решать по нему что-либо про права нельзя — для этого
+        // `messages_of_file`, и почему, написано у `StoredFile::msg_id`.
         let mut statement = self.conn.prepare(
-            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete, ordinal
-               FROM files WHERE file_id = ?1",
+            "SELECT files.file_id, COALESCE(link.msg_id, zeroblob(16)), name_enc, size_bytes,
+                    chunk_total, file_key_enc, preview_enc, incoming, source_path, accepted,
+                    complete, COALESCE(link.ordinal, 0)
+               FROM files
+               LEFT JOIN (
+                    SELECT file_id, msg_id, ordinal FROM message_files
+                     GROUP BY file_id
+                     HAVING ordinal = MIN(ordinal)
+               ) AS link ON link.file_id = files.file_id
+              WHERE files.file_id = ?1",
         )?;
         let mut found = self.read_files(&mut statement, rusqlite::params![&file_id[..]])?;
         Ok(found.pop())
@@ -1730,11 +1878,81 @@ impl Store for SqliteStore {
 
     fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
         let mut statement = self.conn.prepare(
-            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete, ordinal
-               FROM files WHERE msg_id = ?1 ORDER BY ordinal, file_id",
+            "SELECT files.file_id, message_files.msg_id, name_enc, size_bytes, chunk_total,
+                    file_key_enc, preview_enc, incoming, source_path, accepted, complete,
+                    message_files.ordinal
+               FROM message_files
+               JOIN files ON files.file_id = message_files.file_id
+              WHERE message_files.msg_id = ?1
+              ORDER BY message_files.ordinal, files.file_id",
         )?;
         self.read_files(&mut statement, rusqlite::params![&msg_id[..]])
+    }
+
+    fn messages_of_file(&self, file_id: &FileId) -> Result<Vec<MsgId>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT msg_id FROM message_files WHERE file_id = ?1 ORDER BY msg_id")?;
+        let rows = statement.query_map([&file_id[..]], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            // Длина не та — строка испорчена. Пропускаем: в худшем случае
+            // недосчитаемся одного права, то есть откажем на законной
+            // просьбе. Обратная ошибка — разрешить лишнему.
+            let Ok(msg_id) = MsgId::try_from(bytes.as_slice()) else { continue };
+            found.push(msg_id);
+        }
+        Ok(found)
+    }
+
+    fn orphan_file_ids(&self) -> Result<Vec<FileId>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_id FROM files
+              WHERE file_id NOT IN (SELECT file_id FROM message_files)
+              ORDER BY file_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            // Длина не та — строка испорчена. Пропускаем: в худшем случае
+            // на диске останется лишнее. Обратная ошибка — стереть нужное.
+            let Ok(file_id) = FileId::try_from(bytes.as_slice()) else { continue };
+            found.push(file_id);
+        }
+        Ok(found)
+    }
+
+    fn attach_file(&mut self, msg_id: &MsgId, file_id: &FileId, ordinal: u32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO message_files (msg_id, file_id, ordinal)
+                  VALUES (?1, ?2, ?3)",
+            rusqlite::params![&msg_id[..], &file_id[..], i64::from(ordinal)],
+        )?;
+        Ok(())
+    }
+
+    fn detach_files_of(&mut self, msg_id: &MsgId) -> Result<Vec<FileId>> {
+        // Сперва — что было приложено, потом отвязка, потом пересчёт ссылок.
+        // Порядок и есть смысл: спроси мы про сирот до отвязки, их бы не было
+        // ни одной.
+        let attached: Vec<FileId> =
+            self.files_of(msg_id)?.into_iter().map(|file| file.file_id).collect();
+        self.conn.execute("DELETE FROM message_files WHERE msg_id = ?1", [&msg_id[..]])?;
+
+        let mut orphans = Vec::new();
+        for file_id in attached {
+            let left: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM message_files WHERE file_id = ?1",
+                [&file_id[..]],
+                |row| row.get(0),
+            )?;
+            if left == 0 {
+                orphans.push(file_id);
+            }
+        }
+        Ok(orphans)
     }
 
     fn put_contact_share(&mut self, share: &StoredContactShare) -> Result<()> {
@@ -1972,19 +2190,27 @@ impl Store for SqliteStore {
 
     fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
         let mut statement = self.conn.prepare(
-            "SELECT file_id, msg_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                    preview_enc, incoming, source_path, accepted, complete, ordinal
-               FROM files WHERE complete = 0 ORDER BY file_id",
+            "SELECT files.file_id, COALESCE(link.msg_id, zeroblob(16)), name_enc, size_bytes,
+                    chunk_total, file_key_enc, preview_enc, incoming, source_path, accepted,
+                    complete, COALESCE(link.ordinal, 0)
+               FROM files
+               LEFT JOIN (
+                    SELECT file_id, msg_id, ordinal FROM message_files
+                     GROUP BY file_id
+                     HAVING ordinal = MIN(ordinal)
+               ) AS link ON link.file_id = files.file_id
+              WHERE complete = 0
+              ORDER BY files.file_id",
         )?;
         self.read_files(&mut statement, rusqlite::params![])
     }
 
     fn file_ids_of_chat(&self, chat_id: &[u8; 16]) -> Result<Vec<FileId>> {
         let mut statement = self.conn.prepare(
-            "SELECT files.file_id FROM files
-               JOIN messages ON messages.msg_id = files.msg_id
+            "SELECT DISTINCT message_files.file_id FROM message_files
+               JOIN messages ON messages.msg_id = message_files.msg_id
               WHERE messages.chat_id = ?1
-              ORDER BY files.file_id",
+              ORDER BY message_files.file_id",
         )?;
         let rows = statement.query_map([&chat_id[..]], |row| row.get::<_, Vec<u8>>(0))?;
         let mut found = Vec::new();
@@ -2087,8 +2313,8 @@ impl Store for SqliteStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO contacts (
                  ik, sk, onion, chatmail, display_name,
-                 card_version, card_bytes, verified, created_ms, local_name_enc
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 card_version, card_bytes, verified, created_ms, local_name_enc, ygg
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 &contact.ik[..],
                 &contact.sk[..],
@@ -2100,6 +2326,7 @@ impl Store for SqliteStore {
                 i64::from(contact.verified),
                 sql_types::to_sql(contact.created_ms),
                 local_name_enc,
+                contact.ygg,
             ],
         )?;
         Ok(())
@@ -2143,7 +2370,7 @@ impl Store for SqliteStore {
     fn contacts(&self) -> Result<Vec<StoredContact>> {
         let mut statement = self.conn.prepare(
             "SELECT ik, sk, onion, chatmail, display_name, card_version,
-                    card_bytes, verified, created_ms, local_name_enc
+                    card_bytes, verified, created_ms, local_name_enc, ygg
                FROM contacts ORDER BY ik",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2158,6 +2385,7 @@ impl Store for SqliteStore {
                 row.get::<_, i64>(7)? != 0,
                 sql_types::from_sql(row.get(8)?),
                 row.get::<_, Option<Vec<u8>>>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
             ))
         })?;
 
@@ -2174,6 +2402,7 @@ impl Store for SqliteStore {
                 verified,
                 created_ms,
                 local_name_enc,
+                ygg,
             ) = row?;
             // Испорченное локальное имя не повод не отдать контакт: без имени
             // с человеком всё ещё можно переписываться, а без контакта — нет.
@@ -2195,6 +2424,7 @@ impl Store for SqliteStore {
                 verified,
                 created_ms,
                 local_name,
+                ygg,
             });
         }
         Ok(found)
@@ -2215,7 +2445,7 @@ impl Store for SqliteStore {
                 // на равенство — см. `crate::sql_types`.
                 sql_types::id_to_sql(session.session_id),
                 &session.peer_ik[..],
-                i64::from(!session.lan),
+                i64::from(session.binding),
                 state_enc,
                 sql_types::to_sql(session.established_ms),
             ],
@@ -2231,7 +2461,7 @@ impl Store for SqliteStore {
             Ok((
                 sql_types::id_from_sql(row.get(0)?),
                 row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)? == 0,
+                row.get::<_, i64>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
                 sql_types::from_sql(row.get(4)?),
             ))
@@ -2239,7 +2469,7 @@ impl Store for SqliteStore {
 
         let mut found = Vec::new();
         for row in rows {
-            let (session_id, peer_ik, lan, state_enc, established_ms) = row?;
+            let (session_id, peer_ik, binding, state_enc, established_ms) = row?;
             let snapshot =
                 self.open_sealed("sessions.state_enc", &session_id.to_be_bytes(), &state_enc)?;
             found.push(StoredSession {
@@ -2247,7 +2477,11 @@ impl Store for SqliteStore {
                 peer_ik: peer_ik
                     .try_into()
                     .map_err(|_| StoreError::Backend("peer_ik не 32 байта".into()))?,
-                lan,
+                // Отрицательное или огромное число сюда попасть не может:
+                // столбец пишем только мы, кодом семейства. А вот число
+                // **незнакомое** — может, из более новой сборки, и его
+                // разбирает уже ядро.
+                binding: u8::try_from(binding).unwrap_or(u8::MAX),
                 snapshot,
                 established_ms,
             });

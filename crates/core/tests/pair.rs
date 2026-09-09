@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use ratatosk_core::engine::SelfAddresses;
 use ratatosk_core::{Command, Effect, Engine, Event, Input, SeededEntropy};
 use ratatosk_crypto::Identity;
+use ratatosk_proto::ygg::{YggMode, YggSetup};
 use ratatosk_store::{MemoryBlobs, MemoryStore, Store};
 
 type Node = Engine<MemoryStore>;
@@ -42,7 +43,14 @@ fn node_with_blobs(seed: u8, name: &str) -> (Node, Blobs) {
         Box::new(Arc::clone(&blobs)),
         Box::new(SeededEntropy::new(u64::from(seed))),
         SelfAddresses {
-            onion: format!("{name}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"),
+            // **Настоящий** адрес v3, посчитанный из ключа, а не строка
+            // нужной формы. Разница вскрылась на обновлении карточки:
+            // §4.3 требует, чтобы непустой onion был адресом, и рассылка,
+            // везущая прежний «aaaa.onion», отвергалась целиком — вместе
+            // со всем остальным, что в той карточке ехало. Ловилось это
+            // только там, где обновление меняло **не** onion, то есть
+            // раз в год, и выглядело как «ключ меша не доезжает».
+            onion: some_onion(seed),
             chatmail: format!("{name}@nine.example"),
             display_name: name.to_owned(),
         },
@@ -154,6 +162,7 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
+                | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::RestartLan => {}
             }
@@ -291,6 +300,7 @@ fn a_deadline_without_a_receipt_is_a_failure_not_a_success() {
         chatmail: String::new(),
         display_name: "призрак".to_owned(),
         version: 1,
+        ygg: Vec::new(),
     };
     let ghost_ik = card.ik;
     alice
@@ -363,6 +373,7 @@ fn lan_only_contact(node: &mut Node, seed: u8) -> [u8; 32] {
         chatmail: String::new(),
         display_name: "сосед".to_owned(),
         version: 1,
+        ygg: Vec::new(),
     };
     let peer_ik = card.ik;
     node.step(
@@ -1200,6 +1211,263 @@ fn lan_up(node: &mut Node, peer: &Node) {
     )
     .expect("включение локальной сети");
     node.step(0, Input::SeenOnLan { peer_ik: peer.own_card().ik }).expect("маяк");
+}
+
+/// Переводит узел на внешний демон с названным ключом (0.2).
+///
+/// Две команды, а не одна, и порядок между ними свободный: ключ запоминается
+/// в любом режиме, а действующим именем становится в своём. Здесь он назван
+/// первым — так делает и стенд, читая ключ из командной строки до того,
+/// как человек что-либо нажал.
+fn external_mesh(node: &mut Node, now_ms: u64, key: &[u8]) -> Vec<Effect> {
+    node.step(now_ms, Input::Command(Command::SetYggKey(key.to_vec()))).expect("ключ запоминается");
+    node.step(now_ms, Input::Command(Command::SetYggMode(YggMode::External)))
+        .expect("режим внешнего демона")
+}
+
+#[test]
+fn a_mesh_key_is_a_setting_that_travels_in_the_card() {
+    // Три следствия, и все три обязательны: раннер узнаёт настройку (иначе
+    // слушать нечего), карточка растит версию (иначе §4.3 не пропустит),
+    // а собеседники получают обновление (иначе меша для них нет).
+    // Разъехались бы они — «слушаем один адрес, называем другой».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let mesh = [0x5au8; 32];
+
+    let before = alice.own_card().version;
+    let effects = external_mesh(&mut alice, 1_000, &mesh);
+
+    assert!(
+        effects.iter().any(|e| {
+            matches!(e, Effect::SetYgg(YggSetup::External { key }) if key == &mesh.to_vec())
+        }),
+        "раннер обязан узнать настройку: {effects:?}"
+    );
+    let card = alice.own_card();
+    assert_eq!(card.ygg, mesh.to_vec(), "и карточка тоже");
+    assert!(card.version > before, "версия обязана вырасти: было {before}, стало {}", card.version);
+
+    // И доехать до собеседника: до этого места меша для него не было.
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let known = &bob.contacts()[&alice_ik];
+    assert_eq!(known.card.ygg, mesh.to_vec(), "обновление §4.3 обязано довезти ключ");
+    assert!(known.availability.has_ygg, "и §5.4 обязан узнать про ступень");
+}
+
+#[test]
+fn a_named_key_alone_changes_nothing_until_the_mode_says_so() {
+    // Ключ запоминается всегда — чтобы не вводить его дважды, — но именем
+    // становится только в своём режиме. Иначе «ввёл ключ на будущее»
+    // молча включало бы меш, которого человек не просил.
+    let mut alice = node(1, "alice");
+    let before = alice.own_card().version;
+
+    let effects = alice
+        .step(1_000, Input::Command(Command::SetYggKey(vec![0x5au8; 32])))
+        .expect("ключ запоминается");
+    assert!(effects.is_empty(), "в выключенном режиме ключ ничего не двигает: {effects:?}");
+    assert!(alice.own_card().ygg.is_empty(), "и в карточке его нет");
+    assert_eq!(alice.own_card().version, before, "и версия не растёт");
+
+    // А теперь режим — и тот же ключ становится именем без второго ввода.
+    alice
+        .step(1_100, Input::Command(Command::SetYggMode(YggMode::External)))
+        .expect("режим внешнего демона");
+    assert_eq!(alice.own_card().ygg, vec![0x5au8; 32], "названный ключ подхватывается");
+}
+
+#[test]
+fn the_same_mesh_key_twice_costs_nothing() {
+    // Повторное нажатие в настройках не должно растить версию карточки
+    // и рассылать обновление всем контактам ни за чем.
+    let mut alice = node(1, "alice");
+    let mesh = [0x5au8; 32];
+    external_mesh(&mut alice, 1_000, &mesh);
+    let after_first = alice.own_card().version;
+
+    let again =
+        alice.step(1_100, Input::Command(Command::SetYggKey(mesh.to_vec()))).expect("второй раз");
+    assert!(again.is_empty(), "тот же ключ — не событие: {again:?}");
+    assert_eq!(alice.own_card().version, after_first, "и версия не растёт");
+
+    let same_mode = alice
+        .step(1_200, Input::Command(Command::SetYggMode(YggMode::External)))
+        .expect("тот же режим");
+    assert!(same_mode.is_empty(), "тот же режим — тоже не событие: {same_mode:?}");
+    assert_eq!(alice.own_card().version, after_first, "и версия по-прежнему не растёт");
+}
+
+#[test]
+fn a_mesh_key_of_the_wrong_length_is_refused_out_loud() {
+    // Ключ переносится руками из чужого приложения, значит переносится
+    // и с опечаткой. Проглоти мы её — человек остался бы с выключенным
+    // мешем и без объяснения.
+    let mut alice = node(1, "alice");
+    let verdict = alice.step(1_000, Input::Command(Command::SetYggKey(vec![7u8; 31])));
+    assert!(verdict.is_err(), "тридцать один байт — не ключ");
+    assert!(alice.own_card().ygg.is_empty(), "и карточка не тронута");
+
+    // А снятие — законно, и это пустой массив, а не отказ.
+    alice.step(1_100, Input::Command(Command::SetYggKey(Vec::new()))).expect("снятие законно");
+}
+
+#[test]
+fn an_embedded_node_names_itself_and_keeps_the_name() {
+    // Имя в меше у своего узла выводится из своего зерна. Оно обязано
+    // пережить и выключение меша, и возврат: карточка с прежним адресом
+    // уже у контактов, и второе имя на том же устройстве им ничего
+    // не объяснит.
+    let mut alice = node(1, "alice");
+    let before = alice.own_card().version;
+
+    let effects = alice
+        .step(1_000, Input::Command(Command::SetYggMode(YggMode::Embedded)))
+        .expect("режим своего узла");
+    let named = alice.own_card().ygg.clone();
+    assert_eq!(named.len(), 32, "узел обязан назвать себя: {effects:?}");
+    assert!(alice.own_card().version > before, "и это смена карточки");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SetYgg(YggSetup::Embedded { .. }))),
+        "раннер обязан узнать про узел: {effects:?}"
+    );
+
+    // Выключили — имя снялось.
+    alice.step(1_100, Input::Command(Command::SetYggMode(YggMode::Off))).expect("выключение");
+    assert!(alice.own_card().ygg.is_empty(), "выключенный меш имени не называет");
+
+    // Вернулись — имя **то же**, а не новое.
+    alice.step(1_200, Input::Command(Command::SetYggMode(YggMode::Embedded))).expect("возврат");
+    assert_eq!(alice.own_card().ygg, named, "зерно не заводится заново");
+}
+
+#[test]
+fn someone_elses_key_is_refused_while_our_own_node_runs() {
+    // Ровно тот вид молчания, который мы уже ловили: человек вводит ключ,
+    // ничего не ломается, и он остаётся уверен, что настроил меш. В режиме
+    // своего узла чужой ключ — недоразумение, и сказать о нём надо сразу.
+    let mut alice = node(1, "alice");
+    alice.step(1_000, Input::Command(Command::SetYggMode(YggMode::Embedded))).expect("свой узел");
+    let ours = alice.own_card().ygg.clone();
+
+    let verdict = alice.step(1_100, Input::Command(Command::SetYggKey(vec![0x5au8; 32])));
+    assert!(verdict.is_err(), "чужой ключ в режиме своего узла — отказ, а не тишина");
+    assert_eq!(alice.own_card().ygg, ours, "и имя не тронуто");
+}
+
+#[test]
+fn peers_do_not_travel_in_the_card() {
+    // Собеседнику важно наше имя в меше, а не то, через кого мы в него
+    // вошли. Расти версия карточки от смены пиров — каждая правка списка
+    // рассылалась бы всем контактам ни за чем.
+    let mut alice = node(1, "alice");
+    alice.step(1_000, Input::Command(Command::SetYggMode(YggMode::Embedded))).expect("свой узел");
+    let version = alice.own_card().version;
+    let named = alice.own_card().ygg.clone();
+
+    let effects = alice
+        .step(
+            1_100,
+            Input::Command(Command::SetYggPeers(vec!["tcp://ygg.example:9001".to_owned()])),
+        )
+        .expect("пиры называются");
+    assert_eq!(alice.own_card().version, version, "версия карточки от пиров не растёт");
+    assert_eq!(alice.own_card().ygg, named, "и имя не меняется");
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SetYgg(YggSetup::Embedded { peers, .. }) if peers.len() == 1
+        )),
+        "а узел про них узнать обязан: {effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "и рассылки быть не должно: {effects:?}"
+    );
+}
+
+#[test]
+fn leaving_the_screen_silences_the_beacon_without_changing_the_choice() {
+    // Разбор поломки, найденной на телефоне: «LAN включён по умолчанию».
+    // Реестр аккаунтов гасил фоновый командой «выключить LAN» и зажигал
+    // передний командой «включить LAN» — то есть включал локальную сеть
+    // человеку, который её не включал, и записывал это на диск как его
+    // выбор. Маяк §5.1 уходил в эфир без спроса, а `lan_warning()` перед
+    // этим никто не показывал.
+    let mut alice = node(1, "alice");
+
+    // Человек включил сеть — это его выбор, и он на диске.
+    alice
+        .step(
+            1_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .expect("включение локальной сети");
+    assert!(alice.transports().contains(ratatosk_proto::Transport::Lan));
+
+    // Аккаунт ушёл с экрана: маяк гаснет...
+    let effects =
+        alice.step(1_100, Input::Command(Command::SetForeground(false))).expect("уход с экрана");
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: false
+            }
+        )),
+        "маяк обязан погаснуть: {effects:?}"
+    );
+    // ...а выбор — нет. Это разные факты, и в переключателе человек обязан
+    // видеть свой, а не наш.
+    assert!(
+        alice.transports().contains(ratatosk_proto::Transport::Lan),
+        "выбор человека уходом с экрана не меняется"
+    );
+
+    // Вернулся — объявляемся снова, и снова без спроса ничего не включая.
+    let effects =
+        alice.step(1_200, Input::Command(Command::SetForeground(true))).expect("возврат на экран");
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true
+            }
+        )),
+        "маяк обязан вернуться: {effects:?}"
+    );
+}
+
+#[test]
+fn coming_to_the_screen_does_not_turn_the_lan_on() {
+    // Вторая половина той же поломки, и более важная: показ аккаунта
+    // не вправе включать локальную сеть тому, кто её не включал.
+    let mut alice = node(1, "alice");
+    assert!(
+        !alice.transports().contains(ratatosk_proto::Transport::Lan),
+        "§5.1: по умолчанию выключена"
+    );
+
+    let effects =
+        alice.step(1_000, Input::Command(Command::SetForeground(true))).expect("аккаунт на экране");
+    assert!(effects.is_empty(), "показ аккаунта — не команда включить сеть: {effects:?}");
+    assert!(
+        !alice.transports().contains(ratatosk_proto::Transport::Lan),
+        "и включённой она от этого не стала"
+    );
+
+    // И уход с экрана при выключенной сети тоже ничего не делает: гасить
+    // нечего, а лишний эффект раннеру — лишний повод переоткрыть сокет.
+    let effects = alice
+        .step(1_100, Input::Command(Command::SetForeground(false)))
+        .expect("аккаунт ушёл с экрана");
+    assert!(effects.is_empty(), "гасить было нечего: {effects:?}");
 }
 
 #[test]
@@ -3721,9 +3989,12 @@ fn a_shared_contact_disappears_with_its_message() {
 
 /// Настоящий адрес v3 — иначе обновление не пройдёт проверку формата.
 ///
-/// Собственный, посчитанный из ключа: адрес в §4.3 обязан быть адресом,
-/// и пара строк вида «aaaa.onion» здесь не годится, хотя в карточках
-/// остальных тестов их достаточно.
+/// Собственный, посчитанный из ключа: адрес в §4.3 обязан быть адресом.
+/// Раньше здесь стояла оговорка «а в карточках остальных тестов хватает
+/// и строки вида „aaaa.onion“» — она оказалась ловушкой. Хватало ровно
+/// до первого обновления, которое меняло **не** onion: карточка везла
+/// прежнюю строку, §4.3 отвергал её целиком, и выглядело это как «новое
+/// поле не доезжает». Поэтому заготовка узла берёт адрес отсюда же.
 fn some_onion(seed: u8) -> String {
     ratatosk_crypto::OnionKey::from_seed([seed; 32]).address()
 }
@@ -4853,6 +5124,7 @@ fn pump_many(
                 | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
+                | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::RestartLan => {}
             }
@@ -5285,6 +5557,7 @@ fn a_file_that_has_nowhere_to_go_says_so_by_name() {
         chatmail: String::new(),
         display_name: "сосед".into(),
         version: 1,
+        ygg: Vec::new(),
     };
     alice
         .step(
@@ -5344,4 +5617,146 @@ fn every_reason_says_something_different_to_the_human() {
         FileWait::MailboxFull.text().contains("освободите"),
         "человеку надо сказать, что сделать, — иначе причина бесполезна"
     );
+}
+
+#[test]
+fn a_forwarded_file_reaches_the_third_person_without_re_encrypting_anything() {
+    // Поломка со стенда: «с файлами сообщения не пересылаются, вернее
+    // получаются пустыми». Пересылка везла одно тело сообщения, а у
+    // сообщения с вложениями тело — это подпись к ним; нет подписи —
+    // пустое сообщение, и файлы не доехали вовсе. Проверял это человек
+    // за другим экраном, потому что в тестах пересылали только текст.
+    //
+    // Едет **ключ и хэш**, а не байты заново: `proto::forward` обещал
+    // ровно это с самого начала. Отсюда и главное здесь утверждение —
+    // `file_id` у третьего человека **тот же**: перешифруй мы файл под
+    // новый идентификатор, и пересылка гигабайта стоила бы гигабайта
+    // крипты на телефоне.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    let mut vera = node(3, "vera");
+    introduce(&mut alice, &mut bob);
+    introduce(&mut bob, &mut vera);
+
+    let content = payload_of(files::CHUNK_BYTES * 2 + 5);
+    alice_blobs.lock().unwrap().seed("/tmp/otchet.pdf", content.clone());
+
+    for who in [&mut bob, &mut vera] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+
+    // Алиса → Боб: обычная передача файла.
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/otchet.pdf");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let original = only_file(&bob, &alice);
+    assert!(bob.store().file(&original).unwrap().unwrap().complete, "у Боба файл собран");
+
+    // Боб → Вера: пересылка того же сообщения.
+    let with_file = *ids_in(&bob, &alice).last().expect("сообщение с вложением");
+    let effects = bob
+        .step(
+            2_000,
+            Input::Command(Command::ForwardMessages {
+                chat: Engine::<MemoryStore>::chat_id_for(&vera.own_card().ik),
+                msg_ids: vec![with_file],
+            }),
+        )
+        .expect("пересылка принята");
+    pump(&mut bob, &mut vera, 2_000, effects);
+
+    // У Веры сообщение **не пустое**: у него есть вложение, и оно собралось.
+    let forwarded = only_file(&vera, &bob);
+    assert_eq!(forwarded, original, "идентификатор файла при пересылке не меняется");
+    let received = vera.store().file(&forwarded).unwrap().unwrap();
+    assert_eq!(received.name, "otchet.pdf");
+    assert!(received.complete, "пересланный файл обязан собраться, а не остаться обещанием");
+    assert_eq!(assembled(&vera, &forwarded), content, "и совпасть с исходным до байта");
+
+    // И пометка «переслано» — то, ради чего у пересылки вообще есть свой вид.
+    let msg_id = *ids_in(&vera, &bob).last().expect("сообщение у Веры");
+    let message = vera.store().message(&msg_id).unwrap().expect("сообщение на месте");
+    assert!(message.forwarded, "без пометки чужие слова выглядят своими");
+
+    // У Боба файл теперь на двух сообщениях, и удаление исходного не должно
+    // отбирать байты у пересланной копии.
+    assert_eq!(bob.store().messages_of_file(&original).unwrap().len(), 2);
+    bob.step(
+        3_000,
+        Input::Command(Command::DeleteMessages {
+            chat: Engine::<MemoryStore>::chat_id_for(&alice.own_card().ik),
+            msg_ids: vec![with_file],
+        }),
+    )
+    .expect("удаление исходного");
+    assert!(
+        bob.store().file(&original).unwrap().is_some(),
+        "файл читает пересланная копия — уносить его нельзя"
+    );
+}
+
+#[test]
+fn a_forwarded_contact_card_reaches_the_third_person_instead_of_emptiness() {
+    // Третий случай того же класса, и найден он снова со стенда:
+    // «пересылка сообщения с контактом тоже пересылает пустое сообщение».
+    // Тело у такого сообщения пустое по построению — карточка лежит
+    // записью рядом, — а пересылка брала одно тело.
+    //
+    // Проверяется здесь то, ради чего это делалось: у третьего человека
+    // карточка **есть**, она про того же самого человека, и помечена
+    // пересланной.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let mut vera = node(3, "vera");
+    introduce(&mut alice, &mut bob);
+    introduce(&mut bob, &mut vera);
+
+    // Алиса делится с Бобом карточкой **своей** — так проще всего получить
+    // сообщение с карточкой, не заводя четвёртого человека.
+    let alice_ik = alice.own_card().ik;
+    let effects = alice
+        .step(
+            1_000,
+            Input::Command(Command::ShareContact {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                peer_ik: alice_ik,
+            }),
+        )
+        .expect("карточка отправлена");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let with_card = *ids_in(&bob, &alice).last().expect("сообщение с карточкой");
+    assert!(
+        bob.store().contact_share_of(&with_card).unwrap().is_some(),
+        "у Боба карточка приехала записью рядом"
+    );
+
+    // Боб пересылает это Вере.
+    let effects = bob
+        .step(
+            2_000,
+            Input::Command(Command::ForwardMessages {
+                chat: Engine::<MemoryStore>::chat_id_for(&vera.own_card().ik),
+                msg_ids: vec![with_card],
+            }),
+        )
+        .expect("пересылка принята");
+    pump(&mut bob, &mut vera, 2_000, effects);
+
+    let arrived = *ids_in(&vera, &bob).last().expect("сообщение у Веры");
+    let share = vera
+        .store()
+        .contact_share_of(&arrived)
+        .unwrap()
+        .expect("карточка обязана доехать, а не пропасть по дороге");
+    assert_eq!(share.ik, alice_ik, "карточка про того же человека");
+
+    let message = vera.store().message(&arrived).unwrap().expect("сообщение");
+    assert!(message.forwarded, "без пометки чужая карточка выглядит своей");
+    assert!(message.body.is_empty(), "тело у карточки пустое — и это не «пусто вообще»");
+
+    // И у Боба своя копия помечена так же: расхождение экранов про одно
+    // сообщение §14 запрещает.
+    let mine = *ids_in(&bob, &vera).last().expect("своя копия у Боба");
+    assert!(bob.store().message(&mine).unwrap().expect("сообщение").forwarded);
+    assert!(bob.store().contact_share_of(&mine).unwrap().is_some(), "и карточка рядом с ней");
 }

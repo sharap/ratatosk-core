@@ -164,6 +164,16 @@ async-imap = { version = "0.11", default-features = false, features = ["runtime-
 async-smtp = "0.10"
 mdns-sd = "0.20"
 
+# Встроенный узел меша Yggdrasil (0.2). Из git, а не с crates.io: крейта там
+# нет, и ревизия зафиксирована ровно та, на которой всё проверено на стенде.
+# Тянет за собой ironwood, yggdrasil и tokio целиком — поэтому и живёт
+# за признаком `ygg-node`, выключенным по умолчанию: сборка без меша
+# не должна платить за него ни временем, ни размером.
+#
+# Редакция 2024 — их выбор, не наш; наш `rust-version` (1.85) её понимает,
+# и смешивать редакции внутри одной сборки cargo умеет.
+ygg_stream = { git = "https://github.com/Revertron/ygg_stream", rev = "0b5ee57e2a283eff928962b54dd0f8def1444a2b" }
+
 # TLS до почтового сервера (§5.3). Умолчание у tokio-rustls — `aws_lc_rs`,
 # а он тянет сборку C и cmake: ровно та кросс-компиляция под Android,
 # от которой мы уже отказались, выбирая rustls вместо native-tls.

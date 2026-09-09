@@ -64,6 +64,16 @@ use ratatosk_codec::{canonical, CodecError, ContactCard, Value};
 
 /// Ключ карточки в нагрузке.
 const KEY_CARD: u64 = 1;
+/// Ключ признака «переслано».
+///
+/// Признаком, а не отдельным типом нагрузки, как у текста
+/// (`PayloadType::Forward`): тип уже занят под «карточка», а второй
+/// означал бы вторую копию всего разбора. То же решение и по той же
+/// причине, что у предложения файлов (`files::offer_payload`).
+///
+/// Необязателен на чтении: сборка постарше его не везла и покажет
+/// пересланную карточку без пометки — единственное, что она потеряет.
+const KEY_FORWARDED: u64 = 2;
 
 /// Почему карточкой нельзя поделиться.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -82,8 +92,14 @@ pub enum ShareError {
 /// в истории тремя записями: каждая со своим решением «добавить или нет»
 /// и своим статусом доставки.
 #[must_use]
-pub fn payload(card_bytes: &[u8]) -> Value {
-    Value::Map(vec![(Value::Integer(KEY_CARD.into()), Value::Bytes(card_bytes.to_vec()))])
+pub fn payload(card_bytes: &[u8], forwarded: bool) -> Value {
+    let mut fields = vec![(Value::Integer(KEY_CARD.into()), Value::Bytes(card_bytes.to_vec()))];
+    // Ключа нет — «не переслано»: так короче обычный случай и так же
+    // читает его сборка постарше.
+    if forwarded {
+        fields.push((Value::Integer(KEY_FORWARDED.into()), Value::Bool(true)));
+    }
+    Value::Map(fields)
 }
 
 /// Разбирает нагрузку и возвращает **принятые байты** карточки вместе с ней.
@@ -97,13 +113,20 @@ pub fn payload(card_bytes: &[u8]) -> Value {
 ///
 /// [`CodecError::TypeMismatch`] на неверной форме, ошибка разбора карточки
 /// на испорченном содержимом.
-pub fn from_payload(value: &Value) -> Result<(Vec<u8>, ContactCard), CodecError> {
+pub fn from_payload(value: &Value) -> Result<(Vec<u8>, ContactCard, bool), CodecError> {
     let map = canonical::as_map(value)?;
     let Value::Bytes(card_bytes) = canonical::require(map, KEY_CARD)? else {
         return Err(CodecError::TypeMismatch);
     };
     let card = ContactCard::decode(card_bytes)?.into_parts().1;
-    Ok((card_bytes.clone(), card))
+    // Отсутствие и `false` означают одно и то же, а ключ не того типа —
+    // порчу: это уже не «сборка постарше».
+    let forwarded = match canonical::get(map, KEY_FORWARDED) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(CodecError::TypeMismatch),
+        None => false,
+    };
+    Ok((card_bytes.clone(), card, forwarded))
 }
 
 #[cfg(test)]
@@ -118,13 +141,15 @@ mod tests {
             chatmail: "a7f3k9@nine.example".into(),
             display_name: "Кэрол".into(),
             version: 3,
+            ygg: Vec::new(),
         }
     }
 
     #[test]
     fn a_card_travels_whole_and_comes_back_the_same() {
         let bytes = card().encode().unwrap();
-        let (raw, parsed) = from_payload(&payload(&bytes)).unwrap();
+        let (raw, parsed, forwarded) = from_payload(&payload(&bytes, false)).unwrap();
+        assert!(!forwarded, "обычная карточка не переслана");
         assert_eq!(parsed, card());
         assert_eq!(raw, bytes, "байты сохраняются как приняты (§6), а не пересобираются");
     }
@@ -134,7 +159,30 @@ mod tests {
         // Разбор на приёме, а не на показе: испорченная карточка не должна
         // добираться до истории и ждать там нажатия, которое всё равно
         // ничем не кончится.
-        assert!(from_payload(&payload(b"not a card at all")).is_err());
+        assert!(from_payload(&payload(b"not a card at all", false)).is_err());
         assert!(from_payload(&Value::Integer(7.into())).is_err());
+    }
+
+    #[test]
+    fn a_forwarded_card_carries_its_mark() {
+        // Пересылка сообщения с карточкой давала у получателя **пустое**
+        // сообщение: тело у него пустое по построению, а карточка лежит
+        // записью рядом и в пересылку не попадала вовсе. Признак — то,
+        // чем пересланная карточка отличается от своей.
+        let bytes = card().encode().unwrap();
+        let (_, _, forwarded) = from_payload(&payload(&bytes, true)).unwrap();
+        assert!(forwarded, "признак обязан пережить круг");
+    }
+
+    #[test]
+    fn a_card_from_a_build_without_the_mark_reads_as_not_forwarded() {
+        // Ключа нет — «не переслано»: сборка постарше его не везла,
+        // и её нагрузка обязана разбираться по-прежнему.
+        let bytes = card().encode().unwrap();
+        let value = payload(&bytes, false);
+        let Value::Map(fields) = &value else { panic!("нагрузка — карта") };
+        assert_eq!(fields.len(), 1, "у непересланной признака в проводе быть не должно");
+        let (_, _, forwarded) = from_payload(&value).unwrap();
+        assert!(!forwarded);
     }
 }

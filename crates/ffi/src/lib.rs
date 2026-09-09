@@ -30,13 +30,12 @@ use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 #[cfg(feature = "tor")]
 use ratatosk_transport::{onion::arti::OnionRunner, Switched};
-// `Disabled` нужен только тем сборкам, где чего-то нет. Собери мост
-// с обоими признаками — все три ступени заняты настоящими раннерами,
-// и безусловный импорт становится предупреждением ровно в той сборке,
-// которая и пойдёт в приложение.
-#[cfg(any(not(feature = "tor"), not(feature = "mail")))]
+// `Disabled` остаётся нужен: без признаков `tor` и `mail` эти ступени
+// честно отказывают, и это правда о сборке, а не заглушка. Условие с него
+// снято потому, что сборка с обоими признаками всё равно бывает — а вот
+// меш теперь свой раннер имеет во всякой.
 use ratatosk_transport::Disabled;
-use ratatosk_transport::{LanConfig, LanRunner, Transports};
+use ratatosk_transport::{LanConfig, LanRunner, Transports, YggConfig, YggRunner, YGG_PORT};
 
 /// Второй экран телефона (§13.4) — отдельным объектом.
 ///
@@ -217,6 +216,10 @@ pub enum FfiTransport {
     /// Локальная сеть (§5.1). По умолчанию **выключена**: маяк в эфире
     /// выдаёт присутствие устройства всем, кто слушает.
     Lan,
+    /// Меш Yggdrasil (0.2). По умолчанию **выключен**: узел меша переносит
+    /// чужой трафик, то есть тратит батарею и трафик человека на чужие
+    /// пакеты. UI обязан сказать об этом рядом с переключателем.
+    Ygg,
     /// Tor onion-to-onion (§5.2). По умолчанию включён.
     Onion,
     /// Почта chatmail поверх Tor (§5.3). По умолчанию включена.
@@ -227,6 +230,7 @@ impl From<FfiTransport> for ratatosk_proto::Transport {
     fn from(value: FfiTransport) -> ratatosk_proto::Transport {
         match value {
             FfiTransport::Lan => ratatosk_proto::Transport::Lan,
+            FfiTransport::Ygg => ratatosk_proto::Transport::Ygg,
             FfiTransport::Onion => ratatosk_proto::Transport::Onion,
             FfiTransport::Mail => ratatosk_proto::Transport::Mail,
         }
@@ -237,8 +241,43 @@ impl From<ratatosk_proto::Transport> for FfiTransport {
     fn from(value: ratatosk_proto::Transport) -> FfiTransport {
         match value {
             ratatosk_proto::Transport::Lan => FfiTransport::Lan,
+            ratatosk_proto::Transport::Ygg => FfiTransport::Ygg,
             ratatosk_proto::Transport::Onion => FfiTransport::Onion,
             ratatosk_proto::Transport::Mail => FfiTransport::Mail,
+        }
+    }
+}
+
+/// Откуда берётся меш, на границе §13.3 (0.2).
+///
+/// Своё перечисление по той же причине, что и у транспорта: типы протокола
+/// наружу не отдаются.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiYggMode {
+    /// Меша нет. Умолчание, и остаётся им после обновления приложения.
+    Off,
+    /// Внешний демон `yggdrasil` на устройстве; ключ называет человек.
+    External,
+    /// Свой узел в нашем процессе; имя выводится из своего зерна.
+    Embedded,
+}
+
+impl From<FfiYggMode> for ratatosk_proto::ygg::YggMode {
+    fn from(value: FfiYggMode) -> ratatosk_proto::ygg::YggMode {
+        match value {
+            FfiYggMode::Off => ratatosk_proto::ygg::YggMode::Off,
+            FfiYggMode::External => ratatosk_proto::ygg::YggMode::External,
+            FfiYggMode::Embedded => ratatosk_proto::ygg::YggMode::Embedded,
+        }
+    }
+}
+
+impl From<ratatosk_proto::ygg::YggMode> for FfiYggMode {
+    fn from(value: ratatosk_proto::ygg::YggMode) -> FfiYggMode {
+        match value {
+            ratatosk_proto::ygg::YggMode::Off => FfiYggMode::Off,
+            ratatosk_proto::ygg::YggMode::External => FfiYggMode::External,
+            ratatosk_proto::ygg::YggMode::Embedded => FfiYggMode::Embedded,
         }
     }
 }
@@ -807,6 +846,13 @@ pub struct FfiContact {
     /// сообщение, пока он не в сети. Без почтового адреса — **нет**, и это
     /// стоит сказать до того, как человек напишет и станет ждать.
     pub chatmail: Option<String>,
+    /// Открытый ключ узла Yggdrasil из карточки (0.2). `None` — меша нет.
+    ///
+    /// Тридцать два байта, а не строка: адрес `200::/7` выводится из них
+    /// однозначно, и хранить обе записи одного и того же значило бы
+    /// однажды показать человеку одну, а соединиться по другой. Показывать
+    /// его стоит так же, как onion, — на карточке человека, а не в списке.
+    pub ygg: Option<Vec<u8>>,
     /// Версия карточки, монотонная (§4.3).
     ///
     /// Диагностика: по ней видно, доехало ли до нас обновление адресов.
@@ -1324,14 +1370,36 @@ impl RatatoskClient {
         std::thread::Builder::new()
             .name("ratatosk-core".to_owned())
             .spawn(move || {
-                let runtime =
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(RatatoskError::internal(error)));
-                            return;
-                        }
-                    };
+                // **Многопоточный, а не однопоточный**, и это исправление
+                // настоящей медлительности, а не запас на будущее.
+                //
+                // Цикл драйвера живёт в `block_on`, то есть на этом самом
+                // потоке. Всё, что порождает `tokio::spawn`, на однопоточном
+                // рантайме делит поток с ним — а порождает много кто, и
+                // не только мы: bootstrap Tor у arti это десятки задач,
+                // разбирающих консенсус сети, и работа там не ожидание,
+                // а счёт. Пока такая задача считает, цикл драйвера не
+                // отвечает ни на запрос переписки, ни на таймер, и человек
+                // видит приложение, которое «думает» ровно столько, сколько
+                // поднимается Tor.
+                //
+                // Два рабочих потока, а не по числу ядер: считающих задач
+                // у нас единицы, а каждый лишний поток на телефоне — это
+                // память и расход батареи (§13.1). Ядру от этого `Send`
+                // не требуется: `block_on` исполняет будущее на вызывающем
+                // потоке, а `Send` обязателен только тому, что уезжает
+                // в `tokio::spawn`, — и уезжало оно туда и раньше.
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(RatatoskError::internal(error)));
+                        return;
+                    }
+                };
                 runtime.block_on(async move {
                     let started =
                         start(PathBuf::from(db_path), pin, device_key, display_name).await;
@@ -1624,6 +1692,120 @@ impl RatatoskClient {
     /// с карточки (§4.3): обещать путь, которого нет, нельзя.
     pub fn clear_mail_account(&self) -> Result<(), RatatoskError> {
         self.command(Command::SetMailAccount(None))
+    }
+
+    /// Называет открытый ключ **своего** узла в меше Yggdrasil (0.2).
+    ///
+    /// Тридцать два байта ставят ключ, пустой массив снимает меш; любая
+    /// другая длина — отказ. Отказ, а не молчаливое стирание: ключ человек
+    /// переносит руками из чужого приложения, и опечатку надо назвать —
+    /// иначе он останется с выключенным мешем и без объяснения.
+    ///
+    /// **Где его взять.** На десктопе — у демона: `yggdrasilctl getSelf`,
+    /// поле `key`. На телефоне с официальным приложением Yggdrasil —
+    /// из его окна, руками: узел живёт в чужой песочнице, и спросить его
+    /// программно неоткуда. Вывести ключ из адреса `200::/7` **нельзя**:
+    /// адрес сжимает ключ до четырнадцати байт.
+    ///
+    /// **Настройка, а не адрес.** Переживает перезапуск, ставится один раз.
+    /// Смена растит версию карточки и рассылает её контактам (§4.3): имя
+    /// в меше — часть карточки, и собеседники обязаны узнать новое.
+    ///
+    /// **Ступень от этого не становится работающей.** Работает она с того
+    /// момента, как раннер привязался к нашему адресу в меше, — то есть
+    /// когда демон поднят и адрес назначен. До тех пор §5.4 её не выбирает,
+    /// а `transport_ready(Ygg)` честно отвечает «нет».
+    ///
+    /// Перед включением ступени клиент обязан показать [`ygg_warning`].
+    ///
+    /// Относится к режиму внешнего демона. В режиме своего узла имя
+    /// выводится из нашего зерна, и вызов отвечает отказом, а не тишиной.
+    pub fn set_ygg_key(&self, key: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::SetYggKey(key))
+    }
+
+    /// Этот аккаунт вышел на экран или ушёл с него (§5.1).
+    ///
+    /// **Не переключатель локальной сети.** Гасит и зажигает маяк §5.1,
+    /// не трогая выбор человека и ничего не записывая: одно устройство
+    /// с тремя аккаунтами не должно объявлять в эфир три присутствия
+    /// сразу — но и включать локальную сеть тому, кто её не включал,
+    /// оно не вправе.
+    ///
+    /// Приложению с одним аккаунтом звать это не нужно вовсе: умолчание —
+    /// «на экране».
+    ///
+    /// Onion и почты не касается: они не объявляют присутствия, а ждут
+    /// входящих по адресу из карточки.
+    pub fn set_foreground(&self, front: bool) -> Result<(), RatatoskError> {
+        self.command(Command::SetForeground(front))
+    }
+
+    /// Выбирает, откуда берётся меш: никак, внешним демоном, своим узлом.
+    ///
+    /// Три состояния, и человек выбирает сам. Экрану настроек это один
+    /// переключатель на три положения, а не два независимых флажка:
+    /// режимы взаимоисключающи, и «узел встроенный, но выключен»
+    /// пришлось бы объяснять.
+    ///
+    /// **Свой узел называет себя сам.** При первом включении заводится
+    /// зерно, из него выводится имя в меше, оно уезжает в карточке.
+    /// Возврат в этот режим даёт **то же** имя, а не новое.
+    ///
+    /// **Без пиров свой узел ни с кем не соединён** — назовите их
+    /// через [`RatatoskClient::set_ygg_peers`], иначе ступень честно
+    /// останется неработающей.
+    ///
+    /// Перед включением любого режима клиент обязан показать
+    /// [`ygg_warning`].
+    pub fn set_ygg_mode(&self, mode: FfiYggMode) -> Result<(), RatatoskError> {
+        self.command(Command::SetYggMode(mode.into()))
+    }
+
+    /// Текущий режим меша.
+    pub fn ygg_mode(&self) -> Result<FfiYggMode, RatatoskError> {
+        let mode = self
+            .opened
+            .handle
+            .ygg_mode_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(FfiYggMode::from(mode))
+    }
+
+    /// Называет пиров встроенного узла: `tcp://host:port` и подобные.
+    ///
+    /// Список заменяется целиком. Зашитого списка нет сознательно: пир
+    /// видит источник и адресата пакетов в меше, и выбирать за человека,
+    /// кто это будет, приложение не вправе.
+    ///
+    /// В карточке список не отражается: собеседнику важно наше имя в меше,
+    /// а не то, через кого мы в него вошли.
+    pub fn set_ygg_peers(&self, peers: Vec<String>) -> Result<(), RatatoskError> {
+        self.command(Command::SetYggPeers(peers))
+    }
+
+    /// Пиры встроенного узла, как их назвал человек.
+    pub fn ygg_peers(&self) -> Result<Vec<String>, RatatoskError> {
+        self.opened
+            .handle
+            .ygg_peers_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
+    /// Ключ нашего узла в меше, если он назван (0.2). Пусто — меша нет.
+    ///
+    /// Читается из своей карточки: там он и живёт. Нужен экрану настроек,
+    /// чтобы показать человеку **действующее** имя — не то, что он ввёл,
+    /// а то, что уехало собеседникам, — и рядом выведенный адрес для сверки
+    /// с `yggdrasilctl getSelf`. В режиме своего узла это имя мы назвали
+    /// себе сами, и вводить его человеку было негде.
+    pub fn ygg_key(&self) -> Result<Vec<u8>, RatatoskError> {
+        let card = self
+            .opened
+            .handle
+            .own_card_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(card.ygg)
     }
 
     /// Просит chatmail-сервер завести **новый** ящик (§5.3).
@@ -2280,6 +2462,7 @@ impl RatatoskClient {
                 has_avatar: c.has_avatar,
                 onion: c.onion,
                 chatmail: c.chatmail,
+                ygg: c.ygg,
                 card_version: c.card_version,
                 added_ms: c.added_ms,
                 reachability: reachability(c.reachability),
@@ -2786,11 +2969,11 @@ type MailSide = Disabled;
 /// [`ratatosk_transport::Disabled`], и это не заглушка, а правда о сборке:
 /// §5.4 обязан узнать, что ступень не сработала, и перейти к следующей.
 #[cfg(feature = "tor")]
-type Runners = Transports<LanRunner, Switched<OnionRunner>, MailSide>;
+type Runners = Transports<LanRunner, YggRunner, Switched<OnionRunner>, MailSide>;
 
 /// Набор транспортов сборки без Tor: локальная сеть и, если собрана, почта.
 #[cfg(not(feature = "tor"))]
-type Runners = Transports<LanRunner, Disabled, MailSide>;
+type Runners = Transports<LanRunner, YggRunner, Disabled, MailSide>;
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
@@ -2817,6 +3000,10 @@ async fn start(
     // Onion и chatmail пока пусты: их адреса появятся вместе с транспортами
     // этапов 2 и 3. §5.4 с пустыми адресами честно скажет «отправлять некуда»,
     // а не сделает вид, что письмо ушло.
+    //
+    // Меша здесь нет вовсе, и это не забывчивость: его настройки живут
+    // в базе и поднимаются `restore` (`META_YGG_MODE` и соседи). Второй
+    // двери у них нет — была, и первый же заход дал поломку.
     let addresses = SelfAddresses { onion: String::new(), chatmail: String::new(), display_name };
 
     let mut engine = Engine::new(identity, store, Box::new(blobs), Box::new(OsEntropy), addresses);
@@ -2830,6 +3017,14 @@ async fn start(
     // объявлению, а без объявления никого не раскрывает.
     let lan =
         LanRunner::start(LanConfig::default(), card.ik).await.map_err(RatatoskError::internal)?;
+
+    // Меш заводится **с действующим именем из карточки**: `restore` уже
+    // посчитал его из настроек и положил туда. Порт при этом не занимается —
+    // привязка идёт при включении, и удаётся она только при поднятом демоне.
+    // Имени нет — раннер честно откажет, а настройки назовут его на ходу.
+    let ygg = YggRunner::start(YggConfig { enabled: false, port: YGG_PORT }, &card.ygg)
+        .await
+        .map_err(RatatoskError::internal)?;
 
     // Onion поднимается **в фоне опросов драйвера**: bootstrap идёт десятки
     // секунд, и ждать его здесь значило бы держать человека перед пустым
@@ -2887,14 +3082,14 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, onion, mail)
+        Transports::new(lan, ygg, onion, mail)
     };
     // Без признака `tor` onion честно отказывает, а почта работает: §5.3
     // по умолчанию идёт через Tor, но умеет и напрямую.
     #[cfg(not(feature = "tor"))]
     let runner = {
         let _ = &tor_handle;
-        Transports::new(lan, Disabled, mail)
+        Transports::new(lan, ygg, Disabled, mail)
     };
 
     let (driver, handle, events) = Driver::new(engine, runner);
@@ -3130,12 +3325,21 @@ impl AccountRegistry {
         // ровно то состояние, которого вся эта функция и избегает. Отказ
         // здесь означает остановленное ядро, и он не повод бросить остальных
         // в эфире.
+        //
+        // `set_foreground`, а не `set_transport_enabled`, и это исправление
+        // настоящей поломки. Прежде фоновым уходило «выключить LAN»,
+        // а переднему — «включить LAN»: то есть локальная сеть включалась
+        // человеку, который её не включал, и записывалась на диск как его
+        // выбор. Маяк §5.1 уходил в эфир без спроса, `lan_warning()` перед
+        // этим никто не показывал, и обнаруживалось это как «LAN включён
+        // по умолчанию».
+        //
+        // Теперь фактов два и они не смешиваются: выбор человека остаётся
+        // на диске нетронутым, а «на экране» живёт только в памяти ядра.
         let mut failure = None;
         for (account, weak) in opened.iter() {
             let Some(client) = weak.upgrade() else { continue };
-            if let Err(error) =
-                client.set_transport_enabled(FfiTransport::Lan, front == Some(*account))
-            {
+            if let Err(error) = client.set_foreground(front == Some(*account)) {
                 failure.get_or_insert(error);
             }
         }
@@ -3371,6 +3575,55 @@ pub fn file_waiting_text(reason: FfiFileWaitReason) -> String {
 #[must_use]
 pub fn lan_warning() -> String {
     ratatosk_core::honest::LAN_WARNING.to_string()
+}
+
+/// Адрес `200::/7`, выведенный из ключа узла в меше (0.2).
+///
+/// Считает **ядро**, а не клиент, и это §13.3: вывод адреса — правило чужой
+/// сети, а не рисование. Две реализации одного правила разошлись бы молча,
+/// и человек сверял бы с `yggdrasilctl getSelf` не тот адрес, по которому
+/// мы на самом деле слушаем.
+///
+/// `None` — ключ не тридцати двух байт, в том числе пустой.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_address(key: Vec<u8>) -> Option<String> {
+    <[u8; 32]>::try_from(key.as_slice()).ok().map(|key| ratatosk_proto::ygg::address_text(&key))
+}
+
+/// Предупреждение при включении меша Yggdrasil (0.2).
+///
+/// Показывается **до** `set_transport_enabled(Ygg, true)`, как и у LAN.
+/// Разница в цене: LAN раскрывает присутствие, меш вдобавок тратит
+/// батарею и трафик человека на чужие пакеты.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_warning() -> String {
+    ratatosk_core::honest::YGG_WARNING.to_string()
+}
+
+/// Что ещё сказать перед выбором встроенного узла меша (0.2).
+///
+/// Показывается **вдобавок** к [`ygg_warning`], а не вместо: цена та же,
+/// а нового здесь две вещи. Пиров человек называет сам, и без них узел
+/// молчит — это самая частая причина «меш не работает». И имя в меше
+/// приложение выдаёт себе само, вместе с базой.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_node_notice() -> String {
+    ratatosk_core::honest::YGG_NODE_NOTICE.to_string()
+}
+
+/// Что показать при **выключении** встроенного узла меша (0.2).
+///
+/// Обязательно, а не по желанию. Человек выключает меш затем, чтобы
+/// перестать переносить чужой трафик, — а библиотека узла остановки
+/// не умеет, и трафик пойдёт до перезапуска приложения. Промолчать здесь
+/// значило бы пообещать больше, чем делается.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_node_stop_notice() -> String {
+    ratatosk_core::honest::YGG_NODE_STOP_NOTICE.to_string()
 }
 
 /// Предупреждение при отказе от PIN (§8.6).

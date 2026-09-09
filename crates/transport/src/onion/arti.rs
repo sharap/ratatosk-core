@@ -300,26 +300,24 @@ impl OnionRunner {
     }
 
     /// Рассказывает наружу о том, что происходит с onion (§14).
-    ///
-    /// [`mpsc::Sender::try_send`], а не `send`, и это не мелочь: очередь
-    /// вычитывает драйвер, а он в этот момент ждёт нас же внутри
-    /// [`Runner::execute`]. Ожидание на полной очереди было бы взаимной
-    /// блокировкой на все сорок пять секунд набора.
-    ///
-    /// Доля 1.0 — потому что bootstrap к этому моменту позади: новость
-    /// не о подъёме, а о звонке.
     fn note(&self, note: String, blocked: Option<String>) {
-        // И в журнал тоже — потому что в очередь новость ложится сейчас,
-        // а вычитают её после того, как `execute` вернётся, то есть в худшем
-        // случае через сорок пять секунд. Журнал печатается сразу, и «набираем
-        // …» видно в тот момент, когда набор идёт, а не когда он кончился.
-        tracing::info!(blocked = ?blocked, "onion: {note}");
-        let _ =
-            self.events_tx.try_send(TransportEvent::TorProgress { fraction: 1.0, note, blocked });
+        note_to(&self.events_tx, note, blocked);
     }
 
-    /// Соединение с контактом — существующее или новое.
-    async fn ensure_link(&mut self, peer: &PeerAddress) -> Result<Link, TransportError> {
+    /// Связь с контактом — существующая или набираемая.
+    ///
+    /// **Не ждёт соединения.** Набор уезжает в свою задачу
+    /// ([`Link::dialing`]), а кадры до его конца ждут в полосах записи.
+    ///
+    /// Здесь это важнее, чем на любой другой ступени: §5.4 отводит onion
+    /// сорок пять секунд, и ровно столько раньше стояло всё ядро на одном
+    /// недозвоне — набор ждался внутри `Driver::apply`, то есть в теле
+    /// цикла, который отвечает на запросы UI, ведёт таймеры и принимает
+    /// по остальным ступеням.
+    ///
+    /// Отказ приезжает ядру [`TransportEvent::ConnectFailed`] — тем же
+    /// событием, каким приехал бы обрыв, случись он секундой позже.
+    fn ensure_link(&mut self, peer: &PeerAddress) -> Result<Link, TransportError> {
         if let Some(link) = self.links.get(&peer.ik) {
             if !link.is_closed() {
                 return Ok(link.clone());
@@ -340,53 +338,81 @@ impl OnionRunner {
         // вопрос при разборе любого «не ходит».
         self.note(format!("набираем {address}"), None);
 
-        // §5.4 отводит onion 45 секунд и после этого переходит к почте.
-        // Ждать дольше нельзя не из нетерпения: пока мы ждём, человек видит
-        // «отправляется», а сообщение могло бы уже уехать следующей ступенью.
-        let deadline = Duration::from_millis(ONION_CONNECT_TIMEOUT_MS);
-        let stream = match tokio::time::timeout(
-            deadline,
-            self.client.connect((address, SERVICE_PORT)),
-        )
-        .await
-        {
-            Err(_) => {
-                self.note(
-                    format!("{address}: молчит {} с", ONION_CONNECT_TIMEOUT_MS / 1_000),
-                    Some("дескриптор не найден или сервис недоступен".to_owned()),
-                );
-                return Err(TransportError::Timeout);
-            }
-            Ok(Err(error)) => {
-                // Текст ошибки — наружу, а не только в журнал. У arti он
-                // внятный («onion service descriptor not found», «stream
-                // refused»), и по нему сразу видно, чья это беда.
-                self.note(format!("{address}: не дозвонились"), Some(format!("{error}")));
-                return Err(failed("соединение не установилось", &error));
-            }
-            Ok(Ok(stream)) => stream,
-        };
-        self.note(format!("{address}: соединение установлено"), None);
-
-        let link = Link::open(stream, peer.ik, Transport::Onion, self.events_tx.clone());
+        let client = Arc::clone(&self.client);
+        let events = self.events_tx.clone();
+        let address = address.to_owned();
+        let link = Link::dialing(
+            async move {
+                // §5.4 отводит onion 45 секунд и после этого переходит
+                // к почте. Ждать дольше нельзя не из нетерпения: пока мы
+                // ждём, человек видит «отправляется», а сообщение могло бы
+                // уже уехать следующей ступенью.
+                let deadline = Duration::from_millis(ONION_CONNECT_TIMEOUT_MS);
+                let opening = client.connect((address.as_str(), SERVICE_PORT));
+                match tokio::time::timeout(deadline, opening).await {
+                    Err(_) => {
+                        note_to(
+                            &events,
+                            format!("{address}: молчит {} с", ONION_CONNECT_TIMEOUT_MS / 1_000),
+                            Some("дескриптор не найден или сервис недоступен".to_owned()),
+                        );
+                        Err(TransportError::Timeout)
+                    }
+                    Ok(Err(error)) => {
+                        // Текст ошибки — наружу, а не только в журнал.
+                        // У arti он внятный («onion service descriptor not
+                        // found», «stream refused»), и по нему сразу видно,
+                        // чья это беда.
+                        note_to(
+                            &events,
+                            format!("{address}: не дозвонились"),
+                            Some(format!("{error}")),
+                        );
+                        Err(failed("соединение не установилось", &error))
+                    }
+                    Ok(Ok(stream)) => {
+                        note_to(&events, format!("{address}: соединение установлено"), None);
+                        Ok(stream)
+                    }
+                }
+            },
+            peer.ik,
+            Transport::Onion,
+            self.events_tx.clone(),
+        );
         self.links.insert(peer.ik, link.clone());
-        let _ = self
-            .events_tx
-            .send(TransportEvent::Connected { peer_ik: peer.ik, via: Transport::Onion })
-            .await;
         Ok(link)
     }
+}
+
+/// Рассказывает наружу о том, что происходит с onion (§14).
+///
+/// [`mpsc::Sender::try_send`], а не `send`, и это не мелочь: новость
+/// рождается в задаче набора, а очередь вычитывает драйвер. Ожидание
+/// на полной очереди задержало бы набор ровно на то время, пока UI
+/// не разберёт накопившееся, — а очередь эта короткая намеренно.
+///
+/// Доля 1.0 — потому что bootstrap к этому моменту позади: новость
+/// не о подъёме, а о звонке.
+///
+/// Свободной функцией, потому что звать её приходится и из задачи набора,
+/// у которой раннера нет.
+fn note_to(events: &mpsc::Sender<TransportEvent>, note: String, blocked: Option<String>) {
+    // И в журнал тоже: очередь новостей короткая и переполнимая, а строка
+    // «набираем …» нужна в тот момент, когда набор идёт.
+    tracing::info!(blocked = ?blocked, "onion: {note}");
+    let _ = events.try_send(TransportEvent::TorProgress { fraction: 1.0, note, blocked });
 }
 
 impl Runner for OnionRunner {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         match command {
             TransportCommand::Send { peer, via: Transport::Onion, frame, .. } => {
-                let link = self.ensure_link(&peer).await?;
+                let link = self.ensure_link(&peer)?;
                 link.send(frame).await
             }
             TransportCommand::Connect { peer, via: Transport::Onion } => {
-                self.ensure_link(&peer).await.map(|_| ())
+                self.ensure_link(&peer).map(|_| ())
             }
             // Разъединение приходит без `via` — всем транспортам сразу.
             // Забыть соединение здесь достаточно: пишущая задача уходит

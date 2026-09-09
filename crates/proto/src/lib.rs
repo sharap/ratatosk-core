@@ -21,6 +21,7 @@
 //! | [`reaction`] | реакция эмодзи — **дополнение**, в v0.1 не описано |
 //! | [`forward`] | пересылка в другой чат — **дополнение**, в v0.1 не описано |
 //! | [`reply`] | ответ на сообщение — **дополнение**, в v0.1 не описано |
+//! | [`ygg`] | адрес в меше из открытого ключа — **0.2**, в v0.1 не описано |
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +43,7 @@ pub mod reply;
 pub mod retract;
 pub mod session;
 pub mod transport_policy;
+pub mod ygg;
 
 pub use avatar::{AvatarError, MAX_AVATAR_BYTES};
 pub use card_update::UpdateError;

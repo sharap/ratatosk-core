@@ -3,8 +3,9 @@
 //! **Не гонка.** Строгая последовательность с таймаутами:
 //!
 //! 1. Если LAN включён и контакт в нём виден → LAN.
-//! 2. Иначе попытка соединения с onion-адресом, таймаут 45 с.
-//! 3. Если не удалось → отправка почтой.
+//! 2. Иначе, если включён меш Yggdrasil и ключ контакта известен → ygg (0.2).
+//! 3. Иначе попытка соединения с onion-адресом, таймаут 45 с.
+//! 4. Если не удалось → отправка почтой.
 //!
 //! Одновременная отправка одним и тем же сообщением по нескольким транспортам
 //! запрещена. Дублирование на приёме допускается и разрешается дедупликацией
@@ -17,11 +18,12 @@
 //! человек выключил, не «пробуется и отказывает», а не пробуется вовсе:
 //! иначе каждое сообщение платило бы за неё сроком ожидания.
 //!
-//! **Единственное исключение:** LAN и Tor не смешиваются в одной сессии
-//! никогда. Сессия, начатая в LAN, при потере связи не продолжается через
-//! onion — устанавливается новая. Иначе локальный наблюдатель связывает
+//! **Единственное исключение:** семейства транспортов не смешиваются в одной
+//! сессии никогда. Сессия, начатая в LAN, при потере связи не продолжается
+//! через onion — устанавливается новая. Иначе локальный наблюдатель связывает
 //! LAN-присутствие с onion-активностью. Это правило действует и для канала
-//! десктоп—телефон (§13.4).
+//! десктоп—телефон (§13.4). Семейств три: LAN, Tor (onion и почта) и меш
+//! Yggdrasil — см. [`SessionBinding`].
 
 /// Таймаут попытки соединения с onion-сервисом (§5.4).
 pub const ONION_CONNECT_TIMEOUT_MS: u64 = 45_000;
@@ -46,6 +48,49 @@ pub const ONION_CONNECT_TIMEOUT_MS: u64 = 45_000;
 /// заведомо в сети: недоступный ловится таймаутом набора, а не этим. Ждать
 /// в такой ситуации разумно — ответ почти наверняка в пути.
 pub const ONION_REPLY_TIMEOUT_MS: u64 = 2 * ONION_CONNECT_TIMEOUT_MS;
+
+/// Таймаут TCP-соединения внутри локальной сети.
+///
+/// LAN отвечает за миллисекунды; секунды здесь — запас на спящий Wi-Fi,
+/// а не на маршрутизацию.
+///
+/// Живёт рядом со сроками ожидания нарочно: между ними есть обязательная
+/// связь (см. [`LAN_RECEIPT_TIMEOUT_MS`]), а разъехавшись по крейтам, они
+/// однажды разошлись бы и по значениям. Раннер берёт это число отсюда.
+pub const LAN_CONNECT_TIMEOUT_MS: u64 = 2_000;
+
+/// Таймаут соединения по мешу.
+///
+/// Не две секунды, как в локальной сети: маршрут в меше идёт через соседей
+/// и может пересечь континент. И не сорок пять, как у onion: цепочек
+/// встречи здесь нет, соединение либо устанавливается за секунды, либо
+/// не устанавливается вовсе, а за ступенью стоит onion — и его сорок пять
+/// секунд человек оплатит следом.
+pub const YGG_CONNECT_TIMEOUT_MS: u64 = 8_000;
+
+/// Сколько ждать ответа собеседника после того, как кадр ушёл через меш.
+///
+/// **Обязано быть больше [`YGG_CONNECT_TIMEOUT_MS`], и вот почему.**
+/// Соединения односторонние (`ARCHITECTURE.md`, 5ц): ответ собеседника
+/// приезжает не по нашему соединению, а по тому, которое он должен сперва
+/// набрать сам. Значит наш срок обязан вмещать целый чужой набор — ровно
+/// тот довод, что у onion ([`ONION_REPLY_TIMEOUT_MS`]).
+///
+/// # Что было и чего это стоило
+///
+/// Меш мерялся локальной сетью — пять секунд, — а набирает он восемь.
+/// То есть срок выходил **раньше**, чем транспорт успевал сказать
+/// «не соединился»: ступень бросали до того, как она могла отказать.
+/// Для обычного сообщения это стоило лишней ступени, для **копии
+/// в группу** — самого сообщения: её попытка закрывается молчанием
+/// транспорта (§11.3, квитанции у неё нет), и молчание длиною в пять
+/// секунд означало «отдано», когда на деле шёл набор. Копия снималась
+/// с очереди, а через три секунды приезжал отказ, которому уже некого
+/// было вести дальше.
+///
+/// Снаружи это выглядело так: личные сообщения после офлайна доходят,
+/// групповые — чаще всего нет.
+pub const YGG_RECEIPT_TIMEOUT_MS: u64 = 2 * YGG_CONNECT_TIMEOUT_MS;
 
 /// Сколько ждать квитанции по локальной сети, прежде чем считать попытку
 /// неудавшейся (§5.4, §9.4).
@@ -89,6 +134,31 @@ pub const LAN_RECEIPT_TIMEOUT_MS: u64 = 5_000;
 pub enum Transport {
     /// Локальная сеть. По умолчанию выключена (§5.1).
     Lan,
+    /// Меш Yggdrasil (0.2). По умолчанию выключен.
+    ///
+    /// **Здесь было написано неверно, и это стоит помнить.** Причиной
+    /// умолчания называлось «узел переносит чужой трафик». Транзит
+    /// у Yggdrasil требует **двух и более** пиров: узел с одним пиром —
+    /// лист, и путь через него не строится ни один. С выключенным
+    /// мультикастом второй пир сам собой не заводится, а именно так узел
+    /// у нас и живёт: пиров называет человек, поимённо.
+    ///
+    /// Настоящих причин умолчания две, и обе честные.
+    ///
+    /// Первая — **настройка**. Ступень не работает, пока человек не назвал
+    /// пира, а назвать его неоткуда: зашитый список публичных пиров означал
+    /// бы, что **мы** выбираем, кто видит трафик человека (см.
+    /// `ygg::peers_encode`). Включённая по умолчанию и неработающая ступень
+    /// хуже выключенной: §14 запрещает обещать то, чего нет.
+    ///
+    /// Вторая — **адрес**. Он выводится из открытого ключа, постоянен и
+    /// виден каждому узлу, через который идёт трафик. Это долговременный
+    /// опознаватель, и заводить его человеку молча нельзя.
+    ///
+    /// Транзит остаётся платой того, кто назвал **несколько** пиров или
+    /// включил мультикаст. Тогда сказать об этом надо — но это уже про
+    /// настройку, а не про умолчание.
+    Ygg,
     /// Tor onion-to-onion (§5.2).
     Onion,
     /// Почта chatmail поверх Tor (§5.3).
@@ -100,9 +170,29 @@ impl Transport {
     ///
     /// Различие содержательное: квитанции идут только прямым каналом (§9.4),
     /// файлы больше 20 МБ — тоже (§10.3).
+    ///
+    /// Ygg здесь прямой, и это не поблажка новому транспорту: соединение
+    /// живёт всё время разговора, кадры идут в обе стороны, квитанция
+    /// возвращается за те же десятки миллисекунд, что и по локальной сети.
+    /// Отличает его от почты ровно то же, что и onion, — синхронность.
     #[must_use]
     pub const fn is_direct(self) -> bool {
-        matches!(self, Transport::Lan | Transport::Onion)
+        matches!(self, Transport::Lan | Transport::Ygg | Transport::Onion)
+    }
+
+    /// Короткое имя для журнала.
+    ///
+    /// Одно место на всё дерево: имена ступеней читает человек, сверяя
+    /// журнал ядра с журналом транспорта, и «ygg» в одном месте против
+    /// «yggdrasil» в другом стоит ему лишней минуты каждый раз.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Transport::Lan => "lan",
+            Transport::Ygg => "ygg",
+            Transport::Onion => "onion",
+            Transport::Mail => "mail",
+        }
     }
 }
 
@@ -132,7 +222,20 @@ pub struct PeerAvailability {
     /// У LAN и почты этого разрыва нет: порт занят при старте, а почта
     /// асинхронна по устройству — ждать там нечего, и они готовы вместе
     /// с включением.
+    ///
+    /// У меша Yggdrasil разрыв есть, и по той же причине, что у Tor: узлу
+    /// нужно соединиться с соседями и построить маршрут, а внешнему
+    /// демону — просто оказаться запущенным. До этого ступень включена,
+    /// но не готова.
     pub ready: TransportSet,
+    /// Известен открытый ключ Yggdrasil (0.2).
+    ///
+    /// Именно **ключ**, а не адрес, и это одно поле на два способа связи.
+    /// Встроенный узел соединяется по ключу напрямую; внешнему демону
+    /// адрес `200::/7` выводится из того же ключа — он и есть функция
+    /// от ключа. Лестница разницы не видит: ступень адресуема, если ключ
+    /// известен.
+    pub has_ygg: bool,
     /// Известен onion-адрес.
     pub has_onion: bool,
     /// Известен chatmail-адрес.
@@ -158,11 +261,15 @@ impl TransportSet {
             Transport::Lan => 1,
             Transport::Onion => 2,
             Transport::Mail => 4,
+            // Восемь, а не три: биты назначаются по порядку появления,
+            // а не по месту на лестнице. Порядок на лестнице меняется
+            // решением, а записанный байт — уже нет.
+            Transport::Ygg => 8,
         }
     }
 
     /// Все известные биты — маска для чтения с диска.
-    const KNOWN: u8 = 1 | 2 | 4;
+    const KNOWN: u8 = 1 | 2 | 4 | 8;
 
     /// Пустой набор: не разрешён ни один транспорт.
     #[must_use]
@@ -183,6 +290,17 @@ impl TransportSet {
     #[must_use]
     pub const fn with(self, transport: Transport) -> TransportSet {
         TransportSet(self.0 | Self::bit(transport))
+    }
+
+    /// Тот же набор минус один транспорт.
+    ///
+    /// Пара к [`TransportSet::with`], и нужна она там, где набор берётся
+    /// из чужого поля по значению: «разрешено человеком, но сейчас
+    /// не объявляем» — это не смена настройки, и портить ради него
+    /// исходный набор нельзя.
+    #[must_use]
+    pub const fn without(self, transport: Transport) -> TransportSet {
+        TransportSet(self.0 & !Self::bit(transport))
     }
 
     /// Включает или выключает транспорт.
@@ -246,6 +364,38 @@ impl Rung {
     #[must_use]
     pub const fn rising(self) -> bool {
         self.enabled && self.addressable && !self.ready
+    }
+
+    /// Может ли эта ступень открыться **когда-нибудь**.
+    ///
+    /// Отличается от [`Rung::rising`] горизонтом, и разница существенная.
+    /// `rising` отвечает на «уйдёт ли вот-вот» — про ступень, которая уже
+    /// поднимается. Здесь вопрос другой: стоит ли вообще **обещать
+    /// человеку** «отправим, когда появится» (§14), или честнее сразу
+    /// сказать «не доставлено».
+    ///
+    /// Ответ — «стоит», если адрес известен. Собеседник сейчас недостижим,
+    /// но адрес никуда не денется, и ступень заработает, как только он
+    /// вернётся. Выключенная ступень обещанию не мешает: выключатель
+    /// человека, и щёлкнуть его он может в любую минуту.
+    ///
+    /// **LAN — исключение, и в другую сторону.** Адресуемость там даёт
+    /// не карточка, а маяк §5.1, и он может прозвучать в любую минуту.
+    /// Значит включённой локальной сети довольно, даже когда адреса ещё
+    /// нет вовсе.
+    ///
+    /// # Почему это живёт здесь, а не в ядре
+    ///
+    /// Потому что это решение **по ступеням**, а ядро перечисляло их
+    /// руками — и забыло меш. Условие звучало «нет onion и нет почты,
+    /// и LAN выключен — значит ждать нечего», а собеседник, доступный
+    /// только через меш, попадал ровно под него: сообщение ему объявлялось
+    /// недоставимым и **выбрасывалось**. На стенде, где ступеней четыре
+    /// и почта у всех, это не воспроизводилось никогда; на живых
+    /// устройствах с одним мешем — всегда.
+    #[must_use]
+    pub const fn may_open(self) -> bool {
+        self.addressable || (self.enabled && matches!(self.transport, Transport::Lan))
     }
 
     /// Почему ступень не годится — или что она годится.
@@ -321,8 +471,8 @@ impl RungState {
 /// забыть нельзя.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reachability {
-    /// Ступени по порядку §5.4: LAN, onion, почта.
-    pub rungs: [Rung; 3],
+    /// Ступени по порядку §5.4: LAN, ygg, onion, почта.
+    pub rungs: [Rung; 4],
 }
 
 impl Reachability {
@@ -338,6 +488,19 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Lan),
                     ready: peer.ready.contains(Transport::Lan),
                     addressable: peer.seen_on_lan,
+                },
+                // Ygg выше onion, потому что он **прямой и быстрый**:
+                // десятки миллисекунд против секунд у трёх реле Tor,
+                // и квитанция §9.4 возвращается сразу. Довод против —
+                // приватность: адрес меша выводится из открытого ключа
+                // и виден узлам, через которые идёт трафик. Довод учтён
+                // тем, что ступень выключена по умолчанию: кто её включил,
+                // тот выбрал скорость сознательно.
+                Rung {
+                    transport: Transport::Ygg,
+                    enabled: peer.enabled.contains(Transport::Ygg),
+                    ready: peer.ready.contains(Transport::Ygg),
+                    addressable: peer.has_ygg,
                 },
                 Rung {
                     transport: Transport::Onion,
@@ -388,12 +551,7 @@ impl Reachability {
             if !out.is_empty() {
                 out.push(' ');
             }
-            let name = match rung.transport {
-                Transport::Lan => "lan",
-                Transport::Onion => "onion",
-                Transport::Mail => "mail",
-            };
-            out.push_str(name);
+            out.push_str(rung.transport.label());
             out.push('=');
             out.push_str(rung.state().label());
         }
@@ -408,6 +566,17 @@ impl Reachability {
     #[must_use]
     pub fn rising(&self) -> Option<Transport> {
         self.rungs.into_iter().find(|rung| rung.rising()).map(|rung| rung.transport)
+    }
+
+    /// Есть ли смысл ждать: хоть одна ступень может открыться когда-нибудь.
+    ///
+    /// Отвечает на вопрос очереди ожидания — обещать ли человеку «отправим,
+    /// когда появится» (§14) или честнее сразу сказать «не доставлено».
+    /// Разбор по ступеням — в [`Rung::may_open`], и он же объясняет, почему
+    /// вопрос задаётся здесь, а не в ядре.
+    #[must_use]
+    pub fn may_open(&self) -> bool {
+        self.rungs.into_iter().any(Rung::may_open)
     }
 }
 
@@ -503,6 +672,12 @@ impl Attempt {
     pub fn timeout_ms(&self) -> Option<u64> {
         match self.tried.last() {
             Some(Transport::Onion) => Some(ONION_REPLY_TIMEOUT_MS),
+            // У меша свой срок, а не общий с локальной сетью. Здесь стояло
+            // «Ygg меряется по локальной сети», и это была ошибка: набор
+            // в меше длится восемь секунд, а срок стоял пятисекундный —
+            // то есть ступень бросали раньше, чем она успевала отказать.
+            // Разбор — у `YGG_RECEIPT_TIMEOUT_MS`.
+            Some(Transport::Ygg) => Some(YGG_RECEIPT_TIMEOUT_MS),
             Some(Transport::Lan) => Some(LAN_RECEIPT_TIMEOUT_MS),
             // Почта асинхронна по устройству: ждать её «ответа» бессмысленно.
             Some(Transport::Mail) | None => None,
@@ -512,15 +687,26 @@ impl Attempt {
 
 /// Привязка сессии к семейству транспортов (§5.4, исключение).
 ///
-/// LAN и Tor не смешиваются в одной сессии **никогда**. Тип делает это
+/// Семейства не смешиваются в одной сессии **никогда**. Тип делает это
 /// проверяемым: сессия, начатая в LAN, отказывается продолжаться через onion,
 /// и вызывающий обязан установить новую.
+///
+/// Значения уезжают на диск (столбец `binding` у сессий), поэтому
+/// закреплены числами и меняться не могут.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SessionBinding {
     /// Сессия живёт в локальной сети.
-    Lan,
+    Lan = 0,
     /// Сессия живёт поверх Tor — onion или почта.
-    Tor,
+    Tor = 1,
+    /// Сессия живёт в меше Yggdrasil (0.2).
+    ///
+    /// Третье семейство, а не примыкание к одному из двух, и это
+    /// не педантизм. К LAN его не отнести: меш живёт поверх обычного
+    /// интернета и переживает уход из локальной сети. К Tor тем более:
+    /// общего у них нет ничего, кроме того что оба не LAN.
+    Ygg = 2,
 }
 
 impl SessionBinding {
@@ -529,6 +715,7 @@ impl SessionBinding {
     pub const fn of(transport: Transport) -> SessionBinding {
         match transport {
             Transport::Lan => SessionBinding::Lan,
+            Transport::Ygg => SessionBinding::Ygg,
             // Почта тоже идёт поверх Tor (§5.3), поэтому она в том же
             // семействе, что и onion, и смешивать её с LAN так же нельзя.
             Transport::Onion | Transport::Mail => SessionBinding::Tor,
@@ -539,6 +726,28 @@ impl SessionBinding {
     #[must_use]
     pub fn allows(self, transport: Transport) -> bool {
         self == SessionBinding::of(transport)
+    }
+
+    /// Число для записи на диск.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Привязка из числа с диска.
+    ///
+    /// Незнакомое число — семейство из более новой сборки. Сессию по нему
+    /// восстанавливать нельзя: продолжив её транспортом, которого мы
+    /// не знаем, мы отправили бы кадр не туда. `None` значит «эту запись
+    /// пропустить», и рукопожатие заведёт сессию заново.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<SessionBinding> {
+        match code {
+            0 => Some(SessionBinding::Lan),
+            1 => Some(SessionBinding::Tor),
+            2 => Some(SessionBinding::Ygg),
+            _ => None,
+        }
     }
 }
 
@@ -553,6 +762,7 @@ mod tests {
             seen_on_lan: true,
             enabled: everything(),
             ready: everything(),
+            has_ygg: true,
             has_onion: true,
             has_chatmail: true,
         }
@@ -561,7 +771,7 @@ mod tests {
     /// Набор со всеми транспортами.
     fn everything() -> TransportSet {
         let mut set = TransportSet::none();
-        for transport in [Transport::Lan, Transport::Onion, Transport::Mail] {
+        for transport in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
             set.set(transport, true);
         }
         set
@@ -571,6 +781,19 @@ mod tests {
     fn without(transport: Transport) -> PeerAvailability {
         let mut enabled = everything();
         enabled.set(transport, false);
+        PeerAvailability { enabled, ..full() }
+    }
+
+    /// Достижимый контакт без нескольких ступеней сразу.
+    ///
+    /// Понадобилась с приходом меша: проверки «что идёт после LAN» раньше
+    /// выключали одну ступень и получали onion. Теперь между ними стоит
+    /// ygg, и выключать надо обе — иначе проверка молча меняет смысл.
+    fn without_all(list: &[Transport]) -> PeerAvailability {
+        let mut enabled = everything();
+        for transport in list {
+            enabled.set(*transport, false);
+        }
         PeerAvailability { enabled, ..full() }
     }
 
@@ -585,7 +808,14 @@ mod tests {
         // §5.1: по умолчанию LAN выключен, даже если контакт виден.
         let peer = without(Transport::Lan);
         let mut a = Attempt::new();
-        assert_eq!(a.next(peer), Some(Decision::Use(Transport::Onion)));
+        assert_eq!(a.next(peer), Some(Decision::Use(Transport::Ygg)), "следующая ступень — меш");
+
+        // А без меша — onion, как было до 0.2.
+        let mut a = Attempt::new();
+        assert_eq!(
+            a.next(without_all(&[Transport::Lan, Transport::Ygg])),
+            Some(Decision::Use(Transport::Onion))
+        );
     }
 
     #[test]
@@ -599,7 +829,7 @@ mod tests {
         }
 
         // Ровно по одной попытке на транспорт (§5.4).
-        let expected = vec![Transport::Lan, Transport::Onion, Transport::Mail];
+        let expected = vec![Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail];
         assert_eq!(order, expected);
 
         // Цикл выше остановился на `Undeliverable`, и этот же вызов закрыл
@@ -633,7 +863,8 @@ mod tests {
         // её**: §5.4 транспорт после отказа не повторяет.
         let mut rising = everything();
         rising.set(Transport::Onion, false);
-        let peer = PeerAvailability { ready: rising, ..without(Transport::Lan) };
+        let peer =
+            PeerAvailability { ready: rising, ..without_all(&[Transport::Lan, Transport::Ygg]) };
 
         let mut a = Attempt::new();
         assert_eq!(
@@ -644,7 +875,10 @@ mod tests {
 
         // А когда поднялся — он снова ступень, и притом первая из оставшихся.
         let mut a = Attempt::new();
-        assert_eq!(a.next(without(Transport::Lan)), Some(Decision::Use(Transport::Onion)));
+        assert_eq!(
+            a.next(without_all(&[Transport::Lan, Transport::Ygg])),
+            Some(Decision::Use(Transport::Onion))
+        );
     }
 
     #[test]
@@ -653,14 +887,11 @@ mod tests {
         // не «пробуется и отказывает», а выпадает из лестницы целиком:
         // иначе каждое сообщение платило бы за него сроком ожидания,
         // а человек видел бы «не доставлено» вместо «выключено».
+        let peer = without_all(&[Transport::Onion, Transport::Ygg]);
         let mut a = Attempt::new();
+        assert_eq!(a.next(peer), Some(Decision::Use(Transport::Lan)), "первая ступень на месте");
         assert_eq!(
-            a.next(without(Transport::Onion)),
-            Some(Decision::Use(Transport::Lan)),
-            "первая ступень на месте"
-        );
-        assert_eq!(
-            a.next(without(Transport::Onion)),
+            a.next(peer),
             Some(Decision::Use(Transport::Mail)),
             "выключенный onion пропускается целиком, а не пробуется"
         );
@@ -687,12 +918,82 @@ mod tests {
         // Незнакомые биты отбрасываются: запись могла лечь более новой
         // версией, и включать по ней транспорт, которого в этой сборке нет,
         // нечем.
-        assert_eq!(TransportSet::from_bits(0b1111_1111), TransportSet::from_bits(0b0000_0111));
+        assert_eq!(TransportSet::from_bits(0b1111_1111), TransportSet::from_bits(0b0000_1111));
 
         // Выключение действительно выключает, а не «почти».
         set.set(Transport::Onion, false);
         assert!(!set.contains(Transport::Onion));
         assert!(set.contains(Transport::Mail), "соседа выключение не задело");
+    }
+
+    #[test]
+    fn the_mesh_stands_between_the_lan_and_onion() {
+        // Порядок ступеней — и есть §5.4, и проверять его надо не глазами.
+        // Меш выше onion, потому что он прямой и быстрый; ниже локальной
+        // сети, потому что за неё не платят чужим трафиком.
+        let mut a = Attempt::new();
+        let mut order = Vec::new();
+        while let Some(Decision::Use(t)) = a.next(full()) {
+            order.push(t);
+        }
+        let ygg = order.iter().position(|t| *t == Transport::Ygg).expect("меш — ступень");
+        let lan = order.iter().position(|t| *t == Transport::Lan).expect("и локальная сеть тоже");
+        let onion = order.iter().position(|t| *t == Transport::Onion).expect("и onion");
+        assert!(lan < ygg, "локальная сеть остаётся первой");
+        assert!(ygg < onion, "меш выбирается раньше onion");
+    }
+
+    #[test]
+    fn a_mesh_without_a_key_is_not_a_step() {
+        // Ключ в карточке — это и есть адресуемость меша. Без него ступень
+        // не «пробуется и отказывает», а выпадает, как и всякая другая:
+        // иначе каждое сообщение платило бы за неё сроком.
+        let peer = PeerAvailability { has_ygg: false, ..full() };
+        let view = Reachability::of(peer);
+        assert_eq!(view.rung(Transport::Ygg).state(), RungState::NoAddress);
+        assert!(!view.rung(Transport::Ygg).usable());
+
+        let mut a = Attempt::new();
+        a.next(peer);
+        assert_eq!(
+            a.next(peer),
+            Some(Decision::Use(Transport::Onion)),
+            "после локальной сети идёт onion, а не пустая ступень"
+        );
+    }
+
+    #[test]
+    fn the_mesh_is_a_direct_channel() {
+        // Не мелочь: прямизна решает, уходит ли квитанция (§9.4) и можно ли
+        // послать файл больше двадцати мегабайт (§10.3). Меш синхронен так же,
+        // как onion, — соединение живёт весь разговор.
+        assert!(Transport::Ygg.is_direct());
+        assert!(SessionBinding::of(Transport::Ygg).allows(Transport::Ygg));
+    }
+
+    #[test]
+    fn the_mesh_is_a_family_of_its_own() {
+        // Ни LAN, ни Tor: меш живёт поверх обычного интернета и переживает
+        // уход из локальной сети, а с Tor у него общего нет ничего.
+        // Слей мы его с соседом — сессия продолжилась бы чужим семейством,
+        // и §5.4 потерял бы своё единственное исключение.
+        assert_ne!(SessionBinding::of(Transport::Ygg), SessionBinding::Lan);
+        assert_ne!(SessionBinding::of(Transport::Ygg), SessionBinding::Tor);
+        assert!(!SessionBinding::of(Transport::Ygg).allows(Transport::Onion));
+        assert!(!SessionBinding::of(Transport::Lan).allows(Transport::Ygg));
+    }
+
+    #[test]
+    fn a_binding_survives_a_round_trip_through_a_number() {
+        // Числа уезжают в столбец `binding` и возвращаются оттуда.
+        for binding in [SessionBinding::Lan, SessionBinding::Tor, SessionBinding::Ygg] {
+            assert_eq!(SessionBinding::from_code(binding.code()), Some(binding));
+        }
+        // Незнакомое число — запись более новой сборки. Поднимать по нему
+        // сессию нечем: продолжив её транспортом, которого мы не знаем,
+        // мы отправили бы кадр не туда.
+        assert_eq!(SessionBinding::from_code(3), None);
+        assert_eq!(SessionBinding::from_code(u8::MAX), None);
     }
 
     #[test]
@@ -707,9 +1008,25 @@ mod tests {
         // сколько наш. Срок ожидания короче чужого набора означал бы, что
         // первое же сообщение объявляется недоставленным ровно тогда, когда
         // оно доставлено.
+        // Меш выключается вместе с LAN: он стоит между ними, и с ним
+        // попытка ушла бы на него — а срок у него свой, короткий.
+        let mut a = Attempt::new();
+        a.next(without_all(&[Transport::Lan, Transport::Ygg]));
+        assert_eq!(a.timeout_ms(), Some(ONION_REPLY_TIMEOUT_MS));
+
+        // А у меша срок свой. Здесь стояло «меш ждёт как локальная сеть»,
+        // и это утверждение **закрепляло поломку**: набор в меше длится
+        // восемь секунд, а срок стоял пятисекундный — то есть ступень
+        // бросалась раньше, чем успевала отказать. Довод «маршрут строится
+        // сразу, реле по дороге нет» верен про сам маршрут и не имеет
+        // отношения к набору, а мерить надо набор.
+        //
+        // Утверждение писалось под то, что было, а не под то, что должно
+        // быть, — и потому не поймало ничего. Общий инвариант проверяет
+        // `every_direct_rung_waits_longer_than_it_dials`.
         let mut a = Attempt::new();
         a.next(without(Transport::Lan));
-        assert_eq!(a.timeout_ms(), Some(ONION_REPLY_TIMEOUT_MS));
+        assert_eq!(a.timeout_ms(), Some(YGG_RECEIPT_TIMEOUT_MS), "у меша свой срок");
         assert!(
             ONION_REPLY_TIMEOUT_MS >= 2 * ONION_CONNECT_TIMEOUT_MS,
             "в срок ответа обязан помещаться целый чужой набор, и наш тоже"
@@ -727,6 +1044,124 @@ mod tests {
         let mut a = Attempt::new();
         a.next(peer);
         assert_eq!(a.timeout_ms(), None, "почта асинхронна, ждать ответа бессмысленно");
+    }
+
+    #[test]
+    fn every_direct_rung_waits_longer_than_it_dials() {
+        // **Главный инвариант сроков, и он стоил поставки.**
+        //
+        // Срок ожидания ответа обязан пережить не только наш набор, но и
+        // чужой: соединения односторонние (5ц), и ответ приезжает по тому
+        // соединению, которое собеседник должен сперва набрать сам. Отсюда
+        // «вдвое», а не «чуть больше».
+        //
+        // Нарушь это — и ступень бросается **раньше**, чем транспорт успевает
+        // сказать «не соединился». Обычному сообщению это стоит лишней
+        // ступени, а копии в группу — самого сообщения: у неё нет квитанции
+        // (§11.3), её попытку закрывает молчание транспорта, и молчание
+        // короче набора означает «отдано» ровно тогда, когда ещё идёт набор.
+        //
+        // Ровно это и было у меша: набор восемь секунд, срок пять.
+        for (transport, dial, wait) in [
+            (Transport::Lan, LAN_CONNECT_TIMEOUT_MS, LAN_RECEIPT_TIMEOUT_MS),
+            (Transport::Ygg, YGG_CONNECT_TIMEOUT_MS, YGG_RECEIPT_TIMEOUT_MS),
+            (Transport::Onion, ONION_CONNECT_TIMEOUT_MS, ONION_REPLY_TIMEOUT_MS),
+        ] {
+            assert!(
+                wait >= 2 * dial,
+                "{}: ждём {wait} мс, а набираем {dial} мс — ступень бросается до отказа",
+                transport.label()
+            );
+            let mut attempt = Attempt::new();
+            let peer = PeerAvailability {
+                seen_on_lan: true,
+                enabled: everything(),
+                ready: everything(),
+                has_ygg: true,
+                has_onion: true,
+                has_chatmail: true,
+            };
+            // Дойти до нужной ступени, спуская предыдущие.
+            loop {
+                match attempt.next(peer) {
+                    Some(Decision::Use(chosen)) if chosen == transport => break,
+                    Some(Decision::Use(_)) => continue,
+                    other => panic!("до ступени {transport:?} не дошли: {other:?}"),
+                }
+            }
+            assert_eq!(
+                attempt.timeout_ms(),
+                Some(wait),
+                "срок ступени обязан быть тем, что объявлен константой"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mesh_only_contact_is_worth_waiting_for() {
+        // Названная поломка: ядро перечисляло ступени руками — «LAN выключен,
+        // onion нет, почты нет, значит ждать нечего» — и **забыло меш**.
+        // Собеседник, доступный только через него, попадал под это условие
+        // целиком: сообщение объявлялось недоставимым и выбрасывалось, ни разу
+        // не попав в очередь ожидания.
+        //
+        // На стенде это не воспроизводилось никогда: там четыре ступени
+        // и почта у всех. На живых устройствах с одним мешем — всегда.
+        let mesh_only = PeerAvailability {
+            has_ygg: true,
+            enabled: TransportSet::none().with(Transport::Ygg),
+            ..Default::default()
+        };
+        assert!(Reachability::of(mesh_only).may_open(), "адрес в меше известен — ждать есть чего");
+    }
+
+    #[test]
+    fn a_known_address_is_worth_waiting_for_even_with_the_rung_switched_off() {
+        // Выключатель человека, и щёлкнуть его он может в любую минуту.
+        // Обещать «отправим, когда появится» тут честно.
+        for peer in [
+            PeerAvailability { has_ygg: true, ..Default::default() },
+            PeerAvailability { has_onion: true, ..Default::default() },
+            PeerAvailability { has_chatmail: true, ..Default::default() },
+        ] {
+            assert!(
+                Reachability::of(peer).may_open(),
+                "адрес известен, ступень выключена — это чинится переключателем"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enabled_lan_is_worth_waiting_for_without_any_address() {
+        // Исключение в другую сторону: адресуемость в LAN даёт не карточка,
+        // а маяк §5.1, и он может прозвучать в любую минуту.
+        let peer = PeerAvailability {
+            enabled: TransportSet::none().with(Transport::Lan),
+            ..Default::default()
+        };
+        assert!(Reachability::of(peer).may_open(), "маяк может прозвучать");
+    }
+
+    #[test]
+    fn a_contact_without_any_address_and_without_lan_is_not_worth_waiting_for() {
+        // Обратная сторона правила, и без неё оно не значило бы ничего:
+        // обещание «отправим позже» там, где ехать некуда и не станет,
+        // — выдумка, которую §14 запрещает прямо.
+        let nowhere = PeerAvailability {
+            enabled: everything().without(Transport::Lan),
+            ready: everything(),
+            ..Default::default()
+        };
+        assert!(
+            !Reachability::of(nowhere).may_open(),
+            "ни одного адреса и LAN выключен — это «не доставлено», а не «ждём»"
+        );
+
+        // И ровно одна разница между «ждём» и «не доставлено» в этом наборе —
+        // выключатель локальной сети. Пара утверждений стоит рядом нарочно:
+        // порознь каждое верно и без правила, вместе — только с ним.
+        let lan_on = PeerAvailability { enabled: everything(), ..nowhere };
+        assert!(Reachability::of(lan_on).may_open(), "включённый LAN обещает маяк");
     }
 
     #[test]
@@ -783,6 +1218,11 @@ mod tests {
                 seen_on_lan: bits & 8 != 0,
                 enabled,
                 ready,
+                // Меш из этого перебора выведен намеренно: он перебирает
+                // пары «включено — готово» у onion и почты, и третья
+                // ступень посередине только удвоила бы прогон, ничего
+                // не проверив. Её разбирают проверки рядом.
+                has_ygg: false,
                 has_onion: bits & 16 != 0,
                 has_chatmail: true,
             };
@@ -811,6 +1251,7 @@ mod tests {
             seen_on_lan: false,
             enabled,
             ready: TransportSet::none(),
+            has_ygg: false,
             has_onion: true,
             has_chatmail: false,
         };
@@ -853,15 +1294,17 @@ mod tests {
             seen_on_lan: false,
             enabled,
             ready: everything(),
+            has_ygg: false,
             has_onion: false,
             has_chatmail: true,
         };
         let rungs = Reachability::of(peer);
 
         assert_eq!(rungs.rung(Transport::Lan).state(), RungState::Disabled);
+        assert_eq!(rungs.rung(Transport::Ygg).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Onion).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Mail).state(), RungState::Usable);
-        assert_eq!(rungs.refusal(), "lan=выключен onion=адреса нет mail=годен");
+        assert_eq!(rungs.refusal(), "lan=выключен ygg=адреса нет onion=адреса нет mail=годен");
     }
 
     #[test]
@@ -872,6 +1315,7 @@ mod tests {
         // строки было нечем.
         let peer = PeerAvailability {
             seen_on_lan: false,
+            has_ygg: false,
             has_onion: false,
             has_chatmail: false,
             ..full()
@@ -881,7 +1325,10 @@ mod tests {
         assert_eq!(rungs.rung(Transport::Lan).state(), RungState::NoAddress);
         assert_eq!(rungs.route(), None, "отправлять некуда");
         assert_eq!(rungs.rising(), None, "и ждать нечего: подниматься нечему");
-        assert_eq!(rungs.refusal(), "lan=адреса нет onion=адреса нет mail=адреса нет");
+        assert_eq!(
+            rungs.refusal(),
+            "lan=адреса нет ygg=адреса нет onion=адреса нет mail=адреса нет"
+        );
     }
 
     #[test]
@@ -908,6 +1355,28 @@ mod tests {
             for other in &all[n + 1..] {
                 assert_ne!(one.label(), other.label(), "{one:?} и {other:?} неразличимы");
             }
+        }
+    }
+
+    #[test]
+    fn without_is_the_exact_opposite_of_with() {
+        // Пара обязана сходиться: набор, из которого убрали транспорт
+        // и вернули его обратно, — тот же самый. Иначе «сейчас не объявляем»
+        // однажды стало бы «человек выключил».
+        let base = TransportSet::none().with(Transport::Onion).with(Transport::Mail);
+        for transport in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+            assert!(!base.with(transport).without(transport).contains(transport), "{transport:?}");
+            assert_eq!(base.with(transport).without(transport), base.without(transport));
+        }
+    }
+
+    #[test]
+    fn without_leaves_the_others_alone() {
+        let all = TransportSet::from_bits(u8::MAX);
+        let cut = all.without(Transport::Lan);
+        assert!(!cut.contains(Transport::Lan));
+        for transport in [Transport::Ygg, Transport::Onion, Transport::Mail] {
+            assert!(cut.contains(transport), "{transport:?}");
         }
     }
 }

@@ -180,6 +180,7 @@ mod tests {
             chatmail: String::new(),
             display_name: "Алиса".into(),
             version: 1,
+            ygg: Vec::new(),
         }
     }
 

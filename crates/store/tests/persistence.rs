@@ -72,6 +72,10 @@ fn contact(n: u8) -> StoredContact {
         verified: n % 2 == 0,
         created_ms: 1000,
         local_name: None,
+        // Нечётные — с ключом меша, чётные без: так одна и та же
+        // вспомогалка проверяет и то, что тридцать два байта доезжают
+        // до диска и обратно, и то, что пустой ключ остаётся пустым.
+        ygg: if n % 2 == 0 { Vec::new() } else { vec![n; 32] },
     }
 }
 
@@ -148,6 +152,10 @@ fn contacts_and_verification_survive_reopening() {
     assert!(!found.iter().find(|c| c.ik[0] == 3).unwrap().verified);
     // §6: карточка хранится принятыми байтами, а не пересобирается.
     assert_eq!(found.iter().find(|c| c.ik[0] == 2).unwrap().card_bytes, vec![2u8; 64]);
+    // Ключ меша (0.2) — свой столбец, и пустой он тоже переживает открытие:
+    // «нет ключа» обязано остаться «нет ключа», а не стать чем-то ещё.
+    assert_eq!(found.iter().find(|c| c.ik[0] == 3).unwrap().ygg, vec![3u8; 32]);
+    assert!(found.iter().find(|c| c.ik[0] == 2).unwrap().ygg.is_empty());
 }
 
 #[test]
@@ -331,7 +339,7 @@ fn deleting_a_contact_takes_its_sessions_and_avatar() {
         .put_session(&ratatosk_store::StoredSession {
             session_id: 77,
             peer_ik: victim.ik,
-            lan: true,
+            binding: 0,
             snapshot: vec![1, 2, 3],
             established_ms: 1,
         })
@@ -501,7 +509,50 @@ fn an_outbox_entry_round_trips_and_is_sealed() {
     let wrong = SqliteStore::open(&db.0, key(2)).unwrap();
     assert!(wrong.outbox().is_err(), "чужой ключ не должен читать очередь");
 
-    store.delete_outbox(&entry.msg_id).unwrap();
+    store.delete_outbox(&entry.msg_id, &entry.recipient_ik).unwrap();
+    assert!(store.outbox().unwrap().is_empty());
+}
+
+#[test]
+fn one_message_keeps_a_row_per_recipient() {
+    // Сообщение в группу — это N доставок с **одним** номером (§11.3:
+    // копию каждому шлёт сам отправитель). Первичный ключ таблицы всегда
+    // был парой, а удаление ходило по одному номеру — и первая дошедшая
+    // копия уносила из очереди копии всех прочих участников. Наружу это
+    // выглядело как «в группах сообщения доходят не до всех, а недошедшие
+    // не доходят никогда».
+    let db = TempDb::new("outbox-per-recipient");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    // Строка сообщения здесь не нужна: внешний ключ на `messages` пропал
+    // ещё в миграции 0004 вместе с половиной первичного ключа, и 0021
+    // возвращает только вторую — у живых баз есть строки очереди без
+    // сообщения (уборка §12 сносит историю, а очередь её переживает),
+    // и ограничение уронило бы миграцию у них.
+    let msg_id = [7u8; 16];
+    let members: [[u8; 32]; 3] = [[0xa1; 32], [0xb2; 32], [0xc3; 32]];
+    for member in &members {
+        store
+            .put_outbox(&ratatosk_store::StoredOutbox {
+                msg_id,
+                recipient_ik: *member,
+                envelope: b"one message, three copies".to_vec(),
+                queued_ms: 4_000,
+            })
+            .unwrap();
+    }
+    assert_eq!(store.outbox().unwrap().len(), 3, "по строке на участника");
+
+    // Снятие **одной** доставки оставляет остальные.
+    store.delete_outbox(&msg_id, &members[0]).unwrap();
+    let left = store.outbox().unwrap();
+    assert_eq!(left.len(), 2, "ушла ровно одна: {left:?}");
+    assert!(left.iter().all(|e| e.recipient_ik != members[0]));
+
+    // А «сообщения больше нет» уносит всё — и это отдельное имя нарочно,
+    // чтобы «всех» нельзя было получить забывчивостью.
+    store.delete_outbox_all(&msg_id).unwrap();
     assert!(store.outbox().unwrap().is_empty());
 }
 
@@ -1969,6 +2020,8 @@ fn a_sender_chain_survives_reopening_with_its_number() {
                     member_ik: [1u8; 32],
                     chain: [42u8; 32],
                     counter: 0,
+                    chain_wall: 0,
+                    chain_logical: 0,
                     skipped: Vec::new(),
                 },
             )
@@ -1980,6 +2033,8 @@ fn a_sender_chain_survives_reopening_with_its_number() {
                     member_ik: [1u8; 32],
                     chain: [43u8; 32],
                     counter: 7,
+                    chain_wall: 0,
+                    chain_logical: 0,
                     skipped: Vec::new(),
                 },
             )
@@ -2005,9 +2060,18 @@ fn a_sender_chain_belongs_to_one_group_and_one_member() {
         member_ik: [1u8; 32],
         chain: [42u8; 32],
         counter: 3,
+        chain_wall: 1_700_000_000_000,
+        chain_logical: 4,
         skipped: Vec::new(),
     };
     store.put_sender_chain(&[7u8; 16], &mine).unwrap();
+
+    // Метка поворота обязана пережить круг: по ней получатель отличает
+    // свежее объявление цепочки от опоздавшего, и потеряйся она на диске —
+    // после перезапуска он снова принимал бы любое.
+    let found = store.sender_chain(&[7u8; 16], &[1u8; 32]).unwrap().unwrap();
+    assert_eq!(found.chain_wall, 1_700_000_000_000, "метка поворота обязана лечь и подняться");
+    assert_eq!(found.chain_logical, 4, "логическая часть метки — тоже");
 
     assert!(store.sender_chain(&[8u8; 16], &[1u8; 32]).unwrap().is_none(), "другая группа");
     assert!(store.sender_chain(&[7u8; 16], &[2u8; 32]).unwrap().is_none(), "другой участник");
@@ -2030,6 +2094,8 @@ fn a_chain_moved_to_another_row_does_not_open() {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 3,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )
@@ -2068,6 +2134,8 @@ fn a_forgotten_group_takes_its_membership_and_chains_with_it() {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 0,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )
@@ -2184,6 +2252,8 @@ fn a_skipped_cache_survives_reopening_and_is_not_in_the_file() {
                     member_ik: [1u8; 32],
                     chain: [42u8; 32],
                     counter: 9,
+                    chain_wall: 0,
+                    chain_logical: 0,
                     skipped: secret.to_vec(),
                 },
             )
@@ -2216,6 +2286,8 @@ fn an_empty_skipped_cache_comes_back_empty() {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 0,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )
@@ -2243,6 +2315,8 @@ fn a_new_chain_wipes_the_cache_that_belonged_to_the_old_one() {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 5,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: b"old".to_vec(),
             },
         )
@@ -2254,6 +2328,8 @@ fn a_new_chain_wipes_the_cache_that_belonged_to_the_old_one() {
                 member_ik: [1u8; 32],
                 chain: [43u8; 32],
                 counter: 0,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )
@@ -2279,6 +2355,8 @@ fn a_cache_moved_to_another_row_does_not_open() {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 3,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: b"cache".to_vec(),
             },
         )
@@ -2561,4 +2639,105 @@ fn a_deleted_chat_takes_the_group_with_it_in_memory() {
     let mut store = MemoryStore::new();
     store.migrate().unwrap();
     a_deleted_chat_takes_the_group_with_it_on("память", &mut store);
+}
+
+/// Один файл на двух сообщениях — так выглядит пересланное вложение.
+///
+/// Проверяется на **обоих** хранилищах: расхождение здесь означало бы, что
+/// тесты на памяти зелёные, а на устройстве вложение теряется.
+fn a_file_may_belong_to_two_messages_on<S: Store>(what: &str, store: &mut S) {
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_message(&message(2, 200)).unwrap();
+
+    // Исходное сообщение с двумя вложениями.
+    for (ordinal, id) in [10u8, 20].into_iter().enumerate() {
+        let mut record = file(id, 1, true);
+        record.ordinal = u32::try_from(ordinal).unwrap();
+        record.complete = true;
+        store.put_file(&record).unwrap();
+    }
+    // Пересылка: тот же `file_id`, второе сообщение. Перешифровывать байты
+    // нельзя — чанк запечатан с `file_id` в AAD (§10.1), — поэтому файл
+    // именно прикладывается.
+    store.attach_file(&[2u8; 16], &[10u8; 16], 0).unwrap();
+
+    let first: Vec<u8> = store.files_of(&[1u8; 16]).unwrap().iter().map(|f| f.file_id[0]).collect();
+    let second: Vec<u8> =
+        store.files_of(&[2u8; 16]).unwrap().iter().map(|f| f.file_id[0]).collect();
+    assert_eq!(first, [10, 20], "{what}: у исходного сообщения оба вложения");
+    assert_eq!(second, [10], "{what}: у пересланного — то, что переслали");
+
+    let owners = store.messages_of_file(&[10u8; 16]).unwrap();
+    assert_eq!(owners.len(), 2, "{what}: файл знает оба своих сообщения");
+
+    // Удаление исходного не должно уносить байты у пересланной копии:
+    // это и есть цена связки, ради которой она заведена.
+    let orphans = store.detach_files_of(&[1u8; 16]).unwrap();
+    assert_eq!(orphans, vec![[20u8; 16]], "{what}: осиротело только второе вложение");
+    let left: Vec<u8> = store.files_of(&[2u8; 16]).unwrap().iter().map(|f| f.file_id[0]).collect();
+    assert_eq!(left, [10], "{what}: пересланное вложение на месте");
+
+    // А теперь и пересланное сообщение уходит — файл остаётся без ссылок.
+    let orphans = store.detach_files_of(&[2u8; 16]).unwrap();
+    assert_eq!(orphans, vec![[10u8; 16]], "{what}: последняя ссылка ушла — файл осиротел");
+    // Строки осиротевших файлов уходят вместе со связкой — этот инвариант
+    // держит триггер `files_drop_orphans`, а в памяти его зеркало. Список
+    // возвращается всё равно: байты лежат не в хранилище, и убрать их
+    // может только вызывающий.
+    assert!(store.file(&[10u8; 16]).unwrap().is_none(), "{what}: файла без ссылок не бывает");
+    assert!(store.file(&[20u8; 16]).unwrap().is_none(), "{what}: и второго тоже");
+    assert!(
+        store.orphan_file_ids().unwrap().is_empty(),
+        "{what}: сироте неоткуда взяться — её уносит тот же шаг"
+    );
+}
+
+#[test]
+fn a_file_may_belong_to_two_messages() {
+    let db = TempDb::new("file-shared");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    a_file_may_belong_to_two_messages_on("база", &mut store);
+}
+
+#[test]
+fn a_file_may_belong_to_two_messages_in_memory() {
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    a_file_may_belong_to_two_messages_on("память", &mut store);
+}
+
+/// Повторная запись того же файла не отбирает у человека скачанное.
+fn putting_a_known_file_again_keeps_what_we_have_on<S: Store>(what: &str, store: &mut S) {
+    store.put_message(&message(1, 100)).unwrap();
+    store.put_message(&message(2, 200)).unwrap();
+
+    let mut mine = file(10, 1, true);
+    mine.complete = true;
+    store.put_file(&mine).unwrap();
+
+    // Пересланная копия приезжает предложением: собран он у отправителя
+    // или нет, в предложении не сказано, и `complete` там всегда ложь.
+    let mut theirs = file(10, 2, true);
+    theirs.complete = false;
+    store.put_file(&theirs).unwrap();
+
+    let read = store.file(&[10u8; 16]).unwrap().expect("файл на месте");
+    assert!(read.complete, "{what}: собранный файл не отбирают ради строки о нём");
+    assert_eq!(read.msg_id, [1u8; 16], "{what}: `file` называет самое раннее сообщение");
+}
+
+#[test]
+fn putting_a_known_file_again_keeps_what_we_have() {
+    let db = TempDb::new("file-keep");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    putting_a_known_file_again_keeps_what_we_have_on("база", &mut store);
+}
+
+#[test]
+fn putting_a_known_file_again_keeps_what_we_have_in_memory() {
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    putting_a_known_file_again_keeps_what_we_have_on("память", &mut store);
 }

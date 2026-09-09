@@ -180,6 +180,7 @@ fn stranger(seed: u8) -> ContactCard {
         chatmail: String::new(),
         display_name: format!("гость {seed}"),
         version: 1,
+        ygg: Vec::new(),
     }
 }
 
@@ -328,6 +329,19 @@ fn a_second_invitation_rotates_the_chain_again() {
 
     assert_ne!(after_second.chain, after_first.chain, "каждое вступление — новая цепочка");
     assert_eq!(me.groups()[&chat].group.len(), 3);
+
+    // Метка поворота обязана расти, и это не украшение. Оба объявления
+    // едут одновременно и с одинаковым (нулевым) номером; §9.2 разрешает
+    // их переставить, и отличить свежее от опоздавшего получателю больше
+    // нечем. Совпади метки — он взял бы пришедшее последним, то есть
+    // в половине случаев мёртвую цепочку.
+    assert!(
+        (after_second.chain_wall, after_second.chain_logical)
+            > (after_first.chain_wall, after_first.chain_logical),
+        "второй поворот обязан быть старше первого: {:?} против {:?}",
+        (after_second.chain_wall, after_second.chain_logical),
+        (after_first.chain_wall, after_first.chain_logical),
+    );
 }
 
 #[test]
@@ -1068,4 +1082,184 @@ fn a_removed_avatar_stays_removed_after_a_restart() {
 
     assert_eq!(me.group_avatar_of(&chat).expect("чтение"), None);
     assert_eq!(me.groups().get(&chat).expect("группа").avatar_hlc, tag, "метка снятия пережила");
+}
+
+/// Собеседник, до которого **есть чем** достучаться.
+///
+/// Отличается от [`stranger`] одним — непустым onion-адресом, — и разница
+/// здесь вся: с пустой карточкой §5.4 честно отвечает «ехать некуда»,
+/// доставка не откладывается и в очередь не попадает. А проверять надо
+/// именно очередь.
+fn reachable_stranger(seed: u8) -> ContactCard {
+    ContactCard {
+        onion: ratatosk_crypto::OnionKey::from_seed([seed; 32]).address(),
+        ..stranger(seed)
+    }
+}
+
+/// Начало отпечатка — чтобы жалоба теста называла, о ком речь.
+fn who(peer_ik: &[u8; 32]) -> String {
+    peer_ik[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Номер сообщения, только что сказанного в этот чат.
+///
+/// Нужен затем, что в очереди лежат **не только** копии сообщения:
+/// приглашение кладёт туда же вводный блок, состав и карточки — каждому
+/// участнику своим кадром и со своим номером. Первая редакция обоих тестов
+/// ниже брала из очереди «первую строку этого участника» и получала кадр
+/// приглашения, а потом искала его номер у остальных — где его нет и быть
+/// не может. Тест падал на исправном коде, и падал справедливо: он
+/// проверял не то, что называл.
+fn said(alice: &Node, chat: [u8; 16], text: &str) -> [u8; 16] {
+    // По тексту, а не по «первой записи»: порядок истории задаёт §9.1,
+    // и опираться на него там, где нужен конкретный номер, — лишний повод
+    // однажды взять чужой.
+    alice
+        .store()
+        .messages(&chat, 50, None)
+        .expect("история")
+        .into_iter()
+        .find(|stored| stored.body == text.as_bytes())
+        .expect("сказанное обязано лечь в историю")
+        .msg_id
+}
+
+/// Заводит группу с тремя достижимыми участниками.
+fn trio(alice: &mut Node) -> ([u8; 16], Vec<[u8; 32]>) {
+    let chat = create(alice, 1_000, "трое");
+    let members = (2..=4)
+        .map(|seed| {
+            let card = reachable_stranger(seed);
+            let ik = befriend(alice, &card);
+            invite(alice, 1_100 + u64::from(seed), chat, ik);
+            ik
+        })
+        .collect();
+    (chat, members)
+}
+
+#[test]
+fn every_member_gets_its_own_row_in_the_queue() {
+    // Разбор поломки со стенда: «в группах сообщения доходят не всегда
+    // и не до всех, через некоторое время чинится, а недошедшие так
+    // и не доходят».
+    //
+    // Сообщение в группу — это N доставок с **одним** номером (§11.3:
+    // копию каждому шлёт сам отправитель). Очередь же обходилась с ними
+    // по одному номеру: «уже отложено» отвечало второму и всем следующим,
+    // и в ожидании оставался ровно один недостижимый участник из скольких
+    // угодно. Остальные теряли сообщение молча.
+    //
+    // Проверяется поэтому **число строк в очереди**, а не факт отправки:
+    // отправки здесь нет вовсе — onion у всех в карточке есть, но не поднят,
+    // и §5.4 честно откладывает.
+    let mut alice = node(1);
+    let (chat, members) = trio(&mut alice);
+
+    alice
+        .step(2_000, Input::Command(Command::SendText { chat, text: "всем".to_owned() }))
+        .expect("сообщение в группу");
+
+    // Номер **этого** сообщения, а не первой попавшейся строки в очереди:
+    // там лежат и кадры приглашения, у каждого свой номер.
+    let msg_id = said(&alice, chat, "всем");
+    let queued = alice.store().outbox().expect("очередь");
+    let copies: Vec<[u8; 32]> =
+        queued.iter().filter(|e| e.msg_id == msg_id).map(|e| e.recipient_ik).collect();
+    for member in &members {
+        assert!(
+            copies.contains(member),
+            "у участника {} нет копии в очереди: {:?}",
+            who(member),
+            copies.iter().map(who).collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(copies.len(), members.len(), "по копии на участника и ни одной лишней");
+}
+
+#[test]
+fn a_retired_copy_does_not_take_the_others_with_it() {
+    // Вторая половина той же поломки, и она объясняет «недошедшие так
+    // и не доходят». Уборка очереди ехала побочным действием статуса
+    // и по одному номеру: первая дошедшая копия уносила — из памяти
+    // и с диска — копии всех участников, до которых в тот момент было
+    // не достучаться.
+    //
+    // Проверяется на хранилище напрямую: снятие одной доставки обязано
+    // оставить остальные. Ровно этого не делал ни `delete_outbox` (ходил
+    // по номеру), ни `MemoryStore` (держал карту по номеру) — и потому
+    // поломку не мог увидеть ни один тест на памяти.
+    let mut alice = node(1);
+    let (chat, members) = trio(&mut alice);
+    alice
+        .step(2_000, Input::Command(Command::SendText { chat, text: "всем".to_owned() }))
+        .expect("сообщение в группу");
+
+    let msg_id = said(&alice, chat, "всем");
+    alice.store_mut().delete_outbox(&msg_id, &members[0]).expect("снятие одной доставки");
+
+    let left = alice.store().outbox().expect("очередь");
+    assert!(
+        !left.iter().any(|e| e.msg_id == msg_id && e.recipient_ik == members[0]),
+        "снятая доставка обязана уйти"
+    );
+    for member in &members[1..] {
+        assert!(
+            left.iter().any(|e| e.msg_id == msg_id && e.recipient_ik == *member),
+            "а доставка участнику {} обязана остаться",
+            who(member)
+        );
+    }
+}
+
+#[test]
+fn a_member_without_a_card_is_waited_for_not_dropped() {
+    // Третья половина, и она объясняет «при добавлении участника до него
+    // не сразу начинают доходить». Участник появляется в составе раньше,
+    // чем его карточка (§11.5, она едет своим кадром), и копия ему
+    // **выбрасывалась** молча: приезд карточки чинил следующие сообщения,
+    // а сказанное в это окно не доезжало никогда.
+    //
+    // **Дверь здесь другая, и это надо знать.** Настоящий случай — блок
+    // состава от третьего узла, обогнавший карточку, — требует группы
+    // между двумя живыми ядрами, а такой оснастки в наборе нет вовсе
+    // (см. `scenarios.rs`: сценарий §16 про исключение по этой же причине
+    // остался на учебном узле). Ветка кода при этом ровно та же: участник
+    // в составе есть, контакта нет.
+    let mut alice = node(1);
+    let (chat, members) = trio(&mut alice);
+    let orphan = members[0];
+
+    // Контакт убран, участник в составе остался: §11.4 — это разные
+    // действия, и удаление контакта из группы никого не выводит.
+    alice
+        .step(
+            1_500,
+            Input::Command(Command::DeleteContact { peer_ik: orphan, purge_history: false }),
+        )
+        .expect("контакт удалён");
+    assert!(
+        alice.groups()[&chat].group.contains(&orphan),
+        "удаление контакта не выводит из группы"
+    );
+
+    alice
+        .step(2_000, Input::Command(Command::SendText { chat, text: "всем".to_owned() }))
+        .expect("сообщение в группу");
+
+    let msg_id = said(&alice, chat, "всем");
+    let queued = alice.store().outbox().expect("очередь");
+    let copies: Vec<[u8; 32]> =
+        queued.iter().filter(|e| e.msg_id == msg_id).map(|e| e.recipient_ik).collect();
+    assert!(
+        copies.contains(&orphan),
+        "копия участнику без карточки обязана ждать её, а не пропасть: {:?}",
+        copies.iter().map(who).collect::<Vec<_>>()
+    );
+    // И остальным она при этом не помешала: прежде `?` в рассылке обрывал
+    // цикл на первом же спотыкнувшемся участнике.
+    for member in &members[1..] {
+        assert!(copies.contains(member), "участник {} обязан получить копию", who(member));
+    }
 }

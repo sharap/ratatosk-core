@@ -70,6 +70,21 @@ pub fn onion_seed(ours: &Identity) -> Key32 {
     kdf::derive(labels::COMPANION_ONION, ours.backup_seed())
 }
 
+/// Зерно узла меша, который терминал поднимает у себя (§13.4 + 0.2).
+///
+/// Тем же путём и ради того же, что [`onion_seed`]: **не спрашивать
+/// человека**. Меш и без того требует назвать пира; требовать сверх этого
+/// ещё и зерно значило бы просить настроить одно и то же дважды — на
+/// телефоне и на терминале, — а это ровно та сложность, из-за которой
+/// ступень и не включают.
+///
+/// Пиров зерно не заменяет: их терминалу присылает телефон по живому
+/// каналу. Здесь только то, что можно вывести, не спрашивая.
+#[must_use]
+pub fn mesh_seed(ours: &Identity) -> Key32 {
+    kdf::derive(labels::COMPANION_MESH, ours.backup_seed())
+}
+
 fn shared_secret(ours: &StaticSecret, theirs_ik: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let theirs = PublicKey::from(*theirs_ik);
     Zeroizing::new(ours.diffie_hellman(&theirs).to_bytes())

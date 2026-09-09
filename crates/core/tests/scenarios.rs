@@ -49,6 +49,7 @@ struct Node {
 fn to_proto(kind: TransportKind) -> Transport {
     match kind {
         TransportKind::Lan => Transport::Lan,
+        TransportKind::Ygg => Transport::Ygg,
         TransportKind::Onion => Transport::Onion,
         TransportKind::Mail => Transport::Mail,
     }
@@ -57,6 +58,7 @@ fn to_proto(kind: TransportKind) -> Transport {
 fn to_sim(transport: Transport) -> TransportKind {
     match transport {
         Transport::Lan => TransportKind::Lan,
+        Transport::Ygg => TransportKind::Ygg,
         Transport::Onion => TransportKind::Onion,
         Transport::Mail => TransportKind::Mail,
     }
@@ -142,6 +144,7 @@ impl Node {
                 | Effect::SetTransportEnabled { .. }
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
+                | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::RestartLan => {}
             }

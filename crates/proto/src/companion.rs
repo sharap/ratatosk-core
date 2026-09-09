@@ -145,7 +145,7 @@ pub const MAX_GONE_IDS: usize = 256;
 /// «не проверен»: у группы сверки нет и быть не может (§4.2 — про людей),
 /// а `verified` у неё поэтому всегда `false`. Вывести одно из другого
 /// нельзя: несверенный контакт выглядит точно так же.
-pub const WIRE_VERSION: u32 = 17;
+pub const WIRE_VERSION: u32 = 20;
 
 /// Наибольшее число сообщений в одной просьбе десктопа.
 ///
@@ -247,6 +247,10 @@ const KEY_IK: u64 = 1;
 const KEY_SECRET: u64 = 2;
 const KEY_ONION: u64 = 3;
 const KEY_NAME: u64 = 4;
+/// Открытый ключ меша (0.2). Пусто и отсутствует — одинаково «меша нет».
+const KEY_YGG: u64 = 5;
+/// Пиры меша телефона (0.2). Отсутствует — «поднимать узел не с кем».
+const KEY_INVITE_PEERS: u64 = 6;
 
 /// Ключи полей запроса, ответа и новости.
 const KEY_ID: u64 = 1;
@@ -289,6 +293,12 @@ const KEY_AUTHOR: u64 = 35;
 const KEY_MEMBERS: u64 = 36;
 const KEY_MEMBER: u64 = 37;
 const KEY_OWNER: u64 = 38;
+/// Пиры меша в объявлении адреса (0.2).
+const KEY_PEERS: u64 = 39;
+/// Присланная карточка контакта у сообщения (§4.1 + §13.4).
+const KEY_SHARED: u64 = 40;
+/// Кем делятся — личный чат этого человека; отсутствует у своей карточки.
+const KEY_WHO: u64 = 41;
 
 // Виды запроса, ответа и новости нумеруются **каждый в своей области**,
 // и имена это называют вслух. Сперва все три набора звались `KIND_*`,
@@ -332,6 +342,8 @@ const REQUEST_EVICT: u64 = 28;
 const REQUEST_RENAME_GROUP: u64 = 29;
 const REQUEST_SET_GROUP_AVATAR: u64 = 30;
 const REQUEST_LEAVE_GROUP: u64 = 31;
+const REQUEST_SHARE_CONTACT: u64 = 32;
+const REQUEST_ADD_SHARED: u64 = 33;
 
 /// Коды видов ответа — своя нумерация, не общая с запросами.
 const RESPONSE_CHATS: u64 = 1;
@@ -358,6 +370,7 @@ const NOTICE_FILE_PROGRESS: u64 = 7;
 const NOTICE_FILE_GONE: u64 = 8;
 const NOTICE_AVATAR_CHANGED: u64 = 9;
 const NOTICE_REVOKED: u64 = 10;
+const NOTICE_LINK_ADDRESS: u64 = 11;
 
 /// Почему сопряжение не принято.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -444,9 +457,45 @@ pub struct PairingInvite {
     /// найдёт телефон маяком. Он делает негодной работу **вне** общей сети,
     /// и сказать об этом человеку — дело UI (§14).
     pub onion: String,
+    /// Открытый ключ меша телефона (0.2). Пусто — «меша нет».
+    ///
+    /// Ключ, а не адрес: адрес `200::/7` из него выводится, и держать оба
+    /// значило бы завести второе место, где их можно рассогласовать
+    /// (то же решение, что у `PeerAvailability::has_ygg`).
+    ///
+    /// **Приглашение — не единственный путь этого ключа.** Меш включают
+    /// когда угодно, в том числе после сопряжения, а QR к тому времени уже
+    /// сканирован. Поэтому телефон объявляет свой адрес ещё и по живому
+    /// каналу — [`Notice::LinkAddress`], — и десктоп запоминает объявленное
+    /// поверх приглашения. Здесь ключ нужен ровно для первой минуты: пока
+    /// живого канала нет, объявить по нему нечего.
+    pub ygg: Vec<u8>,
+    /// Пиры меша телефона — с кем десктопу поднимать **свой** узел (0.2).
+    ///
+    /// Без них встроенный узел десктопа — тупик по построению: узлу нужны
+    /// пиры, пиры приезжают [`Notice::LinkAddress`] по живому каналу,
+    /// а живого канала нет, пока не поднялась хоть одна ступень. Первый
+    /// запуск десктопа вне общей сети упирался ровно в это.
+    ///
+    /// Поэтому те же пиры едут ещё и в QR. Список короткий
+    /// ([`MAX_INVITE_PEERS`]) — приглашение рисуется кодом на экране,
+    /// и каждая строка растёт в его площадь; трёх адресов довольно, чтобы
+    /// узел встал, а остальное всё равно приедет объявлением.
+    ///
+    /// Секрета в этих строках нет: это публичные точки входа в меш,
+    /// те же, что лежат в открытых списках Yggdrasil.
+    pub ygg_peers: Vec<String>,
     /// Как телефон зовут — чтобы десктоп показал, к кому он подключился.
     pub display_name: String,
 }
+
+/// Сколько пиров меша помещается в приглашение.
+///
+/// Меньше, чем [`MAX_YGG_PEERS`] у объявления, и это не про безопасность,
+/// а про площадь QR: приглашение читают камерой с экрана, и каждая лишняя
+/// строка адреса делает код гуще. Три — чтобы узел встал даже когда один
+/// пир не отвечает; остальное приедет по живому каналу.
+pub const MAX_INVITE_PEERS: usize = 3;
 
 impl PairingInvite {
     /// Собирает ссылку `ratatosk:v0:pair:<base32>`.
@@ -464,6 +513,17 @@ impl PairingInvite {
             (Value::Integer(KEY_IK.into()), Value::Bytes(self.ik.to_vec())),
             (Value::Integer(KEY_SECRET.into()), Value::Bytes(self.secret.as_bytes().to_vec())),
             (Value::Integer(KEY_ONION.into()), Value::Text(self.onion.clone())),
+            (Value::Integer(KEY_YGG.into()), Value::Bytes(self.ygg.clone())),
+            (
+                Value::Integer(KEY_INVITE_PEERS.into()),
+                Value::Array(
+                    self.ygg_peers
+                        .iter()
+                        .take(MAX_INVITE_PEERS)
+                        .map(|peer| Value::Text(peer.clone()))
+                        .collect(),
+                ),
+            ),
             (Value::Integer(KEY_NAME.into()), Value::Text(self.display_name.clone())),
         ])
     }
@@ -494,6 +554,15 @@ impl PairingInvite {
             ik,
             secret: PairingSecret::new(secret),
             onion: onion.to_owned(),
+            // Необязательное на чтении: приглашение сборки до четырнадцатой
+            // ключа меша не несёт, и разбираться оно обязано по-прежнему.
+            // Ключ не той длины — то же «меша нет»: сюда его вписала другая
+            // сторона, и ронять из-за поля, без которого всё работает,
+            // нельзя (то же правило, что у адреса в рукопожатии).
+            ygg: ygg_key(canonical::get(map, KEY_YGG)),
+            // Тот же разбор, что у объявления, и тот же довод: негодная
+            // строка выбрасывается поимённо, а приглашение остаётся годным.
+            ygg_peers: peers_from_value(canonical::get(map, KEY_INVITE_PEERS), MAX_INVITE_PEERS),
             display_name: display_name.to_owned(),
         })
     }
@@ -969,6 +1038,38 @@ pub enum Request {
         /// Из какой.
         chat: ChatId,
     },
+    /// Поделиться в чате карточкой человека (§4.1, дополнение).
+    ///
+    /// # Человек назван **личным чатом**, а не ключом
+    ///
+    /// §13.4 не пускает `IK` через границу устройства, и здесь это не
+    /// формальность: карточка — это и есть ключ, и позволь мы десктопу
+    /// называть людей ключами, граница перестала бы что-либо значить.
+    /// Личный чат — то же имя, которым состав группы называет участников
+    /// ([`Member::chat`]), и телефон разворачивает его сам.
+    ///
+    /// # `None` — своя карточка
+    ///
+    /// «Поделиться собой» — обычное дело, а личного чата с самим собой
+    /// не бывает. Отсутствие поля означает ровно это, тем же приёмом,
+    /// каким [`Request::Avatar`] отличает своё лицо от чужого.
+    ShareContact {
+        /// В какой чат — переписку или группу.
+        chat: ChatId,
+        /// Чью карточку; `None` — свою.
+        who: Option<ChatId>,
+    },
+    /// Добавить к себе того, чья карточка приехала этим сообщением.
+    ///
+    /// **Сообщением, а не карточкой.** Байты карточки лежат на телефоне
+    /// и через границу не ездят — ни туда, ни обратно: приехавшая с
+    /// десктопа «карточка» была бы ключом, назначенным десктопом, то есть
+    /// ровно тем, чего §13.4 не допускает. Десктоп называет **запись
+    /// в истории**, а телефон берёт байты у себя.
+    AddSharedContact {
+        /// Какое сообщение принесло карточку.
+        msg_id: MsgId,
+    },
 }
 
 /// Что десктоп говорит о себе в первом сообщении рукопожатия (§13.4).
@@ -994,9 +1095,18 @@ pub enum Request {
 /// приезжает тем же кадром, что и просьба о связи.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceAddress {
-    /// Onion-адрес десктопа. Пустая строка — «набрать меня можно только
+    /// Onion-адрес. Пустая строка — «набрать меня можно только
     /// в общей сети».
     pub onion: String,
+    /// Открытый ключ меша (0.2). Пусто — «меша нет».
+    ///
+    /// Ключ, а не адрес: адрес `200::/7` из него выводится, и держать оба
+    /// значило бы завести второе место, где их можно рассогласовать.
+    ///
+    /// Меш здесь стоит **между** общей сетью и onion — тем же порядком, что
+    /// в §5.4, и по тем же доводам: он прямой и быстрый, но адрес его виден
+    /// узлам, через которые идёт трафик.
+    pub ygg: Vec<u8>,
 }
 
 /// Наибольшая длина onion-адреса на этом проводе.
@@ -1006,10 +1116,81 @@ pub struct DeviceAddress {
 /// сторона, и «адрес на мегабайт» — это запрос памяти телефона.
 pub const MAX_ONION_LEN: usize = 56 + ".onion".len();
 
-/// Кодирует то, что десктоп говорит о себе в рукопожатии.
+/// Ключ меша из значения CBOR: пусто, не то и не тридцать два байта —
+/// одинаково «меша нет».
+///
+/// Отдельной функцией, а не строкой на месте, потому что мест три: приглашение,
+/// рукопожатие десктопа и объявление телефона. Три разбора одного поля
+/// однажды разошлись бы в том, что считать негодным ключом.
+fn ygg_key(value: Option<&Value>) -> Vec<u8> {
+    match value {
+        Some(Value::Bytes(bytes)) if bytes.len() == crate::ygg::KEY_LEN => bytes.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Наибольшее число пиров в объявлении.
+///
+/// Предел нужен не вкусу: длину списка называет другая сторона, и «тысяча
+/// пиров» — это запрос памяти терминала. Число щедрое: пиров у человека
+/// единицы, десяток — уже много.
+pub const MAX_YGG_PEERS: usize = 16;
+
+/// Наибольшая длина одной строки пира.
+pub const MAX_PEER_LEN: usize = 256;
+
+/// Разбирает список пиров из объявления.
+///
+/// Негодное — не ошибка, а пустой список: связь не должна разваливаться
+/// из-за поля, без которого всё остальное работает. То же правило, что
+/// у адреса.
+///
+/// Слишком длинные строки и лишние сверх предела отбрасываются поимённо,
+/// а не роняют список целиком: один негодный пир не повод остаться без
+/// остальных.
+///
+/// Предел передаётся, а не берётся из константы: у объявления он один
+/// ([`MAX_YGG_PEERS`]), у приглашения другой ([`MAX_INVITE_PEERS`]),
+/// а разбор строки обязан быть тем же самым — иначе два места, где
+/// «негодный пир» значит разное.
+fn peers_from_value(value: Option<&Value>, limit: usize) -> Vec<String> {
+    let Some(Value::Array(items)) = value else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Text(text) if !text.is_empty() && text.len() <= MAX_PEER_LEN => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .take(limit)
+        .collect()
+}
+
+/// Кодирует то, что сторона канала говорит о себе.
+///
+/// Одна карта на оба направления: десктоп кладёт её в нагрузку рукопожатия,
+/// телефон — в [`Notice::LinkAddress`]. Порознь они разошлись бы в разборе
+/// того же самого поля, а адрес — вещь, где расхождение стоит связи.
 #[must_use]
 pub fn device_address_value(address: &DeviceAddress) -> Value {
-    Value::Map(vec![(Value::Integer(KEY_ONION.into()), Value::Text(address.onion.clone()))])
+    Value::Map(vec![
+        (Value::Integer(KEY_ONION.into()), Value::Text(address.onion.clone())),
+        (Value::Integer(KEY_YGG.into()), Value::Bytes(address.ygg.clone())),
+    ])
+}
+
+/// Разбирает карту адреса — ту, что собрал [`device_address_value`].
+///
+/// Отсутствие любого поля — законно и означает «этого пути нет».
+#[must_use]
+pub fn device_address_from_value(value: &Value) -> DeviceAddress {
+    let Ok(map) = canonical::as_map(value) else { return DeviceAddress::default() };
+    let onion = match canonical::get(map, KEY_ONION) {
+        Some(Value::Text(onion)) if onion.len() <= MAX_ONION_LEN => onion.clone(),
+        _ => String::new(),
+    };
+    DeviceAddress { onion, ygg: ygg_key(canonical::get(map, KEY_YGG)) }
 }
 
 /// Разбирает нагрузку рукопожатия от десктопа.
@@ -1027,13 +1208,7 @@ pub fn device_address_from_payload(payload: &[u8]) -> DeviceAddress {
         return DeviceAddress::default();
     }
     let Ok(value) = canonical::decode(payload) else { return DeviceAddress::default() };
-    let Ok(map) = canonical::as_map(&value) else { return DeviceAddress::default() };
-    let Some(onion) = canonical::get(map, KEY_ONION) else { return DeviceAddress::default() };
-    let Ok(onion) = canonical::as_text(onion) else { return DeviceAddress::default() };
-    if onion.len() > MAX_ONION_LEN {
-        return DeviceAddress::default();
-    }
-    DeviceAddress { onion: onion.to_owned() }
+    device_address_from_value(&value)
 }
 
 /// Чат в списке на десктопе.
@@ -1179,6 +1354,36 @@ pub struct StagedFile {
 /// константа не заводится — здесь как раз тот случай, когда второе число
 /// было бы вторым правилом.
 pub const MAX_ATTACHMENTS: usize = crate::files::MAX_FILES_PER_MESSAGE;
+
+/// Карточка человека, которой поделились в чате, — глазами десктопа.
+///
+/// # Ключа здесь нет, и это то же правило, что у вложений
+///
+/// §13.4 не пускает `IK` через границу устройства. Показать карточку
+/// можно и без него: имени довольно, чтобы нарисовать, а «добавить»
+/// делается просьбой про **сообщение** ([`Request::AddSharedContact`]),
+/// а не про ключ.
+///
+/// # «Уже знаком» отвечает одно поле, а не два
+///
+/// Знакомого человека десктоп обязан не предлагать добавлять заново,
+/// а вместо этого уметь открыть с ним переписку — и то и другое отвечает
+/// [`SharedContact::chat`]. Заведи мы рядом ещё и признак `known`,
+/// у одного факта стало бы два источника, и разошлись бы они молча.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedContact {
+    /// Как человека зовут — из самой карточки (§4.1).
+    ///
+    /// Локальное имя сюда не подставляется даже у знакомого: карточка
+    /// рассказывает, как он назвал себя сам, и подменять это своей
+    /// заметкой значило бы показать не то, чем поделились.
+    pub name: String,
+    /// Личный чат с ним, если он уже в контактах. `None` — незнаком.
+    ///
+    /// Оно же отвечает на «добавлять ли»: `Some` — предлагать нечего,
+    /// `None` — можно позвать [`Request::AddSharedContact`].
+    pub chat: Option<ChatId>,
+}
 
 /// Вложение в том виде, в каком его видит десктоп (§10, §13.4).
 ///
@@ -1333,6 +1538,14 @@ pub struct Message {
     /// килобайта на сотню сообщений — это три мегабайта в одном кадре,
     /// то есть страница, которая не влезет.
     pub files: Vec<Attachment>,
+    /// Присланная кем-то карточка контакта (§4.1). `None` — обычное
+    /// сообщение.
+    ///
+    /// **Без этого поля такое сообщение приезжало пустым.** Тело у него
+    /// нарочно пустое — карточка лежит записью рядом, — и десктоп рисовал
+    /// бы пузырь без единого слова. Ровно тот же изъян, что был
+    /// у пересылки файлов, и найден он тем же способом: попробовали.
+    pub shared: Option<SharedContact>,
 }
 
 /// Что телефон отвечает на запрос.
@@ -1623,6 +1836,50 @@ pub enum Notice {
     /// пришлось бы объяснять человеку, а объяснять нечего — сказать ему
     /// надо одно, и это одно в самом факте новости.
     Revoked,
+    /// Телефон объявляет, чем его теперь набрать (0.2).
+    ///
+    /// # Зачем это понадобилось
+    ///
+    /// Адреса в этом канале ехали несимметрично. Десктоп объявляет свой
+    /// в **каждом** рукопожатии ([`DeviceAddress`]), а адрес телефона зашит
+    /// в QR один раз при сопряжении — и другого пути у него не было.
+    ///
+    /// Пока путей было два (общая сеть и onion), это сходило: Tor на телефоне
+    /// либо поднят к моменту показа QR, либо нет, и человек видел это на
+    /// экране. С мешем не сходится: его **включают когда угодно**, в том
+    /// числе через неделю после сопряжения, и требовать за это пересопряжения
+    /// значит требовать объяснимого только реализацией.
+    ///
+    /// Поэтому телефон говорит свой адрес по живому каналу — при подключении
+    /// и при каждой смене, — а десктоп кладёт объявленное поверх того, что
+    /// было в приглашении. Заодно это закрывает и старую щель: onion,
+    /// поднявшийся после сопряжения, тоже доезжает.
+    ///
+    /// # Почему это новость, а не ответ
+    ///
+    /// Спрашивать десктопу нечего: он не знает, менялось ли что-то, и
+    /// спрашивал бы вслепую на каждом подключении. Знает телефон — он
+    /// и говорит.
+    ///
+    /// # Пиры едут этой же новостью
+    ///
+    /// Терминалу нужен **свой** узел меша: чужого демона на машине человека
+    /// может не быть, а ставить его ради второго экрана — та самая сложность
+    /// настройки, из-за которой ступень и не включают.
+    ///
+    /// Узлу нужны два числа: зерно и хотя бы один пир. Зерно терминал
+    /// выводит из секрета сопряжения (`crypto::companion::mesh_seed`) —
+    /// спрашивать не о чем. А пиров называет человек, и назвал он их уже
+    /// **один раз**, на телефоне, где есть экран и настройки. Просить его
+    /// о том же второй раз значило бы настраивать меш дважды.
+    ///
+    /// Пустой список — законное значение и самое частое: меш выключен.
+    LinkAddress {
+        /// Чем набрать телефон.
+        address: DeviceAddress,
+        /// Через кого войти в меш. Пусто — «мешем не пользуюсь».
+        ygg_peers: Vec<String>,
+    },
 }
 
 /// Собирает нагрузку запроса вместе с его номером.
@@ -1827,6 +2084,23 @@ pub fn request_payload(id: u64, request: &Request) -> Value {
                 Value::Integer(REQUEST_LEAVE_GROUP.into()),
             ));
             fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+        }
+        Request::ShareContact { chat, who } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(REQUEST_SHARE_CONTACT.into()),
+            ));
+            fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+            // Ключа нет — «своя карточка». Пустые байты значили бы чат
+            // из шестнадцати нулей, а это законный идентификатор.
+            if let Some(who) = who {
+                fields.push((Value::Integer(KEY_WHO.into()), Value::Bytes(who.to_vec())));
+            }
+        }
+        Request::AddSharedContact { msg_id } => {
+            fields
+                .push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_ADD_SHARED.into())));
+            fields.push((Value::Integer(KEY_MSG_ID.into()), Value::Bytes(msg_id.to_vec())));
         }
     }
     Value::Map(fields)
@@ -2075,6 +2349,18 @@ pub fn request_from_payload(value: &Value) -> Result<(u64, Request), CodecError>
         }
         REQUEST_LEAVE_GROUP => Request::LeaveGroup {
             chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+        },
+        REQUEST_SHARE_CONTACT => Request::ShareContact {
+            chat: canonical::as_array::<16>(canonical::require(map, KEY_CHAT)?)?,
+            // Отсутствие — «своя»; ключ не той длины — порча, а не «своя»:
+            // десктоп кого-то назвал, и понять кого мы не смогли.
+            who: match canonical::get(map, KEY_WHO) {
+                Some(value) => Some(canonical::as_array::<16>(value)?),
+                None => None,
+            },
+        },
+        REQUEST_ADD_SHARED => Request::AddSharedContact {
+            msg_id: canonical::as_array::<16>(canonical::require(map, KEY_MSG_ID)?)?,
         },
         _ => return Err(CodecError::TypeMismatch),
     };
@@ -2445,6 +2731,17 @@ pub fn notice_payload(notice: &Notice) -> Value {
             fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(NOTICE_FILE_GONE.into())));
             fields.push((Value::Integer(KEY_FILE_ID.into()), Value::Bytes(file_id.to_vec())));
         }
+        Notice::LinkAddress { address, ygg_peers } => {
+            fields.push((
+                Value::Integer(KEY_KIND.into()),
+                Value::Integer(NOTICE_LINK_ADDRESS.into()),
+            ));
+            fields.push((Value::Integer(KEY_ITEMS.into()), device_address_value(address)));
+            fields.push((
+                Value::Integer(KEY_PEERS.into()),
+                Value::Array(ygg_peers.iter().map(|p| Value::Text(p.clone())).collect()),
+            ));
+        }
         Notice::Revoked => {
             fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(NOTICE_REVOKED.into())));
         }
@@ -2508,6 +2805,10 @@ pub fn notice_from_payload(value: &Value) -> Result<Notice, CodecError> {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
         }),
         NOTICE_REVOKED => Ok(Notice::Revoked),
+        NOTICE_LINK_ADDRESS => Ok(Notice::LinkAddress {
+            address: device_address_from_value(canonical::require(map, KEY_ITEMS)?),
+            ygg_peers: peers_from_value(canonical::get(map, KEY_PEERS), MAX_YGG_PEERS),
+        }),
         NOTICE_AVATAR_CHANGED => Ok(Notice::AvatarChanged {
             chat: match canonical::get(map, KEY_CHAT) {
                 Some(value) => Some(canonical::as_array::<16>(value)?),
@@ -2612,6 +2913,34 @@ pub fn chat_from_value(value: &Value) -> Result<ChatSummary, CodecError> {
 }
 
 /// Кодирует вложения.
+/// Собирает присланную карточку — то, что десктоп покажет вместо пустоты.
+fn shared_value(shared: &SharedContact) -> Value {
+    // Имя под тем же ключом, что у участника состава (`KEY_TITLE`):
+    // это одно и то же поле по смыслу, и второй ключ под него означал бы
+    // два имени у одной вещи.
+    let mut fields = vec![(Value::Integer(KEY_TITLE.into()), Value::Text(shared.name.clone()))];
+    // Ключа нет — «незнаком». Пустые байты значили бы чат из шестнадцати
+    // нулей, а это законный идентификатор.
+    if let Some(chat) = shared.chat {
+        fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
+    }
+    Value::Map(fields)
+}
+
+/// Разбирает присланную карточку.
+fn shared_from_value(value: &Value) -> Result<SharedContact, CodecError> {
+    let map = canonical::as_map(value)?;
+    // Длину имени здесь не меряем — как не меряет её и состав группы:
+    // границей служит класс кадра (§5.5), а своя проверка рядом с чужой
+    // однажды разошлась бы с ней.
+    let name = canonical::as_text(canonical::require(map, KEY_TITLE)?)?.to_owned();
+    let chat = match canonical::get(map, KEY_CHAT) {
+        Some(value) => Some(canonical::as_array::<16>(value)?),
+        None => None,
+    };
+    Ok(SharedContact { name, chat })
+}
+
 fn files_value(files: &[Attachment]) -> Value {
     Value::Array(
         files
@@ -2794,6 +3123,12 @@ pub fn message_value(message: &Message) -> Value {
     if !message.files.is_empty() {
         fields.push((Value::Integer(KEY_FILES.into()), files_value(&message.files)));
     }
+    // Карточка — тем же правилом, что вложения: нет её, и ключа нет вовсе.
+    // Обычных сообщений на порядки больше, и платить за них байтами
+    // в каждой строке страницы незачем.
+    if let Some(shared) = &message.shared {
+        fields.push((Value::Integer(KEY_SHARED.into()), shared_value(shared)));
+    }
     Value::Map(fields)
 }
 
@@ -2849,6 +3184,10 @@ pub fn message_from_value(value: &Value) -> Result<Message, CodecError> {
             Some(value) => files_from_value(value)?,
             None => Vec::new(),
         },
+        shared: match canonical::get(map, KEY_SHARED) {
+            Some(value) => Some(shared_from_value(value)?),
+            None => None,
+        },
     })
 }
 
@@ -2898,13 +3237,16 @@ mod tests {
     /// они ради истории и ради того, чтобы правка последней строки на месте
     /// бросалась в глаза. Проверяется последняя: она обязана назвать
     /// [`WIRE_VERSION`] и сойтись с тем, что кодировщики строят сейчас.
-    const WIRE_SHAPES: [(u32, u64); 6] = [
+    const WIRE_SHAPES: [(u32, u64); 9] = [
         (12, 0x1ef3_4b21_4945_d1f1),
         (13, 0x9bba_1505_7b0f_b8ed),
         (14, 0x6558_a89b_8e4a_6268),
         (15, 0xeb40_6934_8f4a_321b),
         (16, 0x24f9_5140_8600_1018),
         (17, 0x40cc_2f5a_fbe3_14fa),
+        (18, 0x5f24_d526_d541_70ce),
+        (19, 0x7de1_f453_44f8_5b34),
+        (20, 0xc637_afae_ca20_a717),
     ];
 
     /// FNV-1a — та же, что сторожит замороженные миграции.
@@ -2994,6 +3336,8 @@ mod tests {
             Request::RenameGroup { .. } => "RenameGroup",
             Request::SetGroupAvatar { .. } => "SetGroupAvatar",
             Request::LeaveGroup { .. } => "LeaveGroup",
+            Request::ShareContact { .. } => "ShareContact",
+            Request::AddSharedContact { .. } => "AddSharedContact",
         }
     }
 
@@ -3028,6 +3372,7 @@ mod tests {
             Notice::FileGone { .. } => "FileGone",
             Notice::AvatarChanged { .. } => "AvatarChanged",
             Notice::Revoked => "Revoked",
+            Notice::LinkAddress { .. } => "LinkAddress",
         }
     }
 
@@ -3075,6 +3420,18 @@ mod tests {
                     has_preview: false,
                 },
             ],
+            // Знакомый: у карточки есть личный чат, и «добавить» предлагать
+            // нечего. Незнакомый — второй образец ниже: ключа чата у него
+            // нет вовсе, и без обоих форма провода половины не увидела бы.
+            shared: Some(SharedContact { name: "сосед".into(), chat: Some([8u8; 16]) }),
+        }
+    }
+
+    /// Сообщение с карточкой человека, которого мы не знаем.
+    fn message_with_unknown_contact() -> Message {
+        Message {
+            shared: Some(SharedContact { name: "незнакомец".into(), chat: None }),
+            ..full_message()
         }
     }
 
@@ -3127,6 +3484,10 @@ mod tests {
             Request::SetGroupAvatar { chat, bytes: vec![0x89, b'P', b'N', b'G'] },
             Request::SetGroupAvatar { chat, bytes: Vec::new() },
             Request::LeaveGroup { chat },
+            Request::ShareContact { chat, who: Some([7u8; 16]) },
+            // Своя карточка — без поля: у неё личного чата не бывает.
+            Request::ShareContact { chat, who: None },
+            Request::AddSharedContact { msg_id },
         ]
     }
 
@@ -3143,6 +3504,7 @@ mod tests {
                 avatar_ms: 1_700_000_000_001,
             }]),
             Response::History(vec![full_message()]),
+            Response::History(vec![message_with_unknown_contact()]),
             Response::Done,
             Response::Refused("контакта больше нет".into()),
             Response::Hello { wire: WIRE_VERSION },
@@ -3200,6 +3562,13 @@ mod tests {
             Notice::AvatarChanged { chat: Some([2u8; 16]), avatar_ms: 1_700_000_000_000 },
             Notice::AvatarChanged { chat: None, avatar_ms: 0 },
             Notice::Revoked,
+            Notice::LinkAddress {
+                address: DeviceAddress {
+                    onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+                    ygg: vec![9u8; crate::ygg::KEY_LEN],
+                },
+                ygg_peers: vec!["tls://пир.example:1337".into()],
+            },
         ]
     }
 
@@ -3353,6 +3722,7 @@ mod tests {
             "h:{}",
             shape_of(&device_address_value(&DeviceAddress {
                 onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+                ygg: vec![4u8; crate::ygg::KEY_LEN],
             }))
         ));
         shapes.sort();
@@ -3385,6 +3755,8 @@ mod tests {
             ik: [7u8; 32],
             secret: PairingSecret::new([9u8; 32]),
             onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+            ygg: vec![5u8; crate::ygg::KEY_LEN],
+            ygg_peers: vec!["tls://пир.example:1337".into()],
             display_name: "телефон".into(),
         }
     }
@@ -3421,6 +3793,118 @@ mod tests {
         let bare = PairingInvite { onion: String::new(), ..invite() };
         let uri = bare.to_uri().unwrap();
         assert_eq!(PairingInvite::from_uri(&uri).unwrap(), bare);
+    }
+
+    #[test]
+    fn an_invite_without_a_mesh_key_is_still_an_invite() {
+        // Меш выключен по умолчанию — пира называет человек, — значит
+        // приглашение без ключа — самый частый случай, а не крайний.
+        let bare = PairingInvite { ygg: Vec::new(), ..invite() };
+        let uri = bare.to_uri().unwrap();
+        assert_eq!(PairingInvite::from_uri(&uri).unwrap(), bare);
+    }
+
+    #[test]
+    fn an_invite_without_peers_is_still_an_invite() {
+        // Сборка до пятнадцатой пиров в приглашении не несла, и такая ссылка
+        // обязана разбираться по-прежнему. Пустой список означает ровно то,
+        // что десктоп не поднимет свой узел до первого объявления, —
+        // и это законное состояние, а не порча.
+        let bare = PairingInvite { ygg_peers: Vec::new(), ..invite() };
+        let uri = bare.to_uri().unwrap();
+        assert_eq!(PairingInvite::from_uri(&uri).unwrap(), bare);
+    }
+
+    #[test]
+    fn an_invite_carries_at_most_three_peers() {
+        // Предел режется **на записи**, а не только на чтении: приглашение
+        // рисуется кодом на экране, и лишняя строка — это площадь QR,
+        // которую камера уже может не взять.
+        let many = PairingInvite {
+            ygg_peers: (0..10).map(|i| format!("tls://пир{i}.example:1337")).collect(),
+            ..invite()
+        };
+        let uri = many.to_uri().unwrap();
+        let read = PairingInvite::from_uri(&uri).unwrap();
+        assert_eq!(read.ygg_peers.len(), MAX_INVITE_PEERS, "в ссылку уехало больше предела");
+        assert_eq!(read.ygg_peers[0], "tls://пир0.example:1337");
+    }
+
+    #[test]
+    fn a_bad_peer_in_an_invite_drops_alone() {
+        // Один негодный адрес не повод остаться без остальных: узел встанет
+        // и с двумя. То же правило, что у объявления.
+        let value = Value::Map(vec![
+            (Value::Integer(KEY_IK.into()), Value::Bytes(vec![7u8; 32])),
+            (Value::Integer(KEY_SECRET.into()), Value::Bytes(vec![9u8; 32])),
+            (Value::Integer(KEY_ONION.into()), Value::Text(String::new())),
+            (Value::Integer(KEY_YGG.into()), Value::Bytes(Vec::new())),
+            (
+                Value::Integer(KEY_INVITE_PEERS.into()),
+                Value::Array(vec![
+                    Value::Text("a".repeat(MAX_PEER_LEN + 1)),
+                    Value::Text(String::new()),
+                    Value::Integer(7.into()),
+                    Value::Text("tls://годный.example:1337".into()),
+                ]),
+            ),
+            (Value::Integer(KEY_NAME.into()), Value::Text("телефон".into())),
+        ]);
+        let uri = format!(
+            "{PAIRING_URI_PREFIX}{}",
+            data_encoding::BASE32_NOPAD.encode(&canonical::encode(&value).unwrap())
+        );
+        let read = PairingInvite::from_uri(&uri).unwrap();
+        assert_eq!(read.ygg_peers, vec!["tls://годный.example:1337".to_owned()]);
+    }
+
+    #[test]
+    fn a_mesh_key_of_the_wrong_length_reads_as_no_mesh() {
+        // Длину называет другая сторона, и рукопожатие не должно разваливаться
+        // из-за поля, без которого всё остальное работает. То же правило, что
+        // у onion не той длины.
+        for wrong in [vec![1u8; 31], vec![1u8; 33], Vec::new()] {
+            let mangled = Value::Map(vec![
+                (Value::Integer(KEY_ONION.into()), Value::Text(String::new())),
+                (Value::Integer(KEY_YGG.into()), Value::Bytes(wrong.clone())),
+            ]);
+            assert!(
+                device_address_from_value(&mangled).ygg.is_empty(),
+                "ключ длины {} обязан читаться как «меша нет»",
+                wrong.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_round_trips_in_both_directions() {
+        // Одна карта на оба направления: десктоп кладёт её в рукопожатие,
+        // телефон — в новость. Круг обязан сойтись у обоих, иначе сторона,
+        // читающая чужой формат, молча теряет путь.
+        let address = DeviceAddress {
+            onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+            ygg: vec![6u8; crate::ygg::KEY_LEN],
+        };
+        let bytes = canonical::encode(&device_address_value(&address)).unwrap();
+        assert_eq!(device_address_from_payload(&bytes), address, "через рукопожатие");
+
+        let notice = Notice::LinkAddress {
+            address: address.clone(),
+            ygg_peers: vec!["tls://a.example:1".into(), "tcp://10.0.0.1:2".into()],
+        };
+        assert_eq!(
+            notice_from_payload(&through_cbor(&notice_payload(&notice))).unwrap(),
+            notice,
+            "через новость"
+        );
+    }
+
+    #[test]
+    fn an_empty_handshake_payload_is_still_a_handshake() {
+        // Сборка до тринадцатой нагрузки не шлёт вовсе, и рукопожатие с ней
+        // обязано сойтись. Пустой адрес — «только общая сеть».
+        assert_eq!(device_address_from_payload(&[]), DeviceAddress::default());
+        assert_eq!(device_address_from_payload(&[0x00, 0x01, 0xff]), DeviceAddress::default());
     }
 
     #[test]
@@ -3876,6 +4360,7 @@ mod tests {
                     has_preview: false,
                 },
             ],
+            shared: None,
         };
         let back = message_from_value(&through_cbor(&message_value(&with_file))).unwrap();
         assert_eq!(back, with_file);
@@ -4046,6 +4531,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: many,
+            shared: None,
         };
         let back = message_from_value(&through_cbor(&message_value(&message)))
             .expect("сообщение обязано пережить лишние вложения");
@@ -4112,6 +4598,7 @@ mod tests {
                 forwarded: false,
                 reply_to: None,
                 files: Vec::new(),
+                shared: None,
             },
             Message {
                 msg_id: [4u8; 16],
@@ -4126,6 +4613,7 @@ mod tests {
                 forwarded: false,
                 reply_to: None,
                 files: Vec::new(),
+                shared: None,
             },
         ];
         let cases = [
@@ -4186,6 +4674,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         let value = message_value(&received);
         let map = canonical::as_map(&value).unwrap();
@@ -4212,6 +4701,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         let value = message_value(&bare);
         let map = canonical::as_map(&value).unwrap();
@@ -4435,6 +4925,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         let back = message_from_value(&through_cbor(&message_value(&message)))
             .expect("сообщение обязано пережить лишние реакции");
@@ -4458,6 +4949,7 @@ mod tests {
                 forwarded: false,
                 reply_to: None,
                 files: Vec::new(),
+                shared: None,
             }),
             Notice::Status { msg_id: [1u8; 16], status: 3 },
             Notice::ChatsChanged,
@@ -4479,6 +4971,7 @@ mod tests {
                 forwarded: false,
                 reply_to: None,
                 files: Vec::new(),
+                shared: None,
             }),
             Notice::Reacted {
                 chat: [2u8; 16],
@@ -4518,6 +5011,31 @@ mod tests {
             Notice::AvatarChanged { chat: Some([2u8; 16]), avatar_ms: 0 },
             Notice::AvatarChanged { chat: None, avatar_ms: 0 },
             Notice::Revoked,
+            // Все четыре сочетания адреса: оба пути, каждый по отдельности
+            // и ни одного. Последнее — законное значение, а не вырожденный
+            // случай: телефон без Tor и без меша живёт в общей сети.
+            Notice::LinkAddress {
+                address: DeviceAddress {
+                    onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+                    ygg: vec![9u8; crate::ygg::KEY_LEN],
+                },
+                ygg_peers: vec!["tls://a.example:1".into()],
+            },
+            Notice::LinkAddress {
+                address: DeviceAddress {
+                    onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+                    ygg: Vec::new(),
+                },
+                ygg_peers: Vec::new(),
+            },
+            Notice::LinkAddress {
+                address: DeviceAddress {
+                    onion: String::new(),
+                    ygg: vec![9u8; crate::ygg::KEY_LEN],
+                },
+                ygg_peers: vec!["tcp://[2001:db8::1]:9001".into()],
+            },
+            Notice::LinkAddress { address: DeviceAddress::default(), ygg_peers: Vec::new() },
         ];
         for notice in &cases {
             assert_eq!(
@@ -4568,6 +5086,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         assert_eq!(kinds(&Notice::Message(sample.clone())), NOTICE_MESSAGE);
         assert_eq!(kinds(&Notice::Status { msg_id: [1u8; 16], status: 1 }), NOTICE_STATUS);
@@ -4593,6 +5112,13 @@ mod tests {
             NOTICE_AVATAR_CHANGED
         );
         assert_eq!(kinds(&Notice::Revoked), NOTICE_REVOKED);
+        assert_eq!(
+            kinds(&Notice::LinkAddress {
+                address: DeviceAddress::default(),
+                ygg_peers: Vec::new()
+            }),
+            NOTICE_LINK_ADDRESS
+        );
 
         let all = [
             NOTICE_MESSAGE,
@@ -4605,6 +5131,7 @@ mod tests {
             NOTICE_FILE_GONE,
             NOTICE_AVATAR_CHANGED,
             NOTICE_REVOKED,
+            NOTICE_LINK_ADDRESS,
         ];
         for (at, code) in all.iter().enumerate() {
             assert!(
@@ -4632,6 +5159,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         let arrived =
             notice_from_payload(&through_cbor(&notice_payload(&Notice::Message(message.clone()))))

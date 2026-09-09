@@ -212,6 +212,15 @@ enum Query {
     OpenFile { file_id: FileId, reply: oneshot::Sender<Option<FileReader>> },
     /// Порог автоматического приёма файлов.
     AutoAccept { reply: oneshot::Sender<Option<u64>> },
+    /// Откуда берётся меш (0.2).
+    ///
+    /// Запросом, а не памятью клиента, по той же причине, что и транспорты:
+    /// настройка переживает перезапуск в `meta`, и второй её экземпляр
+    /// в настройках приложения однажды разошёлся бы с тем, по которому
+    /// ядро принимает решения.
+    YggMode { reply: oneshot::Sender<ratatosk_proto::ygg::YggMode> },
+    /// Пиры встроенного узла меша (0.2).
+    YggPeers { reply: oneshot::Sender<Vec<String>> },
     /// Какие транспорты сейчас включены (§5.4).
     ///
     /// Запросом, а не памятью клиента: выбор переживает перезапуск в `meta`,
@@ -291,6 +300,12 @@ pub struct OwnCard {
     pub onion: String,
     /// Почтовый адрес. Пустая строка — «ещё нет».
     pub chatmail: String,
+    /// Открытый ключ узла Yggdrasil (0.2). Пусто — меша нет.
+    ///
+    /// В ссылке он уже есть — карточка везёт его сама, — а здесь лежит
+    /// отдельно затем же, зачем onion: показать человеку, чем до него
+    /// вообще можно достучаться, не разбирая ссылку глазами.
+    pub ygg: Vec<u8>,
 }
 
 /// Состояние транспортов на этом устройстве (§5.4).
@@ -401,6 +416,8 @@ pub struct ContactStatus {
     /// Отвечает на вопрос, который иначе не задать: дойдёт ли до человека
     /// сообщение, пока он не в сети. Без почтового адреса — нет.
     pub chatmail: Option<String>,
+    /// Открытый ключ узла Yggdrasil из карточки (0.2). `None` — меша нет.
+    pub ygg: Option<Vec<u8>>,
     /// Версия карточки, монотонная (§4.3).
     ///
     /// Диагностическая величина: по ней видно, доехало ли до нас обновление
@@ -547,6 +564,13 @@ enum Wake {
     /// на него не опирается, и заводить ради него вход в ядро значило бы
     /// провести через `Engine::step` то, что там нечего делать.
     Notice(Event),
+    /// Событие не касается ни ядра, ни UI — и это **сказано вслух**.
+    ///
+    /// Молчаливое выбрасывание уже стоило поставки: на месте подъёма
+    /// onion стоял `Input::Timer` с нулевой меткой, то есть событие
+    /// пропадало, и понять это можно было только чтением. Отдельный
+    /// вариант делает пропуск решением, которое видно в разборе.
+    Idle,
 }
 
 /// Ручка, через которую UI разговаривает с драйвером.
@@ -644,6 +668,20 @@ impl DriverHandle {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::MailAccount { reply })).await.ok()?;
         answer.await.ok()
+    }
+
+    /// Откуда берётся меш и кому звонит свой узел (0.2).
+    ///
+    /// Двумя строками за один заход: экран настроек показывает их рядом,
+    /// и два похода к ядру дали бы возможность увидеть режим от одного
+    /// момента, а пиров от другого.
+    pub async fn ygg_settings(&self) -> Option<(ratatosk_proto::ygg::YggMode, Vec<String>)> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::YggMode { reply })).await.ok()?;
+        let mode = answer.await.ok()?;
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::YggPeers { reply })).await.ok()?;
+        Some((mode, answer.await.ok()?))
     }
 
     /// То же, блокируя вызывающий поток.
@@ -871,6 +909,20 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает режим меша (0.2).
+    pub fn ygg_mode_blocking(&self) -> Option<ratatosk_proto::ygg::YggMode> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::YggMode { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает пиров встроенного узла меша (0.2).
+    pub fn ygg_peers_blocking(&self) -> Option<Vec<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::YggPeers { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает контакты, блокируя вызывающий поток.
     pub fn contacts_blocking(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
@@ -971,14 +1023,29 @@ impl<S: Store, R: Runner> Driver<S, R> {
         //
         // Клиент, выставляющий переключатели при старте, ничего не портит:
         // повтор того же значения ядро отбрасывает молча.
+        //
+        // **Это до цикла, и потому каждый эффект обязан возвращаться
+        // мгновенно.** Держится оно не на честном слове, а на обязательстве
+        // `Runner::execute`: сети он не ждёт никогда — ни набора номера,
+        // ни входа на сервер, ни подъёма ступени. Нарушенное, оно стоило
+        // поставки: `startup_effects` возвращает в том числе доставки,
+        // недоделанные в прошлый раз, набор ждался внутри `execute`, и
+        // приложение не показывало переписку из своей базы ровно столько,
+        // сколько занимал звонок ко всем, кого нет в сети. С включённым
+        // мешем — секунды на каждого, с onion — сорок пять.
         let now = now_ms();
         for effect in self.engine.startup_effects() {
             if let Some(failed) = self.apply(now, effect).await {
                 // Ответить на это некому и нечем: соединений ещё нет,
                 // доставок тоже. Но промолчать нельзя — это первый признак
                 // того, что транспорт не собрался.
-                let _ = failed;
-                tracing::debug!("транспорт отказался включаться при старте");
+                //
+                // `info`, а не `debug`, и это исправление: строка стояла
+                // на `debug`, то есть при обычном запуске не печаталась
+                // вовсе. Человек видел ступень, которая «включена, но
+                // не работает», и ни слова о том, почему, — а причина
+                // была ровно здесь и была названа раннером.
+                tracing::info!(?failed, "транспорт отказался включаться при старте");
             }
         }
 
@@ -1077,6 +1144,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     self.tolerate(Input::Command(command)).await?;
                 }
                 Wake::Stop => return Ok(()),
+                Wake::Idle => {}
             }
 
             // Уборка (§12) — по событию, а не по таймеру: телефон
@@ -1196,6 +1264,12 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Query::AutoAccept { reply } => {
                 let _ = reply.send(self.engine.auto_accept_bytes());
             }
+            Query::YggMode { reply } => {
+                let _ = reply.send(self.engine.ygg_mode());
+            }
+            Query::YggPeers { reply } => {
+                let _ = reply.send(self.engine.ygg_peers().to_vec());
+            }
             Query::Transports { reply } => {
                 let _ = reply.send(TransportStatus {
                     enabled: self.engine.transports(),
@@ -1219,6 +1293,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     version: card.version,
                     onion: card.onion,
                     chatmail: card.chatmail,
+                    ygg: card.ygg,
                 });
             }
             Query::Search { chat, query, limit, reply } => {
@@ -1281,9 +1356,21 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         // Прямой канал — тот же вопрос, что задаёт §5.4,
                         // и заданный тем же способом: первая прямая ступень,
                         // на которой есть сессия.
-                        let direct = [Transport::Lan, Transport::Onion]
-                            .into_iter()
-                            .find(|via| self.engine.session_for(peer_ik, *via).is_some());
+                        //
+                        // Список берётся из самой лестницы, а не пишется
+                        // руками. Написанный руками, он и подвёл: там стояли
+                        // `[Lan, Onion]`, и появившийся третьим прямой меш
+                        // (0.2) в него не попал — контакт, до которого есть
+                        // живая сессия по мешу, показывался как «прямого
+                        // канала нет».
+                        let direct = ratatosk_proto::transport_policy::Reachability::of(
+                            ratatosk_proto::transport_policy::PeerAvailability::default(),
+                        )
+                        .rungs
+                        .into_iter()
+                        .map(|rung| rung.transport)
+                        .filter(|via| via.is_direct())
+                        .find(|via| self.engine.session_for(peer_ik, *via).is_some());
                         (*peer_ik, (direct, self.engine.anomalies(peer_ik)))
                     })
                     .collect();
@@ -1317,6 +1404,11 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         // Пустая строка в карточке означает «адреса нет».
                         onion: none_if_empty(&contact.card.onion),
                         chatmail: none_if_empty(&contact.card.chatmail),
+                        // Байты, а не строка: адрес меша выводится из ключа
+                        // однозначно, и держать обе записи одного и того же
+                        // значило бы однажды показать одну, а соединиться
+                        // по другой.
+                        ygg: (!contact.card.ygg.is_empty()).then(|| contact.card.ygg.clone()),
                         card_version: contact.card.version,
                         added_ms: contact.added_ms,
                         direct_channel: extras.get(peer_ik).and_then(|(direct, _)| *direct),
@@ -1555,6 +1647,10 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Effect::CreateMailAccount { .. } => Refusal::Mailbox,
             Effect::SetTransportEnabled { .. }
             | Effect::SetMailAccount(_)
+            // Отказ раннера меша на постановку ключа человеку не нужен:
+            // ключ он уже назвал, а поднялся ли демон, скажет готовность
+            // ступени — и скажет по существу, а не строкой в журнале.
+            | Effect::SetYgg(_)
             | Effect::WatchLanPeers(_)
             | Effect::RestartLan
             | Effect::SetTimer { .. }
@@ -1572,6 +1668,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 Some(TransportCommand::SetEnabled { transport, enabled })
             }
             Effect::SetMailAccount(account) => Some(TransportCommand::SetMailAccount(account)),
+            Effect::SetYgg(setup) => Some(TransportCommand::SetYgg(setup)),
             Effect::CreateMailAccount { url, via_tor } => {
                 Some(TransportCommand::CreateMailAccount { url, via_tor })
             }
@@ -1653,14 +1750,29 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 ik: peer_ik,
                 onion: non_empty(&contact.card.onion),
                 chatmail: non_empty(&contact.card.chatmail),
+                ygg: ygg_key(&contact.card.ygg),
             };
         }
         PeerAddress {
             ik: peer_ik,
             onion: self.engine.device_onion(&peer_ik).map(str::to_owned),
             chatmail: None,
+            // Меш у десктопа бывает (0.2), и ключ его приезжает тем же
+            // кадром, что и onion, — нагрузкой рукопожатия (§13.4). Пусто
+            // здесь означает «у этого десктопа меша нет», а не «второму
+            // экрану меш не полагается», как было раньше.
+            ygg: self.engine.device_ygg(&peer_ik).and_then(ygg_key),
         }
     }
+}
+
+/// Ключ меша из карточки: пусто и не тридцать два байта — одинаково «нет».
+///
+/// Длину проверяет и разбор карточки, но проверить её здесь дешевле, чем
+/// один раз ошибиться: `try_into` на срезе чужой длины — это `Err`,
+/// а не паника, только если его написать именно так.
+fn ygg_key(value: &[u8]) -> Option<[u8; 32]> {
+    value.try_into().ok()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -1708,6 +1820,18 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::MailAccountFailed { reason } => Input::MailAccountFailed { reason },
         TransportEvent::Handed { peer_ik, via, handoff } => Input::Handed { peer_ik, via, handoff },
         TransportEvent::Ready { transport } => Input::TransportReady { transport },
+        // **Мимо ядра, и это не пробел.** Свой ключ меша ядро знает и так —
+        // он выведен из зерна, которое лежит у него в хранилище, — и в
+        // карточку (§4.3) попадает оттуда. Событие заведено для режима
+        // компаньона (§13.4): у терминала ядра нет, и взять ключ ему
+        // больше неоткуда. Здесь оно только не должно ничего ломать.
+        // Ядру этот ключ не нужен: свой меш оно знает и так — ключ выведен
+        // из зерна в его хранилище, — и в карточку (§4.3) попадает оттуда.
+        // Событие заведено для режима компаньона (§13.4): у терминала ядра
+        // нет, и взять ключ ему больше неоткуда. Здесь довольно того, чтобы
+        // оно ничего не сломало; `Input::Timer` с нулевой меткой — тот же
+        // приём, каким молча пропускается всё, что ядра не касается.
+        TransportEvent::YggReady { .. } => return Wake::Idle,
         // Через ядро, а не мимо: от этих чисел зависят два его решения —
         // пускать ли почту в выбор канала для файла и просить ли чанки
         // в свой кончающийся ящик. Показ — уже следствие, и приезжает

@@ -52,12 +52,21 @@ use ratatosk_core::{
 use ratatosk_proto::companion::{
     Attachment, ChatSummary, Member, Message, PairingInvite, Reaction,
 };
-use ratatosk_transport::{Disabled, LanConfig, LanRunner, Runner, TransportCommand, Transports};
+use ratatosk_transport::{
+    Disabled, LanConfig, LanRunner, Runner, TransportCommand, Transports, YggConfig, YggRunner,
+    YGG_PORT,
+};
 
-/// Составной транспорт терминала: локальная сеть, свой onion, почты нет.
+/// Составной транспорт терминала: локальная сеть, меш, свой onion. Почты нет.
 ///
 /// Почты нет и не будет ни при каких признаках: почтовый круг — это часы
 /// (§5.3), а второй экран про «здесь и сейчас».
+///
+/// **Меш здесь был `Disabled`, и это стоило целой ступени.** Ровно та же
+/// ошибка, что нашлась в стенде: слот пустой — значит `CompanionDriver`,
+/// подняв свой узел, упирался в `Unavailable` на каждый кадр, и §5яи
+/// работала где угодно, только не в приложении. Один и тот же список,
+/// собираемый в двух местах, разошёлся ровно так, как и должен был.
 ///
 /// Тип один на обе сборки — с живым arti и без него, — и это не украшение:
 /// `start` возвращает раннер, а две ветки с разными типами не собрались бы
@@ -67,7 +76,7 @@ type CompanionOnion = ratatosk_transport::Switched<ratatosk_transport::onion::ar
 #[cfg(not(feature = "tor"))]
 type CompanionOnion = Disabled;
 
-type CompanionRunner = Transports<LanRunner, CompanionOnion, Disabled>;
+type CompanionRunner = Transports<LanRunner, YggRunner, CompanionOnion, Disabled>;
 
 use crate::{to_chat, to_file_id, to_msg_id, to_msg_ids, FfiDeliveryStatus, RatatoskError};
 
@@ -82,6 +91,23 @@ pub struct FfiCompanionReaction {
     pub emoji: String,
     /// Своя ли.
     pub mine: bool,
+}
+
+/// Присланная кем-то карточка человека — в сообщении на десктопе (§4.1).
+///
+/// Ключа здесь нет: §13.4 не пускает `IK` через границу устройства.
+/// Показать карточку это не мешает, а «добавить» делается просьбой
+/// про **сообщение** — [`RatatoskCompanion::add_shared_contact`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCompanionSharedContact {
+    /// Как человек назвал себя сам — из карточки, а не локальная заметка.
+    pub name: String,
+    /// Личный чат с ним, если он уже в контактах.
+    ///
+    /// Оно же отвечает на «предлагать ли добавить»: есть чат — предлагать
+    /// нечего, можно открыть переписку. Два поля вместо одного означали бы
+    /// два источника у одного факта.
+    pub chat_id: Option<Vec<u8>>,
 }
 
 /// Вложение в сообщении, показанном на десктопе.
@@ -273,6 +299,11 @@ pub struct FfiCompanionMessage {
     pub reply_to: Option<Vec<u8>>,
     /// Вложения (§10). Пусто у обычного сообщения.
     pub files: Vec<FfiCompanionAttachment>,
+    /// Присланная карточка человека (§4.1). `None` — обычное сообщение.
+    ///
+    /// Без неё такое сообщение выглядело бы пустым: тело у него нарочно
+    /// пустое, карточка лежит записью рядом.
+    pub shared: Option<FfiCompanionSharedContact>,
 }
 
 /// Что компаньон говорит окну.
@@ -617,14 +648,22 @@ impl RatatoskCompanion {
         std::thread::Builder::new()
             .name("ratatosk-companion".to_owned())
             .spawn(move || {
-                let runtime =
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(RatatoskError::internal(error)));
-                            return;
-                        }
-                    };
+                // Многопоточный по той же причине, что и у телефона
+                // (`RatatoskClient::open`): цикл драйвера живёт в `block_on`
+                // на этом потоке, и на однопоточном рантайме всё, что
+                // порождает `tokio::spawn` — bootstrap Tor, подъём своего
+                // узла меша, — считало бы вместо него.
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(RatatoskError::internal(error)));
+                        return;
+                    }
+                };
                 runtime.block_on(async move {
                     let started = start(&invite_uri, port, peer_addr, tor_dir).await;
                     let (mut driver, handle, events, linked) = match started {
@@ -860,6 +899,48 @@ impl RatatoskCompanion {
             chat: to_chat(&chat_id)?,
             msg_ids: to_msg_ids(&msg_ids)?,
         })
+    }
+
+    /// Делится в чате карточкой человека (§4.1).
+    ///
+    /// Человек назван идентификатором **личного чата** с ним — тем же,
+    /// каким его называет состав группы (`FfiCompanionMember::chat_id`).
+    /// `None` означает «своей карточкой»: личного чата с самим собой
+    /// не бывает, а поделиться собой — обычное дело.
+    ///
+    /// Работает и в группу: телефон зовёт тот же обработчик, что и у своей
+    /// команды, а тот с прошлой поставки умеет обе стороны.
+    ///
+    /// # Errors
+    ///
+    /// Идентификатор не той длины; телефон отказал словами.
+    pub fn share_contact(
+        &self,
+        chat_id: Vec<u8>,
+        who_chat_id: Option<Vec<u8>>,
+    ) -> Result<(), RatatoskError> {
+        let who = match who_chat_id {
+            Some(id) => Some(to_chat(&id)?),
+            None => None,
+        };
+        self.ask(CompanionCommand::ShareContact { chat: to_chat(&chat_id)?, who })
+    }
+
+    /// Добавляет к себе того, чья карточка приехала этим сообщением.
+    ///
+    /// **Называется сообщение, а не карточка.** Байты лежат на телефоне
+    /// и границу не пересекают ни туда, ни обратно: присланная с десктопа
+    /// «карточка» была бы ключом, назначенным десктопом.
+    ///
+    /// Сверки (§4.2) это не даёт и дать не может: она делается голосом
+    /// при встрече, а не нажатием в окне.
+    ///
+    /// # Errors
+    ///
+    /// Идентификатор не той длины; карточки в этом сообщении нет —
+    /// телефон скажет словами.
+    pub fn add_shared_contact(&self, msg_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.ask(CompanionCommand::AddSharedContact { msg_id: to_msg_id(&msg_id)? })
     }
 
     /// Очищает чат **у себя**.
@@ -1289,6 +1370,18 @@ async fn start(
         .await
         .map_err(RatatoskError::internal)?;
 
+    // Меш (§5яи). Ключ пустой, и это не пропуск: своего демона у терминала
+    // нет, а **свой узел** поднимает драйвер — зерно он выводит из секрета
+    // сопряжения, пиров берёт из приглашения или с диска. Настройка приедет
+    // командой `SetYgg(Embedded { .. })`, ключ появится вместе с ней.
+    //
+    // Порт здесь не занимается: привязка идёт при включении, и удаётся она
+    // только при поднявшемся узле. Собрано без `ygg-node` — узел честно
+    // откажет, ступень останется выключенной, и лестница пройдёт мимо.
+    let ygg = YggRunner::start(YggConfig { enabled: false, port: YGG_PORT }, &[])
+        .await
+        .map_err(RatatoskError::internal)?;
+
     // Свой onion-сервис (§13.4). Оба случая дают **один тип**: без каталога
     // подъём сразу объявляется неудавшимся, и составной раннер остаётся тем
     // же. Каталог обязателен потому, что адрес обязан пережить перезапуск —
@@ -1333,12 +1426,12 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, onion, Disabled)
+        Transports::new(lan, ygg, onion, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = (&tor_handle, &tor_dir);
-        Transports::new(lan, Disabled, Disabled)
+        Transports::new(lan, ygg, Disabled, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а
@@ -1528,6 +1621,10 @@ fn message_of(message: &Message) -> FfiCompanionMessage {
         forwarded: message.forwarded,
         reply_to: message.reply_to.map(|id| id.to_vec()),
         files: message.files.iter().map(attachment_of).collect(),
+        shared: message.shared.as_ref().map(|shared| FfiCompanionSharedContact {
+            name: shared.name.clone(),
+            chat_id: shared.chat.map(|chat| chat.to_vec()),
+        }),
     }
 }
 
@@ -1561,6 +1658,7 @@ mod tests {
                 accepted: true,
                 has_preview: true,
             }],
+            shared: None,
         }
     }
 
@@ -1661,6 +1759,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         };
         let it = message_of(&bare);
         // Принятое сообщение статуса не имеет, и рисовать у него галочку

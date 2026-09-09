@@ -642,6 +642,15 @@ const SNAP_KEY_AVATARS: u64 = 6;
 const SNAP_KEY_MINE: u64 = 7;
 const SNAP_KEY_AVATAR: u64 = 8;
 const SNAP_KEY_STAMP: u64 = 9;
+/// Чем набирать телефон — то, что приехало по живому каналу.
+///
+/// Необязательны на чтении: снимок сборки постарше их не несёт. Версию
+/// снимка это не поднимает нарочно — поднятая, она выбросила бы человеку
+/// всю сохранённую переписку ради трёх полей, без которых старый файл
+/// прекрасно читается.
+const SNAP_KEY_ONION: u64 = 10;
+const SNAP_KEY_YGG: u64 = 11;
+const SNAP_KEY_PEERS: u64 = 12;
 
 /// Почему снимок кэша не сложился.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -941,6 +950,29 @@ pub enum ClientEvent {
     /// «подключаемся» (§14). Дальше терминал не подключается: сказать ему
     /// «попробуйте ещё» нечего, а новый второй экран заводится новым QR.
     Revoked,
+    /// Телефон объявил, чем его теперь набрать (0.2).
+    ///
+    /// **Не для показа человеку.** Слой выше набирает телефон сам —
+    /// у ядра нет транспорта (§13.3), — и без этого события следующая
+    /// попытка пошла бы по адресу из приглашения, то есть по тому, которого
+    /// у телефона могло уже не быть.
+    ///
+    /// Пустые значения законны и означают «этого пути нет»: Tor погасили,
+    /// меш выключили. Молчание вместо события означало бы «ничего
+    /// не изменилось», а это разные вещи.
+    PhoneAddress {
+        /// Onion-адрес. Пусто — Tor не поднят.
+        onion: String,
+        /// Открытый ключ меша. Пусто — меша нет.
+        ygg: Vec<u8>,
+        /// Через кого войти в меш. Пусто — «мешем не пользуюсь».
+        ///
+        /// Этим терминал поднимает **свой** узел: зерно он выводит из
+        /// секрета сопряжения, а пиров взять больше неоткуда — спрашивать
+        /// человека второй раз о том, что он уже настроил на телефоне,
+        /// значит настраивать меш дважды.
+        ygg_peers: Vec<String>,
+    },
     /// Лицо сменилось — прежнее показывать больше нельзя.
     ///
     /// **Без байтов**, и это не экономия ради экономии: новость приезжает
@@ -1032,6 +1064,14 @@ pub enum ClientInput {
     /// не в общей сети, а такой разговор всегда начинается новым
     /// рукопожатием.
     OnionReady(String),
+    /// Свой узел меша поднялся — вот его открытый ключ (0.2).
+    ///
+    /// Пусто — «узла нет»: как и у onion, объявлять адрес, которого больше
+    /// нет, значит заставлять телефон звонить в пустоту.
+    ///
+    /// Ключ, а не адрес: адрес `200::/7` из него выводится, и держать оба
+    /// значило бы завести второе место, где их можно рассогласовать.
+    YggReady(Vec<u8>),
     /// Человек за десктопом чего-то хочет.
     Ask(Request),
     /// Забрать вложение целиком.
@@ -1117,8 +1157,33 @@ pub struct CompanionClient {
     identity: Identity,
     /// `IK` телефона — кому звонить.
     phone_ik: [u8; 32],
-    /// Onion-адрес телефона из приглашения. Пустая строка — Tor не поднят.
+    /// Onion-адрес телефона. Пустая строка — Tor не поднят.
+    ///
+    /// Начальное значение — из приглашения, но не окончательное: телефон
+    /// объявляет свой адрес по живому каналу ([`companion::Notice::LinkAddress`]),
+    /// и объявленное кладётся сюда поверх. Так работает Tor, поднявшийся
+    /// **после** сопряжения, — а до этого он не работал никак.
     phone_onion: String,
+    /// Открытый ключ меша телефона (0.2). Пусто — меша нет.
+    ///
+    /// Ровно та же история, что у onion выше, и заведено это поле ради неё:
+    /// меш включают когда угодно, в том числе через неделю после того, как
+    /// QR отсканирован.
+    phone_ygg: Vec<u8>,
+    /// Пиры меша, названные телефоном. Пусто — мешем он не пользуется.
+    ///
+    /// Нужны **своему** узлу: терминал поднимает его сам, а узлу нужен
+    /// хотя бы один пир. Спрашивать человека второй раз о том, что он уже
+    /// настроил на телефоне, — та самая сложность, из-за которой ступень
+    /// и не включают.
+    phone_ygg_peers: Vec<String>,
+    /// Сменился ли адрес телефона с последнего снимка.
+    ///
+    /// Признак нужен затем же, зачем он есть у переписки: слой выше пишет
+    /// файл, только когда есть что писать. Без него объявленный адрес лёг бы
+    /// на диск лишь заодно с первым же новым сообщением — то есть тогда,
+    /// когда придётся, а не когда узнали.
+    addr_dirty: bool,
     /// Как телефон зовут — чтобы окно называлось.
     phone_name: String,
     pending: Option<PendingHandshake>,
@@ -1156,6 +1221,11 @@ pub struct CompanionClient {
     /// выше — [`ClientInput::OnionReady`], — и делает это, когда сервис
     /// поднялся, а не когда понадобился.
     own_onion: String,
+    /// Свой ключ меша, если узел поднят. Пусто — меша нет.
+    ///
+    /// Живёт здесь по той же причине, что и onion: ядро sans-io транспорта
+    /// не видит, и адрес кладёт сюда слой выше — [`ClientInput::YggReady`].
+    own_ygg: Vec<u8>,
     /// Версия провода телефона, когда она уже известна.
     ///
     /// **Ноль означает «телефон древний»**, а не «неизвестно»: так
@@ -1308,6 +1378,15 @@ impl CompanionClient {
             identity: Identity::from_seed(*invite.secret.as_bytes()),
             phone_ik: invite.ik,
             phone_onion: invite.onion.clone(),
+            phone_ygg: invite.ygg.clone(),
+            // Пиры из приглашения — то, чем встаёт **свой** узел десктопа
+            // до первой связи. Объявление по живому каналу приедет позже
+            // и заменит этот короткий список полным.
+            phone_ygg_peers: invite.ygg_peers.clone(),
+            // Приглашение — не новость: класть его на диск отдельной записью
+            // незачем, оно и так есть у слоя выше. Признак поднимет первое
+            // же объявление.
+            addr_dirty: false,
             phone_name: invite.display_name.clone(),
             pending: None,
             session: None,
@@ -1317,6 +1396,7 @@ impl CompanionClient {
             cache: Cache::new(),
             hello: None,
             own_onion: String::new(),
+            own_ygg: Vec::new(),
             revoked: false,
             phone_wire: None,
             download: None,
@@ -1347,6 +1427,48 @@ impl CompanionClient {
     #[must_use]
     pub fn phone_onion(&self) -> &str {
         &self.phone_onion
+    }
+
+    /// Ключ меша телефона. Пусто — меша нет.
+    ///
+    /// Читать его надо **перед каждым набором**, а не один раз при запуске:
+    /// телефон вправе объявить новый по живому каналу, и следующая попытка
+    /// обязана идти по объявленному.
+    #[must_use]
+    pub fn phone_ygg(&self) -> &[u8] {
+        &self.phone_ygg
+    }
+
+    /// Свой ключ меша. Пусто — своего узла нет.
+    ///
+    /// Отвечает на вопрос «есть ли нам чем ехать в меш», и отвечает честно:
+    /// значение приезжает от транспорта, когда узел **поднялся**
+    /// ([`ClientInput::YggReady`]), а не когда человек передал ключ ключом
+    /// командной строки.
+    ///
+    /// Нужно это выбору ступени. Адрес собеседника отвечает только на
+    /// «куда ехать»; ступень, у которой есть куда, но нечем, — это
+    /// бесконечный `Unavailable` вместо отката (§5.4).
+    #[must_use]
+    pub fn own_ygg(&self) -> &[u8] {
+        &self.own_ygg
+    }
+
+    /// Зерно своего узла меша (§13.4 + 0.2).
+    ///
+    /// Выводится из секрета сопряжения — тем же путём, что и onion-ключ,
+    /// и ради того же: **не спрашивать человека**. Устойчиво к перезапуску,
+    /// а это здесь не удобство: телефон запоминает ключ терминала и набирает
+    /// по нему, и меняйся он при каждом запуске — набирать было бы некуда.
+    #[must_use]
+    pub fn mesh_seed(&self) -> ratatosk_crypto::Key32 {
+        ratatosk_crypto::companion::mesh_seed(&self.identity)
+    }
+
+    /// Пиры меша, названные телефоном. Пусто — мешем он не пользуется.
+    #[must_use]
+    pub fn phone_ygg_peers(&self) -> &[String] {
+        &self.phone_ygg_peers
     }
 
     /// Как телефон зовут.
@@ -1389,12 +1511,55 @@ impl CompanionClient {
     /// Отказ кодирования или AEAD — в обоих случаях снимок не получился,
     /// и записывать нечего.
     pub fn snapshot(&mut self) -> Result<Vec<u8>, CacheError> {
-        let bytes = canonical::encode(&self.cache.to_value())?;
+        let bytes = canonical::encode(&self.snapshot_value())?;
         let key = self.cache_key();
         let sealed = ratatosk_crypto::storage_key::seal_field(&key, &self.cache_aad(), &bytes)
             .map_err(|_| CacheError::Sealed)?;
         self.cache.dirty = false;
+        self.addr_dirty = false;
         Ok(sealed)
+    }
+
+    /// Есть ли что класть на диск — переписка **или** адрес.
+    ///
+    /// Двух признаков, а не одного, потому что меняются они порознь:
+    /// объявленный адрес приезжает без единого нового сообщения, а сотня
+    /// сообщений приходит без смены адреса. Один признак на оба означал бы
+    /// либо потерянную запись, либо лишнюю.
+    #[must_use]
+    pub fn snapshot_due(&self) -> bool {
+        self.cache.dirty() || self.addr_dirty
+    }
+
+    /// Снимок целиком: переписка плюс то, чем набирать телефон.
+    ///
+    /// **Адрес кладётся на диск, и это исправление настоящей поломки.**
+    /// Всё, что терминал узнаёт по живому каналу — onion, поднявшийся после
+    /// сопряжения, ключ меша, пиры для своего узла, — умирало вместе
+    /// с процессом. Наружу это выглядело так: узел меша поднимается только
+    /// когда есть общая сеть. Оно и понятно — пиры приезжали новостью,
+    /// новость требовала канала, а канал вне общей сети требовал меша.
+    ///
+    /// Приглашение эту дыру не закрывает: оно отвечает за первую минуту
+    /// **первого** запуска, а адрес меняется и после него.
+    ///
+    /// Файл запечатан ключом из зерна сопряжения — тем же, что и переписка, —
+    /// так что открытым на диске адрес не лежит. Тайны в нём и нет, но
+    /// заводить второе, незапечатанное место было бы странно.
+    fn snapshot_value(&self) -> Value {
+        let mut fields = match self.cache.to_value() {
+            Value::Map(fields) => fields,
+            // `Cache::to_value` собирает карту и только карту; ветка нужна
+            // типу, а не случаю.
+            other => vec![(Value::Integer(SNAP_KEY_CHATS.into()), other)],
+        };
+        fields.push((Value::Integer(SNAP_KEY_ONION.into()), Value::Text(self.phone_onion.clone())));
+        fields.push((Value::Integer(SNAP_KEY_YGG.into()), Value::Bytes(self.phone_ygg.clone())));
+        fields.push((
+            Value::Integer(SNAP_KEY_PEERS.into()),
+            Value::Array(self.phone_ygg_peers.iter().map(|p| Value::Text(p.clone())).collect()),
+        ));
+        Value::Map(fields)
     }
 
     /// Поднимает кэш из снимка.
@@ -1414,7 +1579,53 @@ impl CompanionClient {
         let key = self.cache_key();
         let bytes = ratatosk_crypto::storage_key::open_field(&key, &self.cache_aad(), sealed)
             .map_err(|_| CacheError::Sealed)?;
-        self.cache = Cache::from_value(&canonical::decode(&bytes)?)?;
+        let value = canonical::decode(&bytes)?;
+        self.cache = Cache::from_value(&value)?;
+
+        // Адрес — **поверх** приглашения, и без оглядки на пустоту.
+        // Записанное на диск новее того, что в QR: приглашение снято
+        // в миг сопряжения, а снимок — в последнюю связь. Пустой onion
+        // в файле означает «Tor у телефона был опущен», и подставлять
+        // сюда старый адрес из QR значило бы звонить туда, где не ждут.
+        //
+        // Ключи необязательны на чтении: снимок сборки постарше их не несёт,
+        // и разбираться он обязан по-прежнему — там просто остаётся то,
+        // что дало приглашение.
+        //
+        // Порядок старшинства целиком: **живой канал > диск > приглашение**.
+        // Средняя ступень новая, а вот верхняя — не украшение: кэш включают
+        // командой, и объявление вполне успевает приехать раньше неё.
+        // Затерев тогда объявленное файлом, терминал променял бы то, что
+        // телефон сказал минуту назад, на то, что он говорил в прошлый
+        // запуск.
+        if self.addr_dirty {
+            return Ok(());
+        }
+        let Ok(map) = canonical::as_map(&value) else { return Ok(()) };
+        if let Some(Value::Text(onion)) = canonical::get(map, SNAP_KEY_ONION) {
+            self.phone_onion.clone_from(onion);
+        }
+        if let Some(Value::Bytes(ygg)) = canonical::get(map, SNAP_KEY_YGG) {
+            // Длина проверяется и здесь: файл — тот же чужой ввод, а ключ
+            // не той длины ниже по течению стал бы адресом, которого нет.
+            if ygg.is_empty() || ygg.len() == ratatosk_proto::ygg::KEY_LEN {
+                self.phone_ygg.clone_from(ygg);
+            }
+        }
+        if let Some(Value::Array(peers)) = canonical::get(map, SNAP_KEY_PEERS) {
+            self.phone_ygg_peers = peers
+                .iter()
+                .filter_map(|peer| match peer {
+                    Value::Text(text)
+                        if !text.is_empty() && text.len() <= companion::MAX_PEER_LEN =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .take(companion::MAX_YGG_PEERS)
+                .collect();
+        }
         Ok(())
     }
 
@@ -1479,6 +1690,10 @@ impl CompanionClient {
             ClientInput::Lost => self.on_lost(),
             ClientInput::OnionReady(onion) => {
                 self.own_onion = onion;
+                Vec::new()
+            }
+            ClientInput::YggReady(key) => {
+                self.own_ygg = key;
                 Vec::new()
             }
             ClientInput::Ask(request) => self.on_ask(&request),
@@ -1687,6 +1902,7 @@ impl CompanionClient {
         // телефон находит терминал маяком, и onion ему не нужен вовсе.
         let payload = companion::device_address_value(&companion::DeviceAddress {
             onion: self.own_onion.clone(),
+            ygg: self.own_ygg.clone(),
         });
         let payload = canonical::encode(&payload).unwrap_or_default();
         let Ok((message, pending)) = Initiator::start(&self.identity, &self.phone_ik, &payload)
@@ -2480,6 +2696,28 @@ impl CompanionClient {
                 self.cache.remember_avatar(chat, None, avatar_ms);
                 ClientEvent::AvatarChanged { chat, avatar_ms }
             }
+            // Телефон сказал, чем его теперь набрать. Кладётся **поверх**
+            // приглашения: QR отсканирован однажды, а Tor и меш включают
+            // когда угодно — в том числе неделей позже.
+            //
+            // Событие наружу нужно, и не для показа: набирает телефон
+            // не ядро, а слой выше, и он обязан узнать, что адрес сменился,
+            // чтобы следующая попытка пошла по новому.
+            Notice::LinkAddress { address, ygg_peers } => {
+                // Признак — только на настоящую смену: новость приходит
+                // на каждом рукопожатии, а признак стоит записи на диск.
+                self.addr_dirty |= self.phone_onion != address.onion
+                    || self.phone_ygg != address.ygg
+                    || self.phone_ygg_peers != ygg_peers;
+                self.phone_onion.clone_from(&address.onion);
+                self.phone_ygg.clone_from(&address.ygg);
+                self.phone_ygg_peers.clone_from(&ygg_peers);
+                ClientEvent::PhoneAddress {
+                    onion: address.onion.clone(),
+                    ygg: address.ygg.clone(),
+                    ygg_peers,
+                }
+            }
             // Последний кадр этой сессии: телефон снёс ключи сразу за ним.
             Notice::Revoked => {
                 self.on_revoked();
@@ -2525,6 +2763,7 @@ mod tests {
             forwarded: false,
             reply_to: None,
             files: Vec::new(),
+            shared: None,
         }
     }
 
@@ -2571,6 +2810,7 @@ mod tests {
                 forwarded: false,
                 reply_to: None,
                 files: Vec::new(),
+                shared: None,
             })
             .collect();
         // Идентификаторы намеренно повторяются: проверяется предел, а не
@@ -2775,6 +3015,100 @@ mod tests {
         assert!(!again.dirty(), "и писать его обратно незачем");
     }
 
+    /// Терминал, которому телефон объявил адрес и пиров.
+    fn client_told_its_address() -> CompanionClient {
+        let mut client = bare_client();
+        let notice = companion::Notice::LinkAddress {
+            address: companion::DeviceAddress {
+                onion: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".into(),
+                ygg: vec![7u8; ratatosk_proto::ygg::KEY_LEN],
+            },
+            ygg_peers: vec!["tls://пир.example:1337".into(), "tcp://10.0.0.1:2".into()],
+        };
+        client.on_notice(&companion::notice_payload(&notice));
+        client
+    }
+
+    #[test]
+    fn the_address_the_phone_announced_survives_a_restart() {
+        // Поломка, ради которой это написано: всё, что терминал узнавал
+        // по живому каналу, умирало вместе с процессом. Наружу это выглядело
+        // как «свой узел меша поднимается, только когда есть общая сеть»:
+        // пиры приезжали новостью, новость требовала канала, а канал вне
+        // общей сети требовал меша.
+        let mut client = client_told_its_address();
+        assert!(client.snapshot_due(), "объявленный адрес обязан проситься на диск");
+        let sealed = client.snapshot().expect("снимок");
+        assert!(!client.snapshot_due(), "снятый снимок признак снимает");
+
+        let mut cold = bare_client();
+        assert!(cold.phone_ygg_peers().is_empty(), "холодный терминал не знает ничего");
+        cold.restore(&sealed).expect("снимок поднимается");
+
+        assert_eq!(cold.phone_ygg(), &[7u8; ratatosk_proto::ygg::KEY_LEN]);
+        assert_eq!(cold.phone_ygg_peers().len(), 2);
+        assert!(cold.phone_onion().ends_with(".onion"));
+    }
+
+    #[test]
+    fn a_snapshot_from_a_build_without_addresses_still_opens() {
+        // Ключи адреса необязательны на чтении: снимок сборки постарше
+        // их не несёт, и выбрасывать из-за них сохранённую переписку
+        // человеку было бы не за что.
+        let mut old = bare_client();
+        old.cache.remember_chats(vec![summary(1)]);
+        let value = old.cache.to_value();
+        let bytes = canonical::encode(&value).expect("кодирование");
+        let key = old.cache_key();
+        let sealed = ratatosk_crypto::storage_key::seal_field(&key, &old.cache_aad(), &bytes)
+            .expect("печать");
+
+        let mut cold = bare_client();
+        cold.restore(&sealed).expect("снимок без адреса обязан подниматься");
+        assert_eq!(cold.cache().chats().len(), 1, "переписка на месте");
+        assert!(cold.phone_ygg_peers().is_empty(), "а адреса в нём и не было");
+    }
+
+    #[test]
+    fn what_the_phone_just_said_beats_what_the_disk_remembers() {
+        // Кэш включают командой, и объявление успевает приехать раньше неё.
+        // Затерев тогда объявленное файлом, терминал променял бы сказанное
+        // минуту назад на сказанное в прошлый запуск.
+        let mut older = bare_client();
+        older.on_notice(&companion::notice_payload(&companion::Notice::LinkAddress {
+            address: companion::DeviceAddress { onion: String::new(), ygg: Vec::new() },
+            ygg_peers: vec!["tls://прошлый.example:1".into()],
+        }));
+        let stale = older.snapshot().expect("снимок");
+
+        let mut live = client_told_its_address();
+        live.restore(&stale).expect("снимок поднимается");
+        assert_eq!(
+            live.phone_ygg_peers(),
+            ["tls://пир.example:1337".to_owned(), "tcp://10.0.0.1:2".to_owned()],
+            "живой канал старше диска"
+        );
+    }
+
+    #[test]
+    fn a_mesh_key_of_the_wrong_length_on_disk_is_ignored() {
+        // Файл — тот же чужой ввод, что и кадр из сети. Ключ не той длины
+        // ниже по течению стал бы адресом, которого нет.
+        let mut client = bare_client();
+        let mut fields = match client.cache.to_value() {
+            Value::Map(fields) => fields,
+            _ => unreachable!(),
+        };
+        fields.push((Value::Integer(SNAP_KEY_YGG.into()), Value::Bytes(vec![1u8; 31])));
+        let bytes = canonical::encode(&Value::Map(fields)).expect("кодирование");
+        let key = client.cache_key();
+        let sealed = ratatosk_crypto::storage_key::seal_field(&key, &client.cache_aad(), &bytes)
+            .expect("печать");
+
+        client.restore(&sealed).expect("снимок поднимается");
+        assert!(client.phone_ygg().is_empty(), "ключ не той длины — это «меша нет»");
+    }
+
     #[test]
     fn a_snapshot_of_another_version_is_refused_rather_than_guessed() {
         // Формат менялся — читать нечем. Не беда: переписка живёт на телефоне,
@@ -2808,6 +3142,7 @@ mod tests {
                     forwarded: false,
                     reply_to: None,
                     files: Vec::new(),
+                    shared: None,
                 })
             })
             .collect();
@@ -2881,6 +3216,8 @@ mod tests {
             ik: [3u8; 32],
             secret: companion::PairingSecret::new([4u8; 32]),
             onion: String::new(),
+            ygg: Vec::new(),
+            ygg_peers: Vec::new(),
             display_name: "телефон".into(),
         };
         CompanionClient::from_invite(&invite, Box::new(crate::entropy::SeededEntropy::new(1)))

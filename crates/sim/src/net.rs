@@ -21,6 +21,8 @@ impl NodeId {
 pub enum TransportKind {
     /// Локальная сеть. По умолчанию выключена (§5.1).
     Lan,
+    /// Меш Yggdrasil (0.2). По умолчанию выключен.
+    Ygg,
     /// Tor onion-to-onion (§5.2).
     Onion,
     /// Почта chatmail поверх Tor (§5.3).
@@ -29,8 +31,8 @@ pub enum TransportKind {
 
 impl TransportKind {
     /// Все транспорты.
-    pub const ALL: [TransportKind; 3] =
-        [TransportKind::Lan, TransportKind::Onion, TransportKind::Mail];
+    pub const ALL: [TransportKind; 4] =
+        [TransportKind::Lan, TransportKind::Ygg, TransportKind::Onion, TransportKind::Mail];
 
     /// Прямой ли это канал.
     ///
@@ -39,7 +41,7 @@ impl TransportKind {
     /// 20 МБ — только им же (§10.3).
     #[must_use]
     pub const fn is_direct(self) -> bool {
-        matches!(self, TransportKind::Lan | TransportKind::Onion)
+        matches!(self, TransportKind::Lan | TransportKind::Ygg | TransportKind::Onion)
     }
 }
 
@@ -69,6 +71,24 @@ impl LinkProfile {
         min_latency_ms: 1,
         max_latency_ms: 10,
         loss_permille: 0,
+        duplicate_permille: 0,
+        failure_notice_ms: 5_000,
+    };
+
+    /// Меш Yggdrasil: обычный интернет плюс путь через соседей.
+    ///
+    /// Двадцать–полтораста миллисекунд: пакет идёт напрямую, но не по
+    /// кратчайшему маршруту, а по дереву меша, и число промежуточных узлов
+    /// заранее неизвестно. Потери выше, чем у onion, и это не придирка
+    /// к реализации: маршрут перестраивается на ходу, и кадр, ушедший
+    /// по прежнему пути, теряется целиком.
+    ///
+    /// Срок отказа — пять секунд, как у локальной сети: соединение либо
+    /// устанавливается, либо нет, и ждать сорок пять здесь нечего.
+    pub const YGG: LinkProfile = LinkProfile {
+        min_latency_ms: 20,
+        max_latency_ms: 150,
+        loss_permille: 10,
         duplicate_permille: 0,
         failure_notice_ms: 5_000,
     };
@@ -140,11 +160,16 @@ impl Network {
     pub fn new() -> Network {
         let mut profiles = HashMap::new();
         profiles.insert(TransportKind::Lan, LinkProfile::LAN);
+        profiles.insert(TransportKind::Ygg, LinkProfile::YGG);
         profiles.insert(TransportKind::Onion, LinkProfile::ONION);
         profiles.insert(TransportKind::Mail, LinkProfile::MAIL);
 
         let mut enabled = HashMap::new();
         enabled.insert(TransportKind::Lan, false);
+        // Выключен по той же причине, что и LAN: ступень не работает,
+        // пока не названы пиры. Сценарий, которому она нужна, включает
+        // её явно.
+        enabled.insert(TransportKind::Ygg, false);
         enabled.insert(TransportKind::Onion, true);
         enabled.insert(TransportKind::Mail, true);
 

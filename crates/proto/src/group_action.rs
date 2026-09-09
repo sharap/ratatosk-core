@@ -59,7 +59,9 @@ const KEY_TEXT: u64 = 3;
 const KEY_IDS: u64 = 4;
 /// Ключ вложенного предложения файлов — только у файлов.
 const KEY_OFFER: u64 = 5;
-/// Ключ байтов картинки — только у аватарки.
+/// Ключ байтов картинки — только у аватарки. Он же везёт байты карточки
+/// у `ContactShare`: оба — «непрозрачные байты этого действия», и второй
+/// ключ под то же самое значил бы два имени у одной вещи.
 const KEY_BYTES: u64 = 6;
 
 const KIND_EDIT: u64 = 1;
@@ -69,6 +71,12 @@ const KIND_REPLY: u64 = 4;
 const KIND_FILES: u64 = 5;
 const KIND_RENAME: u64 = 6;
 const KIND_AVATAR: u64 = 7;
+/// Пересланный текст. Заведён затем же, зачем `PayloadType::Forward`
+/// один на один: «переслано» — это утверждение о происхождении слов,
+/// и получатель обязан его видеть.
+const KIND_FORWARD: u64 = 8;
+/// Карточка контакта, которой поделились в группе.
+const KIND_CONTACT: u64 = 9;
 
 /// Почему действие не разобралось.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -144,6 +152,14 @@ pub enum Action {
         caption: String,
         /// Сами файлы; не длиннее [`files::MAX_FILES_PER_MESSAGE`].
         offers: Vec<files::FileOffer>,
+        /// Переслано ли это вложение.
+        ///
+        /// Признаком, а не отдельным видом действия: `Action::Forward`
+        /// везёт слова, а здесь к словам приложены файлы, и второй вид
+        /// означал бы вторую копию всего разбора вложений. Едет он внутри
+        /// вложенного предложения — тем же кодеком, что и один на один,
+        /// так что расходиться этим двум местам нечем.
+        forwarded: bool,
     },
     /// Переименовать группу.
     ///
@@ -193,6 +209,52 @@ pub enum Action {
         /// формата, то же самое, что у лица контакта.
         bytes: Vec<u8>,
     },
+    /// Переслать в группу чужие слова (`crate::forward`).
+    ///
+    /// # Отдельный вид, а не признак у обычного сообщения
+    ///
+    /// Один на один «переслано» — это отдельный тип нагрузки
+    /// (`PayloadType::Forward`), и здесь та же причина: пометка меняет
+    /// смысл слов. Признаком внутри группового сообщения его положить
+    /// было **некуда**: под ключом отправителя едет голый текст, а не
+    /// карта полей, и завести там поле значило бы сменить формат
+    /// зашифрованного тела — то есть сборка постарше показала бы человеку
+    /// CBOR вместо слов.
+    ///
+    /// Ценой стало то, что сборка, не знающая этого вида, пересланного
+    /// сообщения не увидит вовсе. Это designed-поведение
+    /// ([`ActionError::UnknownKind`] — «не порча и не нападение»),
+    /// и оно честнее показанного без пометки: имя рядом с чужими словами
+    /// хуже отсутствия слов.
+    ///
+    /// # Автора здесь нет — как и в 1:1
+    ///
+    /// `crate::forward`: подпись §6 при пересылке не сохраняется, и имя
+    /// рядом с чужими словами было бы утверждением, которое получатель
+    /// проверить не может.
+    Forward {
+        /// Пересланные слова; пустыми не бывают.
+        text: String,
+    },
+    /// Поделиться в группе карточкой известного человека (§4.1).
+    ///
+    /// Байтами карточки, а не разобранными полями: разбирает их
+    /// `contact_share::from_payload` — тот же кодек, что и один на один.
+    /// Разложи мы поля здесь, у одного формата стало бы два сборщика.
+    ///
+    /// Что **не** едет — то же, что и в 1:1: локальное имя, которым
+    /// пользователь подписал человека у себя, и признак сверки.
+    ContactShare {
+        /// Закодированная `ContactCard`.
+        card_bytes: Vec<u8>,
+        /// Переслана ли эта карточка.
+        ///
+        /// Признаком, а не отдельным видом действия, и по той же причине,
+        /// что у файлов: разбор карточки у этого вида уже есть, второй
+        /// означал бы вторую его копию. Едет он внутри вложенной нагрузки
+        /// — тем же кодеком, что и один на один.
+        forwarded: bool,
+    },
 }
 
 /// Собирает открытый текст действия — то, что ляжет под sender key.
@@ -206,17 +268,31 @@ pub fn payload(action: &Action) -> Value {
             (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_RENAME.into())),
             (Value::Integer(KEY_TEXT.into()), Value::Text(title.clone())),
         ]),
-        Action::Files { caption, offers } => Value::Map(vec![
+        Action::Files { caption, offers, forwarded } => Value::Map(vec![
             (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_FILES.into())),
             // Вложенным значением, а не разложенным по ключам: собирает
             // его `files::offer_payload` — тот же кодек, что и в 1:1.
             // Разложи мы поля здесь, у одного формата стало бы два
             // сборщика, и первая же правка разошлась бы.
-            (Value::Integer(KEY_OFFER.into()), files::offer_payload(caption, offers)),
+            (Value::Integer(KEY_OFFER.into()), files::offer_payload(caption, offers, *forwarded)),
         ]),
         Action::Avatar { bytes } => Value::Map(vec![
             (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_AVATAR.into())),
             (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
+        ]),
+        Action::Forward { text } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_FORWARD.into())),
+            (Value::Integer(KEY_TEXT.into()), Value::Text(text.clone())),
+        ]),
+        Action::ContactShare { card_bytes, forwarded } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_CONTACT.into())),
+            // Вложенным значением, а не голыми байтами: собирает его
+            // `contact_share::payload` — тот же кодек, что и в 1:1,
+            // и признак «переслано» приезжает оттуда же.
+            (
+                Value::Integer(KEY_BYTES.into()),
+                crate::contact_share::payload(card_bytes, *forwarded),
+            ),
         ]),
         Action::Retract { targets } => {
             let ids = targets.iter().map(|id| Value::Bytes(id.to_vec())).collect();
@@ -259,6 +335,8 @@ pub fn from_payload(value: &Value) -> Result<Action, ActionError> {
         KIND_FILES => return files_from(map),
         KIND_RENAME => return rename_from(map),
         KIND_AVATAR => return avatar_from(map),
+        KIND_FORWARD => return forward_from(map),
+        KIND_CONTACT => return contact_from(map),
         _ => return Err(ActionError::UnknownKind),
     }
 
@@ -310,14 +388,43 @@ fn avatar_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
     Ok(Action::Avatar { bytes: bytes.clone() })
 }
 
+fn forward_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let text = canonical::require(map, KEY_TEXT)
+        .and_then(canonical::as_text)
+        .map_err(|_| ActionError::Malformed)?;
+    // Предел тот же, что у любого текста в кадре, и берётся он там же:
+    // разойдись проверки, в группу можно было бы переслать то, чего нельзя
+    // сказать. Пустая пересылка отвергается по той же причине, что пустая
+    // правка, — это не слова, а дырка в истории.
+    if text.is_empty() || !files::text_fits(text.len()) {
+        return Err(ActionError::Malformed);
+    }
+    Ok(Action::Forward { text: text.to_owned() })
+}
+
+fn contact_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let nested = canonical::require(map, KEY_BYTES).map_err(|_| ActionError::Malformed)?;
+    // Карточка обязана разбираться **здесь**, а не у получателя потом:
+    // байты приехали от участника, и «положили в историю то, что не
+    // читается» — это запись, которую человек будет видеть вечно.
+    //
+    // Разбирает её тот же кодек, что и один на один, и признак «переслано»
+    // приезжает оттуда же. Дальше едут **принятые байты**, а не
+    // пересобранные из полей: §6 требует, чтобы проверяемое проверялось
+    // над принятым представлением.
+    let (card_bytes, _, forwarded) =
+        crate::contact_share::from_payload(nested).map_err(|_| ActionError::Malformed)?;
+    Ok(Action::ContactShare { card_bytes, forwarded })
+}
+
 fn files_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
     let nested = canonical::require(map, KEY_OFFER).map_err(|_| ActionError::Malformed)?;
     // Правила предложения — числа файлов, длины имени, размера превью —
     // проверяет `offer_from_payload`, и здесь не повторяются. Разойдись
     // они, в группе стало бы можно послать то, чего нельзя один на один.
-    let (caption, offers) =
+    let (caption, offers, forwarded) =
         files::offer_from_payload(nested).map_err(|_| ActionError::Malformed)?;
-    Ok(Action::Files { caption, offers })
+    Ok(Action::Files { caption, offers, forwarded })
 }
 
 fn retract_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
@@ -360,7 +467,7 @@ mod tests {
             Action::Retract { targets: vec![[2u8; 16], [3u8; 16]] },
             Action::Reaction { target: [4u8; 16], emoji: "👍".into() },
             Action::Reply { target: [5u8; 16], text: "согласен".into() },
-            Action::Files { caption: "вот".into(), offers: vec![offer()] },
+            Action::Files { caption: "вот".into(), offers: vec![offer()], forwarded: false },
             Action::Rename { title: "у большого костра".into() },
             Action::Avatar { bytes: png() },
         ] {
@@ -404,8 +511,9 @@ mod tests {
         // Ключ файла (§10.1) едет внутри предложения, и без него чанки
         // не открываются вовсе. Потеряйся он молча — участники получили бы
         // вложение, которое невозможно прочесть.
-        let action = Action::Files { caption: String::new(), offers: vec![offer()] };
-        let Action::Files { offers, caption } = round_trip(&action) else {
+        let action =
+            Action::Files { caption: String::new(), offers: vec![offer()], forwarded: false };
+        let Action::Files { offers, caption, .. } = round_trip(&action) else {
             panic!("вид не тот");
         };
         assert_eq!(offers[0].key, [7u8; 32]);
@@ -421,6 +529,7 @@ mod tests {
         let too_many = Action::Files {
             caption: String::new(),
             offers: vec![offer(); files::MAX_FILES_PER_MESSAGE + 1],
+            forwarded: false,
         };
         let bytes = canonical::encode(&payload(&too_many)).unwrap();
         let value = canonical::decode(&bytes).unwrap();
@@ -535,5 +644,111 @@ mod tests {
         let value =
             Value::Map(vec![(Value::Integer(KEY_KIND.into()), Value::Integer(KIND_EDIT.into()))]);
         assert_eq!(from_payload(&value), Err(ActionError::Malformed));
+    }
+
+    fn card_bytes() -> Vec<u8> {
+        ratatosk_codec::ContactCard {
+            ik: [1u8; 32],
+            sk: [2u8; 32],
+            onion: String::new(),
+            chatmail: "sosed@nine.example".to_owned(),
+            display_name: "сосед".to_owned(),
+            version: 1,
+            ygg: Vec::new(),
+        }
+        .encode()
+        .expect("карточка")
+    }
+
+    #[test]
+    fn forwarded_files_keep_their_mark_across_the_group() {
+        // Пометка едет **внутри предложения**, а не отдельным видом: разбор
+        // вложений у `Files` уже есть, и второй вид означал бы вторую его
+        // копию. Проверяется именно то, что признак переживает круг, —
+        // потерянный, он превратил бы чужие файлы в свои.
+        let action =
+            Action::Files { caption: "вот".into(), offers: vec![offer()], forwarded: true };
+        assert_eq!(round_trip(&action), action);
+    }
+
+    #[test]
+    fn a_build_without_the_mark_reads_files_as_not_forwarded() {
+        // Ключа нет — «не переслано». Сборка постарше признака не везла,
+        // и её предложение обязано разбираться по-прежнему.
+        let plain =
+            Action::Files { caption: "вот".into(), offers: vec![offer()], forwarded: false };
+        let value = payload(&plain);
+        let Value::Map(fields) = &value else { panic!("действие — карта") };
+        assert!(
+            !fields.iter().any(|(key, _)| *key == Value::Integer(KEY_OFFER.into())
+                && format!("{:?}", value).contains("Bool(true)")),
+            "у непересланного признака в проводе быть не должно"
+        );
+        assert_eq!(round_trip(&plain), plain);
+    }
+
+    #[test]
+    fn a_forward_crosses_the_group_as_its_own_kind() {
+        // «Переслано» — утверждение о происхождении слов, и получатель
+        // обязан его видеть. Признаком внутри группового сообщения его
+        // положить некуда: под ключом отправителя едет голый текст.
+        let action = Action::Forward { text: "чужие слова".into() };
+        assert_eq!(round_trip(&action), action);
+    }
+
+    #[test]
+    fn an_empty_forward_is_refused() {
+        // Пустая пересылка — не слова, а дырка в истории. То же правило,
+        // что у пустой правки.
+        let value = Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_FORWARD.into())),
+            (Value::Integer(KEY_TEXT.into()), Value::Text(String::new())),
+        ]);
+        assert_eq!(from_payload(&value), Err(ActionError::Malformed));
+    }
+
+    #[test]
+    fn a_shared_card_crosses_the_group_byte_for_byte() {
+        // Байты едут **принятые**, а не пересобранные из полей: §6 требует,
+        // чтобы проверяемое проверялось над принятым представлением.
+        let action = Action::ContactShare { card_bytes: card_bytes(), forwarded: false };
+        assert_eq!(round_trip(&action), action);
+    }
+
+    #[test]
+    fn a_forwarded_card_keeps_its_mark_across_the_group() {
+        // Пересылка сообщения с карточкой давала пустое сообщение: тело
+        // у него пустое по построению, а карточка лежит записью рядом
+        // и в пересылку не попадала. Признак — то, чем пересланная
+        // карточка отличается от своей, и он обязан пережить круг.
+        let action = Action::ContactShare { card_bytes: card_bytes(), forwarded: true };
+        assert_eq!(round_trip(&action), action);
+    }
+
+    #[test]
+    fn a_shared_card_that_does_not_parse_is_refused_on_arrival() {
+        // Проверка стоит на разборе действия, а не у получателя потом:
+        // «положили в историю то, что не читается» — это запись, которую
+        // человек будет видеть вечно.
+        let value = Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_CONTACT.into())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(vec![0xff; 8])),
+        ]);
+        assert_eq!(from_payload(&value), Err(ActionError::Malformed));
+    }
+
+    #[test]
+    fn the_new_kinds_read_as_unknown_to_an_older_build() {
+        // Цена нового вида названа вслух: сборка постарше пересланного
+        // сообщения не увидит вовсе. Важно, что это `UnknownKind`, а не
+        // `Malformed`, — иначе на ней рос бы счётчик аномалий, и сборка
+        // поновее выглядела бы источником мусора (§7.3).
+        for kind in [KIND_FORWARD, KIND_CONTACT] {
+            let value = Value::Map(vec![
+                (Value::Integer(KEY_KIND.into()), Value::Integer((kind + 100).into())),
+                (Value::Integer(KEY_TEXT.into()), Value::Text("что-то".into())),
+            ]);
+            assert_eq!(from_payload(&value), Err(ActionError::UnknownKind));
+        }
     }
 }

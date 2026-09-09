@@ -17,8 +17,8 @@ use crate::compaction::{self, Task};
 use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
     StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
-    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredReaction,
-    StoredSenderChain, StoredSession,
+    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredPendingGroup,
+    StoredReaction, StoredSenderChain, StoredSession,
 };
 
 /// Хранилище в оперативной памяти.
@@ -65,8 +65,25 @@ pub struct MemoryStore {
     /// Ключ — пара «сообщение, автор»: реакция от человека одна, новая
     /// заменяет прежнюю.
     reactions: BTreeMap<(MsgId, [u8; 32]), StoredReaction>,
-    outbox: BTreeMap<MsgId, StoredOutbox>,
+    /// Очередь доставки, по паре «сообщение и получатель».
+    ///
+    /// Пара, а не один `msg_id`, и разница не теоретическая: сообщение
+    /// в группу — это N доставок с одним номером (§11.3). Ключ из номера
+    /// держал бы одну из них, и остальные пропадали бы при постановке.
+    /// Именно поэтому потерю копий в группе не ловил ни симулятор, ни один
+    /// тест на `MemoryStore`: до диска они не доезжали вовсе.
+    outbox: BTreeMap<(MsgId, [u8; 32]), StoredOutbox>,
     files: BTreeMap<FileId, StoredFile>,
+    /// Отложенные групповые кадры — зеркало таблицы `pending_group`.
+    ///
+    /// Порядок вектора и есть очередь: место в ней — это и возраст.
+    parked: Vec<StoredPendingGroup>,
+    /// Связка «сообщение → файл → место», зеркало таблицы `message_files`.
+    ///
+    /// Отдельной картой, а не полем в `StoredFile`, по той же причине,
+    /// по какой она отдельная таблица: один файл принадлежит нескольким
+    /// сообщениям с тех пор, как появилась пересылка вложений.
+    links: BTreeMap<(MsgId, FileId), u32>,
     /// Присланные карточки контактов: одна на сообщение.
     contact_shares: BTreeMap<MsgId, StoredContactShare>,
     /// Какие чанки приняты. `BTreeSet` по паре, чтобы «первый недостающий»
@@ -116,6 +133,25 @@ impl MemoryStore {
             .filter(|((chat, _, _), _)| chat == chat_id)
             .map(|(_, message)| message.msg_id)
             .collect()
+    }
+
+    /// Убирает файлы, на которые не осталось ни одной связки.
+    ///
+    /// Зеркало триггера `files_drop_orphans`: инвариант «файл без ссылок
+    /// не существует» обязан держаться одинаково в обоих хранилищах,
+    /// иначе симуляция (§16) проверяла бы не то состояние, что на
+    /// устройстве.
+    fn drop_orphan_files(&mut self) {
+        let orphans: Vec<FileId> = self
+            .files
+            .keys()
+            .filter(|file_id| !self.links.keys().any(|(_, id)| id == *file_id))
+            .copied()
+            .collect();
+        for file_id in orphans {
+            self.files.remove(&file_id);
+            self.chunks.retain(|(id, _)| *id != file_id);
+        }
     }
 }
 
@@ -170,22 +206,20 @@ impl Store for MemoryStore {
         for msg_id in removed {
             self.tombstones.remove(&msg_id);
             self.reactions.retain(|(id, _), _| *id != msg_id);
-            // Файлы — тем же каскадом, что и в SQLite. Записи, пережившие
+            // Файлы — тем же каскадом, что и в базе. Записи, пережившие
             // свои сообщения, разошлись бы с продуктом ровно в том месте,
             // которое ищет уборка: она считает лишним на диске то, чего нет
             // в базе, и лишняя запись прятала бы от неё настоящий мусор.
-            let orphaned: Vec<FileId> = self
-                .files
-                .values()
-                .filter(|file| file.msg_id == msg_id)
-                .map(|file| file.file_id)
-                .collect();
-            for file_id in orphaned {
-                self.files.remove(&file_id);
-                self.chunks.retain(|(id, _)| *id != file_id);
-            }
+            //
+            // Со связкой каскад двухступенчатый, как и триггер
+            // `files_drop_orphans` в схеме: уходит связка, а файл — только
+            // если это была последняя ссылка на него. Пересланная копия
+            // читает тот же файл, и унеси мы его вместе с исходным
+            // сообщением, у неё пропали бы байты.
+            self.links.retain(|(m, _), _| *m != msg_id);
             self.contact_shares.remove(&msg_id);
         }
+        self.drop_orphan_files();
         // Всё групповое — тем же каскадом, каким его уносит внешний ключ
         // на `chats` в файловой базе. Найдено при заведении `group_avatars`:
         // здесь не сносилось **ничего** группового, и удалённый чат группы
@@ -379,6 +413,13 @@ impl Store for MemoryStore {
     fn set_device_onion(&mut self, device_id: &[u8; 16], onion: &str) -> Result<()> {
         if let Some(device) = self.devices.get_mut(device_id) {
             device.onion = onion.to_owned();
+        }
+        Ok(())
+    }
+
+    fn set_device_ygg(&mut self, device_id: &[u8; 16], ygg: &[u8]) -> Result<()> {
+        if let Some(device) = self.devices.get_mut(device_id) {
+            device.ygg = ygg.to_vec();
         }
         Ok(())
     }
@@ -595,11 +636,20 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn replace_pending_group(&mut self, frames: &[StoredPendingGroup]) -> Result<()> {
+        self.parked = frames.to_vec();
+        Ok(())
+    }
+
+    fn pending_group(&self) -> Result<Vec<StoredPendingGroup>> {
+        Ok(self.parked.clone())
+    }
+
     fn put_outbox(&mut self, entry: &StoredOutbox) -> Result<()> {
         if !self.migrated {
             return Err(StoreError::Backend("хранилище не проинициализировано".into()));
         }
-        self.outbox.insert(entry.msg_id, entry.clone());
+        self.outbox.insert((entry.msg_id, entry.recipient_ik), entry.clone());
         Ok(())
     }
 
@@ -609,8 +659,13 @@ impl Store for MemoryStore {
         Ok(found)
     }
 
-    fn delete_outbox(&mut self, msg_id: &MsgId) -> Result<()> {
-        self.outbox.remove(msg_id);
+    fn delete_outbox(&mut self, msg_id: &MsgId, recipient_ik: &[u8; 32]) -> Result<()> {
+        self.outbox.remove(&(*msg_id, *recipient_ik));
+        Ok(())
+    }
+
+    fn delete_outbox_all(&mut self, msg_id: &MsgId) -> Result<()> {
+        self.outbox.retain(|(id, _), _| id != msg_id);
         Ok(())
     }
 
@@ -618,17 +673,79 @@ impl Store for MemoryStore {
         if !self.migrated {
             return Err(StoreError::Backend("хранилище не проинициализировано".into()));
         }
-        self.files.insert(file.file_id, file.clone());
+        // Не затирать существующее — то же правило и тот же довод, что
+        // у `INSERT OR IGNORE` в файловой базе: тот же файл приезжает
+        // вторым сообщением после пересылки, а у нас он к тому времени
+        // может быть уже собран.
+        self.files.entry(file.file_id).or_insert_with(|| file.clone());
+        self.links.insert((file.msg_id, file.file_id), file.ordinal);
         Ok(())
     }
 
     fn file(&self, file_id: &FileId) -> Result<Option<StoredFile>> {
-        Ok(self.files.get(file_id).cloned())
+        let Some(file) = self.files.get(file_id) else { return Ok(None) };
+        // Самое раннее вложение — тот же выбор, что делает файловая база.
+        // Связки не осталось вовсе — отдаём запись как есть: сообщение
+        // могли стереть раньше байтов.
+        let earliest = self
+            .links
+            .iter()
+            .filter(|((_, id), _)| id == file_id)
+            .min_by_key(|((msg_id, _), ordinal)| (**ordinal, *msg_id));
+        let mut file = file.clone();
+        if let Some(((msg_id, _), ordinal)) = earliest {
+            file.msg_id = *msg_id;
+            file.ordinal = *ordinal;
+        }
+        Ok(Some(file))
+    }
+
+    fn messages_of_file(&self, file_id: &FileId) -> Result<Vec<MsgId>> {
+        Ok(self.links.keys().filter(|(_, id)| id == file_id).map(|(msg_id, _)| *msg_id).collect())
+    }
+
+    fn attach_file(&mut self, msg_id: &MsgId, file_id: &FileId, ordinal: u32) -> Result<()> {
+        self.links.insert((*msg_id, *file_id), ordinal);
+        Ok(())
+    }
+
+    fn detach_files_of(&mut self, msg_id: &MsgId) -> Result<Vec<FileId>> {
+        let attached: Vec<FileId> =
+            self.links.keys().filter(|(m, _)| m == msg_id).map(|(_, f)| *f).collect();
+        self.links.retain(|(m, _), _| m != msg_id);
+        let orphans: Vec<FileId> = attached
+            .into_iter()
+            .filter(|file_id| !self.links.keys().any(|(_, id)| id == file_id))
+            .collect();
+        // Строки уходят здесь же — как их уносит триггер в файловой базе.
+        // Список всё равно возвращается: байты лежат не в хранилище,
+        // и убрать их может только вызывающий.
+        self.drop_orphan_files();
+        Ok(orphans)
+    }
+
+    fn orphan_file_ids(&self) -> Result<Vec<FileId>> {
+        Ok(self
+            .files
+            .keys()
+            .filter(|file_id| !self.links.keys().any(|(_, id)| id == *file_id))
+            .copied()
+            .collect())
     }
 
     fn files_of(&self, msg_id: &MsgId) -> Result<Vec<StoredFile>> {
-        let mut found: Vec<StoredFile> =
-            self.files.values().filter(|f| f.msg_id == *msg_id).cloned().collect();
+        let mut found: Vec<StoredFile> = self
+            .links
+            .iter()
+            .filter(|((m, _), _)| m == msg_id)
+            .filter_map(|((_, file_id), ordinal)| {
+                self.files.get(file_id).map(|file| StoredFile {
+                    msg_id: *msg_id,
+                    ordinal: *ordinal,
+                    ..file.clone()
+                })
+            })
+            .collect();
         // Тот же порядок, что обещает `Store::files_of` и выдаёт SQLite:
         // сперва по месту в сообщении, а при равенстве — по идентификатору.
         // Расхождение двух хранилищ здесь было бы худшим сортом ошибки:
@@ -735,12 +852,17 @@ impl Store for MemoryStore {
 
     fn file_ids_of_chat(&self, chat_id: &[u8; 16]) -> Result<Vec<FileId>> {
         let of_chat = self.message_ids_of_chat(chat_id);
-        Ok(self
-            .files
-            .values()
-            .filter(|file| of_chat.contains(&file.msg_id))
-            .map(|file| file.file_id)
-            .collect())
+        let mut found: Vec<FileId> = self
+            .links
+            .keys()
+            .filter(|(msg_id, _)| of_chat.contains(msg_id))
+            .map(|(_, file_id)| *file_id)
+            .collect();
+        // Один файл может висеть на двух сообщениях одного чата — после
+        // пересылки внутри него. Список — про файлы, а не про вложения.
+        found.sort_unstable();
+        found.dedup();
+        Ok(found)
     }
 
     fn all_file_ids(&self) -> Result<Vec<FileId>> {
@@ -782,6 +904,7 @@ impl Store for MemoryStore {
 
     fn delete_file(&mut self, file_id: &FileId) -> Result<()> {
         self.files.remove(file_id);
+        self.links.retain(|(_, id), _| id != file_id);
         // Каскада внешних ключей здесь нет — он делается руками, иначе
         // симуляция разошлась бы с продуктом там, где это заметно: учёт
         // чанков пережил бы файл.
@@ -1226,6 +1349,8 @@ mod tests {
             member_ik: [1u8; 32],
             chain: [42u8; 32],
             counter: 3,
+            chain_wall: 0,
+            chain_logical: 0,
             skipped: Vec::new(),
         };
         s.put_sender_chain(&[7u8; 16], &mine).unwrap();
@@ -1248,6 +1373,8 @@ mod tests {
                 member_ik: [1u8; 32],
                 chain: [42u8; 32],
                 counter: 0,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )
@@ -1258,6 +1385,8 @@ mod tests {
                 member_ik: [1u8; 32],
                 chain: [43u8; 32],
                 counter: 7,
+                chain_wall: 0,
+                chain_logical: 0,
                 skipped: Vec::new(),
             },
         )

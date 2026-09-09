@@ -48,7 +48,11 @@ fn phone_with_blobs(seed: u8, name: &str) -> (Phone, Arc<Mutex<MemoryBlobs>>) {
         Box::new(blobs),
         Box::new(SeededEntropy::new(u64::from(seed))),
         SelfAddresses {
-            onion: format!("{name}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"),
+            // Настоящий адрес v3, а не строка нужной формы: §4.3 требует,
+            // чтобы непустой onion был адресом, и карточка с выдуманным
+            // отвергалась бы на первом же обновлении — вместе со всем,
+            // что в ней ехало. Та же ловушка стояла в `pair.rs`.
+            onion: ratatosk_crypto::OnionKey::from_seed([seed; 32]).address(),
             chatmail: format!("{name}@nine.example"),
             display_name: name.to_owned(),
         },
@@ -399,6 +403,7 @@ fn with_contact<S: Store>(phone: &mut Engine<S>, now_ms: u64) -> [u8; 32] {
         chatmail: "сосед@nine.example".into(),
         display_name: "сосед".into(),
         version: 1,
+        ygg: Vec::new(),
     };
     let bytes = card.encode().expect("кодирование карточки");
     phone
@@ -1223,6 +1228,7 @@ fn a_new_contact_tells_the_desktop_the_chat_list_changed() {
         chatmail: "сосед@nine.example".into(),
         display_name: "сосед".into(),
         version: 1,
+        ygg: Vec::new(),
     };
     let effects = phone
         .step(
@@ -1344,6 +1350,7 @@ fn a_contact_may_not_speak_the_companion_wire() {
         chatmail: "чужой@nine.example".into(),
         display_name: "чужой".into(),
         version: 1,
+        ygg: Vec::new(),
     };
     let card_bytes = card.encode().expect("карточка");
     let mut wire = Desktop::with_identity(stranger);
@@ -1963,4 +1970,244 @@ fn the_desktop_leaves_the_group_and_the_chat_stays() {
         &Request::RenameGroup { chat, title: "у ручья".into() },
     );
     assert!(matches!(answer, Response::Refused(_)), "вышедший создатель распоряжаться не вправе");
+}
+
+#[test]
+fn files_uploaded_from_the_desktop_reach_a_group() {
+    // Поломка со стенда: «файлы не отправляются через компаньона в группы,
+    // хотя с личными чатами всё нормально», ядро отвечало «контакт
+    // неизвестен». Оба шага выгрузки искали собеседника **только**
+    // в `by_chat`, где у группы записи нет вовсе: первый отказывал,
+    // не приняв ни байта, второй отказал бы следом.
+    //
+    // Ветка на группу была у `on_send_files` — файлов с самого телефона —
+    // и не было здесь: путь выгрузки писался до групп, а когда группы
+    // появились, правили тот файл, который про группы.
+    let (mut phone, mut desktop, _, _blobs) = paired_with_blobs(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    let bytes: Vec<u8> = (0..64u8).collect();
+    let file_id = stage(&mut phone, &mut desktop, 1_300, chat, "костёр.jpg", &bytes);
+
+    let answer = ask(
+        &mut phone,
+        &mut desktop,
+        1_500,
+        &Request::FileSend { file_ids: vec![file_id], text: "вот костёр".into() },
+    );
+    assert!(matches!(answer, Response::Done), "отправка в группу обязана состояться: {answer:?}");
+
+    // Ищется по тексту, а не по месту в окне: порядок в нём — дело
+    // хранилища, и тест о нём ничего не утверждает.
+    let history = phone.store().messages(&chat, 10, None).expect("история");
+    let sent = history
+        .iter()
+        .find(|m| m.body == "вот костёр".as_bytes())
+        .expect("сообщение с файлом легло в группу");
+    // Статуса у групповой копии нет — один значок на тридцать двух
+    // получателей §14 не разрешает. Это и отличает её от личной.
+    assert!(sent.status.is_none(), "у групповой копии значка доставки не бывает");
+
+    let files = phone.store().files_of(&sent.msg_id).expect("вложения");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "костёр.jpg");
+    // Пустой путь — признак «байты в хранилище запечатанными, а не на диске
+    // хозяина». Он же и делает выгруженный файл неотличимым для участника
+    // от файла, отправленного с телефона.
+    assert!(files[0].source_path.is_none(), "выгруженный файл на диск телефона не ложится");
+    assert!(files[0].complete, "байты уже здесь — качать нечего");
+}
+
+#[test]
+fn an_upload_to_a_chat_that_is_neither_is_still_refused() {
+    // Ветка на группу не должна была превратиться в «пускаем куда угодно»:
+    // чат, которого нет ни среди переписок, ни среди групп, обязан
+    // отказываться по-прежнему — и на первом шаге, до единого байта.
+    let (mut phone, mut desktop, _, _blobs) = paired_with_blobs(1_000);
+
+    let answer = ask(
+        &mut phone,
+        &mut desktop,
+        1_300,
+        &Request::FileOffer {
+            chat: [9u8; 16],
+            name: "ниоткуда.jpg".into(),
+            size_bytes: 32,
+            preview: None,
+        },
+    );
+    assert!(matches!(answer, Response::Refused(_)), "чата нет — отказ словами: {answer:?}");
+}
+
+#[test]
+fn marking_a_group_read_is_quiet_rather_than_refused() {
+    // §11.3: квитанций в группе нет — копии молчаливые. Значит «человек
+    // дочитал» здесь не делает ничего, и это законный ответ, а не отказ.
+    // До правки открытая на десктопе группа отвечала «контакт неизвестен»
+    // на совершенно законную просьбу, и клиенту оставалось гадать,
+    // сломалось у него что-то или нет.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+
+    phone
+        .step(1_300, Input::Command(Command::SendText { chat, text: "все у костра?".into() }))
+        .expect("слово в группу");
+    let history = phone.store().messages(&chat, 10, None).expect("история");
+    let up_to = history
+        .iter()
+        .find(|m| m.body == "все у костра?".as_bytes())
+        .expect("слово легло в историю")
+        .msg_id;
+
+    let answer = ask(&mut phone, &mut desktop, 1_400, &Request::MarkRead { chat, up_to });
+    assert!(matches!(answer, Response::Done), "прочтение группы — тишина, а не отказ: {answer:?}");
+}
+
+/// Заводит второй контакт — тот, которым будут делиться.
+fn with_second_contact<S: Store>(phone: &mut Engine<S>, now_ms: u64) -> [u8; 32] {
+    let other = Identity::from_seed([11u8; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: other.public().ik,
+        sk: other.public().sk,
+        onion: String::new(),
+        chatmail: "друг@nine.example".into(),
+        display_name: "друг".into(),
+        version: 1,
+        ygg: Vec::new(),
+    };
+    phone
+        .step(
+            now_ms,
+            Input::Command(Command::AddContact {
+                card_bytes: card.encode().expect("кодирование карточки"),
+                met_in_person: false,
+            }),
+        )
+        .expect("добавление второго контакта");
+    card.ik
+}
+
+#[test]
+fn the_desktop_shares_a_contact_into_a_group() {
+    // До этой поставки у компаньона обмена карточками не было вовсе:
+    // ни просьбы «поделись», ни поля под присланную. Ядро при этом уже
+    // умело обе стороны — ветка на группу уехала раньше, — и не хватало
+    // ровно провода.
+    //
+    // Человек назван **личным чатом**, а не ключом: §13.4 не пускает `IK`
+    // через границу устройства, и «поделиться контактом» — то место, где
+    // соблазн его пустить наибольший.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let friend_ik = with_second_contact(&mut phone, 1_150);
+    let chat = with_group(&mut phone, 1_200, peer_ik);
+    let friend_chat = Engine::<MemoryStore>::chat_id_for(&friend_ik);
+
+    let answer = ask(
+        &mut phone,
+        &mut desktop,
+        1_300,
+        &Request::ShareContact { chat, who: Some(friend_chat) },
+    );
+    assert!(matches!(answer, Response::Done), "карточка в группу: {answer:?}");
+
+    // Запись легла в группу, и рядом с ней — сама карточка.
+    let history = phone.store().messages(&chat, 10, None).expect("история");
+    let sent = history.last().expect("сообщение с карточкой");
+    let share = phone
+        .store()
+        .contact_share_of(&sent.msg_id)
+        .expect("запись карточки")
+        .expect("карточка рядом с сообщением");
+    assert_eq!(share.ik, friend_ik, "поделились тем, кого назвали");
+}
+
+#[test]
+fn a_shared_contact_reaches_the_desktop_as_a_card_and_not_as_emptiness() {
+    // Тело у такого сообщения нарочно пустое — карточка лежит записью
+    // рядом, — и без поля в проводе десктоп рисовал бы пузырь без единого
+    // слова. Ровно тот же изъян, что был у пересылки файлов.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let friend_ik = with_second_contact(&mut phone, 1_150);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    phone
+        .step(1_300, Input::Command(Command::ShareContact { chat, peer_ik: friend_ik }))
+        .expect("поделились карточкой");
+
+    let Response::History(page) =
+        ask(&mut phone, &mut desktop, 1_400, &Request::History { chat, limit: 10, before: None })
+    else {
+        panic!("на просьбу об истории обязана прийти страница");
+    };
+    let shown = page.last().expect("сообщение на странице");
+    let shared = shown.shared.as_ref().expect("карточка обязана приехать полем");
+    assert_eq!(shared.name, "друг", "имя — из самой карточки, а не локальное");
+    assert_eq!(
+        shared.chat,
+        Some(Engine::<MemoryStore>::chat_id_for(&friend_ik)),
+        "знакомого десктоп обязан узнать: добавлять его нечего, а переписку открыть можно"
+    );
+}
+
+#[test]
+fn the_desktop_adds_an_unknown_contact_by_naming_the_message() {
+    // Байты карточки лежат на телефоне и границу не пересекают ни туда,
+    // ни обратно: присланная с десктопа «карточка» была бы ключом,
+    // назначенным десктопом. Десктоп называет запись в истории.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    // Карточка незнакомого человека приезжает от собеседника — кладём её
+    // так же, как это делает приём кадра: запись рядом с сообщением.
+    let stranger = Identity::from_seed([13u8; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: stranger.public().ik,
+        sk: stranger.public().sk,
+        onion: String::new(),
+        chatmail: "чужой@nine.example".into(),
+        display_name: "чужой".into(),
+        version: 1,
+        ygg: Vec::new(),
+    };
+    phone
+        .step(1_200, Input::Command(Command::ShareContact { chat, peer_ik }))
+        .expect("поделились кем-то знакомым — ради самого сообщения");
+    let msg_id =
+        phone.store().messages(&chat, 10, None).expect("история").last().expect("сообщение").msg_id;
+    // Подменяем карточку на незнакомца: так выглядит присланная извне.
+    phone
+        .store_mut()
+        .put_contact_share(&ratatosk_store::StoredContactShare {
+            msg_id,
+            ik: card.ik,
+            card_bytes: card.encode().expect("кодирование"),
+        })
+        .expect("запись карточки");
+
+    let Response::History(page) =
+        ask(&mut phone, &mut desktop, 1_300, &Request::History { chat, limit: 10, before: None })
+    else {
+        panic!("страница");
+    };
+    let shown = page.iter().find(|m| m.msg_id == msg_id).expect("сообщение с карточкой");
+    assert_eq!(shown.shared.as_ref().expect("карточка").chat, None, "незнакомца показывать некуда");
+
+    let answer = ask(&mut phone, &mut desktop, 1_400, &Request::AddSharedContact { msg_id });
+    assert!(matches!(answer, Response::Done), "добавление обязано состояться: {answer:?}");
+    assert!(phone.contacts().contains_key(&card.ik), "человек обязан оказаться в контактах");
+}
+
+#[test]
+fn adding_from_a_message_without_a_card_is_refused_out_loud() {
+    // Сообщение могли стереть, а карточка уходит вместе с ним. Молчание
+    // здесь человек за ноутбуком прочтёт как поломку окна (§14).
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let answer =
+        ask(&mut phone, &mut desktop, 1_300, &Request::AddSharedContact { msg_id: [7u8; 16] });
+    assert!(matches!(answer, Response::Refused(_)), "отказ словами: {answer:?}");
 }

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use ratatosk_codec::ContactCard;
-use ratatosk_core::io::{Command, Input};
+use ratatosk_core::io::{Command, Effect, Input};
 use ratatosk_core::{vault, Engine, OsEntropy, SelfAddresses};
 use ratatosk_crdt::Hlc;
 use ratatosk_crypto::handshake::Role;
@@ -59,6 +59,142 @@ fn addresses() -> SelfAddresses {
     SelfAddresses { onion: String::new(), chatmail: String::new(), display_name: "я".to_owned() }
 }
 
+/// Собеседник, до которого **есть чем** достучаться.
+///
+/// Отличается от [`peer_card`] одним: непустым onion-адресом. Разница
+/// содержательная, а не косметическая — сообщение контакту без единого
+/// адреса и с выключенным LAN не ложится ни в очередь, ни в отложенные:
+/// §5.4 честно отвечает «ждать нечего», и обещать доставку было бы
+/// выдумкой (`remember_undelivered`). Проверке, которая смотрит на
+/// очередь, нужен собеседник, которому есть что обещать.
+fn reachable_peer_card() -> (Vec<u8>, [u8; 32]) {
+    let peer = Identity::generate();
+    let card = ContactCard {
+        ik: peer.public().ik,
+        sk: peer.public().sk,
+        onion: "sosedwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww.onion".to_owned(),
+        chatmail: String::new(),
+        display_name: "сосед".to_owned(),
+        version: 1,
+        ygg: Vec::new(),
+    };
+    (card.encode().expect("карточка кодируется"), card.ik)
+}
+
+#[test]
+fn a_mesh_key_that_appeared_between_runs_reaches_the_contacts() {
+    // Разбор поломки, найденной на стенде по одной строке `/who`:
+    // «ygg: адрес/виден=нет» у контакта, заведённого до 0.2.
+    //
+    // Настройки меша лежат на диске отдельно от объявленной карточки, и
+    // разъехаться они могут по-настоящему: `on_set_ygg_mode` пишет строку
+    // и **потом** рассылает карточку, а между этими двумя действиями
+    // приложение можно закрыть. Тот же разрыв даёт архив, снятый на другом
+    // устройстве до рассылки.
+    //
+    // Без починки на подъёме получились бы **две разные карточки одной
+    // версии**: у нас с ключом, у контактов без него, — и §4.3 не пропустил
+    // бы исправление никогда, потому что принимает только строго большую
+    // версию. То есть человек, включивший меш, не достучался бы по нему
+    // ни до кого из прежних знакомых.
+    //
+    // Разрыв здесь и воспроизводится: строки настроек кладутся в базу мимо
+    // ядра, ровно как их оставил бы обрыв на полпути.
+    let db = TempDb::new("ygg-appeared");
+    let db_key = Zeroizing::new([5u8; 32]);
+    let (card_bytes, peer_ik) = reachable_peer_card();
+    let mesh = [0x5au8; 32];
+
+    // Первый запуск: меша ещё нет, контакт заведён.
+    let announced_before = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        engine
+            .step(1_000, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+            .expect("контакт");
+        // Объявление, чтобы на диске лежала карточка без меша, — иначе
+        // проверялся бы первый запуск, а не второй.
+        engine
+            .step(
+                1_100,
+                Input::Command(Command::AnnounceAddresses {
+                    onion: Some(String::new()),
+                    chatmail: Some("я@nine.example".to_owned()),
+                }),
+            )
+            .expect("объявление");
+        let card = engine.own_card();
+        assert!(card.ygg.is_empty(), "меша тут ещё нет");
+        card.version
+    };
+
+    // Обрыв на полпути: настройки записаны, карточка разослана не была.
+    {
+        let mut store = db.open(&db_key);
+        store
+            .put_meta(
+                ratatosk_store::META_YGG_MODE,
+                &[ratatosk_proto::ygg::YggMode::External.code()],
+            )
+            .expect("режим лёг на диск");
+        store.put_meta(ratatosk_store::META_YGG_KEY, &mesh).expect("ключ лёг на диск");
+    }
+
+    // Второй запуск: тот же ключ базы, та же личность.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    // Первый же шаг — и **любой**: берётся заведомо холостой вход, который
+    // сам по себе не производит ничего (`Input::Connected` ядру говорит
+    // ровно ничего). Всё, что появится, — от досылки карточки.
+    engine.step(2_000, Input::Connected { peer_ik, via: Transport::Lan }).expect("шаг");
+    let card = engine.own_card();
+    assert_eq!(card.ygg, mesh.to_vec(), "ключ обязан оказаться в карточке");
+    assert!(
+        card.version > announced_before,
+        "версия обязана вырасти, иначе §4.3 обновление не пропустит: \
+         было {announced_before}, стало {}",
+        card.version
+    );
+
+    // Обновление **поставлено в очередь** этому контакту, и поставлено
+    // именно этим шагом: сверяется момент постановки, а не число записей.
+    //
+    // Очередь, а не эффекты шага, и это не придирка. Onion у собеседника
+    // есть, но он не поднят (`ready` при старте — одна локальная сеть),
+    // поэтому §5.4 честно не производит ни одной отправки, а обновление
+    // ложится в отложенные и на диск. Утверждение про эффекты проверяло
+    // бы готовность болванки, а не рассылку карточки.
+    let queued = engine.store().outbox().expect("очередь");
+    assert!(
+        queued.iter().any(|entry| entry.recipient_ik == peer_ik && entry.queued_ms == 2_000),
+        "обновление обязано ждать этого контакта с этого шага: {queued:?}"
+    );
+
+    // И на диске теперь лежит она же. Проверка не лишняя: разослать
+    // и не сохранить значит выдать ту же версию второй раз после
+    // следующего запуска, и тогда обновление не пройдёт §4.3 уже навсегда.
+    let stored = engine
+        .store()
+        .meta(ratatosk_store::META_SELF_CARD)
+        .expect("чтение")
+        .expect("карточка записана");
+    let on_disk = ContactCard::decode(&stored).expect("разбор").into_parts().1;
+    assert_eq!(on_disk.ygg, mesh.to_vec(), "на диске карточка с ключом");
+    assert_eq!(on_disk.version, card.version, "и той же версии");
+
+    // Второй шаг молчит: карточка уже разослана, и повтор бесплатен.
+    engine.step(2_100, Input::Connected { peer_ik, via: Transport::Lan }).expect("шаг");
+    assert_eq!(engine.own_card().version, card.version, "версия не растёт на ровном месте");
+
+    // И контакт при этом на месте — рассылка не тронула знакомства.
+    assert!(engine.contacts().contains_key(&peer_ik));
+}
+
 fn peer_card() -> (Vec<u8>, [u8; 32]) {
     let peer = Identity::generate();
     let card = ContactCard {
@@ -68,6 +204,7 @@ fn peer_card() -> (Vec<u8>, [u8; 32]) {
         chatmail: String::new(),
         display_name: "собеседник".to_owned(),
         version: 1,
+        ygg: Vec::new(),
     };
     (card.encode().expect("карточка кодируется"), card.ik)
 }
@@ -571,7 +708,7 @@ fn the_newest_session_of_a_family_is_the_one_that_sends_after_a_restart() {
                 .put_session(&StoredSession {
                     session_id: session.session_id,
                     peer_ik,
-                    lan: false,
+                    binding: 1,
                     snapshot: session.export().to_vec(),
                     established_ms,
                 })
@@ -622,7 +759,7 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
             .put_session(&StoredSession {
                 session_id: session.session_id,
                 peer_ik,
-                lan: true,
+                binding: 0,
                 snapshot: session.export().to_vec(),
                 established_ms: 1_000,
             })
@@ -644,7 +781,7 @@ fn a_read_receipt_is_not_re_sent_after_a_restart() {
             .unwrap();
         engine.restore().unwrap();
 
-        // Сессия в базе локальная (`lan: true`) — значит и канал к ней
+        // Сессия в базе локальная (`binding: 0`) — значит и канал к ней
         // локальный, а локальная сеть по умолчанию выключена (§5.1) и после
         // перезапуска никем ещё не найдена. Без этих двух строк проверялась
         // бы отправка в сеть, которой нет: прямой канал спрашивает §5.4
@@ -740,7 +877,7 @@ fn a_session_survives_and_its_send_counter_never_goes_back() {
             .put_session(&StoredSession {
                 session_id,
                 peer_ik,
-                lan: true,
+                binding: 0,
                 snapshot: session.export().to_vec(),
                 established_ms: 1_000,
             })
@@ -817,7 +954,7 @@ fn a_lan_link_loss_keeps_the_session_and_silence_only_retires_it() {
         .put_session(&StoredSession {
             session_id,
             peer_ik,
-            lan: true,
+            binding: 0,
             snapshot: session.export().to_vec(),
             established_ms: 1_000,
         })
@@ -1010,7 +1147,7 @@ fn a_message_in_flight_when_the_process_died_still_gets_sent() {
             .put_session(&StoredSession {
                 session_id: session.session_id,
                 peer_ik,
-                lan: true,
+                binding: 0,
                 snapshot: session.export().to_vec(),
                 established_ms: 1_000,
             })
@@ -1435,4 +1572,126 @@ fn a_group_copy_stays_silent_across_a_restart() {
         None,
         "и после перезапуска статуса у групповой копии нет"
     );
+}
+
+#[test]
+fn mesh_settings_reach_the_runner_after_a_restart() {
+    // Разбор поломки со стенда: «настройки yggdrasil не сохраняются при
+    // перезапуске». Сохранялись они прекрасно — `restore` поднимал их
+    // с диска и клал в ядро. Не доезжали они **вниз**: `startup_effects`
+    // перечислял транспорты руками, тремя строками, и появившийся
+    // четвёртым меш в этот список не попал, а `Effect::SetYgg`
+    // не отправлялся оттуда вовсе.
+    //
+    // Наружу это выглядит как потеря настроек, а на деле ядро знает,
+    // раннер нет. Хуже всего то, что каждая половина по отдельности
+    // исправна — и запись на диск, и подъём, и команда; ошибка живёт
+    // **между** ними.
+    let db = TempDb::new("ygg-survives");
+    let db_key = Zeroizing::new([6u8; 32]);
+
+    // Первый запуск: свой узел, один пир, ступень включена.
+    let named = {
+        let mut store = db.open(&db_key);
+        let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+        let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+        engine.restore().expect("подъём");
+        for command in [
+            Command::SetYggMode(ratatosk_proto::ygg::YggMode::Embedded),
+            Command::SetYggPeers(vec!["tcp://ygg.example:9001".to_owned()]),
+            Command::SetTransportEnabled { transport: Transport::Ygg, enabled: true },
+        ] {
+            engine.step(1_000, Input::Command(command)).expect("настройка меша");
+        }
+        let named = engine.own_card().ygg.clone();
+        assert_eq!(named.len(), 32, "узел обязан назвать себя");
+        named
+    };
+
+    // Второй запуск: та же база.
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    assert_eq!(engine.own_card().ygg, named, "имя в меше обязано быть прежним");
+    assert_eq!(engine.ygg_mode(), ratatosk_proto::ygg::YggMode::Embedded, "и режим тоже");
+    assert_eq!(engine.ygg_peers(), ["tcp://ygg.example:9001"], "и пиры");
+
+    // А теперь главное: об этом обязан узнать раннер. Проверяется не поле
+    // ядра, а **эффект**, потому что поломка была ровно между ними.
+    let effects = engine.startup_effects();
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SetYgg(ratatosk_proto::ygg::YggSetup::Embedded { peers, .. })
+                if peers == &["tcp://ygg.example:9001".to_owned()]
+        )),
+        "раннер обязан узнать про свой узел и его пиров: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::SetTransportEnabled { transport: Transport::Ygg, enabled: true }
+        )),
+        "и про то, что ступень включена: {effects:?}"
+    );
+}
+
+#[test]
+fn settings_reach_the_runners_before_the_switches() {
+    // Вторая половина той же поломки, и найдена она была после первой:
+    // `Effect::SetYgg` отправлялся — но **после** `SetTransportEnabled`.
+    // Раннер получал «включить», поднимался по прежней настройке (привязка
+    // к адресу несуществующего демона), отказывал, и приехавшая следом
+    // настройка застанет ступень уже выключенной.
+    //
+    // Наружу: после перезапуска меш не работает, и чинится он выключением
+    // и включением руками. Проверяется поэтому именно **порядок**, а не
+    // наличие: наличие было.
+    let db = TempDb::new("order-at-startup");
+    let db_key = Zeroizing::new([8u8; 32]);
+    let mut store = db.open(&db_key);
+    let identity = vault::load_or_create(&mut store, &db_key).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    let effects = engine.startup_effects();
+    let switch = effects
+        .iter()
+        .position(|e| matches!(e, Effect::SetTransportEnabled { .. }))
+        .expect("выключатели обязаны быть");
+    for (at, effect) in effects.iter().enumerate() {
+        let setting = matches!(
+            effect,
+            Effect::SetYgg(_) | Effect::SetMailAccount(_) | Effect::WatchLanPeers(_)
+        );
+        assert!(
+            !setting || at < switch,
+            "настройка {effect:?} стоит {at}-й, после выключателя на {switch}-м"
+        );
+    }
+}
+
+#[test]
+fn every_rung_is_named_at_startup() {
+    // Список ступеней в `startup_effects` брался руками, и меш в него
+    // не попал. Проверка смотрит не на код, а на исход: каждая ступень
+    // §5.4 обязана быть названа раннерам при подъёме — иначе транспорт,
+    // выключенный человеком, останется поднятым, а включённый не поднимется.
+    let mut store = TempDb::new("all-rungs").open(&Zeroizing::new([7u8; 32]));
+    let identity = vault::load_or_create(&mut store, &Zeroizing::new([7u8; 32])).expect("личность");
+    let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
+    engine.restore().expect("подъём");
+
+    let effects = engine.startup_effects();
+    for transport in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SetTransportEnabled { transport: named, .. } if *named == transport
+            )),
+            "ступень {transport:?} не названа при подъёме: {effects:?}"
+        );
+    }
 }

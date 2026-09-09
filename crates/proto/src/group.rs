@@ -59,6 +59,33 @@ pub const MEMBERSHIP_SNAPSHOT_EVERY: u64 = 5_000;
 /// Идентификатор группы.
 pub type GroupId = [u8; 16];
 
+/// Читает необязательную метку HLC из пары ключей.
+///
+/// Отсутствие метки — не ошибка формата: сборка, не знавшая этого поля,
+/// его не шлёт. Нулевая метка означает «старшинство не названо», и первое
+/// же названное её обгонит.
+///
+/// # Errors
+///
+/// Поле есть, но не целое или логическая компонента не влезает в 32 бита.
+fn optional_hlc(
+    map: &[(Value, Value)],
+    wall_key: u64,
+    logical_key: u64,
+) -> Result<Hlc, CodecError> {
+    let wall_ms = match canonical::get(map, wall_key) {
+        Some(value) => canonical::as_u64(value)?,
+        None => 0,
+    };
+    let logical = match canonical::get(map, logical_key) {
+        Some(value) => {
+            u32::try_from(canonical::as_u64(value)?).map_err(|_| CodecError::TypeMismatch)?
+        }
+        None => 0,
+    };
+    Ok(Hlc::new(wall_ms, logical))
+}
+
 /// Отказ в групповой операции.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GroupError {
@@ -253,6 +280,22 @@ pub const MAX_OBSERVED_TAGS: usize = 256;
 /// 1:1-сессии, которая уже говорит, от кого он. Пересылать чужой ключ
 /// отправителя незачем — при вступлении их отдаёт пригласивший, и отдаёт
 /// как свои сведения, за которые ручается сессия с ним.
+///
+/// # Почему у блока есть метка поворота
+///
+/// Каждое вступление проворачивает цепочку каждого участника (§11.5), а §9.2
+/// разрешает переставлять кадры. Два приглашения подряд — и до участника
+/// едут **два** объявления одной и той же цепочки, с одинаковым `counter`
+/// (после поворота он всегда нулевой). Без признака старшинства получатель
+/// не отличает свежее от опоздавшего и примерно в половине случаев оставляет
+/// себе мёртвую цепочку: номер верный, а ключ не тот. Дальше сообщения
+/// отправителя не открываются — молча, потому что снаружи это неотличимо
+/// от порчи.
+///
+/// Метку ставит **владелец** цепочки в момент поворота, и при пересылке
+/// чужого ключа (§11.5) она едет как есть. Поэтому сравнивать её всегда
+/// можно: две метки одной цепочки выданы одними часами, чьей бы рукой
+/// ни были переданы.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderKeyBlock {
     /// Какой группы.
@@ -263,6 +306,12 @@ pub struct SenderKeyBlock {
     pub chain: [u8; 32],
     /// Номер, которому это состояние соответствует.
     pub counter: u64,
+    /// Когда владелец эту цепочку завёл — метка его часов.
+    ///
+    /// Только для старшинства: получатель берёт цепочку, лишь если метка
+    /// строго новее уже лежащей. Нулевая метка означает «старшинства не
+    /// назвали» — так шлёт сборка, не знавшая этого поля.
+    pub chain_hlc: Hlc,
 }
 
 /// Кодирует ключ отправителя.
@@ -273,6 +322,8 @@ pub fn sender_key_value(block: &SenderKeyBlock) -> Value {
         (Value::Integer(KEY_ACTOR.into()), Value::Bytes(block.member.to_vec())),
         (Value::Integer(KEY_CHAIN.into()), Value::Bytes(block.chain.to_vec())),
         (Value::Integer(KEY_COUNTER.into()), Value::Integer(block.counter.into())),
+        (Value::Integer(KEY_WALL_MS.into()), Value::Integer(block.chain_hlc.wall_ms.into())),
+        (Value::Integer(KEY_LOGICAL.into()), Value::Integer(block.chain_hlc.logical.into())),
     ])
 }
 
@@ -288,6 +339,9 @@ pub fn sender_key_from_value(value: &Value) -> Result<SenderKeyBlock, CodecError
         member: canonical::as_array::<32>(canonical::require(map, KEY_ACTOR)?)?,
         chain: canonical::as_array::<32>(canonical::require(map, KEY_CHAIN)?)?,
         counter: canonical::as_u64(canonical::require(map, KEY_COUNTER)?)?,
+        // Необязательное на чтении — по той же причине, что и метка
+        // названия: сборка, не знавшая старшинства, её не шлёт.
+        chain_hlc: optional_hlc(map, KEY_WALL_MS, KEY_LOGICAL)?,
     })
 }
 
@@ -785,17 +839,7 @@ pub fn intro_from_value(value: &Value) -> Result<Intro, CodecError> {
         // Необязательное на чтении: сборка, не знавшая переименования,
         // метки не шлёт. Ноль означает «метки не выдавали», и первое же
         // переименование его обгонит.
-        title_hlc: Hlc::new(
-            match canonical::get(map, KEY_WALL_MS) {
-                Some(value) => canonical::as_u64(value)?,
-                None => 0,
-            },
-            match canonical::get(map, KEY_LOGICAL) {
-                Some(value) => u32::try_from(canonical::as_u64(value)?)
-                    .map_err(|_| CodecError::TypeMismatch)?,
-                None => 0,
-            },
-        ),
+        title_hlc: optional_hlc(map, KEY_WALL_MS, KEY_LOGICAL)?,
         // Тоже необязательное: сборка, не знавшая аватарок, картинки
         // не шлёт. Проверяется тем же правилом, что и присланная
         // действием, — предел и сигнатура; негодную не берём вовсе,
@@ -806,17 +850,7 @@ pub fn intro_from_value(value: &Value) -> Result<Intro, CodecError> {
             Some(_) => return Err(CodecError::TypeMismatch),
             None => Vec::new(),
         },
-        avatar_hlc: Hlc::new(
-            match canonical::get(map, KEY_AVATAR_WALL) {
-                Some(value) => canonical::as_u64(value)?,
-                None => 0,
-            },
-            match canonical::get(map, KEY_AVATAR_LOGICAL) {
-                Some(value) => u32::try_from(canonical::as_u64(value)?)
-                    .map_err(|_| CodecError::TypeMismatch)?,
-                None => 0,
-            },
-        ),
+        avatar_hlc: optional_hlc(map, KEY_AVATAR_WALL, KEY_AVATAR_LOGICAL)?,
     })
 }
 
@@ -1450,10 +1484,30 @@ mod tests {
 
     #[test]
     fn a_sender_key_survives_the_round_trip() {
-        let block =
-            SenderKeyBlock { group: [7u8; 16], member: OTHER, chain: [3u8; 32], counter: 1_234 };
+        let block = SenderKeyBlock {
+            group: [7u8; 16],
+            member: OTHER,
+            chain: [3u8; 32],
+            counter: 1_234,
+            chain_hlc: Hlc::new(9_000, 2),
+        };
         let back = sender_key_from_value(&sender_key_value(&block)).expect("разбор");
-        assert_eq!(back, block, "номер обязан ехать вместе с ключом");
+        assert_eq!(back, block, "номер и метка поворота обязаны ехать вместе с ключом");
+    }
+
+    #[test]
+    fn a_sender_key_without_a_mark_reads_as_the_beginning_of_time() {
+        // Так выглядит блок от сборки, не знавшей старшинства: разбор
+        // обязан его принять, а метка — оказаться нулевой, чтобы первое
+        // же названное старшинство её обогнало.
+        let old = Value::Map(vec![
+            (Value::Integer(KEY_GROUP.into()), Value::Bytes(vec![7u8; 16])),
+            (Value::Integer(KEY_ACTOR.into()), Value::Bytes(OTHER.to_vec())),
+            (Value::Integer(KEY_CHAIN.into()), Value::Bytes(vec![3u8; 32])),
+            (Value::Integer(KEY_COUNTER.into()), Value::Integer(0.into())),
+        ]);
+        let back = sender_key_from_value(&old).expect("разбор старого блока");
+        assert_eq!(back.chain_hlc, Hlc::default(), "без поля метка обязана быть нулевой");
     }
 
     fn card(n: u8, len: usize) -> Vec<u8> {

@@ -68,7 +68,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
-use ratatosk_codec::ContactCard;
+use ratatosk_codec::{ContactCard, YGG_KEY_LEN};
 use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
 use ratatosk_core::{
     vault, Command, CompanionClient, CompanionCommand, CompanionDriver, CompanionEvent,
@@ -77,6 +77,7 @@ use ratatosk_core::{
 use ratatosk_crypto::{Identity, OnionKey};
 use ratatosk_proto::companion::{ChatSummary, Message, PairingInvite, Reaction};
 use ratatosk_proto::mail::MailAccount;
+use ratatosk_proto::ygg;
 use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, MemoryStore, Store};
 #[cfg(feature = "tor")]
@@ -110,6 +111,14 @@ const TOR_BUILT_IN: bool = cfg!(feature = "tor");
 /// сервера, а не как отсутствие кода.
 const MAIL_BUILT_IN: bool = cfg!(feature = "mail");
 
+/// Есть ли в этом двоичном файле **свой узел** меша (0.2).
+///
+/// Та же история в третий раз, и цена у неё та же. Без `--features ygg-node`
+/// раннер на `/ygg node` отвечает отказом, а отказ читается как «узел
+/// не поднялся» — то есть как чужая неисправность вместо отсутствия кода.
+/// Строка в шапке снимает этот вопрос до того, как он возникнет.
+const YGG_NODE_BUILT_IN: bool = cfg!(feature = "ygg-node");
+
 /// Чем собран этот стенд — одной строкой в шапку.
 ///
 /// Печатается всегда, а не только когда чего-то нет: строка «почта: нет»
@@ -117,7 +126,12 @@ const MAIL_BUILT_IN: bool = cfg!(feature = "mail");
 fn build_line() -> String {
     let tor = if TOR_BUILT_IN { "onion (arti)" } else { "onion НЕТ (--features tor)" };
     let mail = if MAIL_BUILT_IN { "почта" } else { "почта НЕТ (--features mail)" };
-    format!("LAN, {tor}, {mail}")
+    let node = if YGG_NODE_BUILT_IN {
+        "меш: демон и свой узел"
+    } else {
+        "меш: только демон (свой узел — --features ygg-node)"
+    };
+    format!("LAN, {tor}, {mail}, {node}")
 }
 
 struct Args {
@@ -130,6 +144,24 @@ struct Args {
     /// onion честно: LAN — первая ступень §5.4, и пока она работает,
     /// до второй дело не доходит.
     lan: bool,
+    /// Назвал ли человек сеть **явно** ключом командной строки.
+    ///
+    /// Отдельно от самого выбора, и разница стоила поломки: стенд слал
+    /// «включить LAN» на каждом запуске, потому что умолчание у флага —
+    /// «включена». Тем самым он затирал на диске выбор, сделанный в прошлый
+    /// раз командой `/lan`, — то есть настройки локальной сети не переживали
+    /// перезапуск, и виноват был не движок, а этот флаг.
+    ///
+    /// Теперь без ключа стенд не говорит про сеть ничего и берёт то,
+    /// что подняло ядро.
+    lan_named: bool,
+    /// Открытый ключ нашего узла Yggdrasil, шестнадцатеричный (`--ygg`).
+    ///
+    /// Стенду он нужен раньше самого раннера: ключ едет в карточке (§4.1),
+    /// и без него ступень §5.4 у собеседника неадресуема. Пока раннера нет,
+    /// ключ проверяет ровно одно — что карточка с мешем кодируется,
+    /// подписывается и доезжает до второго узла целой.
+    ygg: Option<String>,
     /// Не проверять права на каталоги Tor (`--trust-fs`).
     ///
     /// Нужно там, где `fs-mistrust` отвергает заведомо безопасный путь:
@@ -178,12 +210,48 @@ struct Args {
     peer: Option<String>,
 }
 
+/// Разбирает `--ygg <64 шестнадцатеричных знака>` в тридцать два байта.
+///
+/// Отказ **вслух и с продолжением**: стенд без меша работает, стенд
+/// с молча выброшенным ключом — обманывает.
+fn ygg_from_args(raw: Option<&str>) -> Vec<u8> {
+    let Some(raw) = raw else { return Vec::new() };
+    // Нарезка **по байтам**, а не срезами строки, и это не вкусовщина:
+    // `&raw[i..i + 2]` на строке из многобайтных знаков попадает в середину
+    // символа и роняет стенд паникой. Строка нужной длины из таких знаков
+    // набирается легко — хватит одного, вставленного при копировании.
+    // Поймано стендом на `rustc`, а не на устройстве.
+    let raw = raw.trim().as_bytes();
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes: Option<Vec<u8>> = (raw.len() == YGG_KEY_LEN * 2)
+        .then(|| {
+            raw.chunks_exact(2)
+                .map(|pair| Some(digit(pair[0])? * 16 + digit(pair[1])?))
+                .collect::<Option<Vec<u8>>>()
+        })
+        .flatten();
+    match bytes {
+        Some(bytes) => bytes,
+        None => {
+            eprintln!("--ygg: нужен ключ из 64 шестнадцатеричных знаков, меш выключен");
+            Vec::new()
+        }
+    }
+}
+
 fn parse_args() -> Args {
     let mut args = Args {
         name: "узел".to_owned(),
         port: 0,
         discovery: true,
         lan: true,
+        lan_named: false,
+        ygg: None,
         trust_fs: false,
         data: None,
         pin: None,
@@ -203,7 +271,11 @@ fn parse_args() -> Args {
             "--name" => args.name = argv.next().unwrap_or_default(),
             "--port" => args.port = argv.next().and_then(|p| p.parse().ok()).unwrap_or(0),
             "--no-mdns" => args.discovery = false,
-            "--no-lan" => args.lan = false,
+            "--no-lan" => {
+                args.lan = false;
+                args.lan_named = true;
+            }
+            "--ygg" => args.ygg = argv.next(),
             "--trust-fs" => args.trust_fs = true,
             "--data" => args.data = argv.next().map(PathBuf::from),
             "--pin" => args.pin = argv.next(),
@@ -336,6 +408,27 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     // целиком, а число нужно ещё дважды — в шапке и в подсказке `/devaddr`.
     let lan_port = lan.port();
 
+    // **Меш у терминала — своей рукой, как и onion.** Ядра у него нет,
+    // а `startup_effects` есть только у телефона: там ступень поднимает
+    // ядро, здесь сказать некому.
+    //
+    // Без этих строк второй слот составного раннера оставался `Disabled`,
+    // и лестница канала, дойдя до меша, упиралась в `Unavailable` на каждый
+    // кадр — то есть до onion не добиралась никогда.
+    //
+    // Ключ тот же `--ygg`, что и у обычного запуска: он означает «у меня
+    // уже есть свой демон, ходи через него». Без него терминал поднимает
+    // **встроенный** узел — сам, из зерна сопряжения и пиров телефона
+    // (`CompanionDriver::raise_own_node`). Узел ему нужен обязательно:
+    // клиентского режима у ступени нет, адрес `200::/7` выводится
+    // из собственного ключа.
+    let ygg_key = ygg_from_args(args.ygg.as_deref());
+    let ygg = ratatosk_transport::YggRunner::start(
+        ratatosk_transport::YggConfig { enabled: false, port: ratatosk_transport::YGG_PORT },
+        &ygg_key,
+    )
+    .await?;
+
     // Свой onion-сервис. Оба случая дают **один тип** — как и у узла выше:
     // без каталога подъём сразу объявляется неудавшимся, и составной раннер
     // остаётся тем же. Каталог обязателен потому, что адрес обязан пережить
@@ -374,12 +467,12 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
                 .await
             }
         });
-        Transports::new(lan, onion, Disabled)
+        Transports::new(lan, ygg, onion, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = &tor_handle;
-        Transports::new(lan, Disabled, Disabled)
+        Transports::new(lan, ygg, Disabled, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а
@@ -396,6 +489,35 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
             .await?;
     }
 
+    // То же и мешу: настройка, потом выключатель. Порядок тот, что у ядра
+    // (`startup_effects`), и не случайный — раннер без настройки поднимать
+    // нечего, а поднятый без неё честно отказывает.
+    //
+    // Без ключа ступень остаётся выключенной **здесь**, и это не полумера:
+    // её поднимет драйвер встроенным узлом, когда узнает пиров.
+    //
+    // Отказ не роняет терминал, и это исправление настоящей поломки:
+    // `?` здесь означал, что человек, у которого не запущен демон меша,
+    // получал вместо окна сообщение об ошибке — при том, что локальная
+    // сеть и onion у него работают. Ступень, которая не поднялась, —
+    // это на одну ступень меньше, а не конец работы.
+    if !ygg_key.is_empty() {
+        let setup = TransportCommand::SetYgg(ygg::YggSetup::External { key: ygg_key.clone() });
+        let mut outcome = runner.execute(setup).await;
+        // Включатель — только по удавшейся настройке: поднимать ступень,
+        // которой нечем ехать, значит завести `Unavailable` на каждый кадр.
+        if outcome.is_ok() {
+            let enable = TransportCommand::SetEnabled {
+                transport: ratatosk_proto::Transport::Ygg,
+                enabled: true,
+            };
+            outcome = runner.execute(enable).await;
+        }
+        if let Err(err) = outcome {
+            eprintln!("меш не поднялся ({err}) — работаем без него");
+        }
+    }
+
     println!("терминал : к «{}»", client.phone_name());
     println!("id       : {}", data_encoding::HEXLOWER.encode(&client.device_id()));
     println!("порт     : {lan_port}");
@@ -403,6 +525,24 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
         println!("телефон  : onion в приглашении пуст — звонить только локальной сетью");
     } else {
         println!("телефон  : {}", invite.onion);
+    }
+    match (invite.ygg.is_empty(), ygg_key.is_empty(), YGG_NODE_BUILT_IN) {
+        (true, true, _) => println!("меш      : ни у телефона, ни у нас — ступень не нужна"),
+        (_, false, _) => println!("меш      : свой демон по --ygg, поднимаем сразу"),
+        (_, true, true) if !invite.ygg_peers.is_empty() => {
+            println!("меш      : свой узел, пиров в приглашении — {}", invite.ygg_peers.len());
+        }
+        (_, true, true) => {
+            // Пиров в приглашении нет — телефон их не настроил или ссылка
+            // из сборки, которая их ещё не возила. Узел встанет позже,
+            // объявлением по живому каналу; сказать об этом надо вслух,
+            // иначе «меш не работает» человек будет чинить наугад.
+            println!("меш      : свой узел — пиров в приглашении нет, ждём объявления");
+            println!("           (первое подключение идёт локальной сетью или onion)");
+        }
+        (_, true, false) => {
+            println!("меш      : собрано без --features ygg-node — только демон по --ygg");
+        }
     }
     match (&args.tordir, cfg!(feature = "tor")) {
         (Some(dir), true) => {
@@ -436,6 +576,8 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     println!("команды: /chats   /open <номер>   /more   /read   /cache [on <путь>|off]   /quit");
     println!("         /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
     println!("         /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
+    println!("         /share [номер чата] — поделиться карточкой; без номера — своей");
+    println!("         /add <n>          — добавить того, чья карточка в строке n");
     println!("         /accept <n> [k]   — качать вложение;  /pause — передумать");
     println!("         /decline <n> [k]  — отказаться совсем: приехавшее стирается");
     println!("         /preview <n> [k]  — превью вложения, если оно есть");
@@ -907,6 +1049,33 @@ impl Console {
                 msg_ids,
             });
         }
+        if let Some(rest) = line.strip_prefix("/share") {
+            let Some(chat) = self.current else {
+                println!("< сперва /open <номер>");
+                return None;
+            };
+            let rest = rest.trim();
+            // Без довода — своя карточка: личного чата с самим собой нет,
+            // а поделиться собой хотят чаще всего.
+            let who = if rest.is_empty() {
+                println!("< делимся своей карточкой");
+                None
+            } else {
+                let picked =
+                    rest.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= self.chats.len());
+                let Some(n) = picked else {
+                    println!("< кем делиться: /share <номер чата из /chats>, без номера — собой");
+                    return None;
+                };
+                Some(self.chats[n - 1].chat)
+            };
+            return Some(CompanionCommand::ShareContact { chat, who });
+        }
+        if let Some(rest) = line.strip_prefix("/add ") {
+            let msg_id = self.pick(rest)?;
+            println!("< сверки это не даёт: §4.2 — встреча голосом, а не нажатие");
+            return Some(CompanionCommand::AddSharedContact { msg_id });
+        }
         if line == "/clear" {
             let Some(chat) = self.current else {
                 println!("< сперва /open <номер>");
@@ -1168,6 +1337,7 @@ impl Console {
             println!("<   /chats   /open <номер>   /more   /read");
             println!("<   /react <n> [эмодзи]   /reply <n> <текст>   /edit <n> <текст>");
             println!("<   /del <n…>   /retract <n…>   /fwd <n…> <номер чата>   /clear");
+            println!("<   /share [номер чата]   /add <n> — карточка человека (§4.1)");
             println!("<   /accept <n> [k]   /pause <n> [k]   /decline <n> [k]");
             println!("<   /preview <n> [k]   /avatar [номер чата]   /setavatar [путь]");
             println!("<   /members <номер чата> — состав группы");
@@ -1386,6 +1556,13 @@ async fn run<S: Store + 'static>(
     // Адреса onion и chatmail намеренно пустые: этот стенд проверяет LAN,
     // а §5.4 с непустыми адресами увёл бы доставку на транспорты, которых
     // ещё нет, — и отказ выглядел бы как отказ локальной сети.
+    // Ключ меша разбирается **один раз на запуск**: разбор говорит вслух
+    // при неверном ключе, и два разбора подряд означали бы две одинаковые
+    // жалобы на одну опечатку. Молча пустой ключ был бы худшим исходом:
+    // человек передал `--ygg` и уверен, что меш в карточке, а собеседник
+    // видит ступень без адреса и не понимает почему.
+    let ygg_key = ygg_from_args(args.ygg.as_deref());
+    let have_ygg = !ygg_key.is_empty();
     let addresses = SelfAddresses {
         onion: String::new(),
         chatmail: String::new(),
@@ -1405,10 +1582,36 @@ async fn run<S: Store + 'static>(
     let card = BASE64URL_NOPAD.encode(&engine.own_card().encode()?);
     let fingerprint = engine.fingerprint();
 
-    let config = LanConfig { enabled: args.lan, port: args.port, discovery: args.discovery };
+    // Раннер заводится **выключенным** всегда, а включает его первый шаг
+    // драйвера тем, что подняло ядро (`startup_effects`). Прежде сюда шёл
+    // флаг командной строки, у которого умолчание «включена», — и стенд
+    // зажигал маяк §5.1 до того, как ядро успевало сказать, что человек
+    // его выключил.
+    //
+    // Порт занимается сразу и без флага: он нужен объявлению, а без
+    // объявления никого не раскрывает.
+    // Снимается до того, как ядро уедет в драйвер: дальше спросить его
+    // можно только через ручку, а шапка печатается раньше.
+    let engine_lan = if args.lan_named {
+        args.lan
+    } else {
+        engine.transports().contains(ratatosk_proto::Transport::Lan)
+    };
+
+    let config = LanConfig { enabled: false, port: args.port, discovery: args.discovery };
     let lan = LanRunner::start(config, engine.own_card().ik).await?;
     let port = lan.port();
     let directory = lan.directory();
+
+    // Меш заводится всегда, а включается только с ключом: раннер без ключа
+    // честно отказывает, и это лучше, чем два разных состава раннеров.
+    // Порт занимается при включении, а не здесь, — привязка к своему адресу
+    // удаётся только при поднятом демоне.
+    let ygg = ratatosk_transport::YggRunner::start(
+        ratatosk_transport::YggConfig { enabled: false, port: ratatosk_transport::YGG_PORT },
+        &ygg_key,
+    )
+    .await?;
 
     // Ручка общего Tor-клиента — одна на обе ветки и на оба транспорта.
     // Onion-раннер кладёт в неё клиента, когда поднимется; почта берёт его
@@ -1460,7 +1663,7 @@ async fn run<S: Store + 'static>(
                 .await
             }
         });
-        Transports::new(lan, onion, mail)
+        Transports::new(lan, ygg, onion, mail)
     };
     #[cfg(not(feature = "tor"))]
     let runner = {
@@ -1468,7 +1671,7 @@ async fn run<S: Store + 'static>(
         // молчаливый успех. Ровно это увидит §5.4 и перейдёт к следующей
         // ступени.
         let _ = (&layout, &onion, &tor_handle);
-        Transports::new(lan, Disabled, mail)
+        Transports::new(lan, ygg, Disabled, mail)
     };
 
     println!("узел     : {}", args.name);
@@ -1478,12 +1681,17 @@ async fn run<S: Store + 'static>(
     // же, как стенд со сломанным транспортом. Разбирать вторую неисправность,
     // имея первую, можно долго.
     println!("сборка   : {}", build_line());
+    // Печатается **поднятое с диска**, а не флаг: с этого запуска стенд
+    // без ключа сеть не трогает, и печатать намерение вместо состояния
+    // значило бы врать ровно в той строке, которую читают первой.
+    let lan_now = engine_lan;
     println!(
         "сеть     : {}",
-        if args.lan {
-            "LAN включена — она первая ступень §5.4; выключить: /lan"
-        } else {
-            "LAN выключена (--no-lan) — доставка пойдёт через onion"
+        match (lan_now, args.lan_named) {
+            (true, true) => "LAN включена ключом — первая ступень §5.4; выключить: /lan",
+            (true, false) => "LAN включена (с прошлого запуска) — первая ступень §5.4; /lan",
+            (false, true) => "LAN выключена (--no-lan) — доставка пойдёт через onion",
+            (false, false) => "LAN выключена (§5.1, умолчание) — включить: /lan",
         }
     );
     if known > 0 {
@@ -1504,7 +1712,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1514,13 +1722,29 @@ async fn run<S: Store + 'static>(
     // §5.1: LAN выключен по умолчанию. Стенд включает его явно — ровно так же,
     // как это должен будет сделать пользователь в UI. Команда идёт первой:
     // она проставляет разрешение уже поднятым с диска контактам.
-    handle
-        .send(Command::SetTransportEnabled {
-            transport: ratatosk_proto::Transport::Lan,
-            enabled: args.lan,
-        })
-        .await
-        .ok();
+    if args.lan_named {
+        handle
+            .send(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: args.lan,
+            })
+            .await
+            .ok();
+    }
+
+    // Ключ из командной строки — это выбор режима «внешний демон», и едет
+    // он **командами**, а не полем при сборке: настройки меша живут в базе,
+    // и `--ygg` их меняет, а не подменяет на один запуск. Через ручку,
+    // а не `engine.step` до драйвера: рассылка карточки §4.3 обязана уехать,
+    // а не потеряться вместе с брошенными эффектами.
+    //
+    // Без ключа режим не трогается вовсе. Иначе запуск без флага выключал бы
+    // меш тому, кто настроил его в прошлый раз и просто забыл флаг, — и
+    // выглядело бы это как «стенд ломает настройки».
+    if have_ygg {
+        handle.send(Command::SetYggKey(ygg_key.clone())).await.ok();
+        handle.send(Command::SetYggMode(ygg::YggMode::External)).await.ok();
+    }
 
     tokio::select! {
         result = driver.run() => {
@@ -1528,7 +1752,7 @@ async fn run<S: Store + 'static>(
                 eprintln!("ядро остановилось: {error}");
             }
         }
-        () = console(handle, events, directory, own_ik, onion_address, args.lan) => {}
+        () = console(handle, events, directory, own_ik, onion_address, lan_now) => {}
     }
     Ok(())
 }
@@ -1542,6 +1766,10 @@ async fn console(
     // Свой onion-адрес — для команды `/onion` (§4.3).
     onion_address: String,
     // Включена ли сейчас локальная сеть; переключается командой `/lan`.
+    //
+    // Приходит **поднятой с диска**, а не флагом командной строки: иначе
+    // первый же `/lan` после запуска, где сеть была выключена в прошлый раз,
+    // сработал бы наоборот.
     mut lan_on: bool,
 ) {
     // Последняя новость о Tor — для команды `/tor`. Именно последняя,
@@ -2205,6 +2433,15 @@ async fn console(
                     }
                     continue;
                 }
+                // Голое `/ygg` обязано попадать сюда же, а не мимо: первая
+                // редакция разбирала только `/ygg ` с пробелом, и `/ygg`
+                // уходило в переключатель — то есть команда, которую сама
+                // же подсказка называет «что сейчас», печатала «ключа нет».
+                if line == "/ygg" || line.starts_with("/ygg ") {
+                    let rest = line.strip_prefix("/ygg").unwrap_or_default().trim();
+                    ygg_command(&handle, rest).await;
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix("/mail") {
                     mail_command(&handle, rest.trim()).await;
                     continue;
@@ -2532,6 +2769,14 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         if let Some(chatmail) = &contact.chatmail {
             println!("    почта: {chatmail}");
         }
+        // Ключ меша печатается **адресом**, а не байтами: байты человек
+        // сверять не станет, а по адресу он и пингует, и смотрит
+        // в `yggdrasilctl getPeers`. Пустой ключ не печатается вовсе —
+        // это обычное состояние, а не беда, и строка «меша нет» у каждого
+        // второго контакта была бы шумом.
+        if let Some(key) = contact.ygg.as_ref().and_then(|k| <[u8; 32]>::try_from(&k[..]).ok()) {
+            println!("    ygg-адрес: {}", ygg::address_text(&key));
+        }
 
         let addr = directory
             .get(&contact.peer_ik)
@@ -2550,11 +2795,17 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         for rung in &contact.reachability.rungs {
             let name = match rung.transport {
                 ratatosk_proto::Transport::Lan => "LAN  ",
+                ratatosk_proto::Transport::Ygg => "ygg  ",
                 ratatosk_proto::Transport::Onion => "onion",
                 ratatosk_proto::Transport::Mail => "почта",
             };
             let tail = if rung.transport == ratatosk_proto::Transport::Lan {
                 format!("  адрес: {addr}")
+            } else if rung.transport == ratatosk_proto::Transport::Ygg && !rung.addressable {
+                // Самая частая беда ступени, и по одному «нет» её
+                // не отличить от «мы забыли адрес»: у меша забывать нечего,
+                // ключ либо приехал в карточке, либо нет.
+                "  — ключа нет в его карточке".to_owned()
             } else {
                 String::new()
             };
@@ -2600,6 +2851,7 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
 fn via_name(via: ratatosk_proto::Transport) -> &'static str {
     match via {
         ratatosk_proto::Transport::Lan => "по LAN",
+        ratatosk_proto::Transport::Ygg => "через меш",
         ratatosk_proto::Transport::Onion => "через onion",
         ratatosk_proto::Transport::Mail => "почтой",
     }
@@ -2629,6 +2881,26 @@ async fn print_card(handle: &DriverHandle) {
         println!("  onion в карточке нет — сперва /onion, потом копировать");
     } else {
         println!("  onion: {}", card.onion);
+    }
+    // Ключ меша печатается тем же видом, каким принимается (`--ygg`):
+    // человек копирует его со стенда на стенд, и два разных написания
+    // одного ключа стоили бы ему разбирательства на ровном месте.
+    if card.ygg.is_empty() {
+        println!("  меша в карточке нет: /ygg daemon с --ygg <64 знака> либо /ygg node");
+    } else {
+        let hex: String = card.ygg.iter().map(|b| format!("{b:02x}")).collect();
+        println!("  ygg:   {hex}");
+        // Адрес печатается рядом с ключом, и это не украшение: ключ
+        // переносится руками, а сверять шестьдесят четыре знака глазами
+        // человек не станет. Адрес короткий, и `yggdrasilctl getSelf`
+        // показывает его тем же видом — одного взгляда хватает, чтобы
+        // понять, тот ли ключ перенесли.
+        match <[u8; 32]>::try_from(card.ygg.as_slice()) {
+            Ok(key) => println!("         адрес {} — сверьте с getSelf", ygg::address_text(&key)),
+            // Сюда не попасть: разбор карточки чужую длину отбрасывает.
+            // Но молчать на невозможном хуже, чем сказать о нём.
+            Err(_) => println!("         ключ не тридцати двух байт — адреса нет"),
+        }
     }
 }
 
@@ -2717,6 +2989,207 @@ fn decode_card(encoded: &str) -> Result<Vec<u8>, String> {
 /// Одна команда с подкомандами, а не пять команд: у почты одно состояние,
 /// и разводить его по нескольким именам значит заставить человека помнить,
 /// какое из них что меняет.
+/// `/ygg …` — состояние меша, ступень §5.4, режим и пиры (0.2).
+///
+/// Слова разведены по назначению, и это стоило одной путаницы: `on`/`off`
+/// переключают **ступень** (как `/tor on|off`), `mode` меняет **откуда
+/// берётся меш**. Первая редакция звала выключением и то и другое, и
+/// «выключить меш» означало разом две разные вещи.
+async fn ygg_command(handle: &DriverHandle, rest: &str) {
+    use ratatosk_proto::ygg::YggMode;
+
+    let (word, tail) = match rest.split_once(char::is_whitespace) {
+        Some((word, tail)) => (word, tail.trim()),
+        None => (rest, ""),
+    };
+
+    match word {
+        "" | "?" => ygg_show(handle).await,
+
+        // Ступень §5.4 — тот же переключатель, что `/lan` и `/tor`.
+        "on" | "off" => {
+            let on = word == "on";
+            // Включать нечего, пока нет имени: раннер откажет, и отказ
+            // прочтётся как поломка. Сказать причину здесь дешевле.
+            if on {
+                match handle.own_card().await {
+                    Some(card) if card.ygg.is_empty() => {
+                        println!("< имени в меше нет — включать нечего");
+                        println!("  /ygg mode node   — свой узел, имя он даст сам");
+                        println!("  /ygg mode daemon — внешний демон, ключ из --ygg");
+                        return;
+                    }
+                    None => {
+                        println!("< ядро остановлено");
+                        return;
+                    }
+                    Some(_) => {}
+                }
+            }
+            handle
+                .send(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Ygg,
+                    enabled: on,
+                })
+                .await
+                .ok();
+            if on {
+                // Спрашивается **после** команды, и ответ будет уже про
+                // неё: команды и запросы идут у драйвера одной очередью,
+                // и чтение не может обогнать запись.
+                //
+                // Прежде здесь стояло безусловное «меш включён». Оно
+                // и обмануло: ступень не поднималась, а стенд рапортовал
+                // успех, и разбираться приходилось по журналу.
+                let up = handle
+                    .transports()
+                    .await
+                    .is_some_and(|status| status.ready.contains(ratatosk_proto::Transport::Ygg));
+                if up {
+                    println!("< меш включён и работает — ступень между локальной сетью и onion");
+                } else {
+                    println!("< меш включён, но **не поднялся**");
+                    println!("  причина — в журнале строкой выше: у демона там адрес, который");
+                    println!("  пробовали, у своего узла — причина словами (чаще всего пиры)");
+                }
+            } else {
+                println!("< ступень меша выключена");
+                if handle.ygg_settings().await.map(|(mode, _)| mode) == Some(YggMode::Embedded) {
+                    println!("  {}", ratatosk_core::honest::YGG_NODE_STOP_NOTICE);
+                }
+            }
+        }
+
+        "mode" => ygg_mode(handle, tail).await,
+
+        // Пиры **добавляются**, а не заменяют список. Команда ядра
+        // (`SetYggPeers`) заменяет — так и надо для настройки, у которой
+        // один источник правды. А человек за консолью пишет пиров по одному
+        // и ждёт, что они копятся: первая редакция отдавала его строку
+        // ядру как есть, и второй `/ygg peer` молча стирал первый.
+        "peer" => {
+            let Some((_, mut peers)) = handle.ygg_settings().await else {
+                println!("< ядро остановлено");
+                return;
+            };
+            if tail == "clear" {
+                peers.clear();
+            } else if tail.is_empty() {
+                println!("< /ygg peer <ссылки>   — добавить; /ygg peer clear — очистить");
+                println!(
+                    "  сейчас: {}",
+                    if peers.is_empty() { "пусто".to_owned() } else { peers.join(" ") }
+                );
+                return;
+            } else {
+                for named in tail.split_whitespace() {
+                    if peers.iter().any(|known| known.as_str() == named) {
+                        println!("  уже есть: {named}");
+                    } else {
+                        peers.push(named.to_owned());
+                    }
+                }
+            }
+            let shown = if peers.is_empty() { "пусто".to_owned() } else { peers.join(" ") };
+            handle.send(Command::SetYggPeers(peers)).await.ok();
+            // Печатается **весь** список, а не число добавленных: «названо: 1»
+            // читается как «добавлен один» и ровно так и обмануло.
+            println!("< пиры: {shown}");
+        }
+
+        other => {
+            println!("< не понял «{other}»");
+            println!("  /ygg                    — что сейчас");
+            println!("  /ygg on | off           — ступень §5.4");
+            println!("  /ygg mode daemon|node|off — откуда берётся меш");
+            println!("  /ygg peer <ссылки>      — добавить пиров своему узлу");
+            println!("  /ygg peer clear         — очистить список");
+        }
+    }
+}
+
+/// `/ygg` — что сейчас с мешем, одним экраном.
+///
+/// Печатается всё разом: режим, имя, адрес, ступень и пиры. Порознь эти
+/// строки не значат ничего — «ступень включена» без имени и «имя есть»
+/// без пиров одинаково выглядят как работающий меш.
+async fn ygg_show(handle: &DriverHandle) {
+    use ratatosk_proto::ygg::YggMode;
+
+    let Some((mode, peers)) = handle.ygg_settings().await else {
+        println!("< ядро остановлено");
+        return;
+    };
+    println!("< меш: {}", mode.title());
+    match handle.own_card().await {
+        Some(card) if card.ygg.len() == ygg::KEY_LEN => {
+            let hex: String = card.ygg.iter().map(|b| format!("{b:02x}")).collect();
+            println!("  ключ:  {hex}");
+            if let Ok(key) = <[u8; ygg::KEY_LEN]>::try_from(&card.ygg[..]) {
+                println!("  адрес: {}", ygg::address_text(&key));
+            }
+        }
+        _ => println!("  имени в меше нет — ступень работать не может"),
+    }
+    if let Some(status) = handle.transports().await {
+        let on = status.enabled.contains(ratatosk_proto::Transport::Ygg);
+        let up = status.ready.contains(ratatosk_proto::Transport::Ygg);
+        println!(
+            "  ступень: включена={} работает={}",
+            if on { "да" } else { "нет" },
+            if up { "да" } else { "нет" }
+        );
+    }
+    if mode == YggMode::Embedded {
+        if peers.is_empty() {
+            println!("  пиров нет: узел ни с кем не соединён");
+            println!("  назвать: /ygg peer tcp://host:9001");
+        } else {
+            println!("  пиры: {}", peers.join(" "));
+        }
+        if !YGG_NODE_BUILT_IN {
+            println!("  узла в этой сборке нет: пересоберите с --features ygg-node");
+        }
+    }
+}
+
+/// `/ygg mode …` — откуда берётся меш (0.2).
+async fn ygg_mode(handle: &DriverHandle, tail: &str) {
+    use ratatosk_proto::ygg::YggMode;
+
+    let mode = match tail {
+        "off" | "none" => YggMode::Off,
+        "daemon" => YggMode::External,
+        "node" => YggMode::Embedded,
+        other => {
+            println!("< не понял режим «{other}»: off | daemon | node");
+            return;
+        }
+    };
+    let was = handle.ygg_settings().await.map(|(mode, _)| mode);
+    handle.send(Command::SetYggMode(mode)).await.ok();
+    match mode {
+        YggMode::Off => {
+            println!("< меша нет — имя снято с карточки");
+            if was == Some(YggMode::Embedded) {
+                println!("  {}", ratatosk_core::honest::YGG_NODE_STOP_NOTICE);
+            }
+        }
+        YggMode::External => {
+            println!("< меш: внешний демон; имя — ключ, названный через --ygg");
+            println!("  включить ступень: /ygg on");
+        }
+        YggMode::Embedded => {
+            println!("< меш: свой узел; имя он назвал себе сам — смотрите /ygg");
+            println!("  без пиров он ни с кем не соединён: /ygg peer tcp://host:9001");
+            if !YGG_NODE_BUILT_IN {
+                println!("  но в этой сборке узла нет: пересоберите с --features ygg-node");
+            }
+            println!("  включить ступень: /ygg on");
+        }
+    }
+}
+
 async fn mail_command(handle: &DriverHandle, rest: &str) {
     let (word, tail) = match rest.split_once(char::is_whitespace) {
         Some((word, tail)) => (word, tail.trim()),
@@ -3117,6 +3590,17 @@ fn line(message: &Message) -> String {
         if file.has_preview {
             out.push_str("  (превью: /preview)");
         }
+    }
+    // Карточка человека — отдельной строкой, как вложение. Без неё
+    // сообщение печаталось бы пустым: тело у него нарочно пустое.
+    if let Some(shared) = &message.shared {
+        out.push_str(&format!("\n<     [карточка] {}", shared.name));
+        out.push_str(match shared.chat {
+            // Знакомого добавлять незачем — и сказать об этом надо, иначе
+            // `/add` выглядит командой, которая молча ничего не делает.
+            Some(_) => "  (уже в контактах)",
+            None => "  ← добавить: /add <номер строки>",
+        });
     }
     out
 }

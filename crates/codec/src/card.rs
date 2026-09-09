@@ -9,6 +9,9 @@ use crate::error::{CodecError, Result};
 /// Префикс URI контакт-карточки (§4.1).
 pub const URI_PREFIX: &str = "ratatosk:v0:";
 
+/// Длина открытого ключа Yggdrasil — ed25519, тридцать два байта.
+pub const YGG_KEY_LEN: usize = 32;
+
 // Расхождение со спецификацией, разрешённое сознательно.
 //
 // §4.1 нумерует поля карточки с единицы, а §6 требует, чтобы `protocol_version`
@@ -30,6 +33,15 @@ const KEY_ONION: u64 = 4;
 const KEY_CHATMAIL: u64 = 5;
 const KEY_DISPLAY_NAME: u64 = 6;
 const KEY_VERSION: u64 = 7;
+/// Открытый ключ узла Yggdrasil, 32 байта (0.2).
+///
+/// Ключ **необязателен и на записи, и на чтении**, и оба конца этого
+/// правила нужны. На чтении — потому что карточки, выданные до 0.2, ключа
+/// не несут, а отвергать их значило бы разорвать все прежние знакомства
+/// разом. На записи — потому что канонический CBOR обязан совпадать
+/// до байта: припиши мы пустой ключ, разобранная и заново собранная старая
+/// карточка перестала бы совпадать с подписанными байтами (§6).
+const KEY_YGG: u64 = 8;
 
 /// Контакт-карточка (§4.1).
 ///
@@ -41,6 +53,7 @@ const KEY_VERSION: u64 = 7;
 ///   4: tstr,      ; chatmail-адрес
 ///   5: tstr,      ; отображаемое имя (не доверенное)
 ///   6: uint,      ; версия карточки
+///   7: bytes,     ; открытый ключ Yggdrasil, 32 байта — необязательный
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +73,23 @@ pub struct ContactCard {
     pub display_name: String,
     /// Монотонная версия карточки (§4.3).
     pub version: u64,
+    /// Открытый ключ узла Yggdrasil (0.2). Пусто — меша у контакта нет.
+    ///
+    /// **Ключ, а не адрес**, и это одно поле на два способа связи: встроенный
+    /// узел соединяется по ключу напрямую, внешнему демону адрес `200::/7`
+    /// выводится из того же ключа. Лестница §5.4 разницы не видит.
+    ///
+    /// Отдельная пара ключей, а не [`ContactCard::sk`], и это не запас
+    /// на будущее. Ключ подписи — долговременное имя человека; сделай мы его
+    /// же именем в меше, каждый узел, через который идёт трафик, связывал бы
+    /// сетевую активность с этой личностью. Разные роли — разные ключи.
+    ///
+    /// `Vec`, а не `[u8; 32]`: пусто значит «нет», и отдельного признака
+    /// для этого не заводится. Ключ неверной длины разбором **отбрасывается**,
+    /// а не роняет карточку целиком — как и картинка в `group::Intro`:
+    /// поле, без которого всё остальное работает, не имеет права уносить
+    /// с собой знакомство.
+    pub ygg: Vec<u8>,
 }
 
 impl ContactCard {
@@ -69,7 +99,7 @@ impl ContactCard {
     }
 
     fn to_value(&self) -> Value {
-        Value::Map(vec![
+        let mut fields = vec![
             (Value::Integer(KEY_PROTOCOL_VERSION.into()), Value::Integer(PROTOCOL_VERSION.into())),
             (Value::Integer(KEY_IK.into()), Value::Bytes(self.ik.to_vec())),
             (Value::Integer(KEY_SK.into()), Value::Bytes(self.sk.to_vec())),
@@ -77,7 +107,13 @@ impl ContactCard {
             (Value::Integer(KEY_CHATMAIL.into()), Value::Text(self.chatmail.clone())),
             (Value::Integer(KEY_DISPLAY_NAME.into()), Value::Text(self.display_name.clone())),
             (Value::Integer(KEY_VERSION.into()), Value::Integer(self.version.into())),
-        ])
+        ];
+        // Пустой ключ не пишется вовсе — см. `KEY_YGG`. Карточка без меша
+        // обязана кодироваться теми же байтами, что и до 0.2.
+        if !self.ygg.is_empty() {
+            fields.push((Value::Integer(KEY_YGG.into()), Value::Bytes(self.ygg.clone())));
+        }
+        Value::Map(fields)
     }
 
     /// Разбирает из канонического CBOR, сохраняя принятые байты (§6).
@@ -94,6 +130,19 @@ impl ContactCard {
             display_name: canonical::as_text(canonical::require(map, KEY_DISPLAY_NAME)?)?
                 .to_owned(),
             version: canonical::as_u64(canonical::require(map, KEY_VERSION)?)?,
+            // Нет ключа — нет меша. Есть, но не 32 байта — тоже нет: чужая
+            // длина означает либо порчу, либо формат, которого мы не знаем,
+            // и в обоих случаях соединяться по этим байтам не с кем.
+            // Отказывать всей карточке из-за этого нельзя: подпись §6
+            // проверяется по принятым байтам и остаётся верной, а знакомство
+            // не должно ломаться из-за поля, которого раньше не было.
+            ygg: match canonical::get(map, KEY_YGG) {
+                Some(value) => match canonical::as_bytes(value) {
+                    Ok(bytes) if bytes.len() == YGG_KEY_LEN => bytes.to_vec(),
+                    _ => Vec::new(),
+                },
+                None => Vec::new(),
+            },
         };
         Ok(Raw::new(bytes.to_vec(), card))
     }
@@ -157,6 +206,7 @@ mod tests {
             chatmail: "a7f3k9@nine.example".into(),
             display_name: "Алиса".into(),
             version: 1,
+            ygg: Vec::new(),
         }
     }
 

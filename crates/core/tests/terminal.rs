@@ -43,7 +43,11 @@ fn phone_with_blobs(seed: u8, name: &str) -> (Phone, Blobs) {
         Box::new(blobs),
         Box::new(SeededEntropy::new(u64::from(seed))),
         SelfAddresses {
-            onion: format!("{name}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion"),
+            // Настоящий адрес v3, а не строка нужной формы: §4.3 требует,
+            // чтобы непустой onion был адресом, и карточка с выдуманным
+            // отвергалась бы на первом же обновлении — вместе со всем,
+            // что в ней ехало. Та же ловушка стояла в `pair.rs`.
+            onion: ratatosk_crypto::OnionKey::from_seed([seed; 32]).address(),
             chatmail: format!("{name}@nine.example"),
             display_name: name.to_owned(),
         },
@@ -73,6 +77,7 @@ fn with_contact(phone: &mut Phone, now_ms: u64, name: &str, seed: u8) -> [u8; 32
         chatmail: format!("{name}@nine.example"),
         display_name: name.to_owned(),
         version: 1,
+        ygg: Vec::new(),
     };
     phone
         .step(
@@ -321,6 +326,8 @@ fn an_ask_without_a_link_is_refused_out_loud() {
         ik: Identity::from_seed([1u8; 32]).public().ik,
         secret: ratatosk_proto::companion::PairingSecret::new([5u8; 32]),
         onion: String::new(),
+        ygg: Vec::new(),
+        ygg_peers: Vec::new(),
         display_name: "телефон".into(),
     };
     let mut desktop = CompanionClient::from_invite(&invite, Box::new(SeededEntropy::new(99)));

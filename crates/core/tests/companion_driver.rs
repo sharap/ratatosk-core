@@ -54,10 +54,19 @@ struct FakeRunner {
     /// шесть тестов, а адресацию — один, и менять форму ради него значило бы
     /// править шесть мест из-за седьмого.
     addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>>,
+    /// Все команды подряд — для проверки настройки, а не отправки.
+    ///
+    /// Кадры сюда тоже попадают, и это нарочно: порядок «настроил меш,
+    /// потом поздоровался» проверяется только тем, что обе записи лежат
+    /// в одном списке.
+    commands: Arc<Mutex<Vec<TransportCommand>>>,
 }
 
 impl Runner for FakeRunner {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
+        if let Ok(mut seen) = self.commands.lock() {
+            seen.push(command.clone());
+        }
         if let TransportCommand::Send { peer, via, frame, .. } = command {
             if let Ok(mut seen) = self.addressed.lock() {
                 seen.push((via, peer.onion.clone()));
@@ -88,6 +97,10 @@ struct Pair {
     phone_ik: [u8; 32],
     /// Куда и чем драйвер звонил — общий список с поддельным раннером.
     addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>>,
+    /// Что драйвер просил у транспорта — общий список с поддельным раннером.
+    commands: Arc<Mutex<Vec<TransportCommand>>>,
+    /// Ссылка сопряжения целиком — из неё тест собирает снимок на диск.
+    invite: PairingInvite,
 }
 
 impl Pair {
@@ -216,6 +229,24 @@ fn paired(now_ms: u64) -> (CompanionDriver<FakeRunner>, Pair) {
 /// в момент её выдачи, и подставить его потом было бы враньём — терминал
 /// берёт его именно оттуда.
 fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeRunner>, Pair) {
+    paired_with(now_ms, phone_onion, Vec::new(), false)
+}
+
+/// То же, но у телефона ещё и настроены пиры меша.
+///
+/// Они уезжают в приглашение — и это единственный путь, которым терминал
+/// узнаёт их **до** первой связи. Подставлять их драйверу прямо было бы
+/// враньём ровно в том месте, где и была поломка.
+///
+/// `stale_invite` отдаёт терминалу ссылку **без** пиров — такую, какую
+/// печатала сборка постарше, — оставляя полную в `Pair::invite`. Так
+/// проверяется второй путь: пиры не из QR, а с диска.
+fn paired_with(
+    now_ms: u64,
+    phone_onion: String,
+    ygg_peers: Vec<String>,
+    stale_invite: bool,
+) -> (CompanionDriver<FakeRunner>, Pair) {
     let identity = Identity::from_seed([1u8; 32]);
     let mut store = MemoryStore::new();
     store.migrate().expect("миграция");
@@ -243,6 +274,19 @@ fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeR
         .expect("включение LAN");
     phone.step(0, Input::TransportReady { transport: Transport::Lan }).expect("готовность LAN");
 
+    if !ygg_peers.is_empty() {
+        // Режим — до ключа: в `Off` ключ запоминается, но имени не даёт,
+        // и карточка уехала бы без меша. А без меша в карточке терминалу
+        // и незачем поднимать узел.
+        phone
+            .step(0, Input::Command(Command::SetYggMode(ratatosk_proto::ygg::YggMode::External)))
+            .expect("режим меша телефона");
+        phone
+            .step(0, Input::Command(Command::SetYggKey(vec![3u8; 32])))
+            .expect("ключ меша телефона");
+        phone.step(0, Input::Command(Command::SetYggPeers(ygg_peers))).expect("пиры меша телефона");
+    }
+
     let effects = phone
         .step(now_ms, Input::Command(Command::PairDevice { label: "ноутбук".into() }))
         .expect("сопряжение");
@@ -255,14 +299,25 @@ fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeR
         .expect("ссылка приходит событием");
     let invite = PairingInvite::from_uri(&uri).expect("разбор ссылки");
 
-    let client = CompanionClient::from_invite(&invite, Box::new(SeededEntropy::new(99)));
+    let given = if stale_invite {
+        PairingInvite { ygg_peers: Vec::new(), ..invite.clone() }
+    } else {
+        invite.clone()
+    };
+    let client = CompanionClient::from_invite(&given, Box::new(SeededEntropy::new(99)));
     let desktop_ik = client.ik();
     let phone_ik = invite.ik;
 
     let (to_desktop, events_rx) = tokio::sync::mpsc::channel(64);
     let (sent_tx, from_desktop) = tokio::sync::mpsc::channel(64);
     let addressed: Arc<Mutex<Vec<(Transport, Option<String>)>>> = Arc::default();
-    let runner = FakeRunner { events: events_rx, sent: sent_tx, addressed: Arc::clone(&addressed) };
+    let commands: Arc<Mutex<Vec<TransportCommand>>> = Arc::default();
+    let runner = FakeRunner {
+        events: events_rx,
+        sent: sent_tx,
+        addressed: Arc::clone(&addressed),
+        commands: Arc::clone(&commands),
+    };
 
     let (driver, handle, events) = CompanionDriver::new(client, runner);
     (
@@ -277,6 +332,8 @@ fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeR
             desktop_ik,
             phone_ik,
             addressed,
+            commands,
+            invite,
         },
     )
 }
@@ -291,6 +348,7 @@ fn with_contact(phone: &mut Phone, now_ms: u64) -> [u8; 32] {
         chatmail: "sosed@nine.example".to_owned(),
         display_name: "сосед".to_owned(),
         version: 1,
+        ygg: Vec::new(),
     };
     phone
         .step(
@@ -850,6 +908,164 @@ async fn turning_the_cache_off_wipes_the_file() {
             pair.handle.send(CompanionCommand::KeepCache { path: None }).await.expect("выключение");
             pair.breathe().await;
             assert!(!cache.exists(), "выключение стирает файл");
+        } => {}
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_terminal_raises_its_own_mesh_node_from_the_invite() {
+    // Поломка, ради которой это написано: встроенный узел терминала
+    // не вставал **никогда** вне общей сети. Пиры приезжали только
+    // объявлением по живому каналу, а живой канал требовал поднятой
+    // ступени — узлу неоткуда было взяться, и в журнале стояло
+    // «свой_узел=false» до конца запуска.
+    //
+    // Поэтому пиры едут ещё и в приглашении, а узел поднимается **до**
+    // первого рукопожатия. Проверяется именно порядок: настройка, потом
+    // включатель, и только потом кадр.
+    let (mut driver, mut pair) =
+        paired_with(1_000, String::new(), vec!["tls://пир.example:1337".to_owned()], false);
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.breathe().await;
+            let seen = pair.commands.lock().expect("список команд");
+            let setup = seen
+                .iter()
+                .position(|command| matches!(command, TransportCommand::SetYgg(_)))
+                .expect("узел обязан подниматься до первой связи");
+            let enabled = seen
+                .iter()
+                .position(|command| matches!(
+                    command,
+                    TransportCommand::SetEnabled { transport: Transport::Ygg, enabled: true }
+                ))
+                .expect("поднятая настройка без включателя ступени не даёт");
+            assert!(setup < enabled, "раннеру нечего поднимать до настройки");
+
+            let first_frame = seen
+                .iter()
+                .position(|command| matches!(command, TransportCommand::Send { .. }));
+            assert!(
+                first_frame.is_none_or(|frame| enabled < frame),
+                "узел обязан вставать раньше первого кадра: иначе ступень \
+                 нужна для того, чтобы её поднять"
+            );
+
+            let TransportCommand::SetYgg(ratatosk_proto::ygg::YggSetup::Embedded {
+                peers, ..
+            }) = &seen[setup] else {
+                panic!("без своего демона терминалу полагается встроенный узел");
+            };
+            assert_eq!(peers, &["tls://пир.example:1337".to_owned()], "пиры едут те, что дал телефон");
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn a_terminal_without_peers_asks_the_transport_for_no_mesh_at_all() {
+    // Обратная половина: пиров нет — и ступень не поднимается вовсе.
+    // Поднятая без пиров, она стоила бы `Unavailable` на каждый кадр,
+    // то есть съеденной попытки на пути к onion.
+    let (mut driver, mut pair) = paired(1_000);
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_100).await;
+            let seen = pair.commands.lock().expect("список команд");
+            assert!(
+                !seen.iter().any(|command| matches!(command, TransportCommand::SetYgg(_))),
+                "без пиров поднимать нечего"
+            );
+            assert!(
+                !seen.iter().any(|command| matches!(
+                    command,
+                    TransportCommand::SetEnabled { transport: Transport::Ygg, .. }
+                )),
+                "ступень без узла обязана остаться выключенной"
+            );
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn the_same_peers_announced_again_do_not_restart_the_node() {
+    // Объявление адреса приходит на **каждом** рукопожатии, а перезапуск
+    // узла — это разрыв всего, что через него шло. Повтор с тем же списком
+    // обязан быть тишиной.
+    let (mut driver, mut pair) =
+        paired_with(1_000, String::new(), vec!["tls://пир.example:1337".to_owned()], false);
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_100).await;
+            pair.breathe().await;
+            let seen = pair.commands.lock().expect("список команд");
+            let raised = seen
+                .iter()
+                .filter(|command| matches!(command, TransportCommand::SetYgg(_)))
+                .count();
+            assert_eq!(raised, 1, "узел поднят один раз, дальше объявления его не трогают");
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn peers_kept_on_disk_raise_the_node_without_a_single_frame() {
+    // Живой прогон сказал ровно это: «узел поднимается, только если есть
+    // соединение по lan». Приглашение закрывает первый запуск, а дальше
+    // всё, что терминал узнал по живому каналу, умирало вместе с процессом:
+    // адрес и пиры в снимок не попадали.
+    //
+    // Здесь ссылка нарочно **без** пиров — такая, какую печатала сборка
+    // постарше. Единственный путь, которым узел может встать, — снимок.
+    let dir = temp_dir("mesh-cache");
+    let cache = dir.join("snimok");
+
+    let (mut driver, mut pair) = paired_with(
+        1_000,
+        String::new(),
+        vec!["tls://пир.example:1337".to_owned()],
+        true, // терминалу — ссылка без пиров
+    );
+
+    // Снимок кладёт на диск отдельный терминал того же сопряжения: файл
+    // запечатан ключом из зерна, и чужой не открылся бы.
+    let mut writer = CompanionClient::from_invite(&pair.invite, Box::new(SeededEntropy::new(7)));
+    let sealed = writer.snapshot().expect("снимок");
+    std::fs::write(&cache, &sealed).expect("файл кэша");
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.breathe().await;
+            {
+                let seen = pair.commands.lock().expect("список команд");
+                assert!(
+                    !seen.iter().any(|command| matches!(command, TransportCommand::SetYgg(_))),
+                    "до кэша поднимать нечего: в ссылке пиров нет"
+                );
+            }
+
+            pair.handle
+                .send(CompanionCommand::KeepCache { path: Some(cache.clone()) })
+                .await
+                .expect("команда принята");
+            pair.breathe().await;
+
+            let seen = pair.commands.lock().expect("список команд");
+            let TransportCommand::SetYgg(ratatosk_proto::ygg::YggSetup::Embedded { peers, .. }) =
+                seen.iter()
+                    .find(|command| matches!(command, TransportCommand::SetYgg(_)))
+                    .expect("узел обязан подняться с диска, без единого кадра")
+            else {
+                panic!("без своего демона терминалу полагается встроенный узел");
+            };
+            assert_eq!(peers, &["tls://пир.example:1337".to_owned()]);
         } => {}
     }
     let _ = std::fs::remove_dir_all(&dir);

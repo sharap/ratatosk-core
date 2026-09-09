@@ -603,6 +603,7 @@ mod tests {
             ik: [1u8; 32],
             onion: None,
             chatmail: chatmail.map(str::to_owned),
+            ygg: None,
         }
     }
 

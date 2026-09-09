@@ -200,6 +200,22 @@ pub enum CompanionCommand {
         /// Что.
         msg_ids: Vec<[u8; 16]>,
     },
+    /// Поделиться в чате карточкой человека (§4.1).
+    ///
+    /// Человек назван **личным чатом** с ним — тем же именем, каким его
+    /// называет состав группы. `None` означает «своей карточкой»: личного
+    /// чата с самим собой не бывает.
+    ShareContact {
+        /// В какой чат — переписку или группу.
+        chat: [u8; 16],
+        /// Чьей карточкой; `None` — своей.
+        who: Option<[u8; 16]>,
+    },
+    /// Добавить к себе того, чья карточка приехала этим сообщением.
+    AddSharedContact {
+        /// Какое сообщение принесло карточку.
+        msg_id: [u8; 16],
+    },
     /// Очистить чат у себя.
     ClearChat {
         /// Какой.
@@ -616,6 +632,12 @@ pub struct CompanionDriver<R: Runner> {
     cache_pending: Option<Vec<u8>>,
     saving: Option<Saving>,
     sending: Option<Sending>,
+    /// Пиры, на которых поднят свой узел меша. Пусто — узла нет.
+    ///
+    /// Помнится ровно затем, чтобы не перезапускать узел на том же самом
+    /// списке: объявление адреса приходит на каждом рукопожатии, а перезапуск
+    /// узла — это разрыв всего, что через него шло.
+    mesh_peers: Vec<String>,
     /// Часы. Отдельным полем ради тестов: у драйвера их иначе не подменить.
     now: fn() -> u64,
 }
@@ -652,6 +674,7 @@ impl<R: Runner> CompanionDriver<R> {
             cache_pending: None,
             saving: None,
             sending: None,
+            mesh_peers: Vec::new(),
             now,
         };
         (driver, CompanionHandle { commands: commands_tx }, CompanionEvents { notices: notices_rx })
@@ -664,6 +687,14 @@ impl<R: Runner> CompanionDriver<R> {
 
     /// Основной цикл. Возвращается, когда закрылся транспорт или ручка UI.
     pub async fn run(&mut self) {
+        // Свой узел меша — **до** первого рукопожатия, а не после. Пиры уже
+        // есть, они приехали в приглашении, и поднимать узел позже значило бы
+        // требовать живого канала ради ступени, которая этот канал и даёт.
+        // Узел встаёт не мгновенно; ступень подхватит его `mesh_came_up`,
+        // когда раннер скажет `YggReady`.
+        let peers = self.client.phone_ygg_peers().to_vec();
+        self.raise_own_node(peers).await;
+
         // Здороваемся сразу: адрес мог приехать настройкой, и ждать маяка,
         // которого на loopback может не быть вовсе, незачем.
         self.feed(ClientInput::Reach).await;
@@ -741,10 +772,48 @@ impl<R: Runner> CompanionDriver<R> {
             TransportEvent::TorReady { onion } => {
                 self.feed(ClientInput::OnionReady(onion)).await;
             }
+            // Свой узел меша поднялся — телефону будет чем перезвонить.
+            // Уезжает ключ тем же путём и в тот же миг, что и onion:
+            // следующим рукопожатием.
+            TransportEvent::YggReady { key } => {
+                self.feed(ClientInput::YggReady(key.to_vec())).await;
+                self.mesh_came_up().await;
+            }
             // Остальное компаньона не касается: у него нет ни доставки,
             // ни почты.
             _ => {}
         }
+    }
+
+    /// Узел меша поднялся — и, может быть, пора вернуться на его ступень.
+    ///
+    /// **Возврат нужен не меньше отката, и это уже было записано** — про
+    /// локальную сеть: ушедший на onion терминал остался бы там навсегда,
+    /// гоняя переписку через три реле в соседнюю комнату. У меша ровно то же,
+    /// только причина другая и куда более частая.
+    ///
+    /// Лестница выбирает ступень **один раз**, в миг отказа предыдущей,
+    /// а отказ этот случается через миллисекунды после запуска. Узел меша
+    /// к тому времени ещё не поднялся: включение уходит команде, привязка
+    /// к адресу — это сеть, а свой узел вдобавок ждёт пиров, которые
+    /// приезжают только по живому каналу. То есть в момент решения меша
+    /// **никогда** нет — и лестница, честно его пропустив, уходила на onion
+    /// и не возвращалась.
+    ///
+    /// Наружу это выглядело так: до правки терминал упирался в меш, которого
+    /// у него не было; после — проходил мимо меша, который вот-вот будет.
+    /// Оба раза — одна и та же ошибка: решение принято раньше, чем стало
+    /// что решать.
+    ///
+    /// Кольца отсюда не выходит: событие приходит на подъём узла, а узел
+    /// поднимается один раз.
+    async fn mesh_came_up(&mut self) {
+        if self.via != Transport::Onion || self.client.phone_ygg().is_empty() {
+            return;
+        }
+        tracing::debug!("узел меша поднялся — возвращаемся на его ступень");
+        self.via = Transport::Ygg;
+        self.feed(ClientInput::Reach).await;
     }
 
     /// Канал пропал: связь потеряна, и, может быть, пора сменить транспорт.
@@ -760,10 +829,47 @@ impl<R: Runner> CompanionDriver<R> {
             Some(via) => via == self.via,
             None => true,
         };
-        let switched = ours && self.via == Transport::Lan && !self.client.phone_onion().is_empty();
-        if switched {
-            self.via = Transport::Onion;
-            tracing::debug!("локальная сеть молчит — пробуем onion");
+        // Лестница у канала та же, что у §5.4, и в том же порядке:
+        // общая сеть → меш → onion. Меш выше onion по тем же доводам —
+        // он прямой и быстрый, — и ниже общей сети по тем же: в ней сосед
+        // за стеной, а в меше трафик уходит наружу и возвращается.
+        //
+        // Ступень пропускается, если ехать по ней некуда: адреса нет.
+        // «Звоню туда, где никого нет» честнее, чем «звоню в никуда».
+        // **Ступень нужна с обоих концов.** Ключ телефона отвечает только
+        // на «куда ехать»; на «чем ехать» отвечает свой узел, и без него
+        // ступень выдаёт `Unavailable` на каждый кадр — то есть лестница
+        // встаёт на ней навсегда, потому что синхронный отказ отправки
+        // событием не приходит и отката не заводит.
+        //
+        // Ровно это и случилось на живом стенде: терминал ушёл с общей сети
+        // на меш, которого у него не было, и до onion не добрался никогда.
+        let mesh_ready = !self.client.phone_ygg().is_empty() && !self.client.own_ygg().is_empty();
+        // Вслух, потому что тишина здесь неотличима от «меша нет в сборке».
+        // Пропуск ступени — решение, и в разборе оно обязано быть видно
+        // вместе с причиной: чей именно конец не готов.
+        if self.via == Transport::Lan && !mesh_ready {
+            tracing::debug!(
+                ключ_телефона = !self.client.phone_ygg().is_empty(),
+                свой_узел = !self.client.own_ygg().is_empty(),
+                "меш пропущен: ступень нужна с обоих концов"
+            );
+        }
+        let next = match self.via {
+            Transport::Lan if mesh_ready => Some(Transport::Ygg),
+            Transport::Lan | Transport::Ygg if !self.client.phone_onion().is_empty() => {
+                Some(Transport::Onion)
+            }
+            _ => None,
+        };
+        let switched = ours && next.is_some();
+        if let (true, Some(next)) = (ours, next) {
+            tracing::debug!(
+                прежняя = self.via.label(),
+                следующая = next.label(),
+                "канал молчит — пробуем следующую ступень"
+            );
+            self.via = next;
         }
         self.feed(ClientInput::Lost).await;
 
@@ -819,6 +925,8 @@ impl<R: Runner> CompanionDriver<R> {
             CompanionCommand::ForwardMessages { chat, msg_ids } => {
                 Request::ForwardMessages { chat, msg_ids }
             }
+            CompanionCommand::ShareContact { chat, who } => Request::ShareContact { chat, who },
+            CompanionCommand::AddSharedContact { msg_id } => Request::AddSharedContact { msg_id },
             CompanionCommand::ClearChat { chat } => Request::ClearChat { chat },
             CompanionCommand::MarkRead { chat, up_to } => Request::MarkRead { chat, up_to },
             CompanionCommand::AcceptFile { file_id } => Request::AcceptFile { file_id },
@@ -847,7 +955,7 @@ impl<R: Runner> CompanionDriver<R> {
                 return;
             }
             CompanionCommand::KeepCache { path } => {
-                self.keep_cache(path);
+                self.keep_cache(path).await;
                 return;
             }
         };
@@ -952,7 +1060,7 @@ impl<R: Runner> CompanionDriver<R> {
     }
 
     /// Включает или выключает дисковый кэш (§13.4).
-    fn keep_cache(&mut self, path: Option<PathBuf>) {
+    async fn keep_cache(&mut self, path: Option<PathBuf>) {
         match path {
             Some(path) => {
                 match std::fs::read(&path) {
@@ -962,6 +1070,15 @@ impl<R: Runner> CompanionDriver<R> {
                             // или записан другой сборкой. Переписка живёт
                             // на телефоне, и перечитать её стоит круга по сети.
                             tracing::info!(?error, "кэш не поднят — начинаем с пустого");
+                        } else {
+                            // **Узел — сразу после подъёма файла.** Кэш
+                            // включают командой, то есть уже после `run`,
+                            // а свой узел поднимался только там и по новости.
+                            // Без этой строки пиры с диска лежали бы мёртвым
+                            // грузом до первой связи — ровно та поломка,
+                            // ради которой их и стали записывать.
+                            let peers = self.client.phone_ygg_peers().to_vec();
+                            self.raise_own_node(peers).await;
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -999,7 +1116,7 @@ impl<R: Runner> CompanionDriver<R> {
     /// заход сюда просто вернётся ни с чем.
     fn persist_cache(&mut self) {
         let Some(path) = self.cache_path.clone() else { return };
-        if self.cache_pending.is_none() && !self.client.cache().dirty() {
+        if self.cache_pending.is_none() && !self.client.snapshot_due() {
             return;
         }
         let now = (self.now)();
@@ -1048,6 +1165,18 @@ impl<R: Runner> CompanionDriver<R> {
         }
     }
 
+    /// Говорит раннеру то, что не про отправку кадра.
+    ///
+    /// Отказ уходит в журнал и ничего не останавливает: ступень, которая
+    /// не поднялась, лестница канала просто пропустит — она смотрит на то,
+    /// поднялся ли **узел** (`ClientEvent`/`YggReady`), а не на то, что мы
+    /// его попросили подняться.
+    async fn tell_runner(&mut self, command: TransportCommand) {
+        if let Err(error) = self.runner.execute(command).await {
+            tracing::debug!(?error, "раннер не принял настройку");
+        }
+    }
+
     /// Отдаёт кадр в сеть.
     ///
     /// Адрес телефона берётся из приглашения — там он и лежит с самого
@@ -1057,10 +1186,15 @@ impl<R: Runner> CompanionDriver<R> {
     async fn push(&mut self, frame: Vec<u8>) {
         let onion = self.client.phone_onion();
         let onion = (!onion.is_empty()).then(|| onion.to_owned());
+        // Ключ меша — **каждый раз заново**, а не разобранный при запуске:
+        // телефон вправе объявить новый по живому каналу
+        // (`companion::Notice::LinkAddress`), и следующий кадр обязан идти
+        // по объявленному.
+        let ygg: Option<[u8; 32]> = self.client.phone_ygg().try_into().ok();
         let sent = self
             .runner
             .execute(TransportCommand::Send {
-                peer: PeerAddress { ik: self.phone_ik, onion, chatmail: None },
+                peer: PeerAddress { ik: self.phone_ik, onion, chatmail: None, ygg },
                 via: self.via,
                 frame,
                 handoff: None,
@@ -1345,6 +1479,32 @@ impl<R: Runner> CompanionDriver<R> {
                 .await;
                 None
             }
+            // **Адрес телефона сменился — и набирать надо по новому.**
+            //
+            // Наружу это не идёт: человеку сказать нечего, а вот раннеру
+            // сказать надо. Он и набирает — ядро транспорта не видит (§13.3),
+            // и без этой строки следующая попытка пошла бы по адресу из
+            // приглашения, то есть по тому, которого у телефона может уже
+            // не быть.
+            ClientEvent::PhoneAddress { onion, ygg, ygg_peers } => {
+                tracing::info!(
+                    onion = !onion.is_empty(),
+                    ygg = !ygg.is_empty(),
+                    "телефон объявил, чем его набрать"
+                );
+                // Адрес ставить никуда не надо: он живёт у клиента, а `push`
+                // читает его **перед каждым кадром**.
+                //
+                // А вот свой узел меша поднять надо, и поднять здесь: пиров
+                // взять больше неоткуда. Зерно выводится из секрета
+                // сопряжения, пиры только что приехали — оба числа наконец
+                // есть, и раньше этой минуты их не было.
+                //
+                // Объявленный список полнее того, что уехал в QR, и заменяет
+                // его целиком.
+                self.raise_own_node(ygg_peers.clone()).await;
+                None
+            }
             ClientEvent::Done => {
                 self.tell(CompanionEvent::Done).await;
                 None
@@ -1360,6 +1520,45 @@ impl<R: Runner> CompanionDriver<R> {
                 None
             }
         }
+    }
+
+    /// Поднимает **свой** узел меша на названных пирах.
+    ///
+    /// Узел терминалу нужен свой: у ступени `Ygg` нет «клиентского» режима —
+    /// адрес `200::/7` берётся из собственного ключа, и без работающего узла
+    /// набирать нечем (см. `Transport::Ygg`).
+    ///
+    /// Пиров взять неоткуда, кроме телефона, и в этом была поломка: сперва
+    /// они приезжали только объявлением по живому каналу, а живой канал
+    /// требует поднятой ступени — узел не вставал никогда, если общей сети
+    /// и Tor не было. Поэтому короткий список едет ещё и в приглашении,
+    /// и первый вызов сюда случается на запуске, до всякой связи.
+    ///
+    /// Повторный вызов с тем же списком ничего не делает: раннер перенимает
+    /// настройку перезапуском узла, а перезапускать работающий меш ради
+    /// того же самого — рвать связь на ровном месте.
+    ///
+    /// Без ключа телефона узел не поднимается вовсе, и это то же условие,
+    /// по которому лестница пропускает ступень (`mesh_ready`): меша нет
+    /// у той стороны — ехать по нему некуда, а поднятый ни за чем узел
+    /// это лишний демон и лишний открытый порт на чужой машине.
+    ///
+    /// Порядок тот же, что у ядра (`startup_effects`): настройка, потом
+    /// выключатель. Раннер поднимается по той настройке, которая у него
+    /// есть на момент включения.
+    async fn raise_own_node(&mut self, peers: Vec<String>) {
+        if peers.is_empty() || peers == self.mesh_peers || self.client.phone_ygg().is_empty() {
+            return;
+        }
+        tracing::info!(пиров = peers.len(), "поднимаем свой узел меша");
+        let setup = ratatosk_proto::ygg::YggSetup::Embedded {
+            seed: ratatosk_proto::ygg::NodeSeed::new(self.client.mesh_seed().to_vec()),
+            peers: peers.clone(),
+        };
+        self.mesh_peers = peers;
+        self.tell_runner(TransportCommand::SetYgg(setup)).await;
+        self.tell_runner(TransportCommand::SetEnabled { transport: Transport::Ygg, enabled: true })
+            .await;
     }
 
     /// Отдаёт событие наверх. Некому — значит UI ушёл, и это не беда.

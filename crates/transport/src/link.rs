@@ -35,6 +35,30 @@
 //! это выглядит как «сообщения приходят через одно, а последнее
 //! не приходит никогда» — и только на onion: на TCP буфера нет, и все
 //! тесты этого файла зелены.
+//!
+//! # Связь заводится раньше соединения
+//!
+//! [`Link::dialing`] возвращает полосы **сразу**, а набор номера уезжает
+//! в свою задачу. Кадры при этом не теряются: они ждут в тех же очередях,
+//! в которых ждали бы при медленной сети, и уходят, как только поток
+//! появится.
+//!
+//! Так сделано по следу настоящей поломки, и стоит назвать её целиком.
+//! Раньше набор ждался внутри [`crate::Runner::execute`], то есть внутри
+//! `Driver::apply`, то есть **в теле цикла драйвера** — того самого, который
+//! отвечает на запросы UI. Один недозвон через onion (сорок пять секунд
+//! по §5.4) останавливал ядро целиком: ни переписки на экране, ни таймеров,
+//! ни приёма по локальной сети. А на старте это било сильнее всего:
+//! `Engine::startup_effects` возвращает в том числе доставки, недоделанные
+//! в прошлый раз, и приложение показывало пустой экран ровно столько,
+//! сколько занимал набор до всех, кого нет в сети.
+//!
+//! Отказ от этого не пропадает: он приезжает ядру
+//! [`TransportEvent::ConnectFailed`] — тем же событием, каким приехал бы
+//! обрыв, случись он секундой позже. §5.4 от этого не меняется, меняется
+//! только путь, которым отказ доходит.
+
+use std::future::Future;
 
 use ratatosk_proto::transport_policy::Transport;
 use ratatosk_wire::SizeClass;
@@ -96,19 +120,66 @@ pub(crate) struct Link {
 }
 
 impl Link {
-    /// Заводит полосы и пишущую задачу поверх открытого потока.
-    pub(crate) fn open<W>(
-        writer: W,
+    /// Заводит полосы **до** того, как поток появится: набор идёт в фоне.
+    ///
+    /// Возвращается мгновенно. Кадры, положенные в полосы до конца набора,
+    /// ждут там же, где ждали бы при медленной сети, и уходят, как только
+    /// соединение установится.
+    ///
+    /// # Чем это кончается для ядра
+    ///
+    /// Набор удался — [`TransportEvent::Connected`], как и прежде. Не удался
+    /// — [`TransportEvent::ConnectFailed`], и полосы закрываются вместе
+    /// с задачей: [`Link::is_closed`] отдаёт `true`, раннер забывает связь
+    /// и следующая попытка набирает заново. Ждавшие кадры при этом
+    /// пропадают — и это правильно, потому что ядро узнаёт об отказе тем же
+    /// событием и уводит доставку на следующую ступень §5.4, а запись
+    /// в очереди отправки остаётся на диске до подтверждения.
+    ///
+    /// Отказ **не** возвращается вызывающему: возвращать его некому — набор
+    /// ещё идёт, когда `execute` уже вернулся. В этом вся суть перемены,
+    /// см. заголовок файла.
+    ///
+    /// # Способ завести связь только один, и это нарочно
+    ///
+    /// Рядом стоял `Link::open` — «полосы поверх уже открытого потока», —
+    /// и после этой поставки он остался без единого вызова: исходящие все
+    /// набираются, а принятые соединения работают на чтение
+    /// ([`spawn_read_loop`]) и полос записи не имеют вовсе. Держать его
+    /// значило бы держать второй путь, по которому связь заводится **без**
+    /// новости ядру, — то есть заготовку для следующего «сообщения
+    /// не ходят, и непонятно почему». Готовому потоку здесь отвечает набор,
+    /// который уже удался.
+    pub(crate) fn dialing<F, W>(
+        dial: F,
         peer_ik: [u8; 32],
         via: Transport,
         events: mpsc::Sender<TransportEvent>,
     ) -> Link
     where
+        F: Future<Output = Result<W, TransportError>> + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (urgent_tx, urgent_rx) = mpsc::channel(URGENT_QUEUE);
         let (bulk_tx, bulk_rx) = mpsc::channel(BULK_QUEUE);
-        spawn_write_loop(writer, urgent_rx, bulk_rx, peer_ik, via, events);
+        tokio::spawn(async move {
+            match dial.await {
+                Ok(writer) => {
+                    // Сперва новость, потом запись. Порядок важен: ядро
+                    // считает ступень пригодной по этому событию, и кадр,
+                    // ушедший раньше него, был бы отправлен по соединению,
+                    // о котором ядро ещё не знает.
+                    let _ = events.send(TransportEvent::Connected { peer_ik, via }).await;
+                    write_loop(writer, urgent_rx, bulk_rx, peer_ik, via, events).await;
+                }
+                Err(error) => {
+                    tracing::debug!(?via, ?error, "набор не удался");
+                    let _ = events.send(TransportEvent::ConnectFailed { peer_ik, via }).await;
+                    // Приёмники уходят вместе с задачей — полосы закрыты,
+                    // и ждавшие кадры уезжают в мусор осознанно (см. выше).
+                }
+            }
+        });
         Link { urgent: urgent_tx, bulk: bulk_tx }
     }
 
@@ -219,13 +290,16 @@ pub(crate) fn spawn_read_loop<R>(
     });
 }
 
-/// Пишущая задача: сначала срочная полоса, потом чанки.
+/// Запись: сначала срочная полоса, потом чанки.
 ///
 /// `biased` в [`tokio::select!`] здесь — это и есть весь приоритет: пока
 /// в срочной полосе есть хоть один кадр, к чанкам очередь не доходит.
 /// Голодания у чанков не возникает, потому что мелкие кадры кончаются:
 /// их порождают сообщения и квитанции, а не бесконечный поток.
-fn spawn_write_loop<W>(
+///
+/// Не задача, а будущее: [`Link::dialing`] запускает её **после** набора,
+/// внутри своей задачи, и второй `spawn` там был бы лишним.
+async fn write_loop<W>(
     mut writer: W,
     mut urgent: mpsc::Receiver<Vec<u8>>,
     mut bulk: mpsc::Receiver<Vec<u8>>,
@@ -235,63 +309,61 @@ fn spawn_write_loop<W>(
 ) where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
-        loop {
-            // Обе полосы закрываются вместе — их отправители лежат в одной
-            // записи `Link`, — поэтому `None` с любой из них означает, что
-            // соединение больше никому не нужно.
-            let frame = tokio::select! {
-                biased;
-                frame = urgent.recv() => match frame {
-                    Some(frame) => frame,
-                    None => return,
-                },
-                frame = bulk.recv() => match frame {
-                    Some(frame) => frame,
-                    None => return,
-                },
-            };
-            let Ok(class) = SizeClass::from_frame_len(frame.len()) else {
-                // Кадр не того размера сюда попасть не может: его собирает
-                // `crypto::aead::seal`. Если попал — это ошибка выше, и
-                // молча отправлять её в сеть нельзя.
-                tracing::error!(len = frame.len(), "кадр вне классов размера, не отправлен");
-                continue;
-            };
-            // Запись **и обязательный сброс**. Сброс здесь не осторожность,
-            // а условие работоспособности, и вот почему.
-            //
-            // `DataStream` у arti буферизован: он копит байты и отдаёт их
-            // в цепочку целыми ячейками (около 498 байт полезной нагрузки).
-            // Кадр класса S — 4096 байт плюс байт класса, то есть восемь
-            // полных ячеек и хвост в сотню с лишним байт. Без сброса этот
-            // хвост остаётся в буфере, и у получателя `read_exact` стоит
-            // на недочитанном кадре до тех пор, пока хвост не вытолкнет
-            // **следующая** запись. Снаружи это выглядит как «сообщения
-            // приходят через одно, а последнее не приходит никогда».
-            //
-            // На TCP сброс не стоит ничего: там его и так нет. Поэтому
-            // условия «если поток буферизован» здесь нет — есть просто
-            // правило: кадр записан значит кадр отправлен.
-            //
-            // Сброс на каждый кадр, а не на пачку. Пачка дала бы экономию
-            // в одну неполную ячейку на кадр — а стоила бы правила, которое
-            // держится в голове: «отправлено, если следом идёт ещё что-то».
-            // Такие правила и порождают ошибки вроде этой.
-            let written = writer.write_all(&[tag_of(class)]).await.is_ok()
-                && writer.write_all(&frame).await.is_ok()
-                && writer.flush().await.is_ok();
-            if !written {
-                let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
-                return;
-            }
-            // По этой строке видно, сколько кадров ушло на самом деле.
-            // Вместе с такой же на чтении она отвечает на вопрос, который
-            // иначе неразрешим: кадр не дошёл — его не отправили, потеряли
-            // по дороге или не сумели расшифровать?
-            tracing::debug!(?via, ?class, kind = %frame_kind(&frame), "кадр записан");
+    loop {
+        // Обе полосы закрываются вместе — их отправители лежат в одной
+        // записи `Link`, — поэтому `None` с любой из них означает, что
+        // соединение больше никому не нужно.
+        let frame = tokio::select! {
+            biased;
+            frame = urgent.recv() => match frame {
+                Some(frame) => frame,
+                None => return,
+            },
+            frame = bulk.recv() => match frame {
+                Some(frame) => frame,
+                None => return,
+            },
+        };
+        let Ok(class) = SizeClass::from_frame_len(frame.len()) else {
+            // Кадр не того размера сюда попасть не может: его собирает
+            // `crypto::aead::seal`. Если попал — это ошибка выше, и
+            // молча отправлять её в сеть нельзя.
+            tracing::error!(len = frame.len(), "кадр вне классов размера, не отправлен");
+            continue;
+        };
+        // Запись **и обязательный сброс**. Сброс здесь не осторожность,
+        // а условие работоспособности, и вот почему.
+        //
+        // `DataStream` у arti буферизован: он копит байты и отдаёт их
+        // в цепочку целыми ячейками (около 498 байт полезной нагрузки).
+        // Кадр класса S — 4096 байт плюс байт класса, то есть восемь
+        // полных ячеек и хвост в сотню с лишним байт. Без сброса этот
+        // хвост остаётся в буфере, и у получателя `read_exact` стоит
+        // на недочитанном кадре до тех пор, пока хвост не вытолкнет
+        // **следующая** запись. Снаружи это выглядит как «сообщения
+        // приходят через одно, а последнее не приходит никогда».
+        //
+        // На TCP сброс не стоит ничего: там его и так нет. Поэтому
+        // условия «если поток буферизован» здесь нет — есть просто
+        // правило: кадр записан значит кадр отправлен.
+        //
+        // Сброс на каждый кадр, а не на пачку. Пачка дала бы экономию
+        // в одну неполную ячейку на кадр — а стоила бы правила, которое
+        // держится в голове: «отправлено, если следом идёт ещё что-то».
+        // Такие правила и порождают ошибки вроде этой.
+        let written = writer.write_all(&[tag_of(class)]).await.is_ok()
+            && writer.write_all(&frame).await.is_ok()
+            && writer.flush().await.is_ok();
+        if !written {
+            let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
+            return;
         }
-    });
+        // По этой строке видно, сколько кадров ушло на самом деле.
+        // Вместе с такой же на чтении она отвечает на вопрос, который
+        // иначе неразрешим: кадр не дошёл — его не отправили, потеряли
+        // по дороге или не сумели расшифровать?
+        tracing::debug!(?via, ?class, kind = %frame_kind(&frame), "кадр записан");
+    }
 }
 
 #[cfg(test)]
@@ -304,10 +376,20 @@ mod tests {
     /// на первом же чанке, иначе очередь не наполнится и проверять станет
     /// нечего. На настоящем сокете эту роль играют буферы системы, но их
     /// размер решаем не мы, и тест зависел бы от машины.
+    ///
+    /// Набор здесь удался сразу: способ завести связь один, и готовому
+    /// потоку отвечает готовое будущее. Первым событием при этом приезжает
+    /// [`TransportEvent::Connected`] — тому, кто читает поток событий,
+    /// его надо пропустить.
     fn linked() -> (Link, tokio::io::DuplexStream, mpsc::Receiver<TransportEvent>) {
         let (writer, reader) = tokio::io::duplex(4096);
         let (events_tx, events_rx) = mpsc::channel(8);
-        let link = Link::open(writer, [7u8; 32], Transport::Lan, events_tx);
+        let link = Link::dialing(
+            async move { Ok::<_, TransportError>(writer) },
+            [7u8; 32],
+            Transport::Lan,
+            events_tx,
+        );
         (link, reader, events_rx)
     }
 
@@ -381,7 +463,14 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(8);
         spawn_read_loop(reader, Transport::Onion, events_tx);
 
-        let link = Link::open(writer, [7u8; 32], Transport::Onion, mpsc::channel(8).0);
+        // Новости самой связи уезжают в отдельный канал: этот тест смотрит
+        // на приём, а не на набор.
+        let link = Link::dialing(
+            async move { Ok::<_, TransportError>(writer) },
+            [7u8; 32],
+            Transport::Onion,
+            mpsc::channel(8).0,
+        );
         let mut frame = vec![0u8; SizeClass::S.frame_len()];
         frame[0] = 42;
         link.send(frame.clone()).await.expect("кадр принят");
@@ -397,12 +486,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_may_be_queued_before_the_dial_lands() {
+        // Ради этого связь и заводится раньше соединения: набор уехал
+        // в задачу, а кадр обязан подождать в полосе, а не пропасть
+        // и не задержать вызывающего.
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let (writer, mut incoming) = tokio::io::duplex(SizeClass::S.frame_len() * 2);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let link = Link::dialing(
+            async move {
+                held.await.map_err(|_| TransportError::Unavailable)?;
+                Ok(writer)
+            },
+            [7u8; 32],
+            Transport::Onion,
+            events_tx,
+        );
+
+        link.send(vec![0u8; SizeClass::S.frame_len()])
+            .await
+            .expect("кадр принимается, пока идёт набор");
+
+        // И до конца набора в поток не уходит ничего: писать пока некуда.
+        let mut tag = [0u8; 1];
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            incoming.read_exact(&mut tag),
+        )
+        .await;
+        assert!(early.is_err(), "до соединения писать некуда");
+
+        release.send(()).expect("набор ждёт разрешения");
+        match events_rx.recv().await.expect("новость о соединении") {
+            TransportEvent::Connected { peer_ik, via } => {
+                assert_eq!(peer_ik, [7u8; 32]);
+                assert_eq!(via, Transport::Onion);
+            }
+            other => panic!("ожидалось соединение, пришло {other:?}"),
+        }
+        incoming.read_exact(&mut tag).await.expect("кадр уходит вслед за соединением");
+        assert_eq!(class_of_tag(tag[0]), Some(SizeClass::S));
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_says_so_and_closes_the_link() {
+        // Отказ обязан приехать событием: возвращать его некому — набор
+        // ещё идёт, когда `execute` уже вернулся. А связь обязана закрыться,
+        // иначе раннер держал бы её вечно и больше никогда не набрал бы
+        // этот номер заново.
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let link = Link::dialing(
+            async { Err::<tokio::io::DuplexStream, _>(TransportError::Timeout) },
+            [7u8; 32],
+            Transport::Ygg,
+            events_tx,
+        );
+
+        match events_rx.recv().await.expect("новость об отказе") {
+            TransportEvent::ConnectFailed { peer_ik, via } => {
+                assert_eq!(peer_ik, [7u8; 32]);
+                assert_eq!(via, Transport::Ygg);
+            }
+            other => panic!("ожидался отказ набора, пришло {other:?}"),
+        }
+
+        // Задача досыпает после отправки новости, поэтому не «сразу»,
+        // а «в срок»: проверяется закрытие, а не расторопность планировщика.
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !link.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("не набравшаяся связь обязана закрыться");
+    }
+
+    #[tokio::test]
     async fn a_broken_stream_is_reported_once() {
         // Обрыв обязан дойти до ядра событием, а не только отказом отправки:
         // §5.4 иначе узнает о нём лишь по сроку молчания.
         let (writer, reader) = tokio::io::duplex(64);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        let link = Link::open(writer, [7u8; 32], Transport::Lan, events_tx);
+        let link = Link::dialing(
+            async move { Ok::<_, TransportError>(writer) },
+            [7u8; 32],
+            Transport::Lan,
+            events_tx,
+        );
         drop(reader);
 
         // Первый кадр может уйти в буфер и не заметить обрыва — второй
@@ -411,7 +581,15 @@ mod tests {
             let _ = link.send(vec![0u8; SizeClass::S.frame_len()]).await;
         }
 
-        match events_rx.recv().await.expect("событие об обрыве") {
+        // Первым приезжает состоявшееся соединение — его пропускаем:
+        // проверяется обрыв, а не то, что связь завелась.
+        let broken = loop {
+            match events_rx.recv().await.expect("событие об обрыве") {
+                TransportEvent::Connected { .. } => continue,
+                other => break other,
+            }
+        };
+        match broken {
             TransportEvent::Disconnected { peer_ik, via } => {
                 assert_eq!(peer_ik, [7u8; 32]);
                 assert_eq!(via, Transport::Lan);

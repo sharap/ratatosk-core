@@ -45,6 +45,7 @@ webpki-roots = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
+ygg_stream = { workspace = true, optional = true }
 
 [features]
 default = ["onion", "chatmail", "lan"]
@@ -89,6 +90,20 @@ chatmail-net = [
     "dep:futures",
 ]
 lan = ["dep:mdns-sd"]
+# Встроенный узел меша (0.2). **Не в `default`**, и по двум причинам сразу.
+#
+# Первая — та же, что у `onion-arti` и `chatmail-net`: зависимость идёт
+# из git, а не с crates.io, и сборка остального дерева не должна зависеть
+# от доступности чужого репозитория.
+#
+# Вторая своя: узел тянет ironwood, yggdrasil и tokio целиком. Тот, кому
+# меша не надо — а по умолчанию он выключен (§14), — не должен платить
+# за него ни временем сборки, ни размером бинарника.
+#
+# Без признака режим «свой узел» не исчезает из настроек: он остаётся
+# и отвечает отказом «встроенный узел меша в эту сборку не включён».
+# Спрятать его значило бы оставить человека гадать, куда он делся.
+ygg-node = ["dep:ygg_stream"]
 
 [lints.rust]
 missing_docs = "warn"

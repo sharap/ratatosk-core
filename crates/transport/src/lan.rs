@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatosk_crypto::identity::beacon;
-use ratatosk_proto::transport_policy::Transport;
+use ratatosk_proto::transport_policy::{Transport, LAN_CONNECT_TIMEOUT_MS};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -53,10 +53,12 @@ pub const BEACON_TXT_KEY: &str = "b";
 
 /// Таймаут TCP-соединения внутри локальной сети.
 ///
-/// LAN отвечает за миллисекунды; секунды здесь — запас на спящий Wi-Fi,
-/// а не на маршрутизацию. Дальше ждать нечего: §5.4 переводит доставку
-/// на следующий транспорт.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Число берётся из §5.4 (`transport_policy`), а не задаётся здесь, и это
+/// не педантизм: срок ожидания ответа у той же ступени обязан вмещать
+/// **целый** такой набор — и наш, и чужой (соединения односторонние, 5ц).
+/// Живя в разных крейтах, эти два числа однажды разошлись бы молча. С мешем
+/// ровно это и случилось.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(LAN_CONNECT_TIMEOUT_MS);
 
 /// Настройки LAN-транспорта.
 #[derive(Debug, Clone)]
@@ -302,7 +304,19 @@ impl LanRunner {
         Ok(())
     }
 
-    async fn ensure_link(&mut self, peer_ik: [u8; 32]) -> Result<Link, TransportError> {
+    /// Связь с контактом — существующая или набираемая.
+    ///
+    /// **Не ждёт соединения.** Набор уезжает в свою задачу
+    /// ([`Link::dialing`]), а кадры до его конца ждут в полосах записи.
+    /// Ждать здесь нельзя: `Driver::apply` дожидается каждой команды
+    /// в теле своего цикла, и две секунды набора до устройства, которого
+    /// уже нет в сети, — это две секунды, в которые ядро не отвечает
+    /// ни на что.
+    ///
+    /// Отказ от этого не пропадает: он приезжает
+    /// [`TransportEvent::ConnectFailed`], и адрес забывается там же, в задаче
+    /// набора, — по той же причине, по какой забывался здесь.
+    fn ensure_link(&mut self, peer_ik: [u8; 32]) -> Result<Link, TransportError> {
         if let Some(link) = self.links.get(&peer_ik) {
             if !link.is_closed() {
                 return Ok(link.clone());
@@ -311,18 +325,33 @@ impl LanRunner {
         }
 
         let addr = self.address_of(&peer_ik).ok_or(TransportError::NoAddress)?;
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| TransportError::Timeout)??;
-        // Кадры уже дополнены до класса размера (§5.5); склейка Нейгла только
-        // добавила бы задержку, ничего не экономя.
-        stream.set_nodelay(true)?;
-
-        let link = Link::open(stream, peer_ik, Transport::Lan, self.events_tx.clone());
+        let directory = Arc::clone(&self.directory);
+        let heard = Arc::clone(&self.heard);
+        let link = Link::dialing(
+            async move {
+                let dialed = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| TransportError::Timeout)
+                    .and_then(|opened| opened.map_err(TransportError::from));
+                let stream = match dialed {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        forget_address(&directory, &heard, peer_ik);
+                        return Err(error);
+                    }
+                };
+                // Кадры уже дополнены до класса размера (§5.5); склейка
+                // Нейгла только добавила бы задержку, ничего не экономя.
+                stream.set_nodelay(true)?;
+                // Тип ошибки назван прямо: он определяется только договором
+                // `Link::dialing`, а `?` выше просят его знать раньше.
+                Ok::<_, TransportError>(stream)
+            },
+            peer_ik,
+            Transport::Lan,
+            self.events_tx.clone(),
+        );
         self.links.insert(peer_ik, link.clone());
-
-        let _ =
-            self.events_tx.send(TransportEvent::Connected { peer_ik, via: Transport::Lan }).await;
         Ok(link)
     }
 
@@ -352,38 +381,46 @@ impl LanRunner {
         }
     }
 
-    /// Забывает адрес, по которому не удалось соединиться.
-    ///
-    /// Адрес в справочнике — это не свойство контакта, а последнее, что мы
-    /// о нём слышали. Не дозвонившись, держать его дальше нельзя: устройство
-    /// могло уйти из сети или перезапуститься с другим портом, и тогда каждая
-    /// следующая попытка упирается в ту же дыру, платя за неё таймаутом.
-    /// Забыть — значит вернуться к честному «адрес неизвестен»; живой сосед
-    /// объявится следующим анонсом mDNS через секунды.
-    ///
-    /// Кэш эфира чистится заодно: иначе [`LanRunner::rematch_heard`] вернул бы
-    /// тот же мёртвый адрес при первом же обновлении списка контактов.
-    fn forget_address(&self, peer_ik: [u8; 32]) {
-        let stale = match self.directory.lock() {
-            Ok(mut directory) => directory.remove(&peer_ik),
-            Err(_) => None,
-        };
-        let Some(stale) = stale else { return };
-        if let Ok(mut heard) = self.heard.lock() {
-            heard.retain(|(_, addr)| *addr != stale);
-        }
-    }
-
     /// Сообщает ядру о неудаче, а не только возвращает ошибку.
     ///
     /// Без события §5.4 узнал бы об отказе лишь по таймауту, то есть через
     /// пять секунд там, где ответ уже есть.
+    ///
+    /// Осталось для отказов, которые видны **сразу**: адреса нет вовсе,
+    /// соединение оборвалось на записи. Неудача набора сюда больше не
+    /// приходит — она случается в чужой задаче и рассказывает о себе сама.
     async fn report_failure(&self, peer_ik: [u8; 32]) {
-        self.forget_address(peer_ik);
+        forget_address(&self.directory, &self.heard, peer_ik);
         let _ = self
             .events_tx
             .send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Lan })
             .await;
+    }
+}
+
+/// Забывает адрес, по которому не удалось соединиться.
+///
+/// Адрес в справочнике — это не свойство контакта, а последнее, что мы
+/// о нём слышали. Не дозвонившись, держать его дальше нельзя: устройство
+/// могло уйти из сети или перезапуститься с другим портом, и тогда каждая
+/// следующая попытка упирается в ту же дыру, платя за неё таймаутом.
+/// Забыть — значит вернуться к честному «адрес неизвестен»; живой сосед
+/// объявится следующим анонсом mDNS через секунды.
+///
+/// Кэш эфира чистится заодно: иначе [`LanRunner::rematch_heard`] вернул бы
+/// тот же мёртвый адрес при первом же обновлении списка контактов.
+///
+/// Свободной функцией, а не методом: звать её приходится и из задачи набора,
+/// у которой раннера нет и быть не может, — а два экземпляра этого правила
+/// однажды разошлись бы.
+fn forget_address(directory: &Directory, heard: &Heard, peer_ik: [u8; 32]) {
+    let stale = match directory.lock() {
+        Ok(mut directory) => directory.remove(&peer_ik),
+        Err(_) => None,
+    };
+    let Some(stale) = stale else { return };
+    if let Ok(mut heard) = heard.lock() {
+        heard.retain(|(_, addr)| *addr != stale);
     }
 }
 
@@ -397,7 +434,7 @@ impl Runner for LanRunner {
                 if !self.enabled {
                     return Err(TransportError::Unavailable);
                 }
-                match self.ensure_link(peer.ik).await {
+                match self.ensure_link(peer.ik) {
                     Ok(link) => match link.send(frame).await {
                         Ok(()) => Ok(()),
                         // Забитая очередь чанков — не обрыв: соединение живо,
@@ -421,7 +458,7 @@ impl Runner for LanRunner {
                 if via != Transport::Lan || !self.enabled {
                     return Err(TransportError::Unavailable);
                 }
-                match self.ensure_link(peer.ik).await {
+                match self.ensure_link(peer.ik) {
                     Ok(_) => Ok(()),
                     Err(error) => {
                         self.report_failure(peer.ik).await;
@@ -454,9 +491,9 @@ impl Runner for LanRunner {
             // Почтовые настройки локальной сети не касаются. Сюда они
             // не доходят — составной раннер разводит по адресату, — но
             // молчаливое согласие с чужой командой хуже отказа.
-            TransportCommand::SetMailAccount(_) | TransportCommand::CreateMailAccount { .. } => {
-                Err(TransportError::Unavailable)
-            }
+            TransportCommand::SetMailAccount(_)
+            | TransportCommand::CreateMailAccount { .. }
+            | TransportCommand::SetYgg(_) => Err(TransportError::Unavailable),
         }
     }
 
@@ -757,7 +794,12 @@ mod tests {
         runner.note_address([2u8; 32], SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9));
         let verdict = runner
             .execute(TransportCommand::Send {
-                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
+                peer: crate::runner::PeerAddress {
+                    ik: [2u8; 32],
+                    onion: None,
+                    chatmail: None,
+                    ygg: None,
+                },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
                 handoff: None,
@@ -776,7 +818,12 @@ mod tests {
 
         let verdict = runner
             .execute(TransportCommand::Send {
-                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
+                peer: crate::runner::PeerAddress {
+                    ik: [2u8; 32],
+                    onion: None,
+                    chatmail: None,
+                    ygg: None,
+                },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
                 handoff: None,
@@ -806,17 +853,84 @@ mod tests {
 
         let _ = runner
             .execute(TransportCommand::Send {
-                peer: crate::runner::PeerAddress { ik: [2u8; 32], onion: None, chatmail: None },
+                peer: crate::runner::PeerAddress {
+                    ik: [2u8; 32],
+                    onion: None,
+                    chatmail: None,
+                    ygg: None,
+                },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
                 handoff: None,
             })
             .await;
 
+        // Ждём **события**, а не возврата: набор уехал в свою задачу,
+        // и к возврату `execute` он ещё идёт. Адрес забывается там же,
+        // в задаче, и обязательно **до** новости об отказе — иначе эта
+        // проверка гонялась бы с ней.
+        await_connect_failed(&mut runner).await;
         assert_eq!(
             runner.address_of(&[2u8; 32]),
             None,
             "мёртвый адрес обязан уйти из справочника, а не пережить собеседника"
         );
+    }
+
+    #[tokio::test]
+    async fn sending_does_not_wait_for_the_dial() {
+        // Ради этого всё и переделано. `Driver::apply` дожидается каждой
+        // команды **в теле своего цикла**, и набор, ждавшийся внутри
+        // `execute`, останавливал ядро целиком: ни переписки на экране,
+        // ни таймеров, ни приёма по другим ступеням. На старте это било
+        // сильнее всего — `Engine::startup_effects` возвращает недоделанные
+        // доставки, и приложение молчало ровно столько, сколько занимал
+        // набор ко всем, кого нет в сети.
+        //
+        // Наблюдаемое следствие: команда возвращается `Ok`, хотя соединения
+        // ещё нет и не будет. Отказ приезжает следом — событием.
+        let config = LanConfig { enabled: true, port: 0, discovery: false };
+        let mut runner = LanRunner::start(config, [1u8; 32]).await.unwrap();
+        runner.note_address([2u8; 32], SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9));
+
+        let verdict = runner
+            .execute(TransportCommand::Send {
+                peer: crate::runner::PeerAddress {
+                    ik: [2u8; 32],
+                    onion: None,
+                    chatmail: None,
+                    ygg: None,
+                },
+                via: Transport::Lan,
+                frame: vec![0u8; SizeClass::S.frame_len()],
+                handoff: None,
+            })
+            .await;
+        assert!(
+            verdict.is_ok(),
+            "команда обязана вернуться, не дожидаясь исхода набора: {verdict:?}"
+        );
+
+        // Неудача набора обязана приехать событием — иначе §5.4 узнает
+        // о ней только по сроку ожидания.
+        await_connect_failed(&mut runner).await;
+    }
+
+    /// Ждёт отказ соединения, пропуская всё остальное.
+    ///
+    /// Пропускать приходится: запись адреса в справочник сама по себе
+    /// событие ([`TransportEvent::SeenOnLan`]), и оно приезжает раньше.
+    async fn await_connect_failed(runner: &mut LanRunner) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = runner.next_event().await {
+                if matches!(event, TransportEvent::ConnectFailed { via: Transport::Lan, .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("отказ набора обязан приехать в срок");
+        assert!(waited, "поток событий кончился раньше отказа");
     }
 }

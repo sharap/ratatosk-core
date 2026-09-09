@@ -196,7 +196,7 @@ pub const fn chunk_size_class() -> SizeClass {
 #[must_use]
 pub const fn may_send_over(size_bytes: u64, transport: Transport) -> bool {
     match transport {
-        Transport::Lan | Transport::Onion => true,
+        Transport::Lan | Transport::Ygg | Transport::Onion => true,
         Transport::Mail => size_bytes <= MAIL_FILE_LIMIT_BYTES,
     }
 }
@@ -367,7 +367,7 @@ pub const DEFAULT_AUTO_ACCEPT_BYTES: u64 = 512 * 1024;
 #[must_use]
 pub const fn chunk_window(via: Transport) -> u64 {
     match via {
-        Transport::Lan | Transport::Onion => 2,
+        Transport::Lan | Transport::Ygg | Transport::Onion => 2,
         Transport::Mail => 8,
     }
 }
@@ -387,7 +387,7 @@ pub const fn chunk_window(via: Transport) -> u64 {
 #[must_use]
 pub const fn ack_every(via: Transport) -> u64 {
     match via {
-        Transport::Lan | Transport::Onion => 1,
+        Transport::Lan | Transport::Ygg | Transport::Onion => 1,
         Transport::Mail => 4,
     }
 }
@@ -434,7 +434,11 @@ pub const fn ack_every(via: Transport) -> u64 {
 pub const fn stall_ms(via: Transport) -> u64 {
     match via {
         Transport::Lan => 10_000,
-        Transport::Onion => 120_000,
+        // Меш ближе к onion, чем к локальной сети: маршрут может
+        // перестроиться на ходу, и чанк, ушедший по прежнему пути,
+        // опаздывает на секунды. Десять секунд объявляли бы застой там,
+        // где идёт обычная передача.
+        Transport::Ygg | Transport::Onion => 120_000,
         Transport::Mail => 30 * 60_000,
     }
 }
@@ -475,6 +479,14 @@ pub const fn stall_backoff_ms(via: Transport, attempt: u32) -> u64 {
 const KEY_FILE_ID: u64 = 1;
 /// Ключ списка файлов в предложении.
 const KEY_FILES: u64 = 2;
+/// Ключ признака «переслано» у предложения файлов.
+///
+/// Отдельным признаком, а не отдельным типом нагрузки, как у текста
+/// (`PayloadType::Forward`), и причина прозаична: тип уже занят под
+/// «предложение файлов», а второй означал бы вторую копию всего разбора
+/// вложений. Признак необязателен на чтении — сборка постарше покажет
+/// пересланный файл без пометки, и это единственное, что она потеряет.
+const KEY_FORWARDED: u64 = 3;
 /// Ключ подписи к файлам.
 const KEY_CAPTION: u64 = 1;
 /// Ключ имени файла.
@@ -634,7 +646,7 @@ pub const fn auto_accept(size_bytes: u64, threshold: Option<u64>) -> bool {
 
 /// Собирает нагрузку предложения: подпись и список файлов.
 #[must_use]
-pub fn offer_payload(caption: &str, offers: &[FileOffer]) -> Value {
+pub fn offer_payload(caption: &str, offers: &[FileOffer], forwarded: bool) -> Value {
     let files = offers
         .iter()
         .map(|offer| {
@@ -650,10 +662,16 @@ pub fn offer_payload(caption: &str, offers: &[FileOffer]) -> Value {
             Value::Map(entry)
         })
         .collect();
-    Value::Map(vec![
+    let mut fields = vec![
         (Value::Integer(KEY_CAPTION.into()), Value::Text(caption.to_owned())),
         (Value::Integer(KEY_FILES.into()), Value::Array(files)),
-    ])
+    ];
+    // Ключа нет — «не переслано»: так короче обычный случай и так же
+    // читает его сборка постарше.
+    if forwarded {
+        fields.push((Value::Integer(KEY_FORWARDED.into()), Value::Bool(true)));
+    }
+    Value::Map(fields)
 }
 
 /// Разбирает нагрузку предложения.
@@ -666,7 +684,7 @@ pub fn offer_payload(caption: &str, offers: &[FileOffer]) -> Value {
 ///
 /// [`CodecError::TypeMismatch`], если структура не та или что-то не прошло
 /// [`check_offers`].
-pub fn offer_from_payload(value: &Value) -> Result<(String, Vec<FileOffer>), CodecError> {
+pub fn offer_from_payload(value: &Value) -> Result<(String, Vec<FileOffer>, bool), CodecError> {
     let map = canonical::as_map(value)?;
     let Value::Text(caption) = canonical::require(map, KEY_CAPTION)? else {
         return Err(CodecError::TypeMismatch);
@@ -702,7 +720,14 @@ pub fn offer_from_payload(value: &Value) -> Result<(String, Vec<FileOffer>), Cod
     if check_offers(&offers).is_err() {
         return Err(CodecError::TypeMismatch);
     }
-    Ok((caption.clone(), offers))
+    // Признак необязателен: сборка постарше его не везла. Отсутствие
+    // и `false` означают одно и то же, а ключ не того типа — порчу.
+    let forwarded = match canonical::get(map, KEY_FORWARDED) {
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err(CodecError::TypeMismatch),
+        None => false,
+    };
+    Ok((caption.clone(), offers, forwarded))
 }
 
 /// Собирает нагрузку чанка.
@@ -905,7 +930,7 @@ mod tests {
             [0xAB; 16],
             Hlc::new(u64::MAX, u32::MAX),
             PayloadType::FileOffer,
-            offer_payload(&text, &offers),
+            offer_payload(&text, &offers, false),
         );
         envelope.group_id = Some(vec![0xCD; 16]);
         envelope.fragment = Some(Fragment { uid: [0xEF; 16], index: 4095, total: 4096 });
@@ -953,9 +978,67 @@ mod tests {
                 preview: Some(vec![0x89, b'P', b'N', b'G']),
             },
         ];
-        let (caption, back) = offer_from_payload(&offer_payload("вот", &offers)).unwrap();
+        let (caption, back, _) = offer_from_payload(&offer_payload("вот", &offers, false)).unwrap();
         assert_eq!(caption, "вот");
         assert_eq!(back, offers);
+    }
+
+    #[test]
+    fn a_forwarded_offer_carries_its_mark() {
+        // Пометка «переслано» у файлов едет признаком внутри предложения:
+        // тип конверта уже занят под «предложение файлов», а второй означал
+        // бы вторую копию всего разбора вложений. Потерянный признак
+        // превратил бы чужие файлы в свои — ровно та неправда, о которой
+        // весь `crate::forward`.
+        let offers = vec![FileOffer {
+            file_id: [1u8; 16],
+            name: "кот.jpg".into(),
+            size_bytes: 1024,
+            key: [2u8; 32],
+            preview: None,
+        }];
+        let (_, _, forwarded) = offer_from_payload(&offer_payload("вот", &offers, true)).unwrap();
+        assert!(forwarded, "признак обязан пережить круг");
+    }
+
+    #[test]
+    fn an_offer_from_a_build_without_the_mark_reads_as_not_forwarded() {
+        // Ключа нет — «не переслано»: сборка постарше его не везла, и её
+        // предложение обязано разбираться по-прежнему. Проверяется именно
+        // отсутствие ключа, а не `false` в нём: в проводе его быть не должно.
+        let offers = vec![FileOffer {
+            file_id: [1u8; 16],
+            name: "кот.jpg".into(),
+            size_bytes: 1024,
+            key: [2u8; 32],
+            preview: None,
+        }];
+        let value = offer_payload("вот", &offers, false);
+        let Value::Map(fields) = &value else { panic!("предложение — карта") };
+        assert!(
+            !fields.iter().any(|(key, _)| *key == Value::Integer(KEY_FORWARDED.into())),
+            "у непересланного признака в проводе быть не должно"
+        );
+        let (_, _, forwarded) = offer_from_payload(&value).unwrap();
+        assert!(!forwarded);
+    }
+
+    #[test]
+    fn a_mark_of_the_wrong_type_is_refused() {
+        // Отсутствие ключа законно, а ключ не того типа — порча: это уже
+        // не «сборка постарше», это испорченный или подделанный кадр.
+        let offers = vec![FileOffer {
+            file_id: [1u8; 16],
+            name: "кот.jpg".into(),
+            size_bytes: 1024,
+            key: [2u8; 32],
+            preview: None,
+        }];
+        let Value::Map(mut fields) = offer_payload("вот", &offers, false) else {
+            panic!("предложение — карта")
+        };
+        fields.push((Value::Integer(KEY_FORWARDED.into()), Value::Text("да".into())));
+        assert!(offer_from_payload(&Value::Map(fields)).is_err());
     }
 
     #[test]
@@ -967,7 +1050,7 @@ mod tests {
             key: [0u8; 32],
             preview: None,
         }];
-        let (caption, _) = offer_from_payload(&offer_payload("", &offers)).unwrap();
+        let (caption, _, _) = offer_from_payload(&offer_payload("", &offers, false)).unwrap();
         assert!(caption.is_empty(), "файл без подписи — законное сообщение");
     }
 
@@ -983,21 +1066,24 @@ mod tests {
 
         // Список длиннее предела заставил бы перебрать сколько угодно записей.
         let many: Vec<_> = (0..=MAX_FILES_PER_MESSAGE).map(|_| one("a.txt", 1, None)).collect();
-        assert!(offer_from_payload(&offer_payload("", &many)).is_err());
+        assert!(offer_from_payload(&offer_payload("", &many, false)).is_err());
 
         // Имя с путём. Получатель хранит файл под своим `file_id` и чужое имя
         // путём не считает — но правило дешевле привычки.
         for name in ["../../etc/passwd", "a/b.txt", "", ".", "..", "плохо\u{7}"] {
             assert!(check_name(name).is_err(), "имя прошло: {name}");
         }
-        assert!(offer_from_payload(&offer_payload("", &[one("a/b", 1, None)])).is_err());
+        assert!(offer_from_payload(&offer_payload("", &[one("a/b", 1, None)], false)).is_err());
 
         // Размер и превью — за пределом.
-        assert!(
-            offer_from_payload(&offer_payload("", &[one("a", MAX_FILE_BYTES + 1, None)])).is_err()
-        );
+        assert!(offer_from_payload(&offer_payload(
+            "",
+            &[one("a", MAX_FILE_BYTES + 1, None)],
+            false
+        ))
+        .is_err());
         let big = vec![0u8; PREVIEW_LIMIT_BYTES + 1];
-        assert!(offer_from_payload(&offer_payload("", &[one("a", 1, Some(big))])).is_err());
+        assert!(offer_from_payload(&offer_payload("", &[one("a", 1, Some(big))], false)).is_err());
     }
 
     #[test]

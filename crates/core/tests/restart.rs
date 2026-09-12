@@ -1042,7 +1042,7 @@ fn a_network_change_forgets_what_it_knew_about_the_local_network() {
         "видимость в прежней сети недействительна"
     );
     assert!(
-        effects.iter().any(|e| matches!(e, ratatosk_core::Effect::RestartLan)),
+        effects.iter().any(|e| matches!(e, ratatosk_core::Effect::NetworkChanged)),
         "транспорт обязан подняться заново"
     );
 }
@@ -1051,6 +1051,12 @@ fn a_network_change_forgets_what_it_knew_about_the_local_network() {
 fn a_network_change_with_lan_off_does_not_turn_it_on() {
     // Смена сети — не решение пользователя. §5.1 держит LAN выключенным,
     // пока его не включили сознательно.
+    //
+    // Но сказать о переезде ступеням надо всё равно, и раньше здесь стоял
+    // ровно обратный запрет — «эффектов нет вовсе». Он был верен, пока
+    // эффект назывался `RestartLan`; после того как он стал общим, молчание
+    // означало бы, что меш и onion о смене сети не узнают из-за настройки
+    // локальной сети, к ним не относящейся.
     let db = TempDb::new("netchange-off");
     let db_key = Zeroizing::new([5u8; 32]);
 
@@ -1059,7 +1065,24 @@ fn a_network_change_with_lan_off_does_not_turn_it_on() {
     let mut engine = Engine::new(identity, store, blobs(), Box::new(OsEntropy), addresses());
 
     let effects = engine.step(1_000, Input::Command(Command::NetworkChanged)).unwrap();
-    assert!(effects.is_empty(), "выключенный LAN переоткрывать нечего");
+    assert!(
+        effects.iter().any(|e| matches!(e, ratatosk_core::Effect::NetworkChanged)),
+        "о смене сети обязаны узнать все ступени, а не только включённые"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(
+            e,
+            ratatosk_core::Effect::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                ..
+            }
+        )),
+        "смена сети не решает за пользователя, включать ли локальную сеть"
+    );
+    assert!(
+        !engine.transports().contains(ratatosk_proto::Transport::Lan),
+        "выключенный LAN обязан остаться выключенным"
+    );
 }
 
 #[test]

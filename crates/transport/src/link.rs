@@ -317,11 +317,11 @@ async fn write_loop<W>(
             biased;
             frame = urgent.recv() => match frame {
                 Some(frame) => frame,
-                None => return,
+                None => break,
             },
             frame = bulk.recv() => match frame {
                 Some(frame) => frame,
-                None => return,
+                None => break,
             },
         };
         let Ok(class) = SizeClass::from_frame_len(frame.len()) else {
@@ -356,7 +356,7 @@ async fn write_loop<W>(
             && writer.flush().await.is_ok();
         if !written {
             let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
-            return;
+            break;
         }
         // По этой строке видно, сколько кадров ушло на самом деле.
         // Вместе с такой же на чтении она отвечает на вопрос, который
@@ -364,6 +364,22 @@ async fn write_loop<W>(
         // по дороге или не сумели расшифровать?
         tracing::debug!(?via, ?class, kind = %frame_kind(&frame), "кадр записан");
     }
+
+    // **Поток закрывается явно, а не роняется.** Для `TcpStream` разницы нет
+    // — закрытие делает `Drop`, — а для потоков поверх чужих стеков есть,
+    // и стоила она поставки.
+    //
+    // Наблюдалось это так: после сброса связей (смена сети) следующий набор
+    // к тому же собеседнику по мешу упирался в срок ожидания, и лечился
+    // только перезапуском приложения. Похоже на то, что сессия TCP/KEY
+    // у собеседника оставалась жива — мы уронили свою половину, не сказав
+    // об этом, — а порт у меша постоянный с обеих сторон, так что новый
+    // набор приходил в ту же пару и оставался без ответа.
+    //
+    // Явное закрытие — единственное, чем мы вправе сказать «эта сессия
+    // кончилась», и стоит оно одной строки. Отказ здесь глотается сознательно:
+    // закрываем то, что уже сломано, и второй раз об этом говорить некому.
+    let _ = writer.shutdown().await;
 }
 
 #[cfg(test)]
@@ -526,6 +542,69 @@ mod tests {
         }
         incoming.read_exact(&mut tag).await.expect("кадр уходит вслед за соединением");
         assert_eq!(class_of_tag(tag[0]), Some(SizeClass::S));
+    }
+
+    /// Поток, который помнит, закрыли ли его явно.
+    ///
+    /// Настоящий `TcpStream` этого не различает — закрытие делает `Drop`, —
+    /// а `DuplexStream` тем более: у него обрыв и закрытие на чтении
+    /// выглядят одинаково. Поэтому проверять приходится не следствие,
+    /// а сам вызов.
+    struct Watched {
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tokio::io::AsyncWrite for Watched {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_link_closes_its_stream_instead_of_dropping_it() {
+        // Для `TcpStream` разницы нет, для потока поверх чужого стека есть,
+        // и стоила она поставки: после сброса связей следующий набор к тому
+        // же собеседнику по мешу упирался в срок ожидания и лечился только
+        // перезапуском приложения. Похоже на живую сессию у собеседника,
+        // которой мы не сказали, что она кончилась.
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = Watched { closed: std::sync::Arc::clone(&closed) };
+        let link = Link::dialing(
+            async move { Ok::<_, TransportError>(writer) },
+            [7u8; 32],
+            Transport::Ygg,
+            mpsc::channel(8).0,
+        );
+
+        // Раннер забыл связь — полосы закрылись, пишущая задача выходит.
+        drop(link);
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("забытая связь обязана закрыть поток, а не уронить его молча");
     }
 
     #[tokio::test]

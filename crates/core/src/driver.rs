@@ -352,6 +352,16 @@ pub struct TransportStatus {
     /// такое нечего — и не надо: «предел: неизвестно» человеку не говорит
     /// ничего, а место на экране занимает.
     pub mail_limits: ratatosk_proto::mail::MailLimits,
+    /// Пиры своего узла меша и их состояние (0.2).
+    ///
+    /// `None` — своего узла нет: ступень выключена, режим другой или узел
+    /// ещё не поднялся. Это **не** то же, что пустой список: пустой означает
+    /// «узел есть, а соединён он ни с кем», и лечится это разными
+    /// действиями — в первом случае включить, во втором проверить пиров.
+    ///
+    /// Названный, но мёртвый пир из списка не исчезает, поэтому сшивать его
+    /// с настройками не надо (`ygg::YggPeer`).
+    pub ygg_peers: Option<Vec<ratatosk_proto::ygg::YggPeer>>,
 }
 
 /// Последнее, что Tor сказал о себе (§5.2, §13.1).
@@ -558,6 +568,21 @@ enum Wake {
     /// и onion, и почту; транспорт знает только свою половину, вторую надо
     /// взять у ядра, а до ядра в ветке `select!` не дотянуться.
     TorReady(String),
+    /// Почта не смогла войти на сервер (§5.3, §14).
+    ///
+    /// Отдельная ветка, а не готовый [`Input`], по той же причине, что
+    /// и у [`Wake::TorReady`]: отсюда рождаются **два** действия, и порядок
+    /// между ними важен. Сперва §5.4 узнаёт, что ступени нет, — иначе
+    /// следующее сообщение успеет уйти в сервер, который его не примет;
+    /// потом человек узнаёт, почему.
+    MailLost(String),
+    /// Пиры своего узла меша и их состояние (0.2).
+    ///
+    /// Мимо ядра, и это не пробел: ни одно решение §5.4 на этот состав
+    /// не опирается — опирается оно на готовность ступени, а её меш
+    /// объявляет отдельно. Здесь состав только запоминается для того,
+    /// кто придёт спросить.
+    YggPeers(Vec<ratatosk_proto::ygg::YggPeer>),
     /// Новость для UI, которой ядро не касается вовсе.
     ///
     /// Ход подъёма Tor — не состояние протокола: ни одно решение §5.4
@@ -982,6 +1007,13 @@ pub struct Driver<S: Store, R: Runner> {
     /// Кэш ровно того же назначения, что `tor_note`: событие двигает
     /// индикатор, запрос отвечает тому, кто пришёл смотреть позже.
     mail_limits: ratatosk_proto::mail::MailLimits,
+    /// Пиры своего узла меша. `None` — узла нет.
+    ///
+    /// Запоминается здесь, а не в ядре, по той же причине, что `tor_note`
+    /// и `mail_limits`: §5.4 на этот состав не опирается ни одним решением —
+    /// опирается он на готовность ступени, — а человеку на экране настроек
+    /// он нужен в любой момент, а не в секунду перемены.
+    ygg_peers: Option<Vec<ratatosk_proto::ygg::YggPeer>>,
     /// Последняя жалоба почты, если она не работает.
     mail_failure: Option<String>,
     /// Срок → метки таймеров, которые в этот срок сработают.
@@ -1003,6 +1035,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             notices: notices_tx,
             tor_note: None,
             mail_limits: ratatosk_proto::mail::MailLimits::default(),
+            ygg_peers: None,
             mail_failure: None,
             timers: BTreeMap::new(),
         };
@@ -1104,9 +1137,12 @@ impl<S: Store, R: Runner> Driver<S, R> {
                                 blocked: blocked.clone(),
                             });
                         }
-                        Event::MailLoginFailed { reason } => {
-                            self.mail_failure = Some(reason.clone());
-                        }
+                        // Отказ входа сюда больше не приходит: у него своя
+                        // ветка ([`Wake::MailLost`]), потому что кроме
+                        // новости он рождает ещё и вход в ядро. Здесь
+                        // оставлена ровно эта строка объяснения, а не пустая
+                        // ветка: молчаливое отсутствие читалось бы как
+                        // «а про почту забыли».
                         Event::MailLimits { letter_bytes, mailbox_used, mailbox_limit, .. } => {
                             // Выводы (`crowded`, `carries_files`) не хранятся:
                             // они считаются из этих же трёх чисел правилом
@@ -1142,6 +1178,18 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     // теперь «не трогать» выразимо, и обход не нужен.
                     let command = Command::AnnounceAddresses { onion: Some(onion), chatmail: None };
                     self.tolerate(Input::Command(command)).await?;
+                }
+                Wake::YggPeers(peers) => self.ygg_peers = Some(peers),
+                Wake::MailLost(reason) => {
+                    // Порядок: сперва ступень уходит из лестницы, потом
+                    // новость на экран. Обратный порядок стоил бы одного
+                    // письма в мёртвый сервер на каждое сообщение,
+                    // отправленное между этими двумя строками.
+                    self.tolerate(Input::TransportLost { transport: Transport::Mail }).await?;
+                    self.mail_failure = Some(reason.clone());
+                    if self.notices.try_send(Event::MailLoginFailed { reason }).is_err() {
+                        tracing::debug!("очередь событий UI переполнена, новость отброшена");
+                    }
                 }
                 Wake::Stop => return Ok(()),
                 Wake::Idle => {}
@@ -1277,6 +1325,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     tor: self.tor_note.clone(),
                     mail_failure: self.mail_failure.clone(),
                     mail_limits: self.mail_limits,
+                    ygg_peers: self.ygg_peers.clone(),
                 });
             }
             Query::MailAccount { reply } => {
@@ -1652,7 +1701,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // ступени — и скажет по существу, а не строкой в журнале.
             | Effect::SetYgg(_)
             | Effect::WatchLanPeers(_)
-            | Effect::RestartLan
+            | Effect::NetworkChanged
             | Effect::SetTimer { .. }
             | Effect::Notify(_) => Refusal::Silent,
         };
@@ -1673,7 +1722,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 Some(TransportCommand::CreateMailAccount { url, via_tor })
             }
             Effect::WatchLanPeers(peers) => Some(TransportCommand::WatchLanPeers(peers)),
-            Effect::RestartLan => Some(TransportCommand::RestartLan),
+            Effect::NetworkChanged => Some(TransportCommand::NetworkChanged),
             Effect::SetTimer { after_ms, token } => {
                 self.timers.entry(now_ms.saturating_add(after_ms)).or_default().push(token);
                 None
@@ -1820,6 +1869,7 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::MailAccountFailed { reason } => Input::MailAccountFailed { reason },
         TransportEvent::Handed { peer_ik, via, handoff } => Input::Handed { peer_ik, via, handoff },
         TransportEvent::Ready { transport } => Input::TransportReady { transport },
+        TransportEvent::Lost { transport } => Input::TransportLost { transport },
         // **Мимо ядра, и это не пробел.** Свой ключ меша ядро знает и так —
         // он выведен из зерна, которое лежит у него в хранилище, — и в
         // карточку (§4.3) попадает оттуда. Событие заведено для режима
@@ -1832,6 +1882,7 @@ fn translate(event: TransportEvent) -> Wake {
         // оно ничего не сломало; `Input::Timer` с нулевой меткой — тот же
         // приём, каким молча пропускается всё, что ядра не касается.
         TransportEvent::YggReady { .. } => return Wake::Idle,
+        TransportEvent::YggPeers { peers } => return Wake::YggPeers(peers),
         // Через ядро, а не мимо: от этих чисел зависят два его решения —
         // пускать ли почту в выбор канала для файла и просить ли чанки
         // в свой кончающийся ящик. Показ — уже следствие, и приезжает
@@ -1840,12 +1891,17 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::MailQuota { used_bytes, limit_bytes } => {
             Input::MailQuota { used_bytes, limit_bytes }
         }
-        // Мимо ядра: не сумевшая войти почта просто не становится ступенью,
-        // и §5.4 ведёт себя ровно так же, как до заведения ящика. Сказать
-        // об этом надо человеку, а не протоколу.
-        TransportEvent::MailLoginFailed { reason } => {
-            return Wake::Notice(Event::MailLoginFailed { reason })
-        }
+        // **И человеку, и протоколу**, и вторая половина тут появилась
+        // не сразу. Прежде отказ входа шёл мимо ядра с объяснением: почта,
+        // не сумевшая войти, просто не становится ступенью, и §5.4 ведёт
+        // себя как до заведения ящика.
+        //
+        // Верно это ровно до **первого удачного** входа. После него ступень
+        // числится готовой, и отказ входа означает, что она сломалась:
+        // у ящика кончился хостинг, сменился пароль, сервер лёг. Ядро
+        // об этом не узнавало и продолжало выбирать почту — то есть
+        // складывать письма в сервер, который их не примет.
+        TransportEvent::MailLoginFailed { reason } => return Wake::MailLost(reason),
     };
     Wake::Input(input)
 }
@@ -1868,4 +1924,54 @@ fn none_if_empty(value: &str) -> Option<String> {
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Разбор события транспорта — тонкий слой, и проверять в нём стоит
+    /// ровно одно: не потерялся ли путь до ядра. Обе поломки этого раздела
+    /// были именно потерей пути, а не ошибкой в логике.
+    #[test]
+    fn a_lost_rung_reaches_the_core() {
+        // Событие завели ради этого: без входа готовность у ядра
+        // выставлялась и не гасла, и §5.4 выбирал мёртвую ступень.
+        let wake = translate(TransportEvent::Lost { transport: Transport::Onion });
+        assert!(
+            matches!(wake, Wake::Input(Input::TransportLost { transport: Transport::Onion })),
+            "«ступень отвалилась» обязано доходить до ядра, а не только до журнала"
+        );
+    }
+
+    #[test]
+    fn a_failed_mail_login_is_not_a_notice_only() {
+        // **Это была настоящая поломка, а не недосмотр формы.** Отказ входа
+        // шёл мимо ядра с объяснением «почта просто не становится
+        // ступенью» — верным ровно до первого удачного входа. После него
+        // ступень числилась готовой, и кончившийся хостинг означал письма
+        // в сервер, который их не примет.
+        let reason = "хостинг кончился".to_owned();
+        let wake = translate(TransportEvent::MailLoginFailed { reason });
+        assert!(
+            matches!(wake, Wake::MailLost(said) if said == "хостинг кончился"),
+            "отказ входа обязан и гасить ступень, и доезжать до человека"
+        );
+    }
+
+    #[test]
+    fn the_peer_count_goes_to_the_screen_and_not_to_the_core() {
+        // Число пиров §5.4 не касается: он опирается на готовность ступени,
+        // а её меш объявляет отдельно. Пройди оно входом в ядро — завелось
+        // бы состояние, на которое протокол не смотрит, но обязан отвечать.
+        let wake = translate(TransportEvent::YggPeers { peers: Vec::new() });
+        assert!(matches!(wake, Wake::YggPeers(_)));
+    }
+
+    #[test]
+    fn a_working_rung_still_reaches_the_core() {
+        // Пара к первому: обратный ход не должен был сломать прямой.
+        let wake = translate(TransportEvent::Ready { transport: Transport::Mail });
+        assert!(matches!(wake, Wake::Input(Input::TransportReady { transport: Transport::Mail })));
+    }
 }

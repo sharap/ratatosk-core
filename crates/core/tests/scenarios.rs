@@ -146,7 +146,7 @@ impl Node {
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
-                | Effect::RestartLan => {}
+                | Effect::NetworkChanged => {}
             }
         }
         for input in handed {

@@ -164,7 +164,7 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
-                | Effect::RestartLan => {}
+                | Effect::NetworkChanged => {}
             }
         }
 
@@ -2782,6 +2782,79 @@ fn a_message_waits_for_tor_to_come_up_instead_of_burning_the_step() {
 }
 
 #[test]
+fn a_rung_that_stopped_working_leaves_the_ladder_and_comes_back() {
+    // До этого входа ядру нечем было узнать, что ступень умерла: готовность
+    // выставлялась и не гасла никогда. Снаружи выходила ложь — в разборе
+    // со стенда в журнале стояло `ygg=годен` ровно в ту минуту, когда меш
+    // не работал, — и платило за неё каждое сообщение полным сроком
+    // ожидания. На телефоне сеть меняется по нескольку раз за день,
+    // и набегает это быстро.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Оставляем одну ступень, чтобы проверять её, а не соседнюю: почта
+    // без ящика и так не работает, локальная сеть выключена по §5.1.
+    alice
+        .step(
+            400,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Mail,
+                enabled: false,
+            }),
+        )
+        .unwrap();
+
+    // Ступень отвалилась — **не выключена человеком**, а перестала
+    // работать.
+    alice
+        .step(1_000, Input::TransportLost { transport: Transport::Onion })
+        .expect("ступень отвалилась");
+    assert!(
+        alice.transports().contains(Transport::Onion),
+        "выбор человека не трогается: ступень сломалась, а не выключена"
+    );
+
+    // И §5.4 её больше не выбирает: сообщение честно ждёт вместо того,
+    // чтобы платить сроком за ступень, которой нет.
+    let effects = send_text(&mut alice, &bob, 1_500, "подожду живой ступени");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "в ступень, которая не работает, кадр уходить не должен: {effects:?}"
+    );
+
+    // Ступень вернулась — и ждавшее уехало само, без единого действия
+    // человека. Это и есть вторая половина: «сейчас не работает»,
+    // а не «больше не нужна».
+    let effects = alice
+        .step(2_000, Input::TransportReady { transport: Transport::Onion })
+        .expect("ступень вернулась");
+    pump(&mut alice, &mut bob, 2_000, effects);
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["подожду живой ступени".to_string()],
+        "вернувшаяся ступень обязана увезти то, что ждало"
+    );
+}
+
+#[test]
+fn a_rung_reported_lost_twice_is_not_two_events() {
+    // Транспорт, у которого мигает сеть, не должен превращать это в поток
+    // работы для ядра: повтор отбрасывается молча, как и повторная
+    // готовность.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    let first = alice
+        .step(1_000, Input::TransportLost { transport: Transport::Onion })
+        .expect("ступень отвалилась");
+    let again = alice
+        .step(1_100, Input::TransportLost { transport: Transport::Onion })
+        .expect("повтор законен");
+    assert!(again.is_empty(), "повтор обязан быть молчаливым: {again:?}");
+    let _ = first;
+}
+
+#[test]
 fn switching_tor_off_takes_the_address_out_of_the_card() {
     // §14: выключенный Tor означает, что по нашему адресу больше никого нет.
     // Оставить адрес в карточке — обещать путь, которого не существует:
@@ -5126,7 +5199,7 @@ fn pump_many(
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::CreateMailAccount { .. }
-                | Effect::RestartLan => {}
+                | Effect::NetworkChanged => {}
             }
         }
         let Some((owner, token)) = timers.pop() else { break };

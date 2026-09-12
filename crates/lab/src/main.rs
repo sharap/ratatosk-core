@@ -2451,7 +2451,16 @@ async fn console(
                     // Руками — чтобы проверить переоткрытие, не переключая
                     // Wi-Fi на самом деле.
                     handle.send(Command::NetworkChanged).await.ok();
-                    println!("< сеть объявлена сменившейся: адреса забыты, объявление заново");
+                    println!(
+                        "< сеть объявлена сменившейся: локальная объявляется заново, \
+                         меш и onion сбрасывают связи"
+                    );
+                    // Заодно — состав пиров меша: он печатается той же
+                    // дорогой, потому что «сеть сменилась» до этой ступени
+                    // и так доходит. Строкой в журнале, а не ответом сюда:
+                    // это сырой ответ библиотеки, который мы пока
+                    // не разбираем, и место ему в журнале, а не в UI стенда.
+                    println!("  состав пиров меша — строкой «меш: …» в журнале ниже");
                     continue;
                 }
                 // Одна команда вместо двух: `/add` и `/addr` отличались одной
@@ -3131,9 +3140,11 @@ async fn ygg_show(handle: &DriverHandle) {
         }
         _ => println!("  имени в меше нет — ступень работать не может"),
     }
+    let mut alive = None;
     if let Some(status) = handle.transports().await {
         let on = status.enabled.contains(ratatosk_proto::Transport::Ygg);
         let up = status.ready.contains(ratatosk_proto::Transport::Ygg);
+        alive = status.ygg_peers;
         println!(
             "  ступень: включена={} работает={}",
             if on { "да" } else { "нет" },
@@ -3145,7 +3156,25 @@ async fn ygg_show(handle: &DriverHandle) {
             println!("  пиров нет: узел ни с кем не соединён");
             println!("  назвать: /ygg peer tcp://host:9001");
         } else {
-            println!("  пиры: {}", peers.join(" "));
+            // Названо и живо — рядом, и это не украшение: порознь ни то,
+            // ни другое не отвечает на «какой пир убрать». Мёртвый ищется
+            // перебором, и число — единственный способ увидеть результат.
+            match alive {
+                // Живой состав называет всех — и мёртвых тоже, — поэтому
+                // печатается он, а не названный список: там нет главного,
+                // признака «работает».
+                Some(live) if !live.is_empty() => {
+                    println!("  пиры:");
+                    for peer in live {
+                        let mark =
+                            if peer.up { "работает" } else { "не соединён" };
+                        let side = if peer.inbound { " (входящий)" } else { "" };
+                        println!("    {} — {mark}{side}, {:.0} мс", peer.uri, peer.latency_ms);
+                    }
+                }
+                Some(_) => println!("  пиры: {} — узел ни с кем не соединён", peers.join(" ")),
+                None => println!("  пиры: {} — узел ещё не поднят", peers.join(" ")),
+            }
         }
         if !YGG_NODE_BUILT_IN {
             println!("  узла в этой сборке нет: пересоберите с --features ygg-node");

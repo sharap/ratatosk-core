@@ -33,9 +33,10 @@
 //! # Что кому достаётся
 //!
 //! Команды с явным транспортом (`Send`, `Connect`, `SetEnabled`) уходят
-//! по нему. Команды с именем транспорта в названии (`WatchLanPeers`,
-//! `RestartLan`) — ему же. А `Disconnect` уходит **всем**: в нём нет `via`,
-//! и кто именно держит соединение с этим контактом, знает только сам раннер.
+//! по нему. Команды с именем транспорта в названии (`WatchLanPeers`) — ему
+//! же. А `Disconnect` и `NetworkChanged` уходят **всем**: в первом нет
+//! `via`, и кто держит соединение с этим контактом, знает только сам
+//! раннер; второе касается всех сразу — сеть меняется не у одной ступени.
 
 use ratatosk_proto::transport_policy::Transport;
 
@@ -187,9 +188,7 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Runner for Transports<L, Y, O, 
                 self.to_one(transport, command).await
             }
             // Имя транспорта в названии команды: адресат очевиден.
-            TransportCommand::WatchLanPeers(_) | TransportCommand::RestartLan => {
-                self.lan.execute(command).await
-            }
+            TransportCommand::WatchLanPeers(_) => self.lan.execute(command).await,
             TransportCommand::SetMailAccount(_) | TransportCommand::CreateMailAccount { .. } => {
                 self.mail.execute(command).await
             }
@@ -198,6 +197,11 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Runner for Transports<L, Y, O, 
             // А тут `via` нет, и знать, кто держит соединение с этим
             // контактом, может только сам раннер.
             TransportCommand::Disconnect { .. } => self.to_all(command).await,
+            // Сеть сменилась у всех сразу, и каждая ступень решает сама,
+            // что это для неё значит. Прежде команда звалась `RestartLan`
+            // и доходила до одной — а остальные узнавали о смене сети
+            // таймаутом на первой отправке.
+            TransportCommand::NetworkChanged => self.to_all(command).await,
         }
     }
 
@@ -263,7 +267,7 @@ mod tests {
                 TransportCommand::Disconnect { .. } => "disconnect",
                 TransportCommand::SetEnabled { .. } => "set-enabled",
                 TransportCommand::WatchLanPeers(_) => "watch",
-                TransportCommand::RestartLan => "restart",
+                TransportCommand::NetworkChanged => "network-changed",
                 TransportCommand::SetMailAccount(_) => "mail-account",
                 TransportCommand::CreateMailAccount { .. } => "mail-create",
                 TransportCommand::SetYgg(_) => "ygg",
@@ -324,7 +328,7 @@ mod tests {
             .execute(TransportCommand::SetEnabled { transport: Transport::Lan, enabled: true })
             .await
             .unwrap();
-        transports.execute(TransportCommand::RestartLan).await.unwrap();
+        transports.execute(TransportCommand::WatchLanPeers(Vec::new())).await.unwrap();
 
         let seen = seen.lock().unwrap().clone();
         assert!(
@@ -332,6 +336,29 @@ mod tests {
             "не LAN про это знать незачем: {seen:?}"
         );
         assert_eq!(seen.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_changed_network_reaches_everyone() {
+        // Сеть меняется у всех ступеней сразу. Прежде команда звалась
+        // `RestartLan` и доходила до одной — а меш и onion узнавали
+        // о переезде первой неудачной записью, то есть таймаутом.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (lan, _l) = Recorder::new("lan", &seen);
+        let (onion, _o) = Recorder::new("onion", &seen);
+        let (mail, _m) = Recorder::new("mail", &seen);
+        let (ygg, _y) = Recorder::new("ygg", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, mail);
+
+        transports.execute(TransportCommand::NetworkChanged).await.unwrap();
+
+        let mut who: Vec<&str> = seen.lock().unwrap().iter().map(|(who, _)| *who).collect();
+        who.sort_unstable();
+        assert_eq!(
+            who,
+            vec!["lan", "mail", "onion", "ygg"],
+            "о смене сети обязана узнать каждая ступень"
+        );
     }
 
     #[tokio::test]

@@ -477,7 +477,7 @@ impl Runner for LanRunner {
                 self.set_enabled(enabled)
             }
             TransportCommand::SetEnabled { .. } => Err(TransportError::Unavailable),
-            TransportCommand::RestartLan => self.restart().await,
+            TransportCommand::NetworkChanged => self.restart().await,
             TransportCommand::WatchLanPeers(peers) => {
                 // Сначала пересматриваем уже услышанное, потом запоминаем
                 // список. Порядок неважен для результата, но так очевидно,

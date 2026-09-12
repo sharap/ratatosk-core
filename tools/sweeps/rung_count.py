@@ -43,7 +43,10 @@ checks = [
     ("proto: битов в маске KNOWN", policy, r"const KNOWN: u8 = ([\d |]+);"),
     ("multi: параметров у Transports", multi, r"pub struct Transports<([\w, ]+)> \{"),
     ("multi: длина stopped", multi, r"stopped: \[bool; (\d+)\]"),
-    ("multi: обход to_all", multi, r"for via in \[([^\]]+)\]"),
+    # Пробел перед скобкой не фиксирован: список из пяти транспортов rustfmt
+    # переносит на свою строку, и жёсткий пробел означал бы, что метёлка
+    # молчит ровно с той ступени, ради которой её и писали.
+    ("multi: обход to_all", multi, r"for via in\s*\[([^\]]+)\]"),
     ("multi: веток select", multi, r"(?s)let \(which, event\) = tokio::select! \{(.*?)\n            \};"),
     ("sim: длина TransportKind::ALL", sim, r"pub const ALL: \[TransportKind; (\d+)\]"),
 ]

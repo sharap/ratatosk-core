@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use ratatosk_codec::ContactCard;
 use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_proto::transport_policy::{PeerAvailability, Transport};
 use ratatosk_store::{FileId, Store, StoredFile, StoredMessage, StoredReaction};
@@ -219,6 +220,11 @@ enum Query {
     /// в настройках приложения однажды разошёлся бы с тем, по которому
     /// ядро принимает решения.
     YggMode { reply: oneshot::Sender<ratatosk_proto::ygg::YggMode> },
+    /// Названные человеком реле nostr и путь до них (0.3).
+    ///
+    /// Настройка, а не живое состояние: что из неё работает, отвечает
+    /// [`TransportStatus::nostr_relays`].
+    NostrSettings { reply: oneshot::Sender<(Vec<String>, bool)> },
     /// Пиры встроенного узла меша (0.2).
     YggPeers { reply: oneshot::Sender<Vec<String>> },
     /// Какие транспорты сейчас включены (§5.4).
@@ -306,6 +312,21 @@ pub struct OwnCard {
     /// отдельно затем же, зачем onion: показать человеку, чем до него
     /// вообще можно достучаться, не разбирая ссылку глазами.
     pub ygg: Vec<u8>,
+    /// Открытый ключ nostr (0.3). Пусто — ступень ни разу не включали.
+    ///
+    /// Лежит здесь по той же причине, что ключ меша: в ссылке он уже есть,
+    /// но показать человеку, чем до него можно достучаться, надо не разбирая
+    /// ссылку глазами.
+    pub nostr: Vec<u8>,
+    /// Реле, которые карточка объявляет читающими (0.3, §5.4). Пусто —
+    /// «ступень выключена либо реле не настроены».
+    ///
+    /// Это **не** список настроенных реле: в карточку уходят не все, а не
+    /// более [`ratatosk_codec::MAX_CARD_RELAYS`] — QR не резиновый. Человеку
+    /// показывать надо именно объявленное: собеседник пошлёт туда, а не
+    /// в настройки, и расхождение «настроено пять, объявлено три» — это
+    /// ровно то, что стоит видеть глазами, а не выяснять по молчанию.
+    pub nostr_relays: Vec<String>,
 }
 
 /// Состояние транспортов на этом устройстве (§5.4).
@@ -362,6 +383,14 @@ pub struct TransportStatus {
     /// Названный, но мёртвый пир из списка не исчезает, поэтому сшивать его
     /// с настройками не надо (`ygg::YggPeer`).
     pub ygg_peers: Option<Vec<ratatosk_proto::ygg::YggPeer>>,
+    /// Названные реле nostr и их состояние (0.3).
+    ///
+    /// Пара к [`TransportStatus::ygg_peers`], и различие тех же двух
+    /// состояний здесь так же существенно: `None` — ступени нет вовсе
+    /// (выключена, либо раннера в этой сборке не собрано), пустой список —
+    /// «ступень есть, а реле не названо ни одного». Первое чинится
+    /// переключателем, второе — строкой в настройках.
+    pub nostr_relays: Option<Vec<ratatosk_proto::nostr::NostrRelay>>,
 }
 
 /// Последнее, что Tor сказал о себе (§5.2, §13.1).
@@ -428,6 +457,13 @@ pub struct ContactStatus {
     pub chatmail: Option<String>,
     /// Открытый ключ узла Yggdrasil из карточки (0.2). `None` — меша нет.
     pub ygg: Option<Vec<u8>>,
+    /// Реле, которые объявляет **его** карточка (0.3, §5.4).
+    ///
+    /// Туда уйдёт событие, когда §5.4 выберет ступень nostr: реле в карточке
+    /// — это места, где владелец читает. Показывать это надо ровно затем же,
+    /// зачем onion-адрес: «не дошло» иначе неотличимо от «дошло не туда».
+    /// Пусто — карточка реле не называет, и класть будем на свои.
+    pub nostr_relays: Vec<String>,
     /// Версия карточки, монотонная (§4.3).
     ///
     /// Диагностическая величина: по ней видно, доехало ли до нас обновление
@@ -583,6 +619,12 @@ enum Wake {
     /// объявляет отдельно. Здесь состав только запоминается для того,
     /// кто придёт спросить.
     YggPeers(Vec<ratatosk_proto::ygg::YggPeer>),
+    /// Названные реле nostr и их состояние (0.3).
+    ///
+    /// Мимо ядра, и по той же причине, что состав пиров меша: §5.4
+    /// опирается на готовность ступени, а её раннер объявляет отдельно.
+    /// Здесь состав только запоминается для того, кто придёт спросить.
+    NostrRelays(Vec<ratatosk_proto::nostr::NostrRelay>),
     /// Новость для UI, которой ядро не касается вовсе.
     ///
     /// Ход подъёма Tor — не состояние протокола: ни одно решение §5.4
@@ -707,6 +749,17 @@ impl DriverHandle {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::YggPeers { reply })).await.ok()?;
         Some((mode, answer.await.ok()?))
+    }
+
+    /// Названные реле nostr и признак «мимо Tor» (0.3).
+    ///
+    /// Настройка, а не живое состояние: что из неё работает, лежит
+    /// в [`TransportStatus::nostr_relays`], и различать их обязательно —
+    /// «реле не названы» и «названы, но не отвечают» чинятся по-разному.
+    pub async fn nostr_settings(&self) -> Option<(Vec<String>, bool)> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::NostrSettings { reply })).await.ok()?;
+        answer.await.ok()
     }
 
     /// То же, блокируя вызывающий поток.
@@ -948,6 +1001,13 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает настройку ступени nostr (0.3), блокируя вызывающий поток.
+    pub fn nostr_settings_blocking(&self) -> Option<(Vec<String>, bool)> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::NostrSettings { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает контакты, блокируя вызывающий поток.
     pub fn contacts_blocking(&self) -> Option<Vec<ContactStatus>> {
         let (reply, answer) = oneshot::channel();
@@ -1014,6 +1074,8 @@ pub struct Driver<S: Store, R: Runner> {
     /// опирается он на готовность ступени, — а человеку на экране настроек
     /// он нужен в любой момент, а не в секунду перемены.
     ygg_peers: Option<Vec<ratatosk_proto::ygg::YggPeer>>,
+    /// Названные реле nostr. `None` — ступени нет.
+    nostr_relays: Option<Vec<ratatosk_proto::nostr::NostrRelay>>,
     /// Последняя жалоба почты, если она не работает.
     mail_failure: Option<String>,
     /// Срок → метки таймеров, которые в этот срок сработают.
@@ -1036,6 +1098,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             tor_note: None,
             mail_limits: ratatosk_proto::mail::MailLimits::default(),
             ygg_peers: None,
+            nostr_relays: None,
             mail_failure: None,
             timers: BTreeMap::new(),
         };
@@ -1180,6 +1243,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     self.tolerate(Input::Command(command)).await?;
                 }
                 Wake::YggPeers(peers) => self.ygg_peers = Some(peers),
+                Wake::NostrRelays(relays) => self.nostr_relays = Some(relays),
                 Wake::MailLost(reason) => {
                     // Порядок: сперва ступень уходит из лестницы, потом
                     // новость на экран. Обратный порядок стоил бы одного
@@ -1312,6 +1376,10 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Query::AutoAccept { reply } => {
                 let _ = reply.send(self.engine.auto_accept_bytes());
             }
+            Query::NostrSettings { reply } => {
+                let _ =
+                    reply.send((self.engine.nostr_relays().to_vec(), self.engine.nostr_direct()));
+            }
             Query::YggMode { reply } => {
                 let _ = reply.send(self.engine.ygg_mode());
             }
@@ -1326,24 +1394,14 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     mail_failure: self.mail_failure.clone(),
                     mail_limits: self.mail_limits,
                     ygg_peers: self.ygg_peers.clone(),
+                    nostr_relays: self.nostr_relays.clone(),
                 });
             }
             Query::MailAccount { reply } => {
                 let _ = reply.send(self.engine.mail_account().cloned());
             }
             Query::OwnCard { reply } => {
-                let card = self.engine.own_card();
-                // Кодирование карточки может отказать только на испорченной
-                // памяти, но ронять из-за него ядро нечего: пустая ссылка
-                // видна на экране сразу, а упавший драйвер уносит с собой
-                // переписку.
-                let _ = reply.send(OwnCard {
-                    uri: card.to_uri().unwrap_or_default(),
-                    version: card.version,
-                    onion: card.onion,
-                    chatmail: card.chatmail,
-                    ygg: card.ygg,
-                });
+                let _ = reply.send(own_card_of(&self.engine.own_card()));
             }
             Query::Search { chat, query, limit, reply } => {
                 let store = self.engine.store();
@@ -1458,6 +1516,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         // значило бы однажды показать одну, а соединиться
                         // по другой.
                         ygg: (!contact.card.ygg.is_empty()).then(|| contact.card.ygg.clone()),
+                        nostr_relays: contact.card.nostr_relays.clone(),
                         card_version: contact.card.version,
                         added_ms: contact.added_ms,
                         direct_channel: extras.get(peer_ik).and_then(|(direct, _)| *direct),
@@ -1700,6 +1759,10 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // ключ он уже назвал, а поднялся ли демон, скажет готовность
             // ступени — и скажет по существу, а не строкой в журнале.
             | Effect::SetYgg(_)
+            // И на постановку ключа и реле nostr — по тому же доводу:
+            // сработала ли ступень, скажет её готовность, а не отказ
+            // на настройку.
+            | Effect::SetNostr(_)
             | Effect::WatchLanPeers(_)
             | Effect::NetworkChanged
             | Effect::SetTimer { .. }
@@ -1718,6 +1781,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Effect::SetMailAccount(account) => Some(TransportCommand::SetMailAccount(account)),
             Effect::SetYgg(setup) => Some(TransportCommand::SetYgg(setup)),
+            Effect::SetNostr(setup) => Some(TransportCommand::SetNostr(setup)),
             Effect::CreateMailAccount { url, via_tor } => {
                 Some(TransportCommand::CreateMailAccount { url, via_tor })
             }
@@ -1795,12 +1859,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
     /// а второй экран — про «здесь и сейчас».
     fn address_of(&self, peer_ik: [u8; 32]) -> PeerAddress {
         if let Some(contact) = self.engine.contacts().get(&peer_ik) {
-            return PeerAddress {
-                ik: peer_ik,
-                onion: non_empty(&contact.card.onion),
-                chatmail: non_empty(&contact.card.chatmail),
-                ygg: ygg_key(&contact.card.ygg),
-            };
+            return peer_address_of(&contact.card);
         }
         PeerAddress {
             ik: peer_ik,
@@ -1811,7 +1870,41 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // здесь означает «у этого десктопа меша нет», а не «второму
             // экрану меш не полагается», как было раньше.
             ygg: self.engine.device_ygg(&peer_ik).and_then(ygg_key),
+            nostr: None,
+            // Список реле приезжает карточкой (§4.3), а здесь карточки нет —
+            // это ветка «контакта не знаем». Пусто означает «куда он читает,
+            // неизвестно», и отправка уйдёт на свои реле.
+            nostr_relays: Vec::new(),
         }
+    }
+}
+
+/// Адрес контакта для раннеров — из его карточки (§5.4).
+///
+/// # Зачем отдельной функцией
+///
+/// Затем же, зачем `own_card_of`: это **зеркало**, и расходятся зеркала
+/// молча. Здесь оно разошлось по-настоящему и стоило разбора на стенде.
+///
+/// Ключ nostr (0.3) появился в карточке, `Reachability` начал считать
+/// ступень адресуемой — а сюда поле не дописали, и раннер получал `None`.
+/// Снаружи это выглядело так: §5.4 выбирает nostr (`refusal=… nostr=годен`),
+/// раннер отвечает `NoAddress`, лестница кончается, сообщение вечно «ждёт».
+/// Ни одного отказа сборки при этом не было: поле-то на месте, просто
+/// заполнено пустотой.
+///
+/// Названная так функция попадает под метёлку `mirror`: она требует,
+/// чтобы каждое поле карточки было прочитано в теле, а то, чему переходить
+/// границу не положено, называлось в её списке исключений вместе
+/// с причиной. Второй раз молча разойтись им теперь нечем.
+fn peer_address_of(card: &ContactCard) -> PeerAddress {
+    PeerAddress {
+        ik: card.ik,
+        onion: non_empty(&card.onion),
+        chatmail: non_empty(&card.chatmail),
+        ygg: ygg_key(&card.ygg),
+        nostr: ratatosk_proto::nostr::NostrKey::from_slice(&card.nostr),
+        nostr_relays: card.nostr_relays.clone(),
     }
 }
 
@@ -1841,6 +1934,36 @@ async fn sleep_until(deadline_ms: Option<u64>) {
         }
         // Ждать нечего — пусть просыпают транспорт или UI.
         None => std::future::pending().await,
+    }
+}
+
+/// Вид своей карточки для показа (§4.1).
+///
+/// # Зачем отдельной функцией, а не парой строк на месте
+///
+/// Затем, что это **зеркало**, а зеркала расходятся молча. Сборка стояла
+/// внутри обработчика запроса, и появившийся в карточке ключ nostr (0.3)
+/// в неё не попал: компилятор смолчал бы, потому что забыть можно было
+/// сразу и поле, и строку. Поймала ошибку случайность — стенд полез
+/// за этим полем и не нашёл его.
+///
+/// Названная так функция попадает под метёлку `mirror`: она требует,
+/// чтобы **каждое** поле исходной записи было прочитано в теле. То, что
+/// границу переходить не должно, названо в её списке исключений поимённо
+/// — вместе с причиной.
+///
+/// Кодирование ссылки может отказать только на испорченной памяти, но
+/// ронять из-за него ядро нечего: пустая ссылка видна на экране сразу,
+/// а упавший драйвер уносит с собой переписку.
+fn own_card_of(card: &ContactCard) -> OwnCard {
+    OwnCard {
+        uri: card.to_uri().unwrap_or_default(),
+        version: card.version,
+        onion: card.onion.clone(),
+        chatmail: card.chatmail.clone(),
+        ygg: card.ygg.clone(),
+        nostr: card.nostr.clone(),
+        nostr_relays: card.nostr_relays.clone(),
     }
 }
 
@@ -1883,11 +2006,18 @@ fn translate(event: TransportEvent) -> Wake {
         // приём, каким молча пропускается всё, что ядра не касается.
         TransportEvent::YggReady { .. } => return Wake::Idle,
         TransportEvent::YggPeers { peers } => return Wake::YggPeers(peers),
+        // И то же самое про реле: §5.4 на состав не смотрит, а человек
+        // на экране настроек смотрит.
+        TransportEvent::NostrRelays { relays } => return Wake::NostrRelays(relays),
         // Через ядро, а не мимо: от этих чисел зависят два его решения —
         // пускать ли почту в выбор канала для файла и просить ли чанки
         // в свой кончающийся ящик. Показ — уже следствие, и приезжает
         // он одним сведённым событием (`Engine::tell_mail_limits`).
         TransportEvent::MailLetterLimit { bytes } => Input::MailLetterLimit { bytes },
+        // Через ядро, потому что диск есть только у него: отметка обязана
+        // пережить перезапуск, иначе реле после каждого старта отдаёт всю
+        // сохранённую историю заново.
+        TransportEvent::NostrSince { created_at } => Input::NostrSince { created_at },
         TransportEvent::MailQuota { used_bytes, limit_bytes } => {
             Input::MailQuota { used_bytes, limit_bytes }
         }
@@ -1966,6 +2096,10 @@ mod tests {
         // бы состояние, на которое протокол не смотрит, но обязан отвечать.
         let wake = translate(TransportEvent::YggPeers { peers: Vec::new() });
         assert!(matches!(wake, Wake::YggPeers(_)));
+
+        // И состав реле — туда же и по той же причине.
+        let wake = translate(TransportEvent::NostrRelays { relays: Vec::new() });
+        assert!(matches!(wake, Wake::NostrRelays(_)));
     }
 
     #[test]

@@ -181,6 +181,8 @@ fn stranger(seed: u8) -> ContactCard {
         display_name: format!("гость {seed}"),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     }
 }
 

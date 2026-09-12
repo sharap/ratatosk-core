@@ -897,6 +897,7 @@ impl Runner for YggRunner {
             TransportCommand::SetEnabled { .. }
             | TransportCommand::WatchLanPeers(_)
             | TransportCommand::SetMailAccount(_)
+            | TransportCommand::SetNostr(_)
             | TransportCommand::CreateMailAccount { .. } => Err(TransportError::Unavailable),
         }
     }
@@ -1191,7 +1192,14 @@ mod tests {
     use crate::runner::PeerAddress;
 
     fn peer(ygg: Option<[u8; 32]>) -> PeerAddress {
-        PeerAddress { ik: [7u8; 32], onion: None, chatmail: None, ygg }
+        PeerAddress {
+            ik: [7u8; 32],
+            onion: None,
+            chatmail: None,
+            ygg,
+            nostr: None,
+            nostr_relays: Vec::new(),
+        }
     }
 
     fn frame() -> Vec<u8> {

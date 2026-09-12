@@ -119,6 +119,20 @@ const MAIL_BUILT_IN: bool = cfg!(feature = "mail");
 /// Строка в шапке снимает этот вопрос до того, как он возникнет.
 const YGG_NODE_BUILT_IN: bool = cfg!(feature = "ygg-node");
 
+/// Есть ли в этом двоичном файле ступень поверх реле nostr (0.3).
+///
+/// **Заведена по следу.** Без признака слот ступени занимает `Disabled`,
+/// а он принимает настройку **молча** — и правильно делает: несобранному
+/// раннеру ключ и реле не нужны, а отказ выглядел бы в журнале поломкой,
+/// которой не случилось.
+///
+/// Цена этой правильности — тишина, неотличимая от неработающей ступени:
+/// на стенде было видно «ступень включена, реле названо, ещё не пробовали»
+/// — и так навсегда. То же самое дерево уже писало про onion и почту
+/// («стенд без транспорта выглядел точно так же, как стенд со сломанным»),
+/// и повторять этот урок третий раз незачем.
+const NOSTR_BUILT_IN: bool = cfg!(feature = "nostr");
+
 /// Чем собран этот стенд — одной строкой в шапку.
 ///
 /// Печатается всегда, а не только когда чего-то нет: строка «почта: нет»
@@ -131,7 +145,8 @@ fn build_line() -> String {
     } else {
         "меш: только демон (свой узел — --features ygg-node)"
     };
-    format!("LAN, {tor}, {mail}, {node}")
+    let nostr = if NOSTR_BUILT_IN { "nostr" } else { "nostr НЕТ (--features nostr)" };
+    format!("LAN, {tor}, {mail}, {nostr}, {node}")
 }
 
 struct Args {
@@ -435,6 +450,16 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     // перезапуск: телефон запомнил его с прошлого рукопожатия, а сервис
     // на одноразовом каталоге поднялся бы под другим.
     let tor_handle = ratatosk_transport::onion::TorHandle::default();
+
+    // Раннер nostr заводится одинаково в обеих сборках стенда: Tor ему нужен
+    // не всегда. До локального реле (`ws://127.0.0.1:8080`) он ходит напрямую
+    // — цепочка встречи до петлевого адреса никуда не вела бы, — и ступень
+    // проверяется на своём `nostr-rs-relay` без признака `tor` вовсе.
+    #[cfg(feature = "nostr")]
+    let nostr = ratatosk_transport::nostr::NostrRunner::new(tor_handle.clone());
+    #[cfg(not(feature = "nostr"))]
+    let nostr = Disabled;
+
     #[cfg(feature = "tor")]
     let mut runner = {
         let layout = args.tordir.clone().map(ratatosk_core::TorLayout::under);
@@ -467,12 +492,12 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, Disabled)
+        Transports::new(lan, ygg, onion, nostr, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = &tor_handle;
-        Transports::new(lan, ygg, Disabled, Disabled)
+        Transports::new(lan, ygg, Disabled, nostr, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а
@@ -1626,6 +1651,15 @@ async fn run<S: Store + 'static>(
     #[cfg(not(feature = "mail"))]
     let mail = Disabled;
 
+    // Раннер nostr заводится одинаково в обеих сборках стенда: Tor ему нужен
+    // не всегда. До локального реле (`ws://127.0.0.1:8080`) он ходит напрямую
+    // — цепочка встречи до петлевого адреса никуда не вела бы, — и ступень
+    // проверяется на своём `nostr-rs-relay` без признака `tor` вовсе.
+    #[cfg(feature = "nostr")]
+    let nostr = ratatosk_transport::nostr::NostrRunner::new(tor_handle.clone());
+    #[cfg(not(feature = "nostr"))]
+    let nostr = Disabled;
+
     // С признаком `tor` и дисковым хранилищем стенд поднимает настоящий
     // onion — в фоне, как это делает клиент: bootstrap идёт десятки секунд,
     // а команды со stdin обязаны работать сразу.
@@ -1663,7 +1697,7 @@ async fn run<S: Store + 'static>(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, mail)
+        Transports::new(lan, ygg, onion, nostr, mail)
     };
     #[cfg(not(feature = "tor"))]
     let runner = {
@@ -1671,7 +1705,7 @@ async fn run<S: Store + 'static>(
         // молчаливый успех. Ровно это увидит §5.4 и перейдёт к следующей
         // ступени.
         let _ = (&layout, &onion, &tor_handle);
-        Transports::new(lan, ygg, Disabled, mail)
+        Transports::new(lan, ygg, Disabled, nostr, mail)
     };
 
     println!("узел     : {}", args.name);
@@ -1712,7 +1746,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2442,6 +2476,11 @@ async fn console(
                     ygg_command(&handle, rest).await;
                     continue;
                 }
+                if line == "/nostr" || line.starts_with("/nostr ") {
+                    let rest = line.strip_prefix("/nostr").unwrap_or_default().trim();
+                    nostr_command(&handle, rest).await;
+                    continue;
+                }
                 if let Some(rest) = line.strip_prefix("/mail") {
                     mail_command(&handle, rest.trim()).await;
                     continue;
@@ -2473,6 +2512,54 @@ async fn console(
                     match add_contact(&handle, &directory, rest).await {
                         Ok(ik) => peer = Some(ik),
                         Err(error) => println!("< не принято: {error}"),
+                    }
+                    continue;
+                }
+
+                // Длинный текст **не набирается руками**, и это не лень,
+                // а измеренное свойство терминала: в каноническом режиме
+                // строка со stdin обрезается на 4095 байтах — молча, без
+                // единого сообщения. Первая же попытка проверить многочастный
+                // кадр с клавиатуры дала «текст режется примерно на 4000
+                // символов», и выглядело это как наша поломка.
+                if line == "/long" || line.starts_with("/long ") {
+                    let rest = line.strip_prefix("/long").unwrap_or_default().trim();
+                    let kib: usize = if rest.is_empty() { 8 } else { rest.parse().unwrap_or(0) };
+                    if kib == 0 || kib > 512 {
+                        println!("< нужно: /long [килобайт от 1 до 512] — по умолчанию 8");
+                        continue;
+                    }
+                    let text = long_text(kib * 1024);
+                    if peer.is_none() {
+                        peer = sole_contact(&handle).await;
+                    }
+                    let Some(ik) = peer else {
+                        println!("< писать некому: /add <карточка> [ip:порт]");
+                        continue;
+                    };
+                    let chat = Engine::<MemoryStore>::chat_id_for(&ik);
+                    println!("< шлём длинный текст: {} Б", text.len());
+                    // Класс кадра называется **до** отправки, и не для красоты:
+                    // граница между классами M и L — это граница между «ступень
+                    // nostr это везёт» и «не везёт», и найдена она была дорого,
+                    // как «ограничение примерно 63 килобайта».
+                    //
+                    // Считается настоящей арифметикой (`SizeClass::smallest_for`),
+                    // а не своей копией: своя разошлась бы с ядром молча.
+                    // Запас конверта берётся сверху — тем же числом, которым
+                    // его резервирует протокол.
+                    let with_envelope = text.len() + ratatosk_proto::files::ENVELOPE_RESERVE_BYTES;
+                    match ratatosk_proto::SizeClass::smallest_for(with_envelope) {
+                        Some(ratatosk_proto::SizeClass::L) => {
+                            println!("    класс кадра L — ступень nostr его не везёт (0.3.5),");
+                            println!("    доставка уйдёт ниже по лестнице §5.4, то есть почтой");
+                        }
+                        Some(class) => println!("    класс кадра {class:?}"),
+                        None => println!("    столько не влезает ни в один класс кадра"),
+                    }
+                    println!("    нарезку и сборку ищите в журнале: «кадр поехал частями»");
+                    if handle.send(Command::SendText { chat, text }).await.is_err() {
+                        return;
                     }
                     continue;
                 }
@@ -2537,15 +2624,18 @@ async fn console(
                                         // есть в группе. В переписке двоих
                                         // она повторяла бы имя собеседника
                                         // у каждой строки.
+                                        let body =
+                                            String::from_utf8_lossy(&view.message.body);
+                                        // Длинный текст **проверяется**, а не
+                                        // печатается стеной: глазами в восьми
+                                        // килобайтах обрыв не найти, а стенд
+                                        // находит его по своей же разметке
+                                        // (`/long`).
+                                        let shown = long_verdict(&body)
+                                            .unwrap_or_else(|| body.to_string());
                                         match &view.author {
-                                            Some(author) => println!(
-                                                "< {author}: {}",
-                                                String::from_utf8_lossy(&view.message.body)
-                                            ),
-                                            None => println!(
-                                                "< {}",
-                                                String::from_utf8_lossy(&view.message.body)
-                                            ),
+                                            Some(author) => println!("< {author}: {shown}"),
+                                            None => println!("< {shown}"),
                                         }
                                     }
                                 }
@@ -2786,6 +2876,16 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         if let Some(key) = contact.ygg.as_ref().and_then(|k| <[u8; 32]>::try_from(&k[..]).ok()) {
             println!("    ygg-адрес: {}", ygg::address_text(&key));
         }
+        // Куда уедет событие, когда §5.4 выберет nostr. Печатается только
+        // когда реле названы: пустой список — обычное состояние (старая
+        // карточка, выключенная у собеседника ступень), и строка о нём
+        // у каждого второго контакта была бы шумом. А вот когда ступень
+        // «годна», а сообщение не дошло, разбор начинается именно отсюда:
+        // на своё реле мы бы положили ровно то же событие, и оно бы так же
+        // легло — только читать его было бы некому.
+        if !contact.nostr_relays.is_empty() {
+            println!("    реле nostr (куда класть): {}", contact.nostr_relays.join(", "));
+        }
 
         let addr = directory
             .get(&contact.peer_ik)
@@ -2806,6 +2906,7 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
                 ratatosk_proto::Transport::Lan => "LAN  ",
                 ratatosk_proto::Transport::Ygg => "ygg  ",
                 ratatosk_proto::Transport::Onion => "onion",
+                ratatosk_proto::Transport::Nostr => "nostr",
                 ratatosk_proto::Transport::Mail => "почта",
             };
             let tail = if rung.transport == ratatosk_proto::Transport::Lan {
@@ -2862,8 +2963,74 @@ fn via_name(via: ratatosk_proto::Transport) -> &'static str {
         ratatosk_proto::Transport::Lan => "по LAN",
         ratatosk_proto::Transport::Ygg => "через меш",
         ratatosk_proto::Transport::Onion => "через onion",
+        ratatosk_proto::Transport::Nostr => "через реле nostr",
         ratatosk_proto::Transport::Mail => "почтой",
     }
+}
+
+/// Метка длинного текста стенда.
+///
+/// Нужна затем, чтобы принятый текст **проверялся**, а не читался глазами:
+/// в восьми килобайтах обрыв не виден, а по метке он находится сразу.
+const LONG_MARK: &str = "RK-LONG";
+
+/// Собирает текст ровно такой длины в байтах, по которому видно обрыв.
+///
+/// # Почему только ASCII
+///
+/// Потому что весь вопрос здесь — «сколько байт доехало». Возьми мы
+/// кириллицу, длина в символах разошлась бы с длиной в байтах вдвое,
+/// и диагностика сама вносила бы ту путаницу, которую призвана разрешить.
+///
+/// # Устройство
+///
+/// Голова и хвост несут **объявленную длину**, между ними — нумерованные
+/// блоки по девять байт. Обрыв поэтому и виден, и локализуется: хвоста нет,
+/// а последний целый блок называет своё место.
+fn long_text(bytes: usize) -> String {
+    let head = format!("{LONG_MARK}-{bytes}-start|");
+    let tail = format!("|end-{bytes}-{LONG_MARK}");
+    if bytes <= head.len() + tail.len() {
+        // Столько разметка не занимает — отдаём просто нужную длину.
+        // Проверять на такой длине нечего, но и врать про неё нечем.
+        return "x".repeat(bytes);
+    }
+    let mut out = String::with_capacity(bytes);
+    out.push_str(&head);
+    let mut block = 1u32;
+    while out.len() + tail.len() + 9 <= bytes {
+        out.push_str(&format!("{block:08}|"));
+        block += 1;
+    }
+    while out.len() + tail.len() < bytes {
+        out.push('.');
+    }
+    out.push_str(&tail);
+    out
+}
+
+/// Вердикт о принятом длинном тексте — или `None`, если он не наш.
+///
+/// Отдельной функцией, а не строкой на месте: это **проверка**, и у неё
+/// должны быть свои проверки. Печатать её обязан приём, потому что
+/// отправитель и так знает, что послал.
+fn long_verdict(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(&format!("{LONG_MARK}-"))?;
+    let declared: usize = rest.split_once("-start|")?.0.parse().ok()?;
+    let whole = text.len() == declared && text.ends_with(&format!("|end-{declared}-{LONG_MARK}"));
+    if whole {
+        return Some(format!("длинный текст ЦЕЛ: {declared} Б"));
+    }
+    // Последний целый блок называет место обрыва. Без него «обрезан»
+    // отвечает только на «да или нет», а спрашивают всегда «где».
+    let last = text
+        .rsplit('|')
+        .find(|block| block.len() == 8 && block.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("—");
+    Some(format!(
+        "длинный текст ОБРЕЗАН: {} Б из объявленных {declared}, последний целый блок {last}",
+        text.len()
+    ))
 }
 
 fn yes(value: bool) -> &'static str {
@@ -3114,6 +3281,134 @@ async fn ygg_command(handle: &DriverHandle, rest: &str) {
             println!("  /ygg peer <ссылки>      — добавить пиров своему узлу");
             println!("  /ygg peer clear         — очистить список");
         }
+    }
+}
+
+/// `/nostr` — состояние ступени и её настройка (0.3).
+///
+/// Без доводов печатает всё разом; с доводами настраивает:
+///
+/// * `/nostr on` и `/nostr off` — переключатель ступени §5.4;
+/// * `/nostr relays <адрес> [<адрес>…]` — список реле целиком;
+/// * `/nostr direct on|off` — ходить ли мимо Tor.
+///
+/// Список **заменяется целиком**, а не дополняется: так же устроен `/ygg
+/// peers`, и так же он устроен в настройках у человека. Добавление по одному
+/// потребовало бы удаления по одному, то есть второй команды и второго
+/// способа ошибиться.
+async fn nostr_command(handle: &DriverHandle, rest: &str) {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None => nostr_show(handle).await,
+        Some("on") | Some("off") => {
+            let enabled = rest.starts_with("on");
+            let sent = handle
+                .send(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Nostr,
+                    enabled,
+                })
+                .await;
+            if sent.is_ok() {
+                // Цена называется **до** переключения, как велит §14
+                // и как это сделано у меша. Стенд — тоже клиент.
+                if enabled {
+                    println!("< {}", ratatosk_core::honest::NOSTR_WARNING);
+                }
+                nostr_show(handle).await;
+            }
+        }
+        Some("direct") => {
+            let direct = words.next() == Some("on");
+            if direct {
+                println!("< {}", ratatosk_core::honest::NOSTR_DIRECT_WARNING);
+            }
+            if handle.send(Command::SetNostrDirect(direct)).await.is_ok() {
+                nostr_show(handle).await;
+            }
+        }
+        Some("relays") => {
+            let relays: Vec<String> = words.map(str::to_owned).collect();
+            if handle.send(Command::SetNostrRelays(relays)).await.is_ok() {
+                // Негодные адреса ядро отбрасывает и говорит об этом
+                // в журнал; печать состава ниже покажет, что уцелело.
+                nostr_show(handle).await;
+            }
+        }
+        Some(other) => {
+            println!("< не понял «{other}»: /nostr [on|off|direct on|off|relays <адрес>…]");
+        }
+    }
+}
+
+/// `/nostr` без доводов — всё про ступень одним экраном.
+///
+/// Порознь эти строки не значат ничего: «ступень включена» без реле и «реле
+/// названы» без ключа одинаково выглядят как работающая ступень.
+async fn nostr_show(handle: &DriverHandle) {
+    let Some((relays, direct)) = handle.nostr_settings().await else {
+        println!("< ядро остановлено");
+        return;
+    };
+    println!("< nostr: путь {}", if direct { "напрямую, мимо Tor" } else { "через Tor" });
+    if !NOSTR_BUILT_IN {
+        // Первой строкой и до всего остального: без раннера настройка
+        // ложится на диск и не делает ничего, а выглядит это как рабочая
+        // ступень, которая почему-то молчит.
+        println!("  ВНИМАНИЕ: ступени нет в этой сборке — пересоберите с --features nostr");
+        println!("  всё ниже — настройка на диске; соединяться с реле некому");
+    }
+
+    let card = handle.own_card().await;
+    match &card {
+        Some(card) if card.nostr.len() == ratatosk_proto::nostr::KEY_LEN => {
+            match ratatosk_proto::nostr::NostrKey::from_slice(&card.nostr) {
+                Some(key) => println!("  ключ:    {}", key.npub()),
+                None => println!("  ключ:    в карточке лежит не ключ"),
+            }
+        }
+        _ => println!("  ключа нет — ступень ни разу не включали"),
+    }
+    // Объявленное — это то, куда вам будут **класть**, а настроенное — то,
+    // откуда вы **читаете**. Величины разные: в карточку уходят не все реле
+    // (`MAX_CARD_RELAYS`), и расхождение между ними — ровно то, что стоит
+    // видеть глазами, а не выяснять по молчанию.
+    let advertised: Vec<String> = card.map(|card| card.nostr_relays).unwrap_or_default();
+
+    let mut alive = None;
+    if let Some(status) = handle.transports().await {
+        let transport = ratatosk_proto::Transport::Nostr;
+        alive = status.nostr_relays;
+        println!(
+            "  ступень: включена={} работает={}",
+            yes(status.enabled.contains(transport)),
+            yes(status.ready.contains(transport))
+        );
+    }
+
+    if relays.is_empty() {
+        println!("  реле не названы — ступень работать не может");
+        println!("  назовите: /nostr relays ws://127.0.0.1:8080");
+        return;
+    }
+    println!("  реле ({}):", relays.len());
+    for url in &relays {
+        // Живое состояние приезжает событием и может ещё не приехать —
+        // это не то же, что «реле молчит», и путать их нельзя.
+        let live = alive.as_ref().and_then(|list| list.iter().find(|r| r.url == *url));
+        let mark =
+            if advertised.iter().any(|named| named == url) { " [в карточке]" } else { "" };
+        match live {
+            Some(relay) if relay.up => println!("    {url} — отвечает{mark}"),
+            Some(relay) if relay.note.is_empty() => println!("    {url} — не отвечает{mark}"),
+            Some(relay) => println!("    {url} — не отвечает: {}{mark}", relay.note),
+            None => println!("    {url} — ещё не пробовали{mark}"),
+        }
+    }
+    if advertised.len() < relays.len() {
+        println!(
+            "  в карточке объявлены первые {} — только по ним до вас и дозвонятся (§4.3)",
+            advertised.len()
+        );
     }
 }
 
@@ -3650,4 +3945,58 @@ fn adorn(reactions: &[Reaction]) -> String {
         .map(|r| if r.mine { format!("{}*", r.emoji) } else { r.emoji.clone() })
         .collect();
     format!("  [{}]", list.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_text_is_exactly_as_long_as_asked() {
+        // Ради этого свойства функция и существует: длина объявлена в самом
+        // тексте, и разойдись она с настоящей — проверка на приёме врала бы
+        // в обе стороны.
+        for bytes in [1, 17, 64, 1024, 4095, 4096, 8 * 1024, 64 * 1024] {
+            let text = long_text(bytes);
+            assert_eq!(text.len(), bytes, "просили {bytes}");
+            assert!(text.is_ascii(), "только ASCII: байты обязаны совпасть с символами");
+        }
+    }
+
+    #[test]
+    fn a_whole_long_text_is_called_whole() {
+        let text = long_text(8 * 1024);
+        let verdict = long_verdict(&text).expect("это наш текст");
+        assert!(verdict.contains("ЦЕЛ"), "{verdict}");
+        assert!(verdict.contains("8192"), "{verdict}");
+    }
+
+    #[test]
+    fn a_text_cut_at_four_thousand_is_called_cut_and_placed() {
+        // Ровно тот случай, ради которого всё написано: терминал в каноническом
+        // режиме молча обрезает строку на 4095 байтах, и выглядит это как наша
+        // поломка. Стенд обязан назвать обрыв обрывом.
+        let text = long_text(8 * 1024);
+        let cut = &text[..4095];
+        let verdict = long_verdict(cut).expect("голова на месте, значит наш");
+        assert!(verdict.contains("ОБРЕЗАН"), "{verdict}");
+        assert!(verdict.contains("4095"), "{verdict}");
+        assert!(verdict.contains("8192"), "объявленная длина обязана быть названа: {verdict}");
+        // Место обрыва: до 4095-го байта укладывается четыре с лишним сотни
+        // девятибайтовых блоков, и последний целый обязан быть назван.
+        assert!(
+            verdict.contains("последний целый блок 0000"),
+            "место обрыва не названо: {verdict}"
+        );
+    }
+
+    #[test]
+    fn someone_elses_text_is_not_judged_at_all() {
+        // Обычное сообщение обязано печататься как есть. Вердикт вместо текста
+        // — это потеря переписки на ровном месте.
+        assert_eq!(long_verdict("привет"), None);
+        assert_eq!(long_verdict(""), None);
+        assert_eq!(long_verdict("RK-LONG"), None, "метка без разметки — не наш текст");
+        assert_eq!(long_verdict("RK-LONG-не число-start|"), None);
+    }
 }

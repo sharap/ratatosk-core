@@ -37,6 +37,12 @@ pub struct MemoryStore {
     /// воспроизводимой по сиду.
     contacts: BTreeMap<[u8; 32], StoredContact>,
     sessions: BTreeMap<u64, StoredSession>,
+    /// Отпечатки принятых рукопожатий (§8.3) со временем первой встречи.
+    ///
+    /// `BTreeMap`, а не `HashMap`, по той же причине, что у контактов:
+    /// порядок чтения обязан быть одинаков от запуска к запуску, иначе
+    /// симуляция §16 перестаёт быть воспроизводимой по сиду.
+    handshake_seen: BTreeMap<[u8; 32], u64>,
     avatars: BTreeMap<[u8; 32], StoredAvatar>,
     /// Аватарки групп (§11 + дополнение). Отдельно от `avatars`: ключ там
     /// — `IK` человека, здесь — идентификатор чата, и складывать их в одну
@@ -247,6 +253,34 @@ impl Store for MemoryStore {
 
     fn delete_session(&mut self, session_id: u64) -> Result<()> {
         self.sessions.remove(&session_id);
+        Ok(())
+    }
+
+    fn put_handshake_seen(&mut self, digest: &[u8; 32], seen_ms: u64) -> Result<()> {
+        // Повтор ложится в ту же ячейку и **не** обновляет время: срок
+        // считается от первой встречи, иначе настойчивый повтор продлевал
+        // бы запись вечно.
+        self.handshake_seen.entry(*digest).or_insert(seen_ms);
+        Ok(())
+    }
+
+    fn handshake_seen(&self, newer_than_ms: u64) -> Result<Vec<([u8; 32], u64)>> {
+        let mut found: Vec<([u8; 32], u64)> = self
+            .handshake_seen
+            .iter()
+            .filter(|(_, seen)| **seen > newer_than_ms)
+            .map(|(digest, seen)| (*digest, *seen))
+            .collect();
+        // По времени, а не по отпечатку. Карта упорядочена ключом, то есть
+        // хэшем, — а кэш складывает записи в очередь по времени и снимает
+        // просроченное с её начала. Отдай мы их в порядке хэша, уборка
+        // остановилась бы на первой же «ещё свежей».
+        found.sort_by_key(|(_, seen)| *seen);
+        Ok(found)
+    }
+
+    fn prune_handshake_seen(&mut self, older_than_ms: u64) -> Result<()> {
+        self.handshake_seen.retain(|_, seen| *seen > older_than_ms);
         Ok(())
     }
 

@@ -635,6 +635,8 @@ mod tests {
             onion: None,
             chatmail: chatmail.map(str::to_owned),
             ygg: None,
+            nostr: None,
+            nostr_relays: Vec::new(),
         }
     }
 

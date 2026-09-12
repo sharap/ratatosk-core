@@ -45,6 +45,7 @@ webpki-roots = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 ygg_stream = { workspace = true, optional = true }
 # Только ради `get_peers_json`: состав пиров библиотека отдаёт строкой.
 serde_json = { workspace = true, optional = true }
@@ -92,6 +93,29 @@ chatmail-net = [
     "dep:futures",
 ]
 lan = ["dep:mdns-sd"]
+# Ступень поверх реле nostr (0.3). **Не в `default`**, и по той же причине,
+# что `onion-arti` и `chatmail-net`: пока чужой API не сошёлся сборкой,
+# остальное дерево обязано оставаться зелёным.
+#
+# Признак тянет ровно то, что нужно: веб-сокет, разбор ответа реле и тот же
+# TLS-набор, каким ходит почта. `tls.rs` общий у них с 0.3 — раньше он жил
+# внутри `chatmail`, и ступень реле тянула бы за собой почтовый признак.
+#
+# **Без `onion-arti` ступень не работает и честно отказывает.** Это не сбой
+# сборки, а следствие правила: на реле мы ходим только через Tor, потому что
+# долговечный ключ nostr, связанный с адресом устройства хоть раз, связан
+# с ним навсегда.
+nostr = [
+    "dep:tokio-tungstenite",
+    # Разбор ответа реле. Сборку делает `proto`, разбор — здесь: чужой JSON
+    # по догадке уже стоил нам одного урока на составе пиров меша.
+    "dep:serde_json",
+    # `StreamExt`/`SinkExt` для веб-сокета: он futures-поток, а не tokio-поток.
+    "dep:futures",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:webpki-roots",
+]
 # Встроенный узел меша (0.2). **Не в `default`**, и по двум причинам сразу.
 #
 # Первая — та же, что у `onion-arti` и `chatmail-net`: зависимость идёт

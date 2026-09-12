@@ -39,9 +39,16 @@ pub mod chatmail;
 pub mod lan;
 mod link;
 pub mod multi;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 pub mod onion;
 pub mod runner;
 pub mod switched;
+// TLS жил внутри `chatmail`, пока потребитель был один. Со ступенью nostr
+// их стало двое, и общий модуль внутри одного из них означал бы, что реле
+// тянет за собой почтовый признак сборки.
+#[cfg(any(feature = "chatmail-net", feature = "nostr"))]
+pub mod tls;
 pub mod ygg;
 
 pub use lan::{LanConfig, LanDirectory, LanRunner};

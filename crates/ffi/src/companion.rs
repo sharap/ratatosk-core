@@ -76,7 +76,7 @@ type CompanionOnion = ratatosk_transport::Switched<ratatosk_transport::onion::ar
 #[cfg(not(feature = "tor"))]
 type CompanionOnion = Disabled;
 
-type CompanionRunner = Transports<LanRunner, YggRunner, CompanionOnion, Disabled>;
+type CompanionRunner = Transports<LanRunner, YggRunner, CompanionOnion, Disabled, Disabled>;
 
 use crate::{to_chat, to_file_id, to_msg_id, to_msg_ids, FfiDeliveryStatus, RatatoskError};
 
@@ -1426,12 +1426,12 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, Disabled)
+        Transports::new(lan, ygg, onion, Disabled, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = (&tor_handle, &tor_dir);
-        Transports::new(lan, ygg, Disabled, Disabled)
+        Transports::new(lan, ygg, Disabled, Disabled, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а

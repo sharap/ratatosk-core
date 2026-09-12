@@ -25,14 +25,21 @@ pub enum TransportKind {
     Ygg,
     /// Tor onion-to-onion (§5.2).
     Onion,
+    /// Событие на реле nostr поверх Tor (0.3). По умолчанию выключен.
+    Nostr,
     /// Почта chatmail поверх Tor (§5.3).
     Mail,
 }
 
 impl TransportKind {
     /// Все транспорты.
-    pub const ALL: [TransportKind; 4] =
-        [TransportKind::Lan, TransportKind::Ygg, TransportKind::Onion, TransportKind::Mail];
+    pub const ALL: [TransportKind; 5] = [
+        TransportKind::Lan,
+        TransportKind::Ygg,
+        TransportKind::Onion,
+        TransportKind::Nostr,
+        TransportKind::Mail,
+    ];
 
     /// Прямой ли это канал.
     ///
@@ -103,6 +110,28 @@ impl LinkProfile {
         failure_notice_ms: 45_000,
     };
 
+    /// Nostr: между onion и почтой, и ближе к onion.
+    ///
+    /// Событие уходит на реле по живому веб-сокету и лежит там, пока
+    /// собеседник не зайдёт, — но когда он в сети, доставка идёт секунды,
+    /// а не минуты: реле раздаёт подписчикам сразу. Отсюда и разброс:
+    /// нижняя граница как у onion плюс круг до реле, верхняя — минута
+    /// на случай перегруженного реле, а не четыре, как у почтовой очереди.
+    ///
+    /// Дубли заметны: одно и то же событие приезжает с каждого реле,
+    /// на которое мы его положили. Это не поломка реле, а устройство сети,
+    /// и дедупликация §9.2 обязана это выдержать — здесь оно и проверяется.
+    ///
+    /// `failure_notice_ms` ноль, как у почты: отказ приходит не сроком
+    /// ожидания, а ответом реле («блокировано», «не в списке»).
+    pub const NOSTR: LinkProfile = LinkProfile {
+        min_latency_ms: 1_000,
+        max_latency_ms: 60_000,
+        loss_permille: 3,
+        duplicate_permille: 40,
+        failure_notice_ms: 0,
+    };
+
     /// Почта: секунды и минуты, сильные перестановки, изредка дубли от сервера.
     pub const MAIL: LinkProfile = LinkProfile {
         min_latency_ms: 2_000,
@@ -162,6 +191,7 @@ impl Network {
         profiles.insert(TransportKind::Lan, LinkProfile::LAN);
         profiles.insert(TransportKind::Ygg, LinkProfile::YGG);
         profiles.insert(TransportKind::Onion, LinkProfile::ONION);
+        profiles.insert(TransportKind::Nostr, LinkProfile::NOSTR);
         profiles.insert(TransportKind::Mail, LinkProfile::MAIL);
 
         let mut enabled = HashMap::new();
@@ -171,6 +201,10 @@ impl Network {
         // её явно.
         enabled.insert(TransportKind::Ygg, false);
         enabled.insert(TransportKind::Onion, true);
+        // И nostr по той же причине, что меш: ступень не работает, пока
+        // не названы реле. Включённая по умолчанию, она молча уводила бы
+        // отправку с почты на ступень, которой ни у кого нет.
+        enabled.insert(TransportKind::Nostr, false);
         enabled.insert(TransportKind::Mail, true);
 
         Network { profiles, enabled, segment: HashMap::new(), online: HashMap::new() }

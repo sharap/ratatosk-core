@@ -330,7 +330,14 @@ mod tests {
 
     fn command() -> TransportCommand {
         TransportCommand::Connect {
-            peer: PeerAddress { ik: [1u8; 32], onion: None, chatmail: None, ygg: None },
+            peer: PeerAddress {
+                ik: [1u8; 32],
+                onion: None,
+                chatmail: None,
+                ygg: None,
+                nostr: None,
+                nostr_relays: Vec::new(),
+            },
             via: Transport::Onion,
         }
     }

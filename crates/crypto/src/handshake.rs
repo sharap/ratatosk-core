@@ -412,6 +412,52 @@ impl HandshakeReplayGuard {
         }
     }
 
+    /// Отпечаток целого сообщения рукопожатия.
+    ///
+    /// Та же величина, что считает [`Responder::accept`] внутри, — и именно
+    /// поэтому она вынесена сюда, а не повторена на месте. Считать её надо
+    /// снаружи ровно затем, чтобы **записать на диск**: кэш §8.3 обязан
+    /// пережить перезапуск, а положить в него запись может только тот,
+    /// у кого есть хранилище.
+    ///
+    /// `None` — сообщение короче эфемерного ключа, то есть не рукопожатие.
+    #[must_use]
+    pub fn digest_of(message: &[u8]) -> Option<[u8; 32]> {
+        if message.len() < EPHEMERAL_LEN {
+            return None;
+        }
+        let ephemeral: [u8; EPHEMERAL_LEN] =
+            message[..EPHEMERAL_LEN].try_into().expect("длина проверена выше");
+        Some(HandshakeReplayGuard::digest(&ephemeral, &message[EPHEMERAL_LEN..]))
+    }
+
+    /// Возвращает в кэш отпечаток, прочитанный с диска.
+    ///
+    /// Не `admit`: тот **решает**, что делать с предъявленным рукопожатием,
+    /// и вернул бы `Fresh` на каждую восстановленную запись — то есть
+    /// объявил бы всё виденное невиданным ровно в тот момент, ради которого
+    /// кэш и восстанавливают.
+    ///
+    /// Ответа при этом не восстанавливается: он живёт в памяти и стоит
+    /// сотню с лишним байт на запись. Следствие названо прямо — повтор,
+    /// заставший перезапуск, будет отброшен (`Admission::Stale`), а не
+    /// пересказан. Это верно по существу: раз отпечаток виден, сессия уже
+    /// заведена, и второй её заводить нельзя.
+    /// Записи обязаны приходить **от старых к новым**: очередь `order`
+    /// упорядочена по времени, и [`HandshakeReplayGuard::purge`] снимает
+    /// просроченное с её начала. Придя вразнобой, записи остановили бы
+    /// уборку на первой же «ещё свежей».
+    pub fn remember_seen(&mut self, digest: [u8; 32], when_ms: u64) {
+        if self.seen.insert(digest) {
+            self.order.push_back((digest, when_ms));
+            while self.order.len() > self.capacity {
+                if let Some((old, _)) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
+    }
+
     /// Сохраняет ответ вместе с адресатом, чтобы переслать его при повторе.
     pub fn remember_response(&mut self, digest: [u8; 32], response: &[u8], peer_ik: [u8; 32]) {
         if self.responses.insert(digest, (response.to_vec(), peer_ik)).is_none() {
@@ -724,6 +770,47 @@ mod tests {
         let mut continued = before;
         let mut restored = after;
         assert_eq!(continued.send.next(), restored.send.next());
+    }
+
+    #[test]
+    fn a_digest_restored_from_disk_is_not_admitted_as_fresh() {
+        // Ровно то свойство, ради которого кэш кладётся на диск: рукопожатие,
+        // принятое до перезапуска, после него обязано быть повтором,
+        // а не новостью. Иначе оно выполняется заново, заводит вторую сессию
+        // и вытесняет живую — §5.4 держит одну сессию на семейство.
+        let mut guard = HandshakeReplayGuard::default();
+        let digest = HandshakeReplayGuard::digest(&[3u8; 32], "шифротекст".as_bytes());
+        guard.remember_seen(digest, 1_000);
+        assert_eq!(guard.len(), 1);
+        assert!(matches!(guard.admit(digest, 2_000), Admission::Stale));
+    }
+
+    #[test]
+    fn a_restored_digest_still_ages_from_its_own_time() {
+        // Срок идёт от первой встречи, а не от восстановления. Иначе каждый
+        // перезапуск продлевал бы записи, и кэш перестал бы стареть вовсе.
+        let mut guard = HandshakeReplayGuard::default();
+        let digest = HandshakeReplayGuard::digest(&[4u8; 32], "х".as_bytes());
+        guard.remember_seen(digest, 1_000);
+        guard.purge(1_000 + HANDSHAKE_REPLAY_TTL_MS);
+        assert_eq!(guard.len(), 0, "запись обязана состариться по своему времени");
+    }
+
+    #[test]
+    fn the_digest_of_a_message_matches_the_one_admission_uses() {
+        // `digest_of` существует затем, чтобы ядро записало на диск ровно ту
+        // величину, которую сверяет `accept`. Разойдись они — кэш на диске
+        // оказался бы бесполезен, и молча: каждое рукопожатие после
+        // перезапуска снова считалось бы новым.
+        let mut message = vec![7u8; EPHEMERAL_LEN];
+        message.extend_from_slice("шифротекст".as_bytes());
+        let want = HandshakeReplayGuard::digest(&[7u8; 32], "шифротекст".as_bytes());
+        assert_eq!(HandshakeReplayGuard::digest_of(&message), Some(want));
+        assert_eq!(
+            HandshakeReplayGuard::digest_of(&[1u8; EPHEMERAL_LEN - 1]),
+            None,
+            "короче эфемерного ключа — не рукопожатие"
+        );
     }
 
     #[test]

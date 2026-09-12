@@ -655,6 +655,8 @@ mod tests {
             display_name: "сосед".to_owned(),
             version: 1,
             ygg: Vec::new(),
+            nostr: Vec::new(),
+            nostr_relays: Vec::new(),
         }
         .encode()
         .expect("карточка")

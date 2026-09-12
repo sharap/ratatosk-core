@@ -181,6 +181,8 @@ mod tests {
             display_name: "Алиса".into(),
             version: 1,
             ygg: Vec::new(),
+            nostr: Vec::new(),
+            nostr_relays: Vec::new(),
         }
     }
 

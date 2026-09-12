@@ -909,6 +909,28 @@ pub struct Engine<S: Store> {
     ygg_seed: Vec<u8>,
     /// Кому звонит свой узел (0.2). Пусто — узел одинок, и это видно.
     ygg_peers: Vec<String>,
+    /// Открытый ключ nostr — тот, что стоит в карточке (0.3).
+    ///
+    /// Производная от [`Engine::nostr_seed`], и считается она **одним**
+    /// способом на всё ядро (`nostr_name`). Второй способ однажды разошёлся
+    /// бы с первым, и разошёлся бы молча.
+    nostr: Vec<u8>,
+    /// Закрытый ключ nostr. Пусто — ступень ни разу не включали.
+    nostr_seed: Vec<u8>,
+    /// Названные человеком реле.
+    nostr_relays: Vec<String>,
+    /// Ходить ли на реле мимо Tor.
+    ///
+    /// Ложь — через Tor, и это умолчание. Поле названо «мимо», а не «через»,
+    /// нарочно: отсутствие записи на диске обязано читаться как умолчание,
+    /// а умолчание здесь — Tor (`ratatosk_store::META_NOSTR_DIRECT`).
+    nostr_direct: bool,
+    /// До какого времени ступень nostr досмотрела события, секунды unix.
+    ///
+    /// Лежит на диске (`ratatosk_store::META_NOSTR_SINCE`) и от этого вся
+    /// польза: в памяти она ничего бы не решала. Ноль — «с начала времён»,
+    /// и он верен ровно один раз, при первом включении ступени.
+    nostr_since: u64,
     /// Карточка на диске отстала от того, что мы о себе знаем.
     ///
     /// Ставится подъёмом и снимается первым же шагом. Нужен флаг, а не
@@ -1001,6 +1023,18 @@ pub struct Engine<S: Store> {
     /// Обнуляется при смене карточки: прежние отправки к новой версии
     /// отношения не имеют.
     card_pushed: BTreeSet<[u8; 32]>,
+    /// Кому в этом запуске уже отправили своё лицо (§4.2).
+    ///
+    /// Пара к `card_pushed`, и заведён по той же причине: аватарка уходит
+    /// и при смене, и при установлении сессии, а два повода легко сходятся
+    /// на одном контакте. Лишняя отправка здесь дороже, чем у карточки, —
+    /// тридцать два килобайта против четырёхсот байт, и по реле это восемь
+    /// событий вместо одного.
+    ///
+    /// В памяти, а не на диске, — тоже как у карточки: сессии переживают
+    /// перезапуск (§8.3), значит поводов переслать после него почти
+    /// не возникает.
+    avatar_pushed: BTreeSet<[u8; 32]>,
     /// Сопряжённые устройства-компаньоны по публичной половине их ключа
     /// сопряжения (§13.4).
     ///
@@ -1166,6 +1200,14 @@ impl<S: Store> Engine<S> {
             ygg_named: Vec::new(),
             ygg_seed: Vec::new(),
             ygg_peers: Vec::new(),
+            // Как и у меша: ключ и реле поднимаются с диска в `restore`,
+            // а не приходят сборкой. Умолчание — «ступени нет», и оно же
+            // остаётся у базы, заведённой до 0.3.
+            nostr: Vec::new(),
+            nostr_seed: Vec::new(),
+            nostr_relays: Vec::new(),
+            nostr_direct: false,
+            nostr_since: 0,
             card_stale: false,
             deferred: Vec::new(),
             awaited_discovery: BTreeSet::new(),
@@ -1179,6 +1221,7 @@ impl<S: Store> Engine<S> {
             schedule: Schedule::default(),
             announced: None,
             card_pushed: BTreeSet::new(),
+            avatar_pushed: BTreeSet::new(),
             devices: BTreeMap::new(),
             device_links: BTreeMap::new(),
             device_seen: BTreeSet::new(),
@@ -1215,6 +1258,17 @@ impl<S: Store> Engine<S> {
             display_name: self.addresses.display_name.clone(),
             version: self.announced.as_ref().map_or(1, |card| card.version),
             ygg: self.ygg.clone(),
+            // Пусто, и это не заглушка, а правда о сборке (§14): своего
+            // ключа nostr пока нет — его выводит secp256k1, которого
+            // в дереве нет ни одной кривой (`ratatosk_proto::nostr`).
+            // Пустое поле означает «ступени у меня нет», и §5.4 у
+            // собеседника её не выберет: ровно то, что сейчас верно.
+            //
+            // Заполнится оно там же, где `ygg`: подъёмом ключа в `restore`
+            // и объявлением §4.3, когда раннер приедет.
+            nostr: self.nostr.clone(),
+            // Первые три из названных — см. `nostr_card_relays`.
+            nostr_relays: self.nostr_card_relays(),
         }
     }
 
@@ -1567,6 +1621,7 @@ impl<S: Store> Engine<S> {
                 self.mail_limits.letter_bytes = bytes;
                 Ok(self.tell_mail_limits())
             }
+            Input::NostrSince { created_at } => self.on_nostr_since(created_at),
             Input::MailQuota { used_bytes, limit_bytes } => {
                 let was_crowded = self.mail_limits.crowded();
                 self.mail_limits.mailbox_used = Some(used_bytes);
@@ -1684,11 +1739,10 @@ impl<S: Store> Engine<S> {
                 // До сверки аватарку ему не отправляли — теперь можно.
                 // Два события у пользователя сливаются в одно: сверили —
                 // и лица появились с обеих сторон.
-                let mut effects = Vec::new();
-                if let Some(via) = self.direct_channel(&peer_ik) {
-                    effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
-                }
-                Ok(effects)
+                // Прямого канала здесь больше не требуется: лицо едет
+                // лестницей §5.4, как и карточка, — а значит доедет и почтой,
+                // и через реле, когда собеседника нет в сети.
+                self.offer_avatar(now_ms, peer_ik)
             }
             Command::SendText { chat, text } => self.send_text(now_ms, chat, &text),
             Command::RevokeVerification { peer_ik } => {
@@ -1736,6 +1790,8 @@ impl<S: Store> Engine<S> {
             Command::SetYggKey(key) => self.on_set_ygg_key(now_ms, key),
             Command::SetYggMode(mode) => self.on_set_ygg_mode(now_ms, mode),
             Command::SetYggPeers(peers) => self.on_set_ygg_peers(now_ms, peers),
+            Command::SetNostrRelays(relays) => self.on_set_nostr_relays(now_ms, relays),
+            Command::SetNostrDirect(direct) => self.on_set_nostr_direct(now_ms, direct),
             Command::SetForeground(front) => self.on_set_foreground(now_ms, front),
             Command::CreateMailAccount { url, via_tor } => {
                 self.on_create_mail_account(&url, via_tor)
@@ -1890,6 +1946,7 @@ impl<S: Store> Engine<S> {
             let availability = PeerAvailability {
                 has_ygg: !card.ygg.is_empty(),
                 has_onion: !card.onion.is_empty(),
+                has_nostr: !card.nostr.is_empty(),
                 has_chatmail: !card.chatmail.is_empty(),
                 enabled: self.announcing(),
                 ready: self.ready,
@@ -2003,6 +2060,53 @@ impl<S: Store> Engine<S> {
         // способом на всё ядро (см. `ygg_name`). Второй способ здесь однажды
         // разошёлся бы с первым, и разошёлся бы молча.
         self.ygg = self.ygg_name();
+
+        self.nostr_seed = self.store.meta(ratatosk_store::META_NOSTR_SEED)?.unwrap_or_default();
+        self.nostr_relays = self
+            .store
+            .meta(ratatosk_store::META_NOSTR_RELAYS)?
+            .and_then(|raw| ratatosk_proto::nostr::relays_decode(&raw).ok())
+            .unwrap_or_default();
+        // Единица — и только она — означает «напрямую». Всё остальное,
+        // включая отсутствие строки, читается как «через Tor»: умолчание
+        // обязано получаться из пустоты.
+        self.nostr_direct = self
+            .store
+            .meta(ratatosk_store::META_NOSTR_DIRECT)?
+            .and_then(|raw| raw.first().copied())
+            .is_some_and(|byte| byte == 1);
+        // Anti-replay кэш рукопожатий (§8.3) — с диска, иначе тридцатисуточный
+        // срок не значит ничего: перезапуск обнулял бы кэш весь. Разбор
+        // живой поломки — в `HANDOFF.md`, 6е.
+        //
+        // Срок здесь **не** отсекается, и это не забывчивость: восстановление
+        // идёт без часов — `restore` не берёт `now_ms` нарочно, ядро sans-io
+        // (§13.3) и времени из воздуха не достаёт. Просроченное снимет первое
+        // же рукопожатие: `admit` начинается с `purge`, и у него время есть.
+        // Лишняя запись в кэше до тех пор безвредна — она лишь объявляет
+        // виденным то, что и было видено.
+        match self.store.handshake_seen(0) {
+            Ok(seen) => {
+                for (digest, when_ms) in seen {
+                    self.handshake_guard.remember_seen(digest, when_ms);
+                }
+                tracing::debug!(записей = self.handshake_guard.len(), "кэш рукопожатий поднят");
+            }
+            // Без кэша ядро работает — хуже, но работает: повтор рукопожатия
+            // заведёт лишнюю сессию. Не пускать человека в переписку из-за
+            // этого нечего.
+            Err(error) => tracing::warn!(?error, "кэш рукопожатий не прочитался"),
+        }
+
+        // Отметка досмотренного. Испорченная строка читается как ноль, и это
+        // верное поведение: ноль означает «просить всё», то есть потерю
+        // времени и лишние дубли, а не потерю сообщений.
+        self.nostr_since = self
+            .store
+            .meta(ratatosk_store::META_NOSTR_SINCE)?
+            .and_then(|raw| <[u8; 8]>::try_from(raw.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes);
+        self.nostr = self.nostr_name();
 
         // Своя карточка в том виде, в каком её объявляли (§4.3). Отсюда
         // берутся и версия, и адреса: без адресов первое же объявление после
@@ -2215,6 +2319,7 @@ impl<S: Store> Engine<S> {
             // перезапуска, когда `restore` пересчитает всё с диска.
             has_ygg: !card.ygg.is_empty(),
             has_onion: !card.onion.is_empty(),
+            has_nostr: !card.nostr.is_empty(),
             has_chatmail: !card.chatmail.is_empty(),
             ..PeerAvailability::default()
         };
@@ -2348,7 +2453,24 @@ impl<S: Store> Engine<S> {
             contact.availability.ready = self.ready;
         }
 
+        // Ключ nostr заводится ровно здесь — при первом включении ступени,
+        // а не при заведении аккаунта. Он долговременный опознаватель,
+        // и заводить его тому, кто ступенью не пользуется, незачем: пустое
+        // поле в карточке честно означает «ступени у меня нет».
+        //
+        // И заводится он **до** эффекта раннеру: настройка едет вниз тем же
+        // шагом, и приди она раньше ключа, раннер поднял бы ступень без него.
+        if transport == Transport::Nostr && enabled {
+            self.ensure_nostr_key()?;
+        }
+
         let mut effects = vec![Effect::SetTransportEnabled { transport, enabled }];
+        if transport == Transport::Nostr {
+            // Ступень включили или выключили — раннеру надо сказать, что
+            // с ключом и реле делать, а карточке, возможно, вырасти: ключ
+            // в ней появляется вместе с первым включением.
+            effects.extend(self.apply_nostr(now_ms)?);
+        }
         if transport == Transport::Lan {
             // Прежние «не слышно» устарели: эфир только что открылся или
             // закрылся, и каждому контакту снова полагается срок на
@@ -2624,6 +2746,191 @@ impl<S: Store> Engine<S> {
         }
     }
 
+    /// Называет реле nostr (0.3). Список заменяется целиком.
+    ///
+    /// Негодные адреса **отбрасываются здесь**, до записи на диск: правило
+    /// одно и живёт в `ratatosk_proto::nostr::relay_target`. Настройка,
+    /// которая сохраняется и не работает, хуже отвергнутой — человек видит
+    /// её в списке и считает, что ступень настроена.
+    ///
+    /// Отброшенные называются в журнале поимённо: молча съесть введённую
+    /// строку значит оставить человека гадать, куда она делась.
+    ///
+    /// **В карточке список отражается, и это отличает его от пиров меша.**
+    /// Пир меша — это через кого мы вошли в сеть, собеседнику до него дела
+    /// нет. Реле — это где нас **читать**, и не скажи мы этого, собеседник
+    /// класть события будет не туда. Поэтому смена списка растит версию
+    /// карточки и уезжает обновлением §4.3, как смена onion-адреса.
+    ///
+    /// Цена названа прямо: правка списка реле — это рассылка всем контактам.
+    /// Она приемлема ровно потому, что редка и осознанна; будь она частой,
+    /// правильнее было бы возить список отдельным сообщением, а не картой.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или кодирования списка.
+    fn on_set_nostr_relays(
+        &mut self,
+        now_ms: u64,
+        relays: Vec<String>,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let (good, bad): (Vec<String>, Vec<String>) =
+            relays.into_iter().partition(|url| ratatosk_proto::nostr::relay_target(url).is_some());
+        for url in &bad {
+            tracing::warn!(%url, "адрес реле nostr не годится — не сохраняем");
+        }
+        if good == self.nostr_relays {
+            return Ok(Vec::new());
+        }
+        let encoded = ratatosk_proto::nostr::relays_encode(&good)?;
+        self.nostr_relays = good;
+        self.store.put_meta(ratatosk_store::META_NOSTR_RELAYS, &encoded)?;
+        self.apply_nostr(now_ms)
+    }
+
+    /// Запоминает, до какого времени ступень nostr досмотрела события (0.3).
+    ///
+    /// Только на диск: ни одно решение §5.4 на эту отметку не опирается,
+    /// человеку она не показывается. Нужна она ровно затем, чтобы пережить
+    /// перезапуск, — а диск есть только здесь.
+    ///
+    /// Назад отметка не ходит. Раннер считает её по принятым событиям,
+    /// и убывающее значение означало бы либо перепутанные реле, либо чужие
+    /// часы; в обоих случаях правильный ответ — оставить прежнюю.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn on_nostr_since(&mut self, created_at: u64) -> Result<Vec<Effect>, EngineError> {
+        if created_at <= self.nostr_since {
+            return Ok(Vec::new());
+        }
+        self.nostr_since = created_at;
+        self.store.put_meta(ratatosk_store::META_NOSTR_SINCE, &created_at.to_be_bytes())?;
+        Ok(Vec::new())
+    }
+
+    /// Ходить ли на реле мимо Tor (0.3).
+    ///
+    /// Размен, а не настройка скорости: реле начинает видеть адрес
+    /// устройства рядом с постоянным ключом. Цену человеку называет клиент
+    /// **до** переключения (`crate::honest::NOSTR_DIRECT_WARNING`) — здесь
+    /// решение уже принято, и дело ядра его исполнить.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn on_set_nostr_direct(
+        &mut self,
+        now_ms: u64,
+        direct: bool,
+    ) -> Result<Vec<Effect>, EngineError> {
+        if direct == self.nostr_direct {
+            return Ok(Vec::new());
+        }
+        self.nostr_direct = direct;
+        self.store.put_meta(ratatosk_store::META_NOSTR_DIRECT, &[u8::from(direct)])?;
+        if direct {
+            tracing::warn!("nostr: путь мимо Tor — реле увидит адрес устройства");
+        }
+        self.apply_nostr(now_ms)
+    }
+
+    /// Заводит ключ nostr, если его ещё нет (0.3).
+    ///
+    /// Зовётся при включении ступени, а не при заведении аккаунта, и это
+    /// осознанно: ключ — долговременный опознаватель, и заводить его тому,
+    /// кто ступенью не пользуется, незачем. Пустое поле в карточке означает
+    /// «ступени у меня нет», и это правда до первого включения.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn ensure_nostr_key(&mut self) -> Result<(), EngineError> {
+        if !self.nostr_seed.is_empty() {
+            return Ok(());
+        }
+        let mut seed = [0u8; ratatosk_crypto::nostr::NOSTR_SEED_LEN];
+        // Скаляр secp256k1 обязан лежать строго между нулём и порядком
+        // группы, и случайные байты попадают туда **почти** всегда. Почти —
+        // значит не всегда, и один человек из невообразимого числа получил
+        // бы ступень, которая не заводится.
+        let key = loop {
+            self.entropy.fill(&mut seed);
+            if let Ok(key) = ratatosk_crypto::nostr::NostrKey::from_seed(seed) {
+                break key;
+            }
+        };
+        self.nostr_seed = key.seed().to_vec();
+        self.store.put_meta(ratatosk_store::META_NOSTR_SEED, &self.nostr_seed)?;
+        self.nostr = key.public().to_vec();
+        tracing::info!(
+            ключ = %ratatosk_proto::nostr::NostrKey::new(key.public()).npub(),
+            "заведён ключ nostr"
+        );
+        Ok(())
+    }
+
+    /// Действующий открытый ключ nostr — тем видом, каким он едет в карточке.
+    ///
+    /// Одно место на всё ядро, как и `ygg_name`: второй способ вывести
+    /// то же самое однажды разошёлся бы с первым, и разошёлся бы молча.
+    /// Пусто — ключа нет, то есть ступень ни разу не включали.
+    fn nostr_name(&self) -> Vec<u8> {
+        let Ok(seed) =
+            <[u8; ratatosk_crypto::nostr::NOSTR_SEED_LEN]>::try_from(self.nostr_seed.as_slice())
+        else {
+            return Vec::new();
+        };
+        match ratatosk_crypto::nostr::NostrKey::from_seed(seed) {
+            Ok(key) => key.public().to_vec(),
+            // Испорченное зерно — не повод подставить другой ключ: это
+            // сменило бы наше имя на реле молча. Пусто означает «ступени
+            // нет», и это честнее.
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Что сказать раннеру nostr про текущие настройки (0.3).
+    fn nostr_setup(&self) -> ratatosk_proto::nostr::NostrSetup {
+        use ratatosk_proto::nostr::{NostrSecret, NostrSetup};
+
+        if !self.enabled.contains(Transport::Nostr) {
+            return NostrSetup::Off;
+        }
+        let Ok(seed) =
+            <[u8; ratatosk_crypto::nostr::NOSTR_SEED_LEN]>::try_from(self.nostr_seed.as_slice())
+        else {
+            return NostrSetup::Off;
+        };
+        NostrSetup::On {
+            secret: NostrSecret::new(seed),
+            relays: self.nostr_relays.clone(),
+            via_tor: !self.nostr_direct,
+            since: self.nostr_since,
+        }
+    }
+
+    /// Приводит ступень nostr в соответствие с настройками (0.3).
+    ///
+    /// Одно место на все три команды — включение, список реле, путь, — и это
+    /// не экономия строк, а та же причина, что у `apply_ygg`: действующий
+    /// ключ, настройка раннера и карточка обязаны меняться **вместе**.
+    /// Разойдись они, вышло бы «в карточке один ключ, подписываем другим»,
+    /// и обнаружилось бы это только по тому, что до нас никто не достучался.
+    ///
+    /// Порядок внутри тот же: сперва раннеру, потом рассылка карточки.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища при рассылке карточки.
+    fn apply_nostr(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
+        self.nostr = self.nostr_name();
+        let mut effects = vec![Effect::SetNostr(self.nostr_setup())];
+        effects.extend(self.on_announce_addresses(now_ms, None, None)?);
+        Ok(effects)
+    }
+
     /// Просит транспорт завести новый ящик на chatmail-сервере (§5.3).
     ///
     /// Ссылка разбирается **здесь**, до всякой сети, и по двум причинам.
@@ -2720,7 +3027,13 @@ impl<S: Store> Engine<S> {
             // обновления по сети, которую только что выключили. Если
             // попытка окажется дорогой, честный ответ не здесь, а в §4.3:
             // признак «сейчас недоступен» вместо снятия адреса.
-            Transport::Lan | Transport::Ygg => return Ok(Vec::new()),
+            //
+            // Ключ nostr — тоже имя, и у него довод даже прямее, чем у меша.
+            // Onion-адрес с выключенным сервисом ведёт в никуда: кадр,
+            // посланный туда, теряется. Событие nostr не теряется —
+            // оно лежит на реле и дожидается, пока ступень включат
+            // обратно. Снять ключ значило бы выбросить то, что дошло бы.
+            Transport::Lan | Transport::Ygg | Transport::Nostr => return Ok(Vec::new()),
             Transport::Onion => (Some(String::new()), None),
             Transport::Mail => (None, Some(String::new())),
         };
@@ -2921,6 +3234,7 @@ impl<S: Store> Engine<S> {
         // не действовала, потому что доехала второй.
         effects.push(Effect::SetMailAccount(self.mail.clone()));
         effects.push(Effect::SetYgg(self.ygg_setup()));
+        effects.push(Effect::SetNostr(self.nostr_setup()));
         // Список маяков — тоже настройка, и тоже вперёд выключателей.
         // Отправляется **без оглядки** на то, включена ли локальная сеть:
         // список чистый, ничего не занимает и не раскрывает, а раннер,
@@ -3631,6 +3945,14 @@ impl<S: Store> Engine<S> {
                 // карточки, а значит его появление или смена — та же смена
                 // карточки, и §4.3 обязан о ней узнать.
                 && last.ygg == self.ygg
+                // И ключ nostr (0.3) — по тому же доводу, что ключ меша:
+                // он часть карточки, и его появление или смена есть смена
+                // карточки.
+                && last.nostr == self.nostr
+                // И список реле: собеседник кладёт события туда, куда
+                // он указывает. Смени человек реле и не объяви — события
+                // продолжали бы уходить на прежние, то есть в никуда.
+                && last.nostr_relays == self.nostr_card_relays()
         });
         if unchanged {
             return Ok(Vec::new());
@@ -3818,12 +4140,13 @@ impl<S: Store> Engine<S> {
             };
 
         let Some(contact) = self.contacts.get_mut(&peer_ik) else { return Ok(effects) };
-        // Все три пути пересчитываются разом. Ключ меша появляется в карточке
+        // Все четыре пути пересчитываются разом. Ключ меша появляется в карточке
         // ровно так же, как onion после подъёма Tor, — обновлением §4.3, —
         // и забытая здесь строка означала бы «ключ знаем, а ступени нет»:
         // §5.4 меш не выбрал бы никогда, до самого перезапуска.
         contact.availability.has_ygg = !card.ygg.is_empty();
         contact.availability.has_onion = !card.onion.is_empty();
+        contact.availability.has_nostr = !card.nostr.is_empty();
         contact.availability.has_chatmail = !card.chatmail.is_empty();
         contact.card = card;
         self.persist_contact(&peer_ik)?;
@@ -5841,6 +6164,42 @@ impl<S: Store> Engine<S> {
         &self.ygg_peers
     }
 
+    /// Названные человеком реле nostr (0.3).
+    ///
+    /// Настройка, а не живое состояние: что из неё работает, знает раннер
+    /// и сообщает событием. Различать обязательно — «реле не названы»
+    /// и «названы, но не отвечают» чинятся по-разному.
+    #[must_use]
+    pub fn nostr_relays(&self) -> &[String] {
+        &self.nostr_relays
+    }
+
+    /// Ходит ли ступень nostr мимо Tor (0.3).
+    #[must_use]
+    pub const fn nostr_direct(&self) -> bool {
+        self.nostr_direct
+    }
+
+    /// Реле, объявляемые в карточке, — первые из названных (0.3).
+    ///
+    /// Читаем мы со **всех** названных, а объявляем три: карточка едет
+    /// в QR, и каждый лишний адрес — это плотность кода
+    /// (`ratatosk_codec::MAX_CARD_RELAYS`). Усечение делается здесь, одним
+    /// местом на всё ядро: сравнение с объявленным и сборка карточки
+    /// обязаны усекать **одинаково**, иначе версия карточки росла бы
+    /// на каждом шаге сама по себе.
+    fn nostr_card_relays(&self) -> Vec<String> {
+        self.nostr_relays.iter().take(ratatosk_codec::MAX_CARD_RELAYS).cloned().collect()
+    }
+
+    /// Наш открытый ключ nostr — тот, что стоит в карточке (0.3).
+    ///
+    /// Пусто — ступень ни разу не включали, и ключа нет вовсе.
+    #[must_use]
+    pub fn nostr_key(&self) -> &[u8] {
+        &self.nostr
+    }
+
     // --- правка, пересылка, реакции -----------------------------------------
 
     /// Заменяет текст своего сообщения и просит собеседника сделать то же.
@@ -6663,9 +7022,15 @@ impl<S: Store> Engine<S> {
         // по тому событию потребитель идёт за контактом, и со своим ключом
         // не нашёл бы там ничего.
         let mut effects = vec![Effect::Notify(Event::OwnAvatarChanged)];
+        // Лицо сменилось — значит всё, что рассылалось раньше, показывало
+        // прежнее. Отметки сбрасываются целиком, ровно как у карточки.
+        self.avatar_pushed.clear();
         for peer_ik in recipients {
-            let Some(via) = self.direct_channel(&peer_ik) else { continue };
-            effects.extend(self.send_avatar(now_ms, peer_ik, via, bytes)?);
+            // Живого канала больше не спрашиваем. Спрашивали — и контакт,
+            // до которого достаёт только почта или реле, не узнавал о смене
+            // лица никогда: ни сейчас, ни потом, потому что второго повода
+            // разослать не бывает.
+            effects.extend(self.send_avatar(now_ms, peer_ik, bytes)?);
         }
         Ok(effects)
     }
@@ -6676,53 +7041,75 @@ impl<S: Store> Engine<S> {
     /// или впервые нас увидеть, и узнать, что у него уже есть, нам неоткуда —
     /// спрашивать пришлось бы лишним круговым обменом. Сессия устанавливается
     /// редко и переживает перезапуск (§8.3), так что цена ограничена.
-    fn offer_avatar(
-        &mut self,
-        now_ms: u64,
-        peer_ik: [u8; 32],
-        via: Transport,
-    ) -> Result<Vec<Effect>, EngineError> {
+    ///
+    /// Второй раз одному и тому же в одном запуске не уходит: набор
+    /// [`Engine::avatar_pushed`] стережёт это так же, как `card_pushed`
+    /// стережёт карточку. У аватарки довод весомее — тридцать два килобайта
+    /// против четырёхсот байт, и по реле это восемь событий.
+    fn offer_avatar(&mut self, now_ms: u64, peer_ik: [u8; 32]) -> Result<Vec<Effect>, EngineError> {
+        if self.avatar_pushed.contains(&peer_ik) {
+            return Ok(Vec::new());
+        }
         let own_ik = self.identity.public().ik;
         let Some(avatar) = self.store.avatar(&own_ik)? else {
             // Своей аватарки нет — и сообщать об этом нечего: пустая
             // рассылка при каждом рукопожатии была бы трафиком ни о чём.
             return Ok(Vec::new());
         };
-        self.send_avatar(now_ms, peer_ik, via, &avatar.bytes)
+        self.send_avatar(now_ms, peer_ik, &avatar.bytes)
     }
 
-    /// Кладёт аватарку в кадр — единственное место, где проверяется §4.2.
+    /// Ставит аватарку в очередь §5.4 — единственное место, где проверяется
+    /// §4.2.
     ///
     /// Пустые байты законны: это «я снял аватарку», и сверенный контакт
     /// обязан об этом узнать, иначе у него навсегда останется прежнее лицо.
+    ///
+    /// # Здесь стоял отказ асинхронным ступеням, и он был неверен
+    ///
+    /// Стояло `if !via.is_direct() { return }` — без единого слова почему,
+    /// и это само по себе было признаком: в этом дереве решения объясняются,
+    /// а заглушки молчат. Следствие человек видел прямо: собеседник, до
+    /// которого достаёт только почта или реле, оставался без лица навсегда.
+    ///
+    /// Кадр при этом уходил **мимо очереди** — `Effect::Send` с готовым
+    /// кадром и живой сессией. Отсюда и запрет: у асинхронной ступени
+    /// «живой сессии прямо сейчас» не бывает по устройству.
+    ///
+    /// Дорога для такого уже проложена, и не нами: обновление карточки
+    /// (§4.3) — такая же служебная просьба без своей строки в истории, —
+    /// ездит [`Engine::enqueue_request`], то есть по лестнице §5.4
+    /// с повторами и переживая перезапуск. Аватарка идёт тем же путём,
+    /// и второй дороги для неё заводить незачем.
+    ///
+    /// Размер это выдерживает по построению: `MAX_AVATAR_BYTES` выбран так,
+    /// чтобы конверт укладывался в класс M, а класс M везут все ступени —
+    /// у nostr он режется на части, у почты это одно письмо.
     fn send_avatar(
         &mut self,
         now_ms: u64,
         peer_ik: [u8; 32],
-        via: Transport,
         bytes: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
-        if !via.is_direct() {
-            return Ok(Vec::new());
-        }
         // §4.2: несверенному контакту своё лицо не отдаётся. Он может быть
         // не тем, за кого себя выдаёт, — сверка ровно про эту возможность.
         if !self.contacts.get(&peer_ik).is_some_and(|c| c.verified) {
             return Ok(Vec::new());
         }
-        let Some(session_id) = self.sessions.for_peer(&peer_ik, via) else {
-            return Ok(Vec::new());
-        };
-
-        let hlc = self.clock.now(now_ms)?;
-        let envelope = Envelope::new(
-            self.entropy.msg_id(),
-            hlc,
+        let (msg_id, effects) = self.enqueue_request(
+            now_ms,
+            peer_ik,
             PayloadType::Avatar,
             Value::Bytes(bytes.to_vec()),
-        );
-        let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
+        )?;
+        // Отметка — **после** постановки и только если доставка выжила.
+        // Дословно то же правило и та же причина, что у `card_pushed`
+        // (5аж): пометив контакт, до которого доставка не доехала, мы
+        // разоружили бы досылку при появлении сессии — набор живёт в памяти.
+        if self.delivery_alive(&msg_id, &peer_ik) {
+            self.avatar_pushed.insert(peer_ik);
+        }
+        Ok(effects)
     }
 
     /// Пришла аватарка контакта.
@@ -6741,29 +7128,46 @@ impl<S: Store> Engine<S> {
     /// [`MAX_AVATAR_BYTES`](ratatosk_proto::MAX_AVATAR_BYTES), с перезаписью.
     fn on_avatar(
         &mut self,
+        now_ms: u64,
         via: Transport,
         peer_ik: [u8; 32],
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Квитанция — **до всякого разбора**, и это не вежливость.
+        //
+        // Аватарка теперь едет `enqueue_request`, то есть не молчаливым
+        // кадром, а значит у неё заведён срок. Без подтверждения срок
+        // объявляет неудачу, §5.4 отправляет сессию на покой и начинает
+        // новое рукопожатие — и так при каждой смене лица, пока кадры
+        // собеседника не начнут пропадать как «сессия неизвестна». Ровно
+        // это правило и ровно эта цепочка записаны у обновления карточки
+        // §4.3, и метелка `receipt_wiring` нашла здесь её отсутствие
+        // в ту же минуту, как аватарка попала в очередь.
+        //
+        // До разбора, а не после: отправитель ждёт подтверждения **приёма
+        // кадра**, а не согласия с содержимым. Промолчи мы на негодной
+        // картинке или на устаревшей копии — он слал бы её ещё и ещё.
+        let mut effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+
         let Value::Bytes(bytes) = &envelope.payload else {
             return Err(ratatosk_codec::CodecError::TypeMismatch.into());
         };
-        // Проверка своя, а не доверие отправителю, — как и с квитанциями:
-        // транспорт знаем мы, и подделать его он не может.
-        if !via.is_direct() {
-            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
-            return Ok(Vec::new());
-        }
+        // Здесь стоял отказ всему, что не прямой канал, — пара к такому же
+        // отказу на отправке. Оба сняты вместе: лицо едет лестницей §5.4,
+        // и приехать оно вправе хоть почтой, хоть с реле. Отбрасывать его
+        // за это значило бы считать аномалией собственную доставку.
+        //
         // Кадр расшифрован, то есть сессия есть; но контакт мог не успеть
         // появиться, если карточка из §8.2 почему-то не разобралась.
         if !self.contacts.contains_key(&peer_ik) {
-            return Ok(Vec::new());
+            return Ok(effects);
         }
         // Негодная аватарка — не повод рвать сессию: сообщение отбрасывается
         // так же тихо, как мусорный кадр в §7.3, и записывается в аномалии.
         if ratatosk_proto::avatar::check(bytes).is_err() {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
-            return Ok(Vec::new());
+            return Ok(effects);
         }
 
         // Аватарка уходит заново при каждом установлении сессии, поэтому
@@ -6773,7 +7177,7 @@ impl<S: Store> Engine<S> {
         let arrived_ms = envelope.hlc.wall_ms;
         if let Some(stored) = self.store.avatar(&peer_ik)? {
             if stored.updated_ms > arrived_ms {
-                return Ok(Vec::new());
+                return Ok(effects);
             }
         }
 
@@ -6788,7 +7192,8 @@ impl<S: Store> Engine<S> {
         if let Some(contact) = self.contacts.get_mut(&peer_ik) {
             contact.has_avatar = !bytes.is_empty();
         }
-        Ok(vec![Effect::Notify(Event::AvatarChanged { peer_ik })])
+        effects.push(Effect::Notify(Event::AvatarChanged { peer_ik }));
+        Ok(effects)
     }
 
     /// Аватарка контакта — или `None`, если её нет **или он не сверен**.
@@ -11436,6 +11841,30 @@ impl<S: Store> Engine<S> {
         self.supersede(session, SessionBinding::of(via))?;
         self.persist_session(session_id)?;
 
+        // Отпечаток рукопожатия — на диск, и **до** ответа собеседнику.
+        //
+        // Порядок тот же, что у `persist_session`, и по той же причине:
+        // не записав, мы после перезапуска приняли бы то же рукопожатие
+        // второй раз как новое — то есть завели бы вторую сессию и вытеснили
+        // эту. Ступень nostr делает это не гипотезой, а расписанием: реле
+        // хранит события и отдаёт их снова при каждом старте (`HANDOFF.md`,
+        // 6е).
+        //
+        // Отказ записи ронять шаг нечего: сессия уже заведена, а без записи
+        // мы теряем защиту от повтора, а не переписку.
+        if let Some(digest) = HandshakeReplayGuard::digest_of(message) {
+            if let Err(error) = self.store.put_handshake_seen(&digest, now_ms) {
+                tracing::warn!(?error, "отпечаток рукопожатия не лёг на диск");
+            }
+            // Уборка здесь же, потому что здесь есть время. Рукопожатия
+            // редки — несколько за сутки, — так что лишнего `DELETE`
+            // по индексу это не стоит; а иного места с часами у кэша нет.
+            let stale = now_ms.saturating_sub(ratatosk_crypto::handshake::HANDSHAKE_REPLAY_TTL_MS);
+            if let Err(error) = self.store.prune_handshake_seen(stale) {
+                tracing::warn!(?error, "кэш рукопожатий не почистился");
+            }
+        }
+
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
         effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
 
@@ -11516,7 +11945,7 @@ impl<S: Store> Engine<S> {
         // После ответа, а не до: пока сессия не подтверждена нашим кадром,
         // отправлять по ней нечего. Сверенному контакту уедет лицо, всем
         // остальным — ничего (§4.2).
-        effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
+        effects.extend(self.offer_avatar(now_ms, peer_ik)?);
         // Карточка из первого сообщения (§8.2) применяется только к новому
         // контакту, и у собеседника — то же правило. Значит, наш адрес
         // до него доедет только подписанным обновлением (§4.3).
@@ -11581,7 +12010,7 @@ impl<S: Store> Engine<S> {
         let mut effects =
             if via == Transport::Lan { self.note_lan_presence(peer_ik)? } else { Vec::new() };
         effects.extend(self.flush_outbox(peer_ik)?);
-        effects.extend(self.offer_avatar(now_ms, peer_ik, via)?);
+        effects.extend(self.offer_avatar(now_ms, peer_ik)?);
         // Мы звали — значит карточка уехала в первом сообщении. Но если
         // собеседник уже знал нас, он её отбросил: см. `push_own_card`.
         effects.extend(self.push_own_card(now_ms, peer_ik)?);
@@ -12354,7 +12783,7 @@ impl<S: Store> Engine<S> {
             }
             PayloadType::Forward => self.on_forwarded(now_ms, via, peer_ik, &envelope),
             PayloadType::Reply => self.on_replied(now_ms, via, peer_ik, &envelope),
-            PayloadType::Avatar => self.on_avatar(via, peer_ik, &envelope),
+            PayloadType::Avatar => self.on_avatar(now_ms, via, peer_ik, &envelope),
             PayloadType::Retract => self.on_retract(now_ms, via, peer_ik, &envelope),
             PayloadType::Edit => self.on_edit(now_ms, via, peer_ik, &envelope),
             PayloadType::Reaction => self.on_reaction(now_ms, via, peer_ik, &envelope),

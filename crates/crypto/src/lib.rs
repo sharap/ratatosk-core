@@ -39,6 +39,7 @@ pub mod identity;
 pub mod kdf;
 pub mod labels;
 pub mod mesh;
+pub mod nostr;
 pub mod onion;
 pub mod ratchet;
 pub mod storage_key;

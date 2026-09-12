@@ -22,6 +22,7 @@
 //! | [`forward`] | пересылка в другой чат — **дополнение**, в v0.1 не описано |
 //! | [`reply`] | ответ на сообщение — **дополнение**, в v0.1 не описано |
 //! | [`ygg`] | адрес в меше из открытого ключа — **0.2**, в v0.1 не описано |
+//! | [`nostr`] | ступень поверх реле nostr — **0.3**, в v0.1 не описано |
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -37,6 +38,7 @@ pub mod fragment;
 pub mod group;
 pub mod group_action;
 pub mod mail;
+pub mod nostr;
 pub mod reaction;
 pub mod receipts;
 pub mod reply;
@@ -60,6 +62,11 @@ pub use receipts::{DeliveryStatus, Receipt};
 pub use reply::ReplyError;
 pub use retract::MAX_RETRACT_IDS;
 pub use session::{Route, SessionRegistry};
+// Классы размера живут в `wire` — там же, где кадр. Реэкспорт нужен тем, кто
+// зависит от протокола, но не от провода: без него стенду пришлось бы либо
+// тянуть лишний крейт, либо завести **вторую** арифметику размеров кадра,
+// расходящуюся с настоящей молча.
+pub use ratatosk_wire::SizeClass;
 pub use transport_policy::{
     Attempt, Decision, PeerAvailability, Reachability, Rung, Transport, TransportSet,
 };

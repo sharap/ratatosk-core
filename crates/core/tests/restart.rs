@@ -77,6 +77,8 @@ fn reachable_peer_card() -> (Vec<u8>, [u8; 32]) {
         display_name: "сосед".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     (card.encode().expect("карточка кодируется"), card.ik)
 }
@@ -205,6 +207,8 @@ fn peer_card() -> (Vec<u8>, [u8; 32]) {
         display_name: "собеседник".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     (card.encode().expect("карточка кодируется"), card.ik)
 }
@@ -1708,7 +1712,9 @@ fn every_rung_is_named_at_startup() {
     engine.restore().expect("подъём");
 
     let effects = engine.startup_effects();
-    for transport in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+    for transport in
+        [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Nostr, Transport::Mail]
+    {
         assert!(
             effects.iter().any(|e| matches!(
                 e,

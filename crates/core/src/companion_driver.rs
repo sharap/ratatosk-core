@@ -1203,7 +1203,16 @@ impl<R: Runner> CompanionDriver<R> {
         let sent = self
             .runner
             .execute(TransportCommand::Send {
-                peer: PeerAddress { ik: self.phone_ik, onion, chatmail: None, ygg },
+                peer: PeerAddress {
+                    ik: self.phone_ik,
+                    onion,
+                    chatmail: None,
+                    ygg,
+                    // Ступени nostr у канала компаньона нет и не будет:
+                    // §13.4 про «здесь и сейчас», а реле — это ожидание.
+                    nostr: None,
+                    nostr_relays: Vec::new(),
+                },
                 via: self.via,
                 frame,
                 handoff: None,

@@ -404,6 +404,8 @@ fn with_contact<S: Store>(phone: &mut Engine<S>, now_ms: u64) -> [u8; 32] {
         display_name: "сосед".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let bytes = card.encode().expect("кодирование карточки");
     phone
@@ -1229,6 +1231,8 @@ fn a_new_contact_tells_the_desktop_the_chat_list_changed() {
         display_name: "сосед".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let effects = phone
         .step(
@@ -1351,6 +1355,8 @@ fn a_contact_may_not_speak_the_companion_wire() {
         display_name: "чужой".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let card_bytes = card.encode().expect("карточка");
     let mut wire = Desktop::with_identity(stranger);
@@ -2076,6 +2082,8 @@ fn with_second_contact<S: Store>(phone: &mut Engine<S>, now_ms: u64) -> [u8; 32]
         display_name: "друг".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     phone
         .step(
@@ -2173,6 +2181,8 @@ fn the_desktop_adds_an_unknown_contact_by_naming_the_message() {
         display_name: "чужой".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     phone
         .step(1_200, Input::Command(Command::ShareContact { chat, peer_ik }))

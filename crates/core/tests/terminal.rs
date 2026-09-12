@@ -78,6 +78,8 @@ fn with_contact(phone: &mut Phone, now_ms: u64, name: &str, seed: u8) -> [u8; 32
         display_name: name.to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     phone
         .step(

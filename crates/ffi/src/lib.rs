@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ratatosk_codec::ContactCard;
-use ratatosk_core::driver::{Driver, DriverHandle, EventStream, MessageView};
+use ratatosk_core::driver::{
+    ContactStatus, Driver, DriverHandle, EventStream, MessageView, OwnCard,
+};
 use ratatosk_core::{
     vault, Account, AccountId, Command, Engine, Event, OsEntropy, OutgoingFile, Registry,
     SelfAddresses,
@@ -222,6 +224,15 @@ pub enum FfiTransport {
     Ygg,
     /// Tor onion-to-onion (§5.2). По умолчанию включён.
     Onion,
+    /// Реле nostr поверх Tor (0.3). По умолчанию **выключен**: ступень
+    /// не работает, пока человек не назвал реле, а реле видит, кто кому
+    /// пишет. UI обязан сказать об этом рядом с переключателем — ровно
+    /// так же, как про меш.
+    ///
+    /// **В этой сборке ступень не поднимается ни при каких настройках.**
+    /// Она заведена в лестнице §5.4 и честно отвечает «не поднята»:
+    /// раннера ещё нет. Показывать её человеку как рабочую нельзя (§14).
+    Nostr,
     /// Почта chatmail поверх Tor (§5.3). По умолчанию включена.
     Mail,
 }
@@ -232,6 +243,7 @@ impl From<FfiTransport> for ratatosk_proto::Transport {
             FfiTransport::Lan => ratatosk_proto::Transport::Lan,
             FfiTransport::Ygg => ratatosk_proto::Transport::Ygg,
             FfiTransport::Onion => ratatosk_proto::Transport::Onion,
+            FfiTransport::Nostr => ratatosk_proto::Transport::Nostr,
             FfiTransport::Mail => ratatosk_proto::Transport::Mail,
         }
     }
@@ -243,6 +255,7 @@ impl From<ratatosk_proto::Transport> for FfiTransport {
             ratatosk_proto::Transport::Lan => FfiTransport::Lan,
             ratatosk_proto::Transport::Ygg => FfiTransport::Ygg,
             ratatosk_proto::Transport::Onion => FfiTransport::Onion,
+            ratatosk_proto::Transport::Nostr => FfiTransport::Nostr,
             ratatosk_proto::Transport::Mail => FfiTransport::Mail,
         }
     }
@@ -853,6 +866,13 @@ pub struct FfiContact {
     /// однажды показать человеку одну, а соединиться по другой. Показывать
     /// его стоит так же, как onion, — на карточке человека, а не в списке.
     pub ygg: Option<Vec<u8>>,
+    /// Реле nostr, которые объявляет **его** карточка (0.3).
+    ///
+    /// Туда уйдёт событие, когда §5.4 выберет ступень nostr: реле в карточке
+    /// — это места, где владелец читает. Показывать стоит там же, где onion
+    /// и ключ меша: на карточке человека, а не в списке. Пусто — карточка
+    /// реле не называет, и мы положим на свои, надеясь на общее.
+    pub nostr_relays: Vec<String>,
     /// Версия карточки, монотонная (§4.3).
     ///
     /// Диагностика: по ней видно, доехало ли до нас обновление адресов.
@@ -1097,6 +1117,23 @@ pub struct FfiOwnCard {
     pub onion: String,
     /// Почтовый адрес (§5.3). Пустая строка — ящика нет.
     pub chatmail: String,
+    /// Открытый ключ узла Yggdrasil (0.2). Пусто — меша нет.
+    ///
+    /// В ссылке он уже есть — карточка везёт его сама, — а здесь лежит
+    /// отдельно затем же, зачем onion: показать человеку, чем до него
+    /// вообще можно достучаться, не разбирая ссылку глазами.
+    pub ygg: Vec<u8>,
+    /// Открытый ключ nostr (0.3). Пусто — ступень ни разу не включали.
+    ///
+    /// Байтами, а не строкой `npub1…`: строку отдаёт
+    /// [`RatatoskClient::nostr_npub`], и держать два представления одного
+    /// ключа значило бы однажды показать одно, а подписывать другим.
+    pub nostr: Vec<u8>,
+    /// Реле nostr, которые объявляет эта карточка (0.3).
+    ///
+    /// Именно объявленные, а не названные: сюда собеседник будет класть
+    /// события. Разбор различия — у [`RatatoskClient::nostr_advertised_relays`].
+    pub nostr_relays: Vec<String>,
 }
 
 /// Открытое на чтение вложение (§10.2).
@@ -1465,16 +1502,7 @@ impl RatatoskClient {
     /// не поднят, и сказать об этом честнее, чем показать QR без адреса
     /// и промолчать.
     pub fn my_addresses(&self) -> Result<FfiOwnCard, RatatoskError> {
-        self.opened
-            .handle
-            .own_card_blocking()
-            .map(|card| FfiOwnCard {
-                uri: card.uri,
-                version: card.version,
-                onion: card.onion,
-                chatmail: card.chatmail,
-            })
-            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+        Ok(ffi_own_card_of(&self.own_card()?))
     }
 
     /// Идентификатор чата 1:1 с контактом.
@@ -1835,6 +1863,99 @@ impl RatatoskClient {
             .own_card_blocking()
             .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
         Ok(card.ygg)
+    }
+
+    /// Называет реле nostr (0.3): `wss://relay.example`.
+    ///
+    /// Список заменяется целиком. Зашитого списка нет и не будет: реле
+    /// видит, какие ключи переписываются между собой и когда (0.3.3), —
+    /// и выбирать за человека, кто это будет, приложение не вправе.
+    ///
+    /// Негодные адреса **отбрасываются, а не сохраняются**: ядро называет
+    /// их в журнале и оставляет прежний список. Открытый `ws://` годится
+    /// только до самого устройства (`127.0.0.1`, `localhost`) — наружу он
+    /// отдал бы наблюдателю по дороге тот самый граф, ради сокрытия
+    /// которого всё и городится.
+    ///
+    /// **Первые три уезжают в карточку** и становятся тем местом, куда
+    /// собеседник будет класть события. Читаем мы со всех названных;
+    /// объявляем три — карточка едет в QR, и каждый лишний адрес это
+    /// плотность кода. Что именно объявлено, видно в
+    /// [`RatatoskClient::nostr_advertised_relays`].
+    ///
+    /// Перед включением ступени клиент обязан показать [`nostr_warning`].
+    pub fn set_nostr_relays(&self, relays: Vec<String>) -> Result<(), RatatoskError> {
+        self.command(Command::SetNostrRelays(relays))
+    }
+
+    /// Реле nostr, как их назвал человек (0.3).
+    pub fn nostr_relays(&self) -> Result<Vec<String>, RatatoskError> {
+        Ok(self.nostr_settings()?.0)
+    }
+
+    /// Ходить ли на реле мимо Tor (0.3).
+    ///
+    /// **Размен, а не настройка скорости**, и цену клиент обязан назвать
+    /// человеку **до** переключения — [`nostr_direct_warning`]. Умолчание
+    /// — через Tor.
+    ///
+    /// Включается это там, где Tor недоступен физически: ступень, которая
+    /// в таком месте просто не работает, — не забота о приватности, а
+    /// отсутствие связи. Тот же размен и у почты.
+    pub fn set_nostr_direct(&self, direct: bool) -> Result<(), RatatoskError> {
+        self.command(Command::SetNostrDirect(direct))
+    }
+
+    /// Ходит ли ступень nostr мимо Tor (0.3). Ложь — через Tor.
+    pub fn nostr_direct(&self) -> Result<bool, RatatoskError> {
+        Ok(self.nostr_settings()?.1)
+    }
+
+    /// Реле и их состояние **прямо сейчас** (0.3).
+    ///
+    /// Пара к [`RatatoskClient::nostr_relays`], и пара неразлучная — ровно
+    /// как у пиров меша: тот отдаёт список, который назвал человек, этот —
+    /// сколько из него работает. Порознь ни то, ни другое вопроса
+    /// не закрывает.
+    ///
+    /// Здесь только **свои** реле, те, с которых мы читаем. Реле
+    /// собеседников, куда мы кладём события, сюда не попадают нарочно:
+    /// живое чужое реле не означает, что до нас кто-то дозовётся, и
+    /// показывать его как признак работоспособности было бы обманом.
+    ///
+    /// # Что означает `None`
+    ///
+    /// Ступень ничего ещё не сказала о себе: она выключена, либо раннера
+    /// нет в сборке, либо он только поднимается. Это не то же, что пустой
+    /// список: пустой означает «ступень работает, а реле не названы».
+    pub fn nostr_relays_alive(&self) -> Result<Option<Vec<FfiNostrRelay>>, RatatoskError> {
+        Ok(self
+            .transport_status()?
+            .nostr_relays
+            .map(|relays| relays.iter().map(nostr_relay_of).collect()))
+    }
+
+    /// Свой ключ nostr в виде `npub1…` (NIP-19). Пусто — ступень не включали.
+    ///
+    /// Читается из своей карточки: там он и живёт. Человеку он нужен ровно
+    /// для одного — сверить, что в другом клиенте nostr стоит тот же ключ.
+    /// Байтами это не сверяется, на то bech32 и придуман.
+    pub fn nostr_npub(&self) -> Result<String, RatatoskError> {
+        let card = self.own_card()?;
+        Ok(ratatosk_proto::nostr::NostrKey::from_slice(&card.nostr)
+            .map(|key| key.npub())
+            .unwrap_or_default())
+    }
+
+    /// Реле, которые **объявляет наша карточка** (0.3).
+    ///
+    /// Не то же, что [`RatatoskClient::nostr_relays`], и разница видна
+    /// человеку: названные — места, откуда мы **читаем**; объявленные —
+    /// места, куда собеседник будет **класть**. В карточку уходят не все,
+    /// а первые три, и расхождение «названо пять, объявлено три» стоит
+    /// показать глазами, а не оставлять выяснять по молчанию.
+    pub fn nostr_advertised_relays(&self) -> Result<Vec<String>, RatatoskError> {
+        Ok(self.own_card()?.nostr_relays)
     }
 
     /// Просит chatmail-сервер завести **новый** ящик (§5.3).
@@ -2478,35 +2599,7 @@ impl RatatoskClient {
             .handle
             .contacts_blocking()
             .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
-        Ok(found
-            .into_iter()
-            .map(|c| FfiContact {
-                chat_id: Engine::<SqliteStore>::chat_id_for(&c.peer_ik).to_vec(),
-                peer_ik: c.peer_ik.to_vec(),
-                fingerprint: c.fingerprint,
-                display_name: c.display_name,
-                local_name: c.local_name,
-                verified: c.verified,
-                seen_on_lan: c.availability.seen_on_lan,
-                has_avatar: c.has_avatar,
-                onion: c.onion,
-                chatmail: c.chatmail,
-                ygg: c.ygg,
-                card_version: c.card_version,
-                added_ms: c.added_ms,
-                reachability: reachability(c.reachability),
-                direct_channel: c.direct_channel.map(FfiTransport::from),
-                anomalies: FfiAnomalies {
-                    unknown_session: c.anomalies.unknown_session,
-                    bad_tag: c.anomalies.bad_tag,
-                    malformed: c.anomalies.malformed,
-                    handshake_replay: c.anomalies.handshake_replay,
-                    // Считается ядром, а не клиентом: сумма из четырёх слагаемых
-                    // выглядит безобидно ровно до появления пятого.
-                    total: c.anomalies.total(),
-                },
-            })
-            .collect())
+        Ok(found.iter().map(ffi_contact_of).collect())
     }
 
     /// Список сопряжённых десктопов (§13.4).
@@ -2852,6 +2945,31 @@ impl RatatoskClient {
             .map_err(|_| RatatoskError::internal("ядро остановлено"))
     }
 
+    /// Настройка ступени nostr одним запросом (0.3).
+    ///
+    /// Здесь, а не в экспортируемом блоке, — ровно по причине, записанной
+    /// у `transport_status` ниже. Пару `(Vec<String>, bool)` мост не умеет
+    /// и уметь не должен: наружу она выходит двумя чтениями по отдельности,
+    /// а здесь склеена затем, чтобы не гонять два запроса к ядру ради
+    /// одного экрана.
+    fn nostr_settings(&self) -> Result<(Vec<String>, bool), RatatoskError> {
+        self.opened
+            .handle
+            .nostr_settings_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
+    /// Своя карточка одним запросом — для читателей полей ступеней.
+    ///
+    /// Тоже здесь, и по той же причине: `OwnCard` — тип ядра, а не моста.
+    /// Наружу он выходит только переведённым (`ffi_own_card_of`).
+    fn own_card(&self) -> Result<OwnCard, RatatoskError> {
+        self.opened
+            .handle
+            .own_card_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
     /// Состояние транспортов одним запросом — «включён» и «работает» сразу.
     ///
     /// Живёт **в этом** блоке, а не в экспортируемом, и это не вкусовщина:
@@ -2885,6 +3003,98 @@ pub struct FfiYggPeer {
     pub inbound: bool,
     /// Задержка, мс. У неживого — ноль: она не измерялась.
     pub latency_ms: f64,
+}
+
+/// Переводит контакт через границу.
+///
+/// Именованной функцией, а не замыканием, и это долг, закрытый по следу:
+/// зеркал карточки четыре, и два из них уже расходились молча — каждый раз
+/// это стоило разбора на стенде. Здесь сборка стояла замыканием внутри
+/// `contacts`, то есть вне всякого присмотра, и список реле nostr в неё
+/// дописывался руками.
+///
+/// Названная так функция попадает под метёлку `mirror`: каждое поле
+/// источника обязано быть прочитано в теле, а то, чему границу переходить
+/// не положено, названо в её списке исключений вместе с причиной.
+fn ffi_contact_of(contact: &ContactStatus) -> FfiContact {
+    FfiContact {
+        chat_id: Engine::<SqliteStore>::chat_id_for(&contact.peer_ik).to_vec(),
+        peer_ik: contact.peer_ik.to_vec(),
+        fingerprint: contact.fingerprint.clone(),
+        display_name: contact.display_name.clone(),
+        local_name: contact.local_name.clone(),
+        verified: contact.verified,
+        seen_on_lan: contact.availability.seen_on_lan,
+        has_avatar: contact.has_avatar,
+        onion: contact.onion.clone(),
+        chatmail: contact.chatmail.clone(),
+        ygg: contact.ygg.clone(),
+        nostr_relays: contact.nostr_relays.clone(),
+        card_version: contact.card_version,
+        added_ms: contact.added_ms,
+        reachability: reachability(contact.reachability),
+        direct_channel: contact.direct_channel.map(FfiTransport::from),
+        anomalies: FfiAnomalies {
+            unknown_session: contact.anomalies.unknown_session,
+            bad_tag: contact.anomalies.bad_tag,
+            malformed: contact.anomalies.malformed,
+            handshake_replay: contact.anomalies.handshake_replay,
+            // Считается ядром, а не клиентом: сумма из четырёх слагаемых
+            // выглядит безобидно ровно до появления пятого.
+            total: contact.anomalies.total(),
+        },
+    }
+}
+
+/// Переводит свою карточку через границу.
+///
+/// Именованной функцией, а не замыканием, и это починка по следу: сборка
+/// стояла прямо в `my_addresses`, и появившиеся в карточке ключ меша, ключ
+/// nostr и список реле в неё не попали — компилятор смолчал, потому что
+/// забыть можно было и поле, и строку. Ровно так же и ровно дважды это уже
+/// случалось по ту сторону границы (`ARCHITECTURE.md`, `own_card_of`).
+///
+/// Названная так функция попадает под метёлку `mirror`: каждое поле
+/// источника обязано быть прочитано в теле.
+fn ffi_own_card_of(card: &OwnCard) -> FfiOwnCard {
+    FfiOwnCard {
+        uri: card.uri.clone(),
+        version: card.version,
+        onion: card.onion.clone(),
+        chatmail: card.chatmail.clone(),
+        ygg: card.ygg.clone(),
+        nostr: card.nostr.clone(),
+        nostr_relays: card.nostr_relays.clone(),
+    }
+}
+
+/// Реле nostr и его состояние **прямо сейчас** (0.3).
+///
+/// Пара к `FfiYggPeer`, и по той же причине: реле держит кто-то посторонний,
+/// и оно может исчезнуть навсегда. Без живого состава «nostr не работает»
+/// и «одно из трёх реле умерло полгода назад» выглядят на экране одинаково,
+/// а чинятся по-разному.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiNostrRelay {
+    /// Адрес, которым соединялись: та же строка, что человек ввёл.
+    pub url: String,
+    /// Соединение работает и подписка принята.
+    pub up: bool,
+    /// Почему не работает — словами, для показа человеку (§14).
+    ///
+    /// Пусто у живого, а у неживого пусто означает «ещё не пробовали»:
+    /// задача реле до соединения не дошла. Различать это стоит — первое
+    /// чинится ожиданием, второе временем.
+    pub note: String,
+}
+
+/// Переводит реле через границу.
+///
+/// Именованной функцией, а не замыканием, по той же причине, что и пир меша:
+/// метёлка `mirror` требует, чтобы **каждое** поле источника было прочитано,
+/// а замыкание она не видит.
+fn nostr_relay_of(relay: &ratatosk_proto::nostr::NostrRelay) -> FfiNostrRelay {
+    FfiNostrRelay { url: relay.url.clone(), up: relay.up, note: relay.note.clone() }
 }
 
 /// Переводит пира меша через границу.
@@ -3021,6 +3231,19 @@ type MailSide = ratatosk_transport::chatmail::runner::MailRunner;
 #[cfg(not(feature = "mail"))]
 type MailSide = Disabled;
 
+/// Раннер ступени nostr — или его отсутствие.
+///
+/// Отдельным псевдонимом по той же причине, что и почтовый: признаки
+/// `tor`, `mail` и `nostr` независимы, и перечислять их сочетания значило
+/// бы писать одно и то же восемь раз.
+#[cfg(feature = "nostr")]
+type NostrSide = ratatosk_transport::nostr::NostrRunner;
+
+/// Ступени nostr в этой сборке нет: [`ratatosk_transport::Disabled`] честно
+/// отказывает, а настройка при этом живёт и ждёт сборки с раннером.
+#[cfg(not(feature = "nostr"))]
+type NostrSide = Disabled;
+
 /// Набор транспортов этой сборки.
 ///
 /// Псевдоним, а не тип по месту: состав транспортов виден в сигнатурах,
@@ -3032,11 +3255,12 @@ type MailSide = Disabled;
 /// [`ratatosk_transport::Disabled`], и это не заглушка, а правда о сборке:
 /// §5.4 обязан узнать, что ступень не сработала, и перейти к следующей.
 #[cfg(feature = "tor")]
-type Runners = Transports<LanRunner, YggRunner, Switched<OnionRunner>, MailSide>;
+type Runners = Transports<LanRunner, YggRunner, Switched<OnionRunner>, NostrSide, MailSide>;
 
-/// Набор транспортов сборки без Tor: локальная сеть и, если собрана, почта.
+/// Набор транспортов сборки без Tor: локальная сеть и, если собраны,
+/// реле nostr и почта.
 #[cfg(not(feature = "tor"))]
-type Runners = Transports<LanRunner, YggRunner, Disabled, MailSide>;
+type Runners = Transports<LanRunner, YggRunner, Disabled, NostrSide, MailSide>;
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
@@ -3108,6 +3332,18 @@ async fn start(
     #[cfg(not(feature = "mail"))]
     let mail = Disabled;
 
+    // Ступень nostr (0.3). Ручка Tor у неё общая с onion и почтой — по той же
+    // причине: второй `TorClient` означал бы второй bootstrap.
+    //
+    // Без признака ступень честно отказывает, а **настройка живёт**: реле
+    // и путь ложатся на диск и ждут сборки, в которой найдётся раннер.
+    // Клиенту это надо показывать словами, иначе экран настроек выглядит
+    // рабочим, а ступень молчит — на стенде этот разбор уже был.
+    #[cfg(feature = "nostr")]
+    let nostr = ratatosk_transport::nostr::NostrRunner::new(tor_handle.clone());
+    #[cfg(not(feature = "nostr"))]
+    let nostr = Disabled;
+
     #[cfg(feature = "tor")]
     let runner = {
         let layout = ratatosk_core::TorLayout::beside(&db_path);
@@ -3145,14 +3381,14 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, mail)
+        Transports::new(lan, ygg, onion, nostr, mail)
     };
     // Без признака `tor` onion честно отказывает, а почта работает: §5.3
     // по умолчанию идёт через Tor, но умеет и напрямую.
     #[cfg(not(feature = "tor"))]
     let runner = {
         let _ = &tor_handle;
-        Transports::new(lan, ygg, Disabled, mail)
+        Transports::new(lan, ygg, Disabled, nostr, mail)
     };
 
     let (driver, handle, events) = Driver::new(engine, runner);
@@ -3687,6 +3923,45 @@ pub fn ygg_node_notice() -> String {
 #[must_use]
 pub fn ygg_node_stop_notice() -> String {
     ratatosk_core::honest::YGG_NODE_STOP_NOTICE.to_string()
+}
+
+/// Предупреждение при включении ступени nostr (0.3).
+///
+/// Показывается **до** `set_transport_enabled(Nostr, true)`, как у LAN
+/// и у меша. Цена своя: реле видит, какие ключи переписываются между собой
+/// и когда, — то же, что почтовый сервер видит по `From:` и `To:`.
+///
+/// Средство у человека одно, и оно настоящее: реле он называет сам и может
+/// назвать несколько, поделив след между ними. У почты такого выбора нет —
+/// сервер один.
+#[uniffi::export]
+#[must_use]
+pub fn nostr_warning() -> String {
+    ratatosk_core::honest::NOSTR_WARNING.to_string()
+}
+
+/// Что сказать **до** переключения ступени nostr на путь мимо Tor (0.3).
+///
+/// Обязательно, а не по желанию: ключ nostr долговечен и общий для всех
+/// собеседников, и реле, увидевшее адрес устройства рядом с ним, связывает
+/// их навсегда. Решение при этом остаётся за человеком — есть места, где
+/// Tor недоступен физически, и там ступень без этого не работает вовсе.
+#[uniffi::export]
+#[must_use]
+pub fn nostr_direct_warning() -> String {
+    ratatosk_core::honest::NOSTR_DIRECT_WARNING.to_string()
+}
+
+/// Что сказать про файлы на ступени nostr (0.3).
+///
+/// Файлы этой ступенью не ходят и ходить не будут: кусок файла — кадр
+/// класса L, мебибайт, а реле меряют событие десятками килобайт. Передача
+/// ждёт прямой связи или уходит почтой, и сказать об этом надо словами —
+/// молчащая передача выглядит как поломка.
+#[uniffi::export]
+#[must_use]
+pub fn nostr_no_files_notice() -> String {
+    ratatosk_core::honest::NOSTR_NO_FILES_NOTICE.to_string()
 }
 
 /// Предупреждение при отказе от PIN (§8.6).

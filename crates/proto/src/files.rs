@@ -197,6 +197,18 @@ pub const fn chunk_size_class() -> SizeClass {
 pub const fn may_send_over(size_bytes: u64, transport: Transport) -> bool {
     match transport {
         Transport::Lan | Transport::Ygg | Transport::Onion => true,
+        // Nostr не везёт файлов вовсе, и это не «пока», а устройство
+        // ступени. Чанк — кадр класса L, мебибайт (§5.5); реле ограничивают
+        // событие десятками килобайт и вдобавок считают частоту. Один чанк
+        // разложился бы на два десятка событий подряд, то есть на верный
+        // отказ по частоте, — а окно `chunk_window` послало бы их восемь
+        // таких разом.
+        //
+        // Предел по размеру, как у почты, здесь ничего бы не спас:
+        // не проходит **любой** чанк, потому что класс у него всегда L.
+        // Поэтому отказ безусловный, и разбирать его человеку не надо:
+        // ниже стоит почта, и файл поедет ею.
+        Transport::Nostr => false,
         Transport::Mail => size_bytes <= MAIL_FILE_LIMIT_BYTES,
     }
 }
@@ -368,7 +380,12 @@ pub const DEFAULT_AUTO_ACCEPT_BYTES: u64 = 512 * 1024;
 pub const fn chunk_window(via: Transport) -> u64 {
     match via {
         Transport::Lan | Transport::Ygg | Transport::Onion => 2,
-        Transport::Mail => 8,
+        // Nostr стоит рядом с почтой, и до этой ветки доходить нечему:
+        // [`may_send_over`] чанков туда не пускает вовсе. Число тут затем,
+        // что разбор обязан быть исчерпывающим, и выбрано оно **не наугад**:
+        // случись ступени однажды научиться возить чанки, умолчание не
+        // должно оказаться оптимистичнее самой терпеливой из соседних.
+        Transport::Nostr | Transport::Mail => 8,
     }
 }
 
@@ -388,7 +405,8 @@ pub const fn chunk_window(via: Transport) -> u64 {
 pub const fn ack_every(via: Transport) -> u64 {
     match via {
         Transport::Lan | Transport::Ygg | Transport::Onion => 1,
-        Transport::Mail => 4,
+        // Опять рядом с почтой и опять недостижимо — см. `chunk_window`.
+        Transport::Nostr | Transport::Mail => 4,
     }
 }
 
@@ -439,7 +457,8 @@ pub const fn stall_ms(via: Transport) -> u64 {
         // опаздывает на секунды. Десять секунд объявляли бы застой там,
         // где идёт обычная передача.
         Transport::Ygg | Transport::Onion => 120_000,
-        Transport::Mail => 30 * 60_000,
+        // И здесь рядом с почтой, по той же причине — см. `chunk_window`.
+        Transport::Nostr | Transport::Mail => 30 * 60_000,
     }
 }
 
@@ -1259,6 +1278,21 @@ mod tests {
         // общего предела файла, а не равен ему. Сравняй их — и гигабайт
         // уехал бы почтой, то есть не уехал бы никуда.
         assert!(MAIL_FILE_LIMIT_BYTES < MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn nostr_carries_no_file_at_any_size() {
+        // Отказ безусловный, и это существенно: предел по размеру,
+        // как у почты, не спас бы ничего — не проходит **любой** чанк,
+        // потому что класс у него всегда L, а событие реле меряется
+        // десятками килобайт.
+        //
+        // Проверяется и ноль: «файл в ноль байт» — законный случай
+        // (`chunk_count` отвечает на него нулём), и ветка, написанная
+        // через сравнение, пропустила бы его молча.
+        for size in [0, 1, CHUNK_BYTES as u64, MAIL_FILE_LIMIT_BYTES, MAX_FILE_BYTES, u64::MAX] {
+            assert!(!may_send_over(size, Transport::Nostr), "{size} байт всё равно не поедет");
+        }
     }
 
     #[test]

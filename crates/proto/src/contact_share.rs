@@ -142,6 +142,8 @@ mod tests {
             display_name: "Кэрол".into(),
             version: 3,
             ygg: Vec::new(),
+            nostr: Vec::new(),
+            nostr_relays: Vec::new(),
         }
     }
 

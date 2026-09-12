@@ -2497,6 +2497,45 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn put_handshake_seen(&mut self, digest: &[u8; 32], seen_ms: u64) -> Result<()> {
+        // `OR IGNORE`, а не `OR REPLACE`: срок §8.3 считается от **первой**
+        // встречи. Обновляй повтор время, настойчивый повторяющийся кадр
+        // продлевал бы запись бесконечно — то есть кэш перестал бы стареть
+        // ровно там, где стареть обязан.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO handshake_seen (digest, created_ms) VALUES (?1, ?2)",
+            rusqlite::params![&digest[..], sql_types::to_sql(seen_ms)],
+        )?;
+        Ok(())
+    }
+
+    fn handshake_seen(&self, newer_than_ms: u64) -> Result<Vec<([u8; 32], u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT digest, created_ms FROM handshake_seen
+              WHERE created_ms > ?1
+           ORDER BY created_ms ASC",
+        )?;
+        let mut rows = stmt.query([sql_types::to_sql(newer_than_ms)])?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next()? {
+            let raw: Vec<u8> = row.get(0)?;
+            // Строка не той длины — порча, а не запись: пропускаем молча.
+            // Уронить здесь весь запуск из-за одной строки кэша значило бы
+            // променять защиту от повтора на невозможность войти.
+            let Ok(digest) = <[u8; 32]>::try_from(raw.as_slice()) else { continue };
+            found.push((digest, sql_types::from_sql(row.get::<_, i64>(1)?)));
+        }
+        Ok(found)
+    }
+
+    fn prune_handshake_seen(&mut self, older_than_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM handshake_seen WHERE created_ms <= ?1",
+            [sql_types::to_sql(older_than_ms)],
+        )?;
+        Ok(())
+    }
+
     fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let found = self
             .conn

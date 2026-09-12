@@ -493,7 +493,8 @@ impl Runner for LanRunner {
             // молчаливое согласие с чужой командой хуже отказа.
             TransportCommand::SetMailAccount(_)
             | TransportCommand::CreateMailAccount { .. }
-            | TransportCommand::SetYgg(_) => Err(TransportError::Unavailable),
+            | TransportCommand::SetYgg(_)
+            | TransportCommand::SetNostr(_) => Err(TransportError::Unavailable),
         }
     }
 
@@ -799,6 +800,8 @@ mod tests {
                     onion: None,
                     chatmail: None,
                     ygg: None,
+                    nostr: None,
+                    nostr_relays: Vec::new(),
                 },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
@@ -823,6 +826,8 @@ mod tests {
                     onion: None,
                     chatmail: None,
                     ygg: None,
+                    nostr: None,
+                    nostr_relays: Vec::new(),
                 },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
@@ -858,6 +863,8 @@ mod tests {
                     onion: None,
                     chatmail: None,
                     ygg: None,
+                    nostr: None,
+                    nostr_relays: Vec::new(),
                 },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],
@@ -900,6 +907,8 @@ mod tests {
                     onion: None,
                     chatmail: None,
                     ygg: None,
+                    nostr: None,
+                    nostr_relays: Vec::new(),
                 },
                 via: Transport::Lan,
                 frame: vec![0u8; SizeClass::S.frame_len()],

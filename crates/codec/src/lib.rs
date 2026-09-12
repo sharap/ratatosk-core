@@ -21,7 +21,7 @@ pub use canonical::{Raw, PROTOCOL_VERSION};
 // конверт, не имея этого типа, нельзя. Реэкспорт избавляет остальные крейты
 // от прямой зависимости на ciborium и заодно фиксирует, что версия у всех
 // одна.
-pub use card::{CardUpdate, ContactCard, URI_PREFIX, YGG_KEY_LEN};
+pub use card::{CardUpdate, ContactCard, MAX_CARD_RELAYS, NOSTR_KEY_LEN, URI_PREFIX, YGG_KEY_LEN};
 pub use ciborium::value::Value;
 pub use envelope::{Envelope, Fragment, PayloadType};
 pub use error::{CodecError, Result};

@@ -2,7 +2,7 @@
 //!
 //! До этого модуля драйвер держал ровно один [`Runner`], и это было незаметно
 //! ровно до тех пор, пока транспорт был один. §5.4 описывает лестницу:
-//! LAN, меш Yggdrasil, onion, почта, — и лестница из одной ступени
+//! LAN, меш Yggdrasil, onion, nostr, почта, — и лестница из одной ступени
 //! не лестница.
 //!
 //! # Почему не `Box<dyn Runner>`
@@ -16,7 +16,8 @@
 //! компилятор перечисляет их сам.
 //!
 //! Чего ещё нет — [`Disabled`]: раннер, который честно отказывает. Сегодня
-//! это onion и почта, и отказ у них не заглушка, а правда о сборке.
+//! это nostr, а в сборке без признака — и onion с почтой; отказ у них
+//! не заглушка, а правда о сборке.
 //!
 //! # Отмена: требование к `next_event`
 //!
@@ -60,7 +61,8 @@ impl Runner for Disabled {
             // раннеру они не нужны, но и поломкой это не является.
             TransportCommand::SetEnabled { .. }
             | TransportCommand::SetMailAccount(_)
-            | TransportCommand::SetYgg(_) => Ok(()),
+            | TransportCommand::SetYgg(_)
+            | TransportCommand::SetNostr(_) => Ok(()),
             // А вот на это молчаливое согласие было бы обманом: человек
             // нажал «завести почту» и ждёт ящика, которого несобранный
             // раннер не заведёт. Отказ доедет до него словами.
@@ -71,7 +73,7 @@ impl Runner for Disabled {
 
     async fn next_event(&mut self) -> Option<TransportEvent> {
         // Именно вечное ожидание, а не `None`. `None` означает «раннер
-        // остановлен», и составной раннер, увидев его от всех троих, решил бы,
+        // остановлен», и составной раннер, увидев его от всех сразу, решил бы,
         // что транспорта в приложении не осталось вовсе, — а не собранный
         // транспорт и остановленный это разные вещи.
         std::future::pending().await
@@ -87,22 +89,23 @@ impl Runner for Disabled {
 /// собирая состав, легко перепутать соседние ступени местами, а типы
 /// в таком порядке заставляют читать сборку как лестницу.
 #[derive(Debug)]
-pub struct Transports<L, Y, O, M> {
+pub struct Transports<L, Y, O, N, M> {
     lan: L,
     ygg: Y,
     onion: O,
+    nostr: N,
     mail: M,
     /// Кто уже остановился.
     ///
     /// Нужно затем, чтобы остановка одного транспорта не выглядела остановкой
     /// всех. LAN, выключенный человеком, не должен уносить с собой onion.
-    stopped: [bool; 4],
+    stopped: [bool; 5],
 }
 
-impl<L: Runner, Y: Runner, O: Runner, M: Runner> Transports<L, Y, O, M> {
+impl<L: Runner, Y: Runner, O: Runner, N: Runner, M: Runner> Transports<L, Y, O, N, M> {
     /// Собирает состав.
-    pub fn new(lan: L, ygg: Y, onion: O, mail: M) -> Transports<L, Y, O, M> {
-        Transports { lan, ygg, onion, mail, stopped: [false; 4] }
+    pub fn new(lan: L, ygg: Y, onion: O, nostr: N, mail: M) -> Transports<L, Y, O, N, M> {
+        Transports { lan, ygg, onion, nostr, mail, stopped: [false; 5] }
     }
 
     /// LAN-раннер — за настройками, которые есть только у него.
@@ -125,6 +128,11 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Transports<L, Y, O, M> {
         &self.onion
     }
 
+    /// Раннер nostr.
+    pub fn nostr(&self) -> &N {
+        &self.nostr
+    }
+
     /// Почтовый раннер.
     pub fn mail(&self) -> &M {
         &self.mail
@@ -139,6 +147,7 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Transports<L, Y, O, M> {
             Transport::Lan => self.lan.execute(command).await,
             Transport::Ygg => self.ygg.execute(command).await,
             Transport::Onion => self.onion.execute(command).await,
+            Transport::Nostr => self.nostr.execute(command).await,
             Transport::Mail => self.mail.execute(command).await,
         }
     }
@@ -159,7 +168,9 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Transports<L, Y, O, M> {
     /// в котором потом потерялся бы настоящий отказ.
     async fn to_all(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         let mut failure = None;
-        for via in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+        for via in
+            [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Nostr, Transport::Mail]
+        {
             match self.to_one(via, command.clone()).await {
                 Ok(()) | Err(TransportError::Unavailable) => {}
                 Err(error) => {
@@ -174,7 +185,7 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Transports<L, Y, O, M> {
     }
 }
 
-impl<L: Runner, Y: Runner, O: Runner, M: Runner> Runner for Transports<L, Y, O, M> {
+impl<L: Runner, Y: Runner, O: Runner, N: Runner, M: Runner> Runner for Transports<L, Y, O, N, M> {
     async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         match &command {
             // Транспорт назван явно — §5.4 выбрал его и отвечает за выбор.
@@ -194,6 +205,8 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Runner for Transports<L, Y, O, 
             }
             // Ключ меша — тому, кто по нему слушает.
             TransportCommand::SetYgg(_) => self.ygg.execute(command).await,
+            // Ключ и реле nostr — тому, кто по ним подписывается.
+            TransportCommand::SetNostr(_) => self.nostr.execute(command).await,
             // А тут `via` нет, и знать, кто держит соединение с этим
             // контактом, может только сам раннер.
             TransportCommand::Disconnect { .. } => self.to_all(command).await,
@@ -220,7 +233,8 @@ impl<L: Runner, Y: Runner, O: Runner, M: Runner> Runner for Transports<L, Y, O, 
                 event = self.lan.next_event(), if !self.stopped[0] => (0, event),
                 event = self.ygg.next_event(), if !self.stopped[1] => (1, event),
                 event = self.onion.next_event(), if !self.stopped[2] => (2, event),
-                event = self.mail.next_event(), if !self.stopped[3] => (3, event),
+                event = self.nostr.next_event(), if !self.stopped[3] => (3, event),
+                event = self.mail.next_event(), if !self.stopped[4] => (4, event),
             };
 
             match event {
@@ -271,6 +285,7 @@ mod tests {
                 TransportCommand::SetMailAccount(_) => "mail-account",
                 TransportCommand::CreateMailAccount { .. } => "mail-create",
                 TransportCommand::SetYgg(_) => "ygg",
+                TransportCommand::SetNostr(_) => "nostr",
             };
             self.seen.lock().unwrap().push((self.name, what.to_owned()));
             if self.refuse {
@@ -288,7 +303,14 @@ mod tests {
     }
 
     fn peer() -> PeerAddress {
-        PeerAddress { ik: [1u8; 32], onion: None, chatmail: None, ygg: None }
+        PeerAddress {
+            ik: [1u8; 32],
+            onion: None,
+            chatmail: None,
+            ygg: None,
+            nostr: None,
+            nostr_relays: Vec::new(),
+        }
     }
 
     fn send(via: Transport) -> TransportCommand {
@@ -302,7 +324,8 @@ mod tests {
         let (onion, _o) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         transports.execute(send(Transport::Onion)).await.unwrap();
         transports.execute(send(Transport::Mail)).await.unwrap();
@@ -322,7 +345,8 @@ mod tests {
         let (onion, _o) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         transports
             .execute(TransportCommand::SetEnabled { transport: Transport::Lan, enabled: true })
@@ -348,7 +372,8 @@ mod tests {
         let (onion, _o) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         transports.execute(TransportCommand::NetworkChanged).await.unwrap();
 
@@ -356,7 +381,7 @@ mod tests {
         who.sort_unstable();
         assert_eq!(
             who,
-            vec!["lan", "mail", "onion", "ygg"],
+            vec!["lan", "mail", "nostr", "onion", "ygg"],
             "о смене сети обязана узнать каждая ступень"
         );
     }
@@ -370,12 +395,13 @@ mod tests {
         let (onion, _o) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         transports.execute(TransportCommand::Disconnect { peer: peer() }).await.unwrap();
 
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 4, "всем четверым: {seen:?}");
+        assert_eq!(seen.len(), 5, "всем пятерым: {seen:?}");
     }
 
     #[tokio::test]
@@ -388,11 +414,12 @@ mod tests {
         let (onion, _o) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         let verdict = transports.execute(TransportCommand::Disconnect { peer: peer() }).await;
         assert!(verdict.is_err(), "отказ обязан дойти до вызывающего");
-        assert_eq!(seen.lock().unwrap().len(), 4, "но обход дошёл до всех");
+        assert_eq!(seen.lock().unwrap().len(), 5, "но обход дошёл до всех");
     }
 
     #[tokio::test]
@@ -402,7 +429,8 @@ mod tests {
         let (onion, onion_tx) = Recorder::new("onion", &seen);
         let (mail, _m) = Recorder::new("mail", &seen);
         let (ygg, _y) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, _n) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         onion_tx
             .send(TransportEvent::Connected { peer_ik: [2u8; 32], via: Transport::Onion })
@@ -433,7 +461,8 @@ mod tests {
         let (onion, onion_tx) = Recorder::new("onion", &seen);
         let (mail, mail_tx) = Recorder::new("mail", &seen);
         let (ygg, ygg_tx) = Recorder::new("ygg", &seen);
-        let mut transports = Transports::new(lan, ygg, onion, mail);
+        let (nostr, nostr_tx) = Recorder::new("nostr", &seen);
+        let mut transports = Transports::new(lan, ygg, onion, nostr, mail);
 
         drop(lan_tx);
         onion_tx
@@ -442,13 +471,14 @@ mod tests {
             .unwrap();
         assert!(transports.next_event().await.is_some(), "остановка LAN не отменяет событий onion");
 
-        // Меш роняется вместе с остальными, и забыть его нельзя: живой
-        // отправитель у одной ступени означает, что «все встали» никогда
-        // не наступит, и проверка не падает, а **виснет**. Так и вышло
-        // при добавлении четвёртой ступени.
+        // Роняются **все**, и забыть хоть одного нельзя: живой отправитель
+        // у одной ступени означает, что «все встали» никогда не наступит,
+        // и проверка не падает, а **виснет**. Так и вышло при добавлении
+        // четвёртой ступени, и ровно так вышло бы при добавлении пятой.
         drop(onion_tx);
         drop(mail_tx);
         drop(ygg_tx);
+        drop(nostr_tx);
         assert!(transports.next_event().await.is_none(), "а когда встали все — вот теперь конец");
     }
 
@@ -458,9 +488,10 @@ mod tests {
         // кадр ушёл, и не перешёл бы к следующей ступени.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (lan, _l) = Recorder::new("lan", &seen);
-        let mut transports = Transports::new(lan, Disabled, Disabled, Disabled);
+        let mut transports = Transports::new(lan, Disabled, Disabled, Disabled, Disabled);
 
         assert!(transports.execute(send(Transport::Onion)).await.is_err());
+        assert!(transports.execute(send(Transport::Nostr)).await.is_err());
         assert!(transports.execute(send(Transport::Mail)).await.is_err());
         assert!(seen.lock().unwrap().is_empty(), "и до LAN это не дошло");
 

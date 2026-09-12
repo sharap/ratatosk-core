@@ -163,6 +163,7 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
+                | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::NetworkChanged => {}
             }
@@ -301,6 +302,8 @@ fn a_deadline_without_a_receipt_is_a_failure_not_a_success() {
         display_name: "призрак".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let ghost_ik = card.ik;
     alice
@@ -374,6 +377,8 @@ fn lan_only_contact(node: &mut Node, seed: u8) -> [u8; 32] {
         display_name: "сосед".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let peer_ik = card.ik;
     node.step(
@@ -740,7 +745,16 @@ fn an_avatar_from_an_unverified_contact_is_kept_but_hidden() {
     alice
         .step(0, Input::Command(Command::AddContact { card_bytes: b_card, met_in_person: true }))
         .unwrap();
-    alice.step(500, Input::Command(Command::SetAvatar(avatar(4)))).unwrap();
+    // **Эффекты смены лица обязаны быть прокачаны**, и это не придирка
+    // к тесту, а следствие переезда аватарки на очередь §5.4. Раньше она
+    // уходила только по живой сессии, то есть при её отсутствии не порождала
+    // ничего. Теперь порождает — и, как всякая постановка в очередь, начинает
+    // рукопожатие. Выброси мы эти эффекты, `ensure_handshake` при следующей
+    // отправке увидел бы рукопожатие уже в пути и правильно не начал бы
+    // второго: текст не уехал бы, Боб не узнал бы Алису вовсе. Ровно этот
+    // разбор записан у `introduce_and_settle`.
+    let effects = alice.step(500, Input::Command(Command::SetAvatar(avatar(4)))).unwrap();
+    pump(&mut alice, &mut bob, 500, effects);
 
     // Боб узнаёт Алису из рукопожатия (§8.2), то есть несверенной.
     let effects = send_text(&mut alice, &bob, 1_000, "привет");
@@ -804,6 +818,130 @@ fn an_unverified_contact_gets_no_avatar() {
     assert!(
         events.iter().any(|e| matches!(e, Event::AvatarChanged { .. })),
         "сверка обязана открыть контакту лицо: {events:?}"
+    );
+}
+
+#[test]
+fn an_avatar_reaches_a_contact_only_mail_can_reach() {
+    // Ради этого всё и переделано. Аватарка уходила **мимо очереди** —
+    // готовым кадром по живой сессии прямого канала, — и потому до
+    // собеседника, до которого достаёт только почта или реле, не доезжала
+    // никогда. Ни сейчас, ни потом: второго повода разослать лицо не бывает.
+    //
+    // Теперь она едет `enqueue_request`, то есть лестницей §5.4 — той же
+    // дорогой, что и обновление карточки §4.3, которое почтой ходило
+    // с самого начала.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    mail_only(&mut alice);
+    mail_only(&mut bob);
+    introduce_and_settle(&mut alice, &mut bob, 1_000);
+
+    let effects =
+        alice.step(2_000, Input::Command(Command::SetAvatar(avatar(5)))).expect("аватарка принята");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Send { via: Transport::Mail, .. })),
+        "лицо обязано уехать почтой: {effects:?}"
+    );
+
+    let events = pump(&mut alice, &mut bob, 2_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::AvatarChanged { .. })),
+        "получатель не узнал о лице: {events:?}"
+    );
+    assert_eq!(
+        bob.avatar_of(&alice.own_card().ik).unwrap(),
+        Some(avatar(5)),
+        "лицо обязано доехать и показаться: контакт сверен при встрече"
+    );
+}
+
+#[test]
+fn an_avatar_is_answered_with_a_receipt_only_where_receipts_ride() {
+    // Здесь стояло «приём лица обязан ответить квитанцией» — без оговорки,
+    // и проверка справедливо упала. §9.4: квитанции ходят **только прямыми
+    // каналами**; почтой каждая была бы отдельным письмом, то есть удвоением
+    // трафика и метаданных у сервера.
+    //
+    // Требование метелки `receipt_wiring` этому не противоречит: она требует,
+    // чтобы приём **звал** `send_receipt`, а уже он решает по §9.4, ехать ли.
+    // Цепочка, ради которой метелка заведена, живёт на прямом канале — там
+    // срок читается как `Failure::Silent` и отправляет сессию на покой.
+    // У почты попытка закрывается самой отправкой, и подтверждать нечего.
+    //
+    // Обе половины в одном тесте нарочно: порознь каждая выглядит
+    // работающей, а вместе они и есть правило.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    // Прямой канал: квитанция обязана быть.
+    let effects =
+        alice.step(2_000, Input::Command(Command::SetAvatar(avatar(6)))).expect("аватарка принята");
+    let (via, frame) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send { via, frame, .. } => Some((*via, frame.clone())),
+            _ => None,
+        })
+        .expect("лицо обязано уехать");
+    assert!(via.is_direct(), "обмен идёт прямым каналом: {via:?}");
+    let back = bob.step(2_100, Input::Received { via, frame }).expect("лицо принимается");
+    assert!(
+        back.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "по прямому каналу приём лица обязан ответить квитанцией: {back:?}"
+    );
+
+    // Почта: квитанции нет, и это не пробел, а §9.4.
+    let (mut carol, mut dave) = (node(3, "carol"), node(4, "dave"));
+    mail_only(&mut carol);
+    mail_only(&mut dave);
+    introduce_and_settle(&mut carol, &mut dave, 1_000);
+    let effects =
+        carol.step(2_000, Input::Command(Command::SetAvatar(avatar(7)))).expect("аватарка принята");
+    let letter = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Send { via: Transport::Mail, frame, .. } => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("лицо обязано уехать письмом");
+    let back = dave
+        .step(2_100, Input::Received { via: Transport::Mail, frame: letter })
+        .expect("лицо принимается");
+    assert!(
+        !back.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "почтой квитанции не ходят (§9.4): {back:?}"
+    );
+    assert!(
+        back.iter().any(|e| matches!(e, Effect::Notify(Event::AvatarChanged { .. }))),
+        "но само лицо обязано приехать: {back:?}"
+    );
+}
+
+#[test]
+fn a_face_is_not_offered_twice_in_one_run() {
+    // Поводов отправить лицо два — смена и установление сессии, — и на одном
+    // контакте они легко сходятся. Тридцать два килобайта на пустом месте
+    // дороже, чем четыреста байт карточки, поэтому отметка та же, что
+    // у `card_pushed`.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let effects =
+        alice.step(2_000, Input::Command(Command::SetAvatar(avatar(8)))).expect("аватарка принята");
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    // Сверка — ещё один повод предложить лицо, и вот его-то отметка
+    // и обязана погасить: Боб уже сверен, лицо уже уехало.
+    let again = alice
+        .step(3_000, Input::Command(Command::MarkVerified { peer_ik: bob.own_card().ik }))
+        .expect("повторная сверка принимается");
+    assert!(
+        !again.iter().any(|e| matches!(e, Effect::Send { .. })),
+        "лицо уже уехало — второй раз посылать нечего: {again:?}"
     );
 }
 
@@ -5198,6 +5336,7 @@ fn pump_many(
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
+                | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::NetworkChanged => {}
             }
@@ -5631,6 +5770,8 @@ fn a_file_that_has_nowhere_to_go_says_so_by_name() {
         display_name: "сосед".into(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     alice
         .step(

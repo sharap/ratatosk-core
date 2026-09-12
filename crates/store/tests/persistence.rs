@@ -2741,3 +2741,75 @@ fn putting_a_known_file_again_keeps_what_we_have_in_memory() {
     store.migrate().unwrap();
     putting_a_known_file_again_keeps_what_we_have_on("память", &mut store);
 }
+
+#[test]
+fn the_handshake_replay_cache_survives_a_restart() {
+    // Ради этого всё и написано. §8.3 назначает записи кэша срок в тридцать
+    // суток, а кэш жил в памяти — то есть срок не значил ничего. Ступень nostr
+    // сделала это видимым: реле хранит события и отдаёт их снова после старта,
+    // и забывчивый кэш принимал давнее рукопожатие как новое.
+    //
+    // Таблица под это лежала в схеме с самой первой миграции и не
+    // использовалась ни разу.
+    let db = TempDb::new("handshake-seen");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_handshake_seen(&[1u8; 32], 1_000).unwrap();
+    store.put_handshake_seen(&[2u8; 32], 2_000).unwrap();
+    // Повтор не заводит второй строки и **не** обновляет время: срок идёт
+    // от первой встречи, иначе настойчивый повтор продлевал бы запись вечно.
+    store.put_handshake_seen(&[1u8; 32], 9_000).unwrap();
+    drop(store);
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let seen = store.handshake_seen(0).unwrap();
+    assert_eq!(seen.len(), 2, "обе записи пережили перезапуск");
+    assert_eq!(seen[0], ([1u8; 32], 1_000), "и порядок — от старых к новым");
+    assert_eq!(seen[1], ([2u8; 32], 2_000));
+}
+
+#[test]
+fn the_handshake_replay_cache_is_cut_by_age_both_ways() {
+    // Срок отсекается дважды — уборкой и при чтении. База могла пролежать
+    // дольше срока, и просроченные записи не должны воскресать вместе с ней.
+    let db = TempDb::new("handshake-age");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+
+    store.put_handshake_seen(&[3u8; 32], 100).unwrap();
+    store.put_handshake_seen(&[4u8; 32], 900).unwrap();
+
+    assert_eq!(store.handshake_seen(500).unwrap().len(), 1, "чтение отсекает старое");
+
+    store.prune_handshake_seen(500).unwrap();
+    let left = store.handshake_seen(0).unwrap();
+    assert_eq!(left, vec![([4u8; 32], 900)], "уборка убрала то же самое");
+}
+
+#[test]
+fn the_memory_store_keeps_the_handshake_cache_the_same_way() {
+    // Два хранилища обязаны вести себя одинаково: на `MemoryStore` живут
+    // и стенд без `--data`, и симуляция §16, и почти все проверки ядра.
+    // Разойдись они — поломка нашлась бы только на телефоне.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+
+    // Отпечатки нарочно взяты так, что порядок по хэшу и порядок по времени
+    // **противоположны**: карта в памяти упорядочена ключом, и отдай она
+    // записи этим порядком, уборка в кэше остановилась бы на первой же
+    // «ещё свежей».
+    store.put_handshake_seen(&[9u8; 32], 100).unwrap();
+    store.put_handshake_seen(&[9u8; 32], 800).unwrap();
+    store.put_handshake_seen(&[1u8; 32], 900).unwrap();
+
+    assert_eq!(
+        store.handshake_seen(0).unwrap(),
+        vec![([9u8; 32], 100), ([1u8; 32], 900)],
+        "от старых к новым, и повтор не обновил время"
+    );
+    assert_eq!(store.handshake_seen(500).unwrap(), vec![([1u8; 32], 900)]);
+
+    store.prune_handshake_seen(500).unwrap();
+    assert_eq!(store.handshake_seen(0).unwrap(), vec![([1u8; 32], 900)]);
+}

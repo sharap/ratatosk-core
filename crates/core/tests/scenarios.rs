@@ -51,6 +51,7 @@ fn to_proto(kind: TransportKind) -> Transport {
         TransportKind::Lan => Transport::Lan,
         TransportKind::Ygg => Transport::Ygg,
         TransportKind::Onion => Transport::Onion,
+        TransportKind::Nostr => Transport::Nostr,
         TransportKind::Mail => Transport::Mail,
     }
 }
@@ -60,6 +61,7 @@ fn to_sim(transport: Transport) -> TransportKind {
         Transport::Lan => TransportKind::Lan,
         Transport::Ygg => TransportKind::Ygg,
         Transport::Onion => TransportKind::Onion,
+        Transport::Nostr => TransportKind::Nostr,
         Transport::Mail => TransportKind::Mail,
     }
 }
@@ -145,6 +147,7 @@ impl Node {
                 | Effect::WatchLanPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
+                | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
                 | Effect::NetworkChanged => {}
             }

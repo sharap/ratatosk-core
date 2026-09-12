@@ -244,6 +244,8 @@ async fn a_peer_that_accepts_but_stays_silent_leaves_the_message_waiting() {
         display_name: "молчун".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let ghost_ik = ghost_card.ik;
     let bytes = ghost_card.encode().expect("карточка кодируется");
@@ -284,6 +286,8 @@ async fn a_peer_that_never_answers_leaves_the_message_waiting() {
         display_name: "призрак".to_owned(),
         version: 1,
         ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
     };
     let ghost_ik = ghost_card.ik;
     let bytes = ghost_card.encode().expect("карточка кодируется");

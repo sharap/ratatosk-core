@@ -32,7 +32,8 @@ use ratatosk_proto::group::{self, Group, GroupId};
 use ratatosk_proto::mail::{AccountUrl, MailAccount, Secret};
 use ratatosk_proto::receipts::{Receipt, MAX_RECEIPT_IDS};
 use ratatosk_proto::transport_policy::{
-    Attempt, Decision, PeerAvailability, Reachability, SessionBinding, TransportSet,
+    receipt_timeout_ms, Attempt, Decision, PeerAvailability, Reachability, SessionBinding,
+    TransportSet,
 };
 use ratatosk_proto::{DeliveryStatus, SessionRegistry, Transport};
 use ratatosk_store::{
@@ -730,6 +731,21 @@ struct UnsentReply {
     via: Transport,
     /// Кадр целиком, как он уже уходил.
     frame: Vec<u8>,
+    /// Когда ответ посылали **заново** в последний раз, если посылали.
+    ///
+    /// **Нужно, чтобы не слать его пачкой.** Поводов «собеседника снова
+    /// слышно» подряд бывает несколько: кадр пришёл принятым каналом,
+    /// следом приехал список контактов, следом опознались уже услышанные
+    /// объявления. На стенде ответ на рукопожатие ушёл от этого три раза
+    /// за сто двадцать миллисекунд — в самой узкой полосе из шести
+    /// ступеней (§5.5), и ни один повтор ничего не добавил: ответа
+    /// на первый ещё физически не могло быть.
+    ///
+    /// Считается именно от **повтора**, а не от первой отправки. Первый
+    /// повтор обязан уйти сразу: он и нужен затем, что первая отправка
+    /// не удалась, — ровно ради этого случая весь `unsent_replies`
+    /// и заведён. Сдерживаются только второй и дальше.
+    resent_ms: Option<u64>,
 }
 
 /// Сообщение в очереди доставки.
@@ -5557,6 +5573,17 @@ impl<S: Store> Engine<S> {
             self.sending.iter_mut().find(|s| s.file_id == file.file_id && s.peer_ik == peer_ik)
         {
             slot.sent_upto = next;
+        }
+        // **Только когда что-то действительно ушло.** `pump_file` зовётся
+        // и вхолостую — окно закрыто, ждём подтверждения, — и строка
+        // на каждый такой заход была бы не ходом передачи, а шумом.
+        if next > sending.sent_upto {
+            effects.push(Effect::Notify(Event::FileSending {
+                file_id: file.file_id,
+                peer_ik,
+                sent: next,
+                total: file.chunk_total,
+            }));
         }
         Ok(effects)
     }
@@ -11526,18 +11553,77 @@ impl<S: Store> Engine<S> {
     /// это сообщение ждало. Вызывающий обязан посмотреть на ответ, а не
     /// на свой вопрос, — иначе сессия появится на одной ступени, а отправка
     /// пойдёт по другой.
+    /// # Исчерпанная лестница — повод повторить, а не начать заново
+    ///
+    /// **Разбор четвёртой поломки эфирной дуги, и самой дорогой.** На стенде
+    /// десктоп отправил телефону **четыре** первых шага за полсекунды, три
+    /// из них — за пятьсот микросекунд. Кадры были разные, то есть каждый
+    /// нёс свой эфемерный ключ Noise; телефон честно завёл четыре сессии,
+    /// каждая вытеснила предыдущую, и осталась четвёртая. Десктоп разобрал
+    /// **первый** ответ, закрыл рукопожатие и оставил себе первую. Дальше
+    /// двенадцать кадров подряд «тег не сошёлся», и само это уже
+    /// не выправлялось.
+    ///
+    /// Откуда четыре. Лестница §5.4 в эфире одноступенчата: кроме радио
+    /// пробовать нечего. Первый же отказ объявляет попытку исчерпанной,
+    /// а исчерпанное рукопожатие [`Engine::retry_handshake`] выбрасывало —
+    /// иначе запись в `pending` заперла бы этот вход навсегда. Выброшенное,
+    /// оно переставало быть «уже в пути», и следующее сообщение из очереди
+    /// чеканило новое. В очереди стояла сотня кадров замера.
+    ///
+    /// Правило: **новый эфемерный ключ только при смене семейства
+    /// транспортов.** То же семейство — тот же самый кадр, байт в байт;
+    /// ровно так уже поступает `retry_handshake`, переходя внутри семьи,
+    /// и здесь это просто перестаёт быть исключением.
+    ///
+    /// Повторный кадр ничего не ломает у получателя: он побайтно тот же,
+    /// его ловит `HandshakeReplayGuard`, и ответ уходит прежний
+    /// (`HandshakeOutcome::Repeat`) — та самая ветка, что спасает контакт
+    /// с потерянным первым ответом. Сессия у него остаётся одна.
+    ///
+    /// Запереть вход это тоже больше не может: повторив кадр, мы заводим
+    /// попытке новый срок, и она перестаёт быть исчерпанной — то есть
+    /// следующее сообщение снова ждёт, а не шлёт.
     fn ensure_handshake(
         &mut self,
         peer_ik: [u8; 32],
         transport: Transport,
     ) -> Result<(Vec<Effect>, Transport), EngineError> {
-        if let Some(pending) = self.pending.iter().find(|p| p.peer_ik == peer_ik) {
+        let Some(at) = self.pending.iter().position(|p| p.peer_ik == peer_ik) else {
+            return Ok((self.begin_handshake(peer_ik, transport)?, transport));
+        };
+        if !self.pending[at].attempt.is_finished() {
             // Второе рукопожатие только потратило бы ещё одну операцию
             // у получателя и породило вторую сессию.
-            let on = pending.attempt.tried().last().copied().unwrap_or(transport);
+            let on = self.pending[at].attempt.tried().last().copied().unwrap_or(transport);
             return Ok((Vec::new(), on));
         }
-        Ok((self.begin_handshake(peer_ik, transport)?, transport))
+
+        // Лестница кончилась, а рукопожатие всё ещё нужно. Повторяем его
+        // с начала лестницы — и **тем же кадром**, если семейство то же.
+        let availability = self.availability_of(&peer_ik)?;
+        let mut attempt = Attempt::new();
+        walk_attempt_to(&mut attempt, availability, transport);
+        let binding = SessionBinding::of(transport);
+        let frame = if binding == self.pending[at].binding {
+            self.pending[at].frame.clone()
+        } else {
+            // Другое семейство — и вот здесь новый ключ обязателен: сессия
+            // семейству принадлежит (§5.4), и прежнее состояние `snow`
+            // к этой ступени не относится.
+            let card = self.own_card().encode()?;
+            let (message, state) = Initiator::start(&self.identity, &peer_ik, &card)?;
+            let frame = self.handshake_frame(HANDSHAKE_STEP_FIRST, &message)?;
+            self.pending[at].state = state;
+            self.pending[at].frame = frame.clone();
+            frame
+        };
+        let (handoff, token, set_timer) = self.arm_handshake(&attempt, transport);
+        let pending = &mut self.pending[at];
+        pending.attempt = attempt;
+        pending.binding = binding;
+        pending.timer = Some(token);
+        Ok((vec![Effect::Send { peer_ik, via: transport, frame, handoff }, set_timer], transport))
     }
 
     fn allocate_timer(&mut self) -> u64 {
@@ -11720,13 +11806,21 @@ impl<S: Store> Engine<S> {
                 Some(Decision::Undeliverable) | None => step = HandshakeStep::Exhausted,
             }
         }
-        // Исчерпанное рукопожатие выбрасывается. Оставшись, оно не только
-        // текло бы памятью, но и блокировало `ensure_handshake`: тот считает
-        // запись в `pending` признаком «рукопожатие уже в пути», и следующая
-        // попытка связаться с этим контактом не началась бы никогда.
-        if step == HandshakeStep::Exhausted {
-            pending.retain(|p| p.peer_ik != peer_ik || !p.attempt.is_finished());
-        }
+        // **Исчерпанное рукопожатие остаётся, и это правка поломки.**
+        //
+        // Здесь стояло `pending.retain(…)`: запись выбрасывалась, чтобы
+        // не запереть [`Engine::ensure_handshake`] — тот считает запись
+        // в `pending` признаком «рукопожатие уже в пути». Лекарство вышло
+        // хуже болезни. Выброшенное рукопожатие переставало существовать,
+        // и следующее сообщение из очереди чеканило **новое** — с новым
+        // эфемерным ключом Noise. На одноступенчатой лестнице эфира, где
+        // отказ исчерпывает попытку сразу, сотня кадров замера дала
+        // четыре рукопожатия за полсекунды и разошедшиеся сессии
+        // у сторон. Разбор целиком — у `ensure_handshake`.
+        //
+        // Запирания теперь нет по другой причине: `ensure_handshake`,
+        // увидев исчерпанную попытку, повторяет **прежний** кадр и заводит
+        // ей новый срок. Вход открыт, а ключ не меняется.
         self.pending = pending;
         Ok((effects, step))
     }
@@ -12312,7 +12406,7 @@ impl<S: Store> Engine<S> {
             // круг. Именно этот случай и разбирается в `unsent_replies`:
             // мы поздоровались в ответ, когда отвечать было некуда,
             // и вот собеседника стало слышно.
-            effects.extend(self.resend_reply(peer_ik, via));
+            effects.extend(self.resend_reply(now_ms, peer_ik, via));
             // И то, что не уехало раньше: он снова в сети.
             effects.extend(self.retry_deferred(Some(peer_ik))?);
             // Недокачанные файлы спрашиваются здесь же — но только если
@@ -12336,7 +12430,12 @@ impl<S: Store> Engine<S> {
     /// плоха.
     fn remember_reply(&mut self, peer_ik: [u8; 32], via: Transport, frame: &[u8]) {
         self.unsent_replies.retain(|held| held.peer_ik != peer_ik || held.via != via);
-        self.unsent_replies.push(UnsentReply { peer_ik, via, frame: frame.to_vec() });
+        self.unsent_replies.push(UnsentReply {
+            peer_ik,
+            via,
+            frame: frame.to_vec(),
+            resent_ms: None,
+        });
     }
 
     /// Забывает ответ: доказано, что собеседник его получил.
@@ -12349,18 +12448,29 @@ impl<S: Store> Engine<S> {
     /// Запись при этом **остаётся**: слышимость не есть доставка. Уйдёт она
     /// только по [`Engine::forget_reply`], то есть по первому кадру сессии —
     /// единственному доказательству, которое у нас бывает.
-    fn resend_reply(&mut self, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
+    fn resend_reply(&mut self, now_ms: u64, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
         let Some(held) =
-            self.unsent_replies.iter().find(|held| held.peer_ik == peer_ik && held.via == via)
+            self.unsent_replies.iter_mut().find(|held| held.peer_ik == peer_ik && held.via == via)
         else {
             return Vec::new();
         };
+        // **Не чаще круга — начиная со второго повтора.** Поводов
+        // «собеседника снова слышно» подряд бывает несколько, и без этой
+        // проверки ответ уходил пачкой: на стенде трижды за сто двадцать
+        // миллисекунд. Ответа на первый к тому времени не могло быть
+        // физически — круг по эфиру длиннее всей этой пачки.
+        let gap = receipt_timeout_ms(via, held.frame.len()).unwrap_or(0);
+        if held.resent_ms.is_some_and(|last| now_ms.saturating_sub(last) < gap) {
+            return Vec::new();
+        }
+        held.resent_ms = Some(now_ms);
+        let frame = held.frame.clone();
         tracing::info!(
             peer = %short_ik(&peer_ik),
             ?via,
             "ответ на рукопожатие уходит заново: собеседника снова слышно"
         );
-        vec![Effect::Send { peer_ik, via, frame: held.frame.clone(), handoff: None }]
+        vec![Effect::Send { peer_ik, via, frame, handoff: None }]
     }
 
     /// Обнаружение ответило (или кончился срок) — двигаем отложенное.

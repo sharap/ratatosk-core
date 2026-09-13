@@ -201,10 +201,12 @@ impl FfiBluetooth {
     /// переписывается.
     pub fn on_heard(&self, payload: Vec<u8>, address: Vec<u8>, random: bool) {
         let Some(address) = FfiBluetooth::address(&address) else {
-            // `eprintln!`, а не `tracing`: у этого крейта журнала нет
-            // и заводить его ради одной строки не стоит — так же
-            // записывает свою беду `tracing_stop`.
-            eprintln!("ratatosk: эфир: адрес не шести байт ({})", address.len());
+            // Через `tracing`, как и весь остальной журнал. Стояло здесь
+            // `eprintln!` с оговоркой «у этого крейта журнала нет» — и это
+            // было правдой ровно до `enable_logging`: на Android системный
+            // поток ошибок уходит в никуда, так что строка была написана
+            // в пустоту.
+            tracing::warn!(длина = address.len(), "эфир: адрес не шести байт");
             return;
         };
         self.air.on_heard(&payload, address, random);

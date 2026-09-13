@@ -36,7 +36,10 @@ use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::{note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress, DialFuture};
+use super::{
+    dial_attempt_limit, note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress,
+    DialFuture,
+};
 use crate::link::spawn_read_loop;
 use crate::runner::{TransportError, TransportEvent};
 
@@ -98,19 +101,6 @@ const BUSY_PAUSE: Duration = Duration::from_millis(250);
 /// не кончается, означает другое: адреса больше нет. Ждать его дольше
 /// нечем: приватный адрес проворачивается, и прежний не оживёт.
 const BUSY_TRIES: u32 = 2;
-
-/// Сколько ждать одну попытку набора, прежде чем считать адрес мёртвым.
-///
-/// Три секунды. Довод измеренный, а не выбранный: удавшиеся наборы
-/// на стенде занимали 60, 338 и 438 миллисекунд — запас семикратный.
-///
-/// Нужен этот предел из-за телефона. Android **объявляется одним
-/// приватным адресом, а подключается другим** (замечено на стенде:
-/// объявление с `67:0C:…`, входящий канал с `72:A6:…`), и набор
-/// по объявленному не удаётся никогда. Без предела каждое первое
-/// сообщение стоило бы полного срока §5.4 — десяти секунд ожидания
-/// там, где ответ известен заранее.
-const ATTEMPT_LIMIT: Duration = Duration::from_secs(3);
 
 /// Как часто спрашивать канал, готов ли он на самом деле.
 ///
@@ -850,6 +840,11 @@ async fn dial(
         tokio::time::sleep(RADIO_HANDOVER).await;
     }
 
+    // Предел одной попытки зависит от того, каков адрес: постоянному
+    // собеседнику дают дозвониться, приватный проверяют накоротке.
+    // Само правило — не здесь: оно протокольное (`dial_attempt_limit`).
+    let attempt = dial_attempt_limit(target.random);
+
     let mut busy_tries = 0u32;
     let stream = loop {
         let left = budget.saturating_sub(started.elapsed());
@@ -861,12 +856,11 @@ async fn dial(
             );
             return Err(TransportError::Timeout);
         }
-        // Каждой попытке — свой предел, а не весь остаток бюджета.
-        // Довод измеренный: удавшиеся наборы занимали 60, 338 и 438 мс,
-        // то есть три секунды — семикратный запас. Висящий дольше `connect`
-        // не «медленный», он мёртвый: адрес, по которому нас ждут, у BLE
-        // отвечает сразу или не отвечает вовсе.
-        match tokio::time::timeout(left.min(ATTEMPT_LIMIT), Stream::connect(sa)).await {
+        // Каждой попытке — свой предел, а не весь остаток бюджета:
+        // висящий дольше `connect` не «медленный», он мёртвый, и следующая
+        // попытка упрётся в тот же адрес. Сколько именно ждать — решено
+        // выше по адресу, а не здесь.
+        match tokio::time::timeout(left.min(attempt), Stream::connect(sa)).await {
             Ok(Ok(stream)) => break stream,
             // «Операция уже идёт» — не отказ, а **занятость**: к этому
             // устройству уже тянут связь, и через мгновение она либо
@@ -920,7 +914,8 @@ async fn dial(
                 tracing::warn!(
                     адрес = %super::radio_address(&target.addr),
                     psm = target.psm,
-                    попытка_мс = ATTEMPT_LIMIT.as_millis(),
+                    случайный = target.random,
+                    попытка_мс = attempt.as_millis(),
                     "эфир: набор повис — похоже, по этому адресу никого нет"
                 );
                 return Err(TransportError::Timeout);

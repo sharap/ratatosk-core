@@ -1777,7 +1777,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1842,6 +1842,9 @@ async fn console(
     let mut tor: Option<String> = None;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut peer: Option<[u8; 32]> = None;
+    // Замер эфира. Живёт в петле, а не в `report`: считать надо по ходу,
+    // а `report` про состояние стенда ничего не знает и знать не должен.
+    let mut probe: Option<Probe> = None;
 
     loop {
         tokio::select! {
@@ -2568,6 +2571,51 @@ async fn console(
                 // единого сообщения. Первая же попытка проверить многочастный
                 // кадр с клавиатуры дала «текст режется примерно на 4000
                 // символов», и выглядело это как наша поломка.
+                if line == "/probe" || line.starts_with("/probe ") {
+                    let rest = line.strip_prefix("/probe").unwrap_or_default().trim();
+                    if rest.is_empty() {
+                        match &probe {
+                            Some(held) => held.tally(),
+                            None => println!("{PROBE_USAGE}"),
+                        }
+                        continue;
+                    }
+                    let mut words = rest.split_whitespace();
+                    let Some(class) = words.next().and_then(probe_class) else {
+                        println!("{PROBE_USAGE}");
+                        continue;
+                    };
+                    let count: usize = match words.next() {
+                        Some(word) => word.parse().unwrap_or(0),
+                        None => Probe::default_count(class),
+                    };
+                    if count == 0 || count > PROBE_MAX {
+                        println!("{PROBE_USAGE}");
+                        continue;
+                    }
+                    if peer.is_none() {
+                        peer = sole_contact(&handle).await;
+                    }
+                    let Some(ik) = peer else {
+                        println!("< писать некому: /add <карточка> [ip:порт]");
+                        continue;
+                    };
+                    let Some(started) = Probe::start(class, count) else {
+                        println!("< столько не влезает ни в один класс кадра");
+                        continue;
+                    };
+                    started.announce();
+                    let chat = Engine::<MemoryStore>::chat_id_for(&ik);
+                    for _ in 0..count {
+                        let text = long_text(started.text_bytes);
+                        if handle.send(Command::SendText { chat, text }).await.is_err() {
+                            return;
+                        }
+                    }
+                    probe = Some(started);
+                    continue;
+                }
+
                 if line == "/long" || line.starts_with("/long ") {
                     let rest = line.strip_prefix("/long").unwrap_or_default().trim();
                     let kib: usize = if rest.is_empty() { 8 } else { rest.parse().unwrap_or(0) };
@@ -2696,8 +2744,18 @@ async fn console(
                             }
                         }
                     }
-                    Event::StatusChanged { .. }
-                    | Event::MessagesDeleted { .. }
+                    // Замер считает **доставленные**: квитанция — это
+                    // доказательство того, что кадр расшифровался на той
+                    // стороне, то есть доехал целым. Ничего точнее у нас
+                    // нет и быть не может.
+                    Event::StatusChanged { msg_id, status } => {
+                        if let Some(held) = probe.as_mut() {
+                            if held.note(*msg_id, *status) {
+                                held.tally();
+                            }
+                        }
+                    }
+                    Event::MessagesDeleted { .. }
                     | Event::MessageEdited { .. }
                     | Event::ReactionChanged { .. }
                     | Event::ContactChanged { .. }
@@ -2709,6 +2767,7 @@ async fn console(
                     | Event::GroupRenamed { .. }
                     | Event::GroupAvatarChanged { .. }
                     | Event::FileProgress { .. }
+                    | Event::FileSending { .. }
                     | Event::FileGone { .. }
                     // Печатается в `report`, а здесь делать нечего: ход
                     // подъёма Tor ничего не меняет в состоянии стенда.
@@ -3043,6 +3102,143 @@ const LONG_MARK: &str = "RK-LONG";
 /// Голова и хвост несут **объявленную длину**, между ними — нумерованные
 /// блоки по девять байт. Обрыв поэтому и виден, и локализуется: хвоста нет,
 /// а последний целый блок называет своё место.
+/// Как звать замер, если позвали неправильно.
+const PROBE_USAGE: &str = "\
+< нужно: /probe <s|m|l> [сколько] — класс кадра и сколько их послать
+    s — 4 КиБ, m — 64 КиБ, l — мебибайт; без числа берётся разумное
+    /probe без слов печатает итог начатого замера";
+
+/// Больше этого за один замер не шлём: цифры от этого точнее не станут,
+/// а эфир занят будет надолго.
+const PROBE_MAX: usize = 100;
+
+/// Замер эфира: сколько кадров такого класса доехало и за какое время.
+///
+/// # Зачем он вообще нужен
+///
+/// Про кадры в эфире у нас были **впечатления**, а не числа: «класс S
+/// доходит всегда», «M иногда теряется», «L никогда». Решение же от них
+/// зависит прямое — каким классом возить чанки файлов (§10.2) и стоит ли
+/// заводить четвёртый класс между S и M. Впечатление «иногда» годится
+/// для разговора и не годится для правки протокола.
+///
+/// Считает он **доставленные**, и это не выбор из удобства: квитанция
+/// (§9.4) означает, что кадр расшифровался на той стороне, то есть доехал
+/// целым. Ничего точнее у отправителя нет и быть не может — испорченный
+/// кадр молча отбрасывается получателем, и сказать о нём некому.
+struct Probe {
+    /// Какой класс меряем.
+    class: ratatosk_proto::SizeClass,
+    /// Сколько послали.
+    count: usize,
+    /// Сколько полезных байт в каждом.
+    text_bytes: usize,
+    /// Когда начали.
+    started: std::time::Instant,
+    /// Что услышали про каждое сообщение.
+    seen: std::collections::BTreeMap<[u8; 16], DeliveryStatus>,
+}
+
+impl Probe {
+    /// Сколько кадров слать, если человек не назвал число.
+    ///
+    /// У класса L своё: двадцать мебибайт по эфиру — это полчаса, и такой
+    /// замер человек прервёт раньше, чем он кончится.
+    fn default_count(class: ratatosk_proto::SizeClass) -> usize {
+        match class {
+            ratatosk_proto::SizeClass::L => 3,
+            _ => 20,
+        }
+    }
+
+    /// Заводит замер, подобрав длину текста под класс.
+    ///
+    /// Текст берётся **под завязку** класса: меряем худший случай, ради
+    /// которого всё и затевалось. Класс пересчитывается той же арифметикой,
+    /// что у ядра (`smallest_for`), и если он вышел другим — замер
+    /// не заводится вовсе: инструмент, врущий о том, что померил, хуже
+    /// отсутствующего.
+    fn start(class: ratatosk_proto::SizeClass, count: usize) -> Option<Probe> {
+        let text_bytes =
+            class.max_payload().checked_sub(ratatosk_proto::files::ENVELOPE_RESERVE_BYTES)?;
+        let with_envelope = text_bytes + ratatosk_proto::files::ENVELOPE_RESERVE_BYTES;
+        if ratatosk_proto::SizeClass::smallest_for(with_envelope) != Some(class) {
+            return None;
+        }
+        Some(Probe {
+            class,
+            count,
+            text_bytes,
+            started: std::time::Instant::now(),
+            seen: std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Говорит, что и сколько сейчас поедет.
+    fn announce(&self) {
+        println!(
+            "< замер: {} кадров класса {:?}, полезных {} Б в каждом",
+            self.count, self.class, self.text_bytes
+        );
+        // Ожидаемое время называется заранее, чтобы человек не гадал,
+        // повис замер или просто идёт. Скорость — скромная из политики,
+        // то есть настоящее время выйдет не больше названного.
+        if let Some(speed) =
+            ratatosk_proto::transport_policy::floor_bytes_per_sec(ratatosk_proto::Transport::Bt)
+        {
+            let seconds = self.count as u64 * self.class.frame_len() as u64 / speed;
+            println!("    по эфиру это не дольше {seconds} с; итог — /probe");
+        }
+    }
+
+    /// Запоминает новость о сообщении. Отдаёт `true`, когда дождались всех.
+    fn note(&mut self, msg_id: [u8; 16], status: DeliveryStatus) -> bool {
+        // Сообщения замера не отличить от прочих по событию, и различать
+        // их незачем: пока замер идёт, стенд ничего другого не шлёт.
+        // Зато `Delivered` не перетирается более поздним `Read`: нам важен
+        // первый признак того, что кадр доехал.
+        let slot = self.seen.entry(msg_id).or_insert(status);
+        if matches!(status, DeliveryStatus::Delivered | DeliveryStatus::Read) {
+            *slot = status;
+        }
+        self.delivered() >= self.count
+    }
+
+    /// Сколько доехало.
+    fn delivered(&self) -> usize {
+        self.seen
+            .values()
+            .filter(|status| matches!(status, DeliveryStatus::Delivered | DeliveryStatus::Read))
+            .count()
+    }
+
+    /// Печатает итог: доля дошедших и полезная скорость.
+    fn tally(&self) {
+        let done = self.delivered();
+        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        println!("< замер {:?}: доехало {done} из {}, за {:.1} с", self.class, self.count, elapsed);
+        // **Полезная скорость, а не «сколько байт прошло».** Кадр добивается
+        // до размера класса (§7), и у короткого сообщения по эфиру едет
+        // добивка. Считать надо то, ради чего ехали.
+        let useful = done as f64 * self.text_bytes as f64 / elapsed;
+        let onwire = done as f64 * self.class.frame_len() as f64 / elapsed;
+        println!("    полезных {:.1} Б/с, всего в эфир {:.1} Б/с", useful, onwire);
+        if done < self.count {
+            println!("    недоехавшие могли и не потеряться: квитанция ещё в пути");
+        }
+    }
+}
+
+/// Класс кадра по слову человека.
+fn probe_class(word: &str) -> Option<ratatosk_proto::SizeClass> {
+    match word {
+        "s" | "S" => Some(ratatosk_proto::SizeClass::S),
+        "m" | "M" => Some(ratatosk_proto::SizeClass::M),
+        "l" | "L" => Some(ratatosk_proto::SizeClass::L),
+        _ => None,
+    }
+}
+
 fn long_text(bytes: usize) -> String {
     let head = format!("{LONG_MARK}-{bytes}-start|");
     let tail = format!("|end-{bytes}-{LONG_MARK}");
@@ -4138,6 +4334,12 @@ fn report(event: &Event) {
         }
         Event::FileProgress { file_id, received, total } => {
             println!("< файл {}: {received}/{total}", short(file_id));
+        }
+        // **Отдано, а не доставлено**, и слово выбрано нарочно. Знаем мы
+        // ровно то, что кадр вручён транспорту; дошёл ли он — скажет
+        // следующая просьба получателя, а не это число (§14).
+        Event::FileSending { file_id, peer_ik, sent, total } => {
+            println!("< файл {}: отдано {sent}/{total} → {}", short(file_id), short(peer_ik));
         }
         Event::FileGone { file_id } => {
             println!("< вложение {} убрано — от него отказались", short(file_id));

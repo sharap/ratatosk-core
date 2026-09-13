@@ -396,6 +396,7 @@ trait EventObserver: Send + Sync {
 | `FileWaitsForChannel` | `file_id`, `reason` | показать на файле `file_waiting_text(reason)`; снимает следующий `FileProgress` |
 | `MailLimits` | `letter_bytes`, `mailbox_used`, `mailbox_limit`, `crowded`, `carries_files` | обновить экран настроек почты; сказать словами, если `crowded` или не `carries_files` |
 | `FileProgress` | `file_id`, `received`, `total` | обновить полосу; `total = 0` — файл отклонён |
+| `FileSending` | `file_id`, `peer_ik`, `sent`, `total` | полоса **у отправителя**: отдано транспорту, а не доставлено — словами про доставку не писать (§14) |
 | `ReactionChanged` | `chat_id`, `msg_id`, `author_ik` | перечитать сообщение вместе с реакциями |
 | `AvatarChanged` | `peer_ik` | сбросить кэш картинки, перечитать `avatar_of` |
 | `OwnAvatarChanged` | — | своё лицо сменилось; перечитать `my_avatar`. Приходит **и когда сменил сопряжённый десктоп** |

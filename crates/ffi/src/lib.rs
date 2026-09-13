@@ -523,6 +523,23 @@ pub enum FfiEvent {
         /// Всего чанков.
         total: u64,
     },
+    /// Ход передачи файла **у отправителя**.
+    ///
+    /// Числа тут значат другое, чем в [`FfiEvent::FileProgress`], и
+    /// показывать их надо другими словами. «Принято» — это то, что
+    /// собралось у получателя и сошлось суммой; «отдано» — то, что мы
+    /// вручили транспорту. Второе доказывает отправку, а не доставку,
+    /// и обещать по нему доставку значило бы врать (§14).
+    FileSending {
+        /// Какой файл.
+        file_id: Vec<u8>,
+        /// Кому.
+        peer_ik: Vec<u8>,
+        /// Отдано транспорту чанков.
+        sent: u64,
+        /// Всего чанков.
+        total: u64,
+    },
     /// Вложения больше нет: от него отказались, и всё убрано.
     ///
     /// Строку вложения надо **убрать**, а не обнулить в ней числа. Само
@@ -3841,6 +3858,12 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::FileProgress { file_id, received, total } => {
             FfiEvent::FileProgress { file_id: file_id.to_vec(), received, total }
         }
+        Event::FileSending { file_id, peer_ik, sent, total } => FfiEvent::FileSending {
+            file_id: file_id.to_vec(),
+            peer_ik: peer_ik.to_vec(),
+            sent,
+            total,
+        },
         Event::FileGone { file_id } => FfiEvent::FileGone { file_id: file_id.to_vec() },
         Event::HonestNotice { text } => FfiEvent::HonestNotice { text: text.to_owned() },
         Event::CommandRefused { reason } => FfiEvent::CommandRefused { reason },
@@ -3871,7 +3894,90 @@ fn translate(event: Event) -> Option<FfiEvent> {
 fn tracing_stop(error: &ratatosk_core::EngineError) {
     // Отказ ядра наружу не выбрасывается: клиент уже держит объект, а
     // конструктор давно вернулся. Единственное, что честно, — записать.
-    eprintln!("ratatosk: ядро остановилось: {error}");
+    //
+    // **И записать туда, где прочтут.** Стоял здесь `eprintln!`, то есть
+    // на Android — в никуда: остановка ядра, самая громкая беда из всех,
+    // не оставляла следа вовсе. Теперь она идёт общим журналом
+    // (`enable_logging`).
+    tracing::error!(%error, "ядро остановилось");
+}
+
+/// Умолчание отбора строк журнала.
+///
+/// Наше — подробно, чужое — по делу. Без второй половины `logcat` тонет
+/// в arti и tokio, а нужны там наши шесть ступеней.
+#[cfg(target_os = "android")]
+const LOG_DEFAULT: &str = "ratatosk_transport=debug,ratatosk_core=debug,ratatosk_ffi=debug,info";
+
+/// Заводит журнал ядра. Зовётся клиентом **до** открытия хранилища.
+///
+/// # Почему это вообще нужна отдельная просьба
+///
+/// Журнал ядра идёт через `tracing`, а `tracing` без подписчика — тишина
+/// по построению: макросы никуда не пишут, и стоит это ноль. На десктопе
+/// подписчика ставит стенд; на телефоне не ставил никто, и в `logcat`
+/// не было ни одной нашей строки. Разбор шестой ступени (0.4) с телефона
+/// из-за этого шёл вслепую: видно было только то, что печатает Kotlin.
+///
+/// Поставить его молча при открытии хранилища нельзя: подписчик — вещь
+/// процесса, а не сессии, и ставится он один раз на всю жизнь процесса.
+/// Решать за приложение, писать ли его внутренности в системный журнал,
+/// — не наше дело.
+///
+/// # Что попадёт в `logcat`
+///
+/// Тег `ratatosk`, то есть `adb logcat -s ratatosk`. Уровень и отбор
+/// задаёт `filter` в синтаксисе `RUST_LOG`
+/// (`ratatosk_transport=debug,info`); пустая строка означает умолчание —
+/// наши крейты подробно, остальное по делу.
+///
+/// # Второй вызов ничего не делает
+///
+/// И не считается ошибкой: подписчик в процессе один, а клиент,
+/// открывающий второй аккаунт, позовёт эту функцию снова — отказывать
+/// ему не за что.
+///
+/// Вне Android — пусто, и это не заглушка: там этот крейт линкуется
+/// в стенд, у которого подписчик свой.
+#[uniffi::export]
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+pub fn enable_logging(filter: String) {
+    #[cfg(target_os = "android")]
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        // Отбор написан человеком и мог быть написан неверно. Отказывать
+        // за это нечем и незачем: журнал заведётся обычным отбором,
+        // а о подмене будет сказано вслух — уже в самом журнале.
+        // «Не включается, и непонятно почему» тут хуже всего.
+        let asked = filter.trim().to_owned();
+        let (env, bad) = match tracing_subscriber::EnvFilter::try_new(&asked) {
+            Ok(env) if !asked.is_empty() => (env, false),
+            // `new`, а не `try_new`: строка наша собственная, и ошибка
+            // в ней — не событие времени выполнения, а опечатка,
+            // которая обязана быть заметной сразу.
+            _ => (tracing_subscriber::EnvFilter::new(LOG_DEFAULT), !asked.is_empty()),
+        };
+        let layer = match tracing_android::layer("ratatosk") {
+            Ok(layer) => layer,
+            Err(error) => {
+                // Сказать некуда — журнала-то и нет. Остаётся системный
+                // поток ошибок: на Android он уходит в никуда, но на
+                // эмуляторе и в тестах виден.
+                eprintln!("ratatosk: журнал не завёлся: {error}");
+                return;
+            }
+        };
+        // `try_init`, а не `init`: второй вызов — обычное дело
+        // (клиент открыл второй аккаунт), а не повод ронять приложение.
+        let _ = tracing_subscriber::registry().with(env).with(layer).try_init();
+        if bad {
+            tracing::warn!(отбор = %asked, "журнал: отбор не разобрался, взят обычный");
+        } else {
+            tracing::info!("журнал: пишем в logcat под тегом ratatosk");
+        }
+    }
 }
 
 /// Тексты из §14, которые клиент обязан показать дословно.

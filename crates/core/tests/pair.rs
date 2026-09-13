@@ -701,6 +701,70 @@ fn a_handshake_answer_nobody_could_send_goes_out_when_the_peer_is_heard() {
 }
 
 #[test]
+fn a_queue_waiting_for_a_session_mints_one_handshake_and_repeats_it() {
+    // **Разбор четвёртой поломки эфирной дуги, и самой дорогой.** На стенде
+    // десктоп отправил телефону четыре первых шага за полсекунды, три из них
+    // — за пятьсот микросекунд. Кадры были разные, то есть каждый нёс свой
+    // эфемерный ключ Noise; телефон завёл четыре сессии, каждая вытеснила
+    // предыдущую, и осталась четвёртая. Десктоп разобрал **первый** ответ
+    // и оставил себе первую. Дальше двенадцать кадров подряд «тег
+    // не сошёлся», и само это уже не выправлялось.
+    //
+    // Откуда четыре: лестница §5.4 в эфире одноступенчата, первый же отказ
+    // объявляет попытку исчерпанной, исчерпанное рукопожатие выбрасывалось —
+    // и следующее сообщение из очереди чеканило новое. В очереди стояла
+    // сотня кадров замера.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "первое"));
+    let first = air_sends(&outgoing).first().cloned().expect("первый шаг уходит эфиром");
+
+    // Лестница кончилась: кроме радио пробовать нечего, и оно отказало.
+    alice
+        .step(1_100, Input::ConnectFailed { peer_ik: bob_ik, via: ratatosk_proto::Transport::Bt })
+        .expect("транспорт отказал");
+
+    // Второе сообщение. Оно вправе растолкать рукопожатие — но **тем же
+    // кадром**: новый эфемерный ключ завёл бы у собеседника вторую сессию,
+    // а нашу первую мы бы себе оставили.
+    let second = send_text(&mut alice, &bob, 1_200, "второе");
+    let repeated = air_sends(&second);
+    assert!(!repeated.is_empty(), "рукопожатие обязано повториться: {second:?}");
+    for frame in &repeated {
+        assert_eq!(
+            frame, &first,
+            "повтор обязан быть побайтно тем же: иначе у собеседника вторая сессия"
+        );
+    }
+
+    // А третье уже молчит: повтор завёл попытке новый срок, и она больше
+    // не исчерпана. Иначе сотня кадров замера дала бы сотню повторов.
+    let third = send_text(&mut alice, &bob, 1_300, "третье");
+    assert!(
+        air_sends(&third).is_empty(),
+        "рукопожатие уже в пути — третьему сообщению слать нечего: {third:?}"
+    );
+
+    // И главное: собеседник видит **одно** рукопожатие, а не два. Повтор
+    // ловит `HandshakeReplayGuard`, ответ уходит прежний, сессия одна.
+    let answered = bob
+        .step(1_400, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+        .expect("первый шаг разобран");
+    let reply = air_sends(&answered).first().cloned().expect("ответ уходит эфиром");
+    let again = bob
+        .step(1_500, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("повтор разобран");
+    assert_eq!(
+        air_sends(&again).first(),
+        Some(&reply),
+        "на повтор уходит прежний ответ, а не новый: {again:?}"
+    );
+}
+
+#[test]
 fn a_contact_added_with_only_the_air_on_is_watched_there() {
     // **Разбор седьмой причины подряд в одной дуге.** Список маяков ехал
     // транспорту с оглядкой: `if enabled.contains(Lan)`. Верно это было
@@ -780,6 +844,47 @@ fn turning_the_air_off_forgets_that_the_peer_was_heard() {
     assert!(
         !alice.contacts()[&bob_ik].availability.seen_on_bt,
         "радио выключено — ловить маяки некому, и отметка держаться не вправе"
+    );
+}
+
+#[test]
+fn a_handshake_answer_is_not_repeated_faster_than_a_round_trip() {
+    // **Разбор пачки из трёх рукопожатий за сто двадцать миллисекунд.**
+    // Поводов «собеседника снова слышно» подряд бывает несколько: кадр
+    // пришёл принятым каналом, следом приехал список контактов, следом
+    // опознались уже услышанные объявления. Каждый повод посылал ответ
+    // заново — в самой узкой полосе из шести ступеней (§5.5), и ни один
+    // повтор ничего не добавлял: ответа на первый к тому времени не могло
+    // быть физически.
+    //
+    // Сдерживается при этом **второй повтор и дальше**, а не первый:
+    // первый нужен именно затем, что первая отправка не удалась, —
+    // ради этого случая `unsent_replies` и заведён.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    let first =
+        air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия уходит эфиром");
+
+    let answered = bob
+        .step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("рукопожатие разобрано");
+    let reply = air_sends(&answered).first().cloned().expect("ответ уходит той же ступенью");
+    bob.step(1_200, Input::ConnectFailed { peer_ik: alice_ik, via: ratatosk_proto::Transport::Bt })
+        .expect("транспорт отказал");
+
+    let first_wake =
+        bob.step(1_300, Input::SeenOnBt { peer_ik: alice_ik }).expect("объявление опознано");
+    assert!(air_sends(&first_wake).contains(&reply), "первый повтор уходит сразу");
+
+    let second_wake =
+        bob.step(1_420, Input::SeenOnBt { peer_ik: alice_ik }).expect("и ещё раз опознано");
+    assert!(
+        !air_sends(&second_wake).contains(&reply),
+        "а второй — нет: круг по эфиру длиннее ста двадцати миллисекунд: {second_wake:?}"
     );
 }
 
@@ -4117,6 +4222,65 @@ fn a_broken_transfer_resumes_where_it_stopped() {
     let file_id = only_file(&bob, &alice);
     assert!(bob.store().file(&file_id).unwrap().unwrap().complete, "файл дособрался");
     assert_eq!(assembled(&bob, &file_id), content, "и совпал с исходным до байта");
+}
+
+#[test]
+fn the_sender_is_told_how_far_its_own_file_has_gone() {
+    // **У отправителя не было ничего.** Стенд после `/file` печатал «ход
+    // передачи — строками „файл …: принято/всего“», а строки эти
+    // существовали только для входящих файлов: обещание, которого некому
+    // было сдержать (§14). Разбор передачи к телефону упирался в это
+    // каждый раз — по журналу отправителя нельзя было сказать, ушёл ли
+    // чанк, идёт ли он сейчас или встал.
+    //
+    // Числа тут значат «отдано транспорту», а не «доставлено», и потому
+    // событие своё, а не `FileProgress` с другой стороны.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+    let hello = send_text(&mut alice, &bob, 800, "сейчас пришлю");
+    pump(&mut alice, &mut bob, 800, hello);
+
+    alice_blobs.lock().unwrap().seed("/tmp/otdano.bin", payload_of(files::CHUNK_BYTES + 5));
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    let offer = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/otdano.bin".into(), preview: None }],
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+    // Пока получатель не попросил — отдавать нечего, и говорить нечего.
+    assert!(
+        !offer.iter().any(|e| matches!(e, Effect::Notify(Event::FileSending { .. }))),
+        "одно предложение файла ходом передачи не является: {offer:?}"
+    );
+
+    let mut asked = Vec::new();
+    for (via, frame) in frames(offer) {
+        asked.extend(frames(bob.step(1_000, Input::Received { via, frame }).unwrap()));
+    }
+    assert!(!asked.is_empty(), "получатель обязан попросить первый чанк");
+
+    let mut told = Vec::new();
+    for (via, frame) in asked {
+        told.extend(alice.step(1_100, Input::Received { via, frame }).unwrap());
+    }
+    let (sent, total) = told
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Notify(Event::FileSending { sent, total, .. }) => Some((*sent, *total)),
+            _ => None,
+        })
+        .expect("отдав чанки, отправитель обязан сказать сколько");
+    assert!(sent > 0, "отдано хоть что-то");
+    assert_eq!(total, 2, "и названо из скольких: файл в чанк с хвостиком");
+    assert!(sent <= total, "отдать больше, чем есть, нельзя: {sent} из {total}");
 }
 
 #[test]

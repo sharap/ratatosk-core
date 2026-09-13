@@ -78,15 +78,28 @@ if not guard:
 elif guard.group(1) != "Failure::Unreachable":
     bad.append(f"engine.rs: адрес забывается по {guard.group(1)} — обрыв снова всё ломает")
 
-# 5. Кадр по локальной сети возвращает адрес.
-if "fn note_lan_presence" not in engine:
-    bad.append("engine.rs: note_lan_presence исчезла — маяк снова единственное свидетельство")
+# 5. Пришедший кадр возвращает адрес — **обоим** эфирам.
+#
+# Правило было про локальную сеть (`note_lan_presence`) и оттого наполовину
+# неверное: в Bluetooth адресуемость давало только услышанное объявление,
+# и собеседник, дозвонившийся до нас сам, числился «не слышен» при живом
+# канале. §5.4 такую ступень не пробовал вовсе — `tried=[]`.
+if "fn note_presence" not in engine:
+    bad.append("engine.rs: note_presence исчезла — маяк снова единственное свидетельство")
 else:
-    # Три двери, через которые кадр попадает в ядро по локальной сети:
-    # входящее рукопожатие, ответ на наше, данные в живой сессии.
-    calls = engine.count("self.note_lan_presence(")
-    if calls != 3:
-        bad.append(f"engine.rs: note_lan_presence зовётся из {calls} мест, ожидалось три")
+    # Четыре двери, через которые кадр попадает в ядро прямой ступенью:
+    # входящее рукопожатие, **его повтор**, ответ на наше, данные в живой
+    # сессии. Повтор добавлен последним и не зря: собеседник, повторяющий
+    # первый шаг, иначе не давал ни отметки достижимости, ни имени связи —
+    # и контакт по эфиру «не добавлялся».
+    calls = engine.count("self.note_presence(")
+    if calls != 4:
+        bad.append(f"engine.rs: note_presence зовётся из {calls} мест, ожидалось четыре")
+    # И обе ступени обязаны в ней разбираться: отметки разные
+    # (`seen_on_lan`, `seen_on_bt`), и потерять вторую — вернуть поломку.
+    for flag in ("seen_on_lan, true", "seen_on_bt, true"):
+        if flag not in engine:
+            bad.append(f"engine.rs: note_presence больше не ставит {flag.split(',')[0]}")
 
 print("\n".join(bad) if bad else "чисто")
 sys.exit(1 if bad else 0)

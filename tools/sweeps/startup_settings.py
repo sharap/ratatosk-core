@@ -140,7 +140,7 @@ SWITCH = "SetTransportEnabled"
 
 # Порядок читается по **своему** телу, а зов помощника считается за те
 # эффекты, которые помощник отдаёт, — в той точке, где его позвали.
-# Иначе `effects.push(self.watch_lan_peers())` не виден вовсе: своего
+# Иначе `effects.push(self.watch_peers())` не виден вовсе: своего
 # литерала `Effect::` у него нет.
 own = own_body_of(src, "startup_effects") or ""
 order = []

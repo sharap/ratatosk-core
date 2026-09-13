@@ -701,6 +701,117 @@ fn a_handshake_answer_nobody_could_send_goes_out_when_the_peer_is_heard() {
 }
 
 #[test]
+fn a_contact_added_with_only_the_air_on_is_watched_there() {
+    // **Разбор седьмой причины подряд в одной дуге.** Список маяков ехал
+    // транспорту с оглядкой: `if enabled.contains(Lan)`. Верно это было
+    // ровно до 0.4, пока эфир был один; их стало два, а оглядка осталась.
+    //
+    // На стенде с выключенным LAN и включённым Bluetooth это значило вот
+    // что: карточка добавлена, контакт в ядре есть, а до эфира он не доехал
+    // вовсе. Собеседник вещал в двух метрах, его объявление разбиралось
+    // целым — и перебирать было не по чему.
+    let (mut alice, bob) = (node(1, "alice"), node(2, "bob"));
+    let bob_card = bob.own_card().encode().expect("карточка собирается");
+    let bob_ik = bob.own_card().ik;
+
+    // Единственная ступень — эфир: ровно то положение, в котором ломалось.
+    alice
+        .step(
+            0,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: false,
+            }),
+        )
+        .expect("локальная сеть выключается");
+    alice
+        .step(
+            0,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается");
+
+    let added = alice
+        .step(
+            1_000,
+            Input::Command(Command::AddContact { card_bytes: bob_card, met_in_person: false }),
+        )
+        .expect("карточка принята");
+
+    let watched = added
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::WatchPeers(peers) => Some(peers.clone()),
+            _ => None,
+        })
+        .expect("список маяков обязан уехать: контактов стало больше");
+    assert!(
+        watched.contains(&bob_ik),
+        "добавленный контакт обязан попасть в список, каким бы эфиром его ни искали: {watched:?}"
+    );
+}
+
+#[test]
+fn turning_the_air_off_forgets_that_the_peer_was_heard() {
+    // Слышимость — знание о том, что слышим **сейчас**, а не память о том,
+    // что когда-то слышали: с выключенным радио маяков не ловит никто.
+    // У локальной сети это правило было с самого начала, а эфир Bluetooth
+    // приехал позже и его не получил — отметка переживала выключение,
+    // и §5.4 при следующем включении шёл в эфир по устаревшему
+    // свидетельству: «слышно» есть, адреса нет, срок уплачен.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+    let _ = air_only(&mut alice, bob_ik);
+    assert!(alice.contacts()[&bob_ik].availability.seen_on_bt, "объявление услышано");
+
+    alice
+        .step(
+            2_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Bt,
+                enabled: false,
+            }),
+        )
+        .expect("эфир выключается");
+    assert!(
+        !alice.contacts()[&bob_ik].availability.seen_on_bt,
+        "радио выключено — ловить маяки некому, и отметка держаться не вправе"
+    );
+}
+
+#[test]
+fn a_repeated_advert_with_nothing_waiting_sends_nothing() {
+    // **Обратная сторона правки про съеденное пробуждение.** Отметка
+    // «слышно» одна, а ставят её два события — кадр и объявление, — и чтобы
+    // второе не пропадало, разбор очереди теперь идёт и без перехода:
+    // когда ждать есть чего.
+    //
+    // Цена этому — проверка на каждом повторном объявлении, а они идут
+    // каждые несколько секунд. Разбирать на каждом очередь нельзя: эфир —
+    // самая узкая полоса из шести ступеней (§5.5), и пересылка на повторе
+    // была бы шумом ровно там, где его меньше всего можно себе позволить.
+    //
+    // Проверяется поэтому не «ничего не произошло» вообще, а то, ради чего
+    // всё: повторное объявление, когда ждать нечего, не кладёт в эфир
+    // ни одного кадра.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+    let _ = air_only(&mut alice, bob_ik);
+
+    let again =
+        alice.step(2_000, Input::SeenOnBt { peer_ik: bob_ik }).expect("объявление повторилось");
+    assert!(
+        air_sends(&again).is_empty(),
+        "повторное объявление, когда ждать нечего, эфир не трогает: {again:?}"
+    );
+}
+
+#[test]
 fn a_handshake_answer_that_did_arrive_is_not_sent_a_second_time() {
     // Обратная сторона той же правки, и без неё она была бы хуже болезни:
     // ответ, который дошёл, обязан быть забыт. Иначе каждое новое появление
@@ -749,6 +860,86 @@ fn a_handshake_answer_that_did_arrive_is_not_sent_a_second_time() {
     assert!(
         !air_sends(&heard).contains(&reply),
         "ответ уже дошёл — повторять его значит вбросить рукопожатие в живую сессию: {heard:?}"
+    );
+}
+
+#[test]
+fn a_frame_from_the_air_makes_the_contact_addressable_there() {
+    // **Разбор поломки со стенда, и поломка была тихой до самого конца.**
+    // Адресуемость в Bluetooth давало только услышанное объявление.
+    // А собеседник, который дозвонился до нас **сам**, объявления мог
+    // и не подать — и числился «не слышен» при живом канале и работающей
+    // сессии. Снаружи это выглядело так: переписка идёт, обе стороны видят
+    // сообщения, а своё уходит в «ждём, когда появится», причём §5.4 даже
+    // не пробует ступень: `tried=[]`.
+    //
+    // Открытый канал — свидетельство достижимости **более сильное**, чем
+    // объявление: по объявлению ещё надо дозвониться, а по каналу уже
+    // можно писать.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    let first = air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия");
+
+    // Боб объявления Алисы не слышал ни разу — только принял её кадр.
+    assert!(
+        !bob.contacts()[&alice_ik].availability.seen_on_bt,
+        "объявления не было: проверка про кадр, а не про маяк"
+    );
+    bob.step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("рукопожатие разобрано");
+
+    assert!(
+        bob.contacts()[&alice_ik].availability.seen_on_bt,
+        "кадр, пришедший эфиром, и есть доказательство достижимости"
+    );
+    assert!(
+        !bob.contacts()[&alice_ik].availability.seen_on_lan,
+        "эфиры разные: кадр по Bluetooth не делает адресуемой локальную сеть"
+    );
+}
+
+#[test]
+fn a_repeated_first_step_is_answered_as_fully_as_the_first() {
+    // **Повтор первого шага — не второй сорт.** Собеседник, не получивший
+    // ответа, повторяет рукопожатие; сессия у нас уже есть, и сторож
+    // отдаёт прежний ответ. Раньше отсюда уезжал **только** он — ни имени
+    // принятой связи, ни отметки достижимости. В эфире это значило, что
+    // ответ на повтор пойдёт набором, то есть к телефону не пойдёт вовсе,
+    // а §5.4 продолжит считать, что адреса нет.
+    //
+    // Снаружи выглядело как «контакт по Bluetooth не добавляется»: первый
+    // шаг проходил, а всё, что после, упиралось в эту дверь.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let bob_ik = bob.own_card().ik;
+
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    let first = air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия");
+
+    bob.step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+        .expect("первый раз");
+
+    let again = bob
+        .step(1_200, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("повтор разобран");
+
+    assert!(!air_sends(&again).is_empty(), "прежний ответ обязан уехать заново: {again:?}");
+    // Проверяется по эффектам, а не по отметке в контакте: отметку поставил
+    // ещё первый шаг, и по ней повтор от него не отличить. А имя связи —
+    // то, чего у повтора не было вовсе, и без чего ответ уходит набором.
+    assert!(
+        again.iter().any(|effect| matches!(
+            effect,
+            Effect::Attributed { peer_ik, via: ratatosk_proto::Transport::Bt }
+                if *peer_ik == alice_ik
+        )),
+        "повтор обязан назвать связь, которой пришёл: {again:?}"
     );
 }
 

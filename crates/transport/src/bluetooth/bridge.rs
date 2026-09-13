@@ -54,7 +54,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::{note_advert, unix_seconds, Air, AirSetup, BtAddress, DialFuture};
+use super::{note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress, DialFuture};
 use crate::link::spawn_read_loop;
 use crate::runner::{TransportError, TransportEvent};
 
@@ -345,7 +345,16 @@ impl Bridge {
         match advert::payload(&record, psm) {
             Ok(payload) => {
                 radio.advertise(payload.to_vec());
-                tracing::info!(slot, psm, "эфир: объявились через мост");
+                // Ключ и начало записи маяка — затем же, зачем у местного
+                // радио: чтобы журнал телефона сличался с журналом машины
+                // напрямую, а не через догадку о том, что он вещал.
+                tracing::info!(
+                    slot,
+                    psm,
+                    ключ = %short(&setup.my_ik),
+                    маяк = %short_record(&record),
+                    "эфир: объявились через мост"
+                );
                 true
             }
             Err(error) => {

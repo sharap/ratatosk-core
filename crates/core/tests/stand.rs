@@ -193,11 +193,12 @@ impl Peer {
                 Effect::SetTimer { after_ms, token } => ctx.set_timer(after_ms, token),
                 Effect::Connect { .. }
                 | Effect::SetTransportEnabled { .. }
-                | Effect::WatchLanPeers(_)
+                | Effect::WatchPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
+                | Effect::Attributed { .. }
                 | Effect::NetworkChanged => {}
             }
         }
@@ -257,6 +258,7 @@ impl SimNode for Peer {
 fn to_proto(kind: TransportKind) -> Transport {
     match kind {
         TransportKind::Lan => Transport::Lan,
+        TransportKind::Bt => Transport::Bt,
         TransportKind::Ygg => Transport::Ygg,
         TransportKind::Onion => Transport::Onion,
         TransportKind::Nostr => Transport::Nostr,
@@ -267,6 +269,7 @@ fn to_proto(kind: TransportKind) -> Transport {
 fn to_sim(transport: Transport) -> TransportKind {
     match transport {
         Transport::Lan => TransportKind::Lan,
+        Transport::Bt => TransportKind::Bt,
         Transport::Ygg => TransportKind::Ygg,
         Transport::Onion => TransportKind::Onion,
         Transport::Nostr => TransportKind::Nostr,

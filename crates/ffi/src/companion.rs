@@ -76,7 +76,8 @@ type CompanionOnion = ratatosk_transport::Switched<ratatosk_transport::onion::ar
 #[cfg(not(feature = "tor"))]
 type CompanionOnion = Disabled;
 
-type CompanionRunner = Transports<LanRunner, YggRunner, CompanionOnion, Disabled, Disabled>;
+type CompanionRunner =
+    Transports<LanRunner, Disabled, YggRunner, CompanionOnion, Disabled, Disabled>;
 
 use crate::{to_chat, to_file_id, to_msg_id, to_msg_ids, FfiDeliveryStatus, RatatoskError};
 
@@ -1366,7 +1367,7 @@ async fn start(
     .map_err(RatatoskError::internal)?;
     // Телефон объявляется от своего `IK`, и без этой строки его маяк
     // не с чем было бы сравнить.
-    lan.execute(TransportCommand::WatchLanPeers(vec![phone_ik]))
+    lan.execute(TransportCommand::WatchPeers(vec![phone_ik]))
         .await
         .map_err(RatatoskError::internal)?;
 
@@ -1426,12 +1427,12 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, Disabled, Disabled)
+        Transports::new(lan, Disabled, ygg, onion, Disabled, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = (&tor_handle, &tor_dir);
-        Transports::new(lan, ygg, Disabled, Disabled, Disabled)
+        Transports::new(lan, Disabled, ygg, Disabled, Disabled, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а

@@ -121,7 +121,14 @@ impl Pair {
             }
             let _ = self
                 .to_desktop
-                .send(TransportEvent::Received { via: Transport::Lan, peer_hint: None, frame })
+                .send(TransportEvent::Received {
+                    via: Transport::Lan,
+                    peer_hint: None,
+                    // Провод этого теста — локальная сеть, а у неё принятых
+                    // связей нет: ответ едет своим набором.
+                    link: None,
+                    frame,
+                })
                 .await;
         }
         true

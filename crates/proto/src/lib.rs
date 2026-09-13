@@ -23,11 +23,13 @@
 //! | [`reply`] | ответ на сообщение — **дополнение**, в v0.1 не описано |
 //! | [`ygg`] | адрес в меше из открытого ключа — **0.2**, в v0.1 не описано |
 //! | [`nostr`] | ступень поверх реле nostr — **0.3**, в v0.1 не описано |
+//! | [`bluetooth`] | объявление BLE шестой ступени — **0.4**, в v0.1 не описано |
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod avatar;
+pub mod bluetooth;
 pub mod card_update;
 pub mod companion;
 pub mod contact_share;

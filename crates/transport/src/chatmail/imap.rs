@@ -251,6 +251,8 @@ impl Receiver {
                             // а кто прислал кадр — устанавливает рукопожатие
                             // (§8.2), и только оно.
                             peer_hint: None,
+                            // Связей у почты нет: ответ уедет письмом.
+                            link: None,
                             frame,
                         };
                         if events.send(event).await.is_err() {

@@ -23,6 +23,11 @@ ratatosk-store.workspace = true
 ratatosk-transport.workspace = true
 
 data-encoding.workspace = true
+# Контрольная сумма файла — только для стенда и только глазами: два узла
+# печатают её после отправки и после сборки, и человек сверяет. Свою
+# сумму заводить нельзя — она сошлась бы сама с собой; берётся та же,
+# что у дерева (§8.1).
+blake3.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -45,6 +50,11 @@ mail = ["ratatosk-transport/chatmail-net"]
 # Для реле в интернете признак `tor` нужен, иначе путь честно откажет —
 # ровно как у почты.
 nostr = ["ratatosk-transport/nostr"]
+# Живой эфир Bluetooth (0.4). **Не по умолчанию**: `bluer` — обвязка BlueZ,
+# то есть Linux, и ему нужен запущенный `bluetoothd`. Стенд с этим признаком
+# и есть та проверка, ради которой ступень писалась: два десктопа в одной
+# комнате, без сети вообще.
+bt = ["ratatosk-transport/bt"]
 # Встроенный узел меша (0.2). **Не по умолчанию**: зависимость идёт из git
 # и тянет ironwood с yggdrasil целиком. Без признака режим «свой узел»
 # остаётся в настройках и честно отказывает.

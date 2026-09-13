@@ -21,6 +21,8 @@ impl NodeId {
 pub enum TransportKind {
     /// Локальная сеть. По умолчанию выключена (§5.1).
     Lan,
+    /// Канал L2CAP поверх Bluetooth LE (0.4). По умолчанию выключен.
+    Bt,
     /// Меш Yggdrasil (0.2). По умолчанию выключен.
     Ygg,
     /// Tor onion-to-onion (§5.2).
@@ -33,8 +35,9 @@ pub enum TransportKind {
 
 impl TransportKind {
     /// Все транспорты.
-    pub const ALL: [TransportKind; 5] = [
+    pub const ALL: [TransportKind; 6] = [
         TransportKind::Lan,
+        TransportKind::Bt,
         TransportKind::Ygg,
         TransportKind::Onion,
         TransportKind::Nostr,
@@ -48,7 +51,10 @@ impl TransportKind {
     /// 20 МБ — только им же (§10.3).
     #[must_use]
     pub const fn is_direct(self) -> bool {
-        matches!(self, TransportKind::Lan | TransportKind::Ygg | TransportKind::Onion)
+        matches!(
+            self,
+            TransportKind::Lan | TransportKind::Bt | TransportKind::Ygg | TransportKind::Onion
+        )
     }
 }
 
@@ -80,6 +86,36 @@ impl LinkProfile {
         loss_permille: 0,
         duplicate_permille: 0,
         failure_notice_ms: 5_000,
+    };
+
+    /// Bluetooth: канал L2CAP в одной комнате (0.4).
+    ///
+    /// Задержка не миллисекундная, как в проводной сети, и упирается она
+    /// не в расстояние, а в расписание: пакеты в BLE ходят интервалами
+    /// соединения, и кадр ждёт ближайшего. Отсюда десятки миллисекунд
+    /// снизу и сотни сверху — интервал выбирает не приложение, а стек
+    /// на обеих сторонах.
+    ///
+    /// Потери редкие: канальный уровень переспрашивает сам. Дублей нет
+    /// вовсе — поток, а не события на реле.
+    ///
+    /// **Задержки сверены с живым стендом** (`HANDOFF.md`, 6з): круг
+    /// с квитанцией на кадрах от 4 до 64 КиБ занимает 370–540 мс в обе
+    /// стороны, то есть односторонняя задержка того же порядка, что здесь.
+    ///
+    /// Чего профиль по-прежнему не знает — **пропускной способности**:
+    /// модель сети считает задержки и потери, а не байты в секунду.
+    /// На стенде мебибайт идёт около тридцати секунд (≈35 КБ/с), и это
+    /// число сегодня живёт в другом месте — `floor_bytes_per_sec`
+    /// в политике, откуда его берут сроки ожидания.
+    pub const BT: LinkProfile = LinkProfile {
+        min_latency_ms: 30,
+        max_latency_ms: 400,
+        loss_permille: 2,
+        duplicate_permille: 0,
+        // Столько же, сколько `BT_CONNECT_TIMEOUT_MS` в политике: встреча
+        // расписаний объявления и сканирования занимает секунды.
+        failure_notice_ms: 10_000,
     };
 
     /// Меш Yggdrasil: обычный интернет плюс путь через соседей.
@@ -189,6 +225,7 @@ impl Network {
     pub fn new() -> Network {
         let mut profiles = HashMap::new();
         profiles.insert(TransportKind::Lan, LinkProfile::LAN);
+        profiles.insert(TransportKind::Bt, LinkProfile::BT);
         profiles.insert(TransportKind::Ygg, LinkProfile::YGG);
         profiles.insert(TransportKind::Onion, LinkProfile::ONION);
         profiles.insert(TransportKind::Nostr, LinkProfile::NOSTR);
@@ -196,6 +233,9 @@ impl Network {
 
         let mut enabled = HashMap::new();
         enabled.insert(TransportKind::Lan, false);
+        // И эфир выключен: он стоит батареи постоянно, а не в момент
+        // отправки, и сценарий, которому он нужен, включает его явно.
+        enabled.insert(TransportKind::Bt, false);
         // Выключен по той же причине, что и LAN: ступень не работает,
         // пока не названы пиры. Сценарий, которому она нужна, включает
         // её явно.

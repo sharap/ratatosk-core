@@ -712,6 +712,26 @@ struct OutgoingHandshake {
     timer: Option<u64>,
 }
 
+/// Ответ на рукопожатие, который ещё не доказано доставлен.
+///
+/// Хранится **не вместо** повтора первого шага, а рядом с ним: собеседник
+/// по-прежнему вправе повторить первый шаг и получить тот же ответ
+/// (`HandshakeOutcome::Repeat`). Здесь лечится другой случай — когда повтора
+/// ждать долго, а собеседник уже слышен.
+struct UnsentReply {
+    peer_ik: [u8; 32],
+    /// Ступень, на которой ответ обязан уехать.
+    ///
+    /// Именно та же, а не «любая доступная». Сессия отвечающего привязана
+    /// к семейству той ступени, по которой пришёл первый шаг
+    /// ([`SessionBinding::of`]), и ответ, ушедший другим семейством, завёл бы
+    /// вторую сессию на тот же слот — ту самую беду, которую разбирает
+    /// [`Engine::retry_handshake`].
+    via: Transport,
+    /// Кадр целиком, как он уже уходил.
+    frame: Vec<u8>,
+}
+
 /// Сообщение в очереди доставки.
 #[derive(Debug, Clone)]
 struct Delivery {
@@ -808,6 +828,27 @@ pub struct Engine<S: Store> {
     /// (`Store::membership`), и подъём собирает это поле из них.
     groups: BTreeMap<ChatId, GroupState>,
     pending: Vec<OutgoingHandshake>,
+    /// Ответы на рукопожатие, которые не удалось отправить.
+    ///
+    /// Разбор поломки со стенда, и поломка эта тихая. Отвечающая сторона
+    /// заводит сессию **в тот же миг**, как разобрала первый шаг, а ответ
+    /// уходит одним-единственным [`Effect::Send`]: не вышло — и всё, его
+    /// никто не повторит. У нас сессия есть, у собеседника её нет, и каждый
+    /// наш кадр он выбрасывает как «неизвестная сессия», а мы об этом
+    /// не узнаём — кадр не расшифрован, сказать нам некому.
+    ///
+    /// В эфире это не редкость, а **обычное дело**: собеседник услышал нас
+    /// раньше, чем мы его, набрал канал и поздоровался — а отвечать нам
+    /// некуда, его объявления мы ещё не поймали. Ровно это и было в логе:
+    /// «адреса нет» в ту же миллисекунду, что и принятое рукопожатие.
+    ///
+    /// Лечилось оно само, но дорого: собеседник через полминуты повторял
+    /// первый шаг, мы переотправляли сохранённый ответ — а человек к тому
+    /// времени успевал увидеть «собеседника нет в сети».
+    ///
+    /// Поэтому ответ хранится до тех пор, пока не станет ясно, что он дошёл,
+    /// и уходит заново, едва собеседника стало слышно.
+    unsent_replies: Vec<UnsentReply>,
     outbox: Vec<Delivery>,
     next_timer_token: u64,
     /// Какие транспорты разрешил человек (§5.4).
@@ -880,6 +921,12 @@ pub struct Engine<S: Store> {
     mail_via_tor: Option<bool>,
     /// Кого заметили в LAN раньше, чем добавили в контакты.
     seen_on_lan: BTreeSet<[u8; 32]>,
+    /// То же для эфира Bluetooth (0.4).
+    ///
+    /// Множество своё, а не общее с локальной сетью: контакт мог быть
+    /// слышен в одном эфире и не слышен в другом, и слив их в одно, мы
+    /// отдали бы §5.4 ступень, которой нет.
+    seen_on_bt: BTreeSet<[u8; 32]>,
     /// Открытый ключ нашего узла в меше (0.2). Пусто — меша нет.
     ///
     /// Здесь он живёт **в разобранном виде и в единственном экземпляре**,
@@ -1179,6 +1226,7 @@ impl<S: Store> Engine<S> {
             pending_group: Vec::new(),
             groups: BTreeMap::new(),
             pending: Vec::new(),
+            unsent_replies: Vec::new(),
             outbox: Vec::new(),
             next_timer_token: 1,
             enabled: DEFAULT_TRANSPORTS,
@@ -1188,6 +1236,7 @@ impl<S: Store> Engine<S> {
             mail_limits: ratatosk_proto::mail::MailLimits::default(),
             mail_via_tor: None,
             seen_on_lan: BTreeSet::new(),
+            seen_on_bt: BTreeSet::new(),
             // Имя в меше — производная от настроек, а настройки поднимаются
             // с диска в `restore`. До подъёма меша нет, и это верно: базы
             // ещё не читали.
@@ -1642,39 +1691,8 @@ impl<S: Store> Engine<S> {
                 // её нет. Молчание он прочтёт как «приложение сломалось».
                 Ok(vec![Effect::Notify(Event::MailAccountFailed { reason })])
             }
-            Input::SeenOnLan { peer_ik } => {
-                // mDNS повторяет объявления, поэтому важен именно **переход**
-                // «не видели → видим»: на каждом повторе перебирать очередь
-                // незачем, а на первом — необходимо.
-                let appeared = match self.contacts.get(&peer_ik) {
-                    Some(contact) => !contact.availability.seen_on_lan,
-                    None => false,
-                };
-                match self.contacts.get_mut(&peer_ik) {
-                    Some(contact) => contact.availability.seen_on_lan = true,
-                    // Контакт и его видимость приходят разными путями —
-                    // командой от UI и событием транспорта, — и порядок между
-                    // ними не гарантирован. Потерять отметку значило бы
-                    // отправить почтой сообщение собеседнику за стенкой,
-                    // и разбираться потом, почему.
-                    None => {
-                        self.seen_on_lan.insert(peer_ik);
-                        return Ok(Vec::new());
-                    }
-                }
-                // Собеседник нашёлся — всё, что ждало этого ответа, едет
-                // немедленно, не досиживая свой срок.
-                let mut effects = self.resume_discovery(peer_ik)?;
-                if appeared {
-                    // И то, что не уехало раньше: он снова в сети.
-                    effects.extend(self.retry_deferred(Some(peer_ik))?);
-                    // Недокачанные файлы спрашиваются здесь же — но только
-                    // если сессия уже есть: просьба без прямого канала уйдёт
-                    // в никуда, а рукопожатие позовёт нас ещё раз.
-                    effects.extend(self.resume_files(now_ms, peer_ik)?);
-                }
-                Ok(effects)
-            }
+            Input::SeenOnLan { peer_ik } => self.note_heard(now_ms, peer_ik, Transport::Lan),
+            Input::SeenOnBt { peer_ik } => self.note_heard(now_ms, peer_ik, Transport::Bt),
             Input::Connected { .. } => Ok(Vec::new()),
             // Разрыв соединения — это событие **сокета**, а не сессии, и
             // путать их оказалось дорого. Раньше здесь закрывалась LAN-сессия:
@@ -1954,6 +1972,11 @@ impl<S: Store> Engine<S> {
                 // устройство: адрес в локальной сети меняется при каждом
                 // подключении, и поднимать его с диска значило бы врать.
                 seen_on_lan: false,
+                // И слышимость в эфире — тем более: объявление BLE меняется
+                // каждые пятнадцать минут (0.4), а собеседник, слышимый
+                // вчера, сегодня может быть в другом городе. Поднимет это
+                // поле раннер Bluetooth, услышав объявление, и никто иной.
+                seen_on_bt: false,
             };
             let chat = Self::chat_id_for(&peer_ik);
             self.contacts.insert(
@@ -2334,6 +2357,11 @@ impl<S: Store> Engine<S> {
             enabled: self.announcing(),
             ready: self.ready,
             seen_on_lan: self.seen_on_lan.remove(&peer_ik),
+            // И то же про эфир: объявление могло прозвучать раньше, чем
+            // человек досканировал карточку. Потерять отметку значило бы
+            // отправить почтой сообщение тому, кто сидит за столом
+            // напротив.
+            seen_on_bt: self.seen_on_bt.remove(&peer_ik),
             ..availability
         };
 
@@ -3033,7 +3061,12 @@ impl<S: Store> Engine<S> {
             // посланный туда, теряется. Событие nostr не теряется —
             // оно лежит на реле и дожидается, пока ступень включат
             // обратно. Снять ключ значило бы выбросить то, что дошло бы.
-            Transport::Lan | Transport::Ygg | Transport::Nostr => return Ok(Vec::new()),
+            // Bluetooth здесь же, и довод тот же, что у локальной сети:
+            // адреса в карточке у него нет вовсе — ступень адресуется
+            // эфиром (0.4). Снимать нечего.
+            Transport::Lan | Transport::Bt | Transport::Ygg | Transport::Nostr => {
+                return Ok(Vec::new())
+            }
             Transport::Onion => (Some(String::new()), None),
             Transport::Mail => (None, Some(String::new())),
         };
@@ -7376,7 +7409,7 @@ impl<S: Store> Engine<S> {
         // сопряжения — по тому же правилу §5.1, что и контакт от `IK`, —
         // и без этой строки телефон принял бы рукопожатие и не смог бы
         // ответить.
-        Effect::WatchLanPeers(self.contacts.keys().chain(self.devices.keys()).copied().collect())
+        Effect::WatchPeers(self.contacts.keys().chain(self.devices.keys()).copied().collect())
     }
 
     // --- компаньон (§13.4) --------------------------------------------------
@@ -11341,7 +11374,7 @@ impl<S: Store> Engine<S> {
         };
 
         let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let (handoff, timer) = self.arm_send(delivery, transport);
+        let (handoff, timer) = self.arm_send(delivery, transport, frame.len());
         Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
     }
 
@@ -11382,10 +11415,22 @@ impl<S: Store> Engine<S> {
     /// теперь не значит: срок у такой копии обычный, отказ канала ведёт её
     /// на следующую ступень, а вышедший на прямом канале срок читается как
     /// успех — «транспорт не пожаловался» (см. [`Engine::on_timer`]).
-    fn arm_send(&mut self, delivery: &mut Delivery, transport: Transport) -> (Option<u64>, Effect) {
+    fn arm_send(
+        &mut self,
+        delivery: &mut Delivery,
+        transport: Transport,
+        frame_len: usize,
+    ) -> (Option<u64>, Effect) {
         let timer = self.allocate_timer();
         let (after_ms, handoff) = if transport.is_direct() {
-            (delivery.attempt.timeout_ms().unwrap_or(ONION_FALLBACK_TIMEOUT_MS), None)
+            // **Срок считается от размера кадра**, а не от одного лишь
+            // транспорта. Мебибайт на медленной ступени едет десятки
+            // секунд, и срок, выданный по имени транспорта, объявил бы его
+            // неудавшимся на середине пути — а молчание в ответ
+            // на отправленный кадр закрывает сессию. На эфире (0.4) это
+            // выглядело как «длинный текст идёт сорок секунд и рвёт
+            // переписку»; разбор — у `receipt_timeout_ms`.
+            (delivery.attempt.timeout_ms_for(frame_len).unwrap_or(ONION_FALLBACK_TIMEOUT_MS), None)
         } else {
             (MAIL_HANDOFF_TIMEOUT_MS, Some(timer))
         };
@@ -11866,6 +11911,15 @@ impl<S: Store> Engine<S> {
         }
 
         let frame = self.handshake_frame(HANDSHAKE_STEP_RESPONSE, &response)?;
+        // **Имя связи — раньше ответа, и порядок тут не вкусовой.** Ответ
+        // поедет той же связью, которой пришёл первый шаг; назови мы её
+        // после, транспорт получил бы кадр для канала, о котором ещё
+        // не знает, — и полез бы набирать, чего с телефоном сделать нельзя.
+        effects.push(Effect::Attributed { peer_ik, via });
+        // Ответ запоминается **до** того, как уедет, и не из перестраховки:
+        // узнать, что он не уехал, мы можем только потом и не всегда, —
+        // а сессия у нас уже есть. См. [`Engine::unsent_replies`].
+        self.remember_reply(peer_ik, via, &frame);
         effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
 
         // Рукопожатие §8.2 аутентифицировано — значит по локальной сети
@@ -12009,6 +12063,10 @@ impl<S: Store> Engine<S> {
         // а не он объявился. Разница видна в мешe, где объявиться нечем.
         let mut effects =
             if via == Transport::Lan { self.note_lan_presence(peer_ik)? } else { Vec::new() };
+        // Имя связи — раньше всего, что по ней поедет. Ответ на рукопожатие
+        // мог прийти принятым каналом, и досылка очереди ниже обязана
+        // застать его уже названным.
+        effects.push(Effect::Attributed { peer_ik, via });
         effects.extend(self.flush_outbox(peer_ik)?);
         effects.extend(self.offer_avatar(now_ms, peer_ik)?);
         // Мы звали — значит карточка уехала в первом сообщении. Но если
@@ -12054,7 +12112,7 @@ impl<S: Store> Engine<S> {
         };
 
         let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let (handoff, timer) = self.arm_send(delivery, transport);
+        let (handoff, timer) = self.arm_send(delivery, transport, frame.len());
         Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
     }
 
@@ -12122,6 +12180,109 @@ impl<S: Store> Engine<S> {
         let mut effects = self.resume_discovery(peer_ik)?;
         effects.extend(self.retry_deferred(Some(peer_ik))?);
         Ok(effects)
+    }
+
+    /// Контакт слышен в эфире — в локальной сети или в Bluetooth.
+    ///
+    /// Одна функция на два эфира, и это не экономия строк. Правило здесь
+    /// одно и то же, и оно не про радио: **важен переход** «не слышали →
+    /// слышим». Объявления повторяются — mDNS по своему расписанию, BLE
+    /// по своему, — и перебирать очередь на каждом повторе значит делать
+    /// работу впустую; на первом — необходимо. Две копии этого правила
+    /// разошлись бы, и разошлись бы молча: одна ступень возобновляла бы
+    /// отложенное, другая нет.
+    ///
+    /// Поля при этом **разные** (`seen_on_lan`, `seen_on_bt`), и слить их
+    /// нельзя: устройство бывает слышно в Bluetooth и невидимо в локальной
+    /// сети — разные сети Wi-Fi, гостевая сеть с изоляцией клиентов, —
+    /// и наоборот. Слитое поле отдало бы §5.4 ступень, которой нет.
+    fn note_heard(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        via: Transport,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let bt = via == Transport::Bt;
+        let appeared = match self.contacts.get(&peer_ik) {
+            Some(contact) if bt => !contact.availability.seen_on_bt,
+            Some(contact) => !contact.availability.seen_on_lan,
+            None => false,
+        };
+        match self.contacts.get_mut(&peer_ik) {
+            Some(contact) if bt => contact.availability.seen_on_bt = true,
+            Some(contact) => contact.availability.seen_on_lan = true,
+            // Контакт и его слышимость приходят разными путями — командой
+            // от UI и событием транспорта, — и порядок между ними
+            // не гарантирован. Потерять отметку значило бы отправить почтой
+            // сообщение собеседнику за стенкой, и разбираться потом, почему.
+            None => {
+                if bt {
+                    self.seen_on_bt.insert(peer_ik);
+                } else {
+                    self.seen_on_lan.insert(peer_ik);
+                }
+                return Ok(Vec::new());
+            }
+        }
+        // Собеседник нашёлся — всё, что ждало этого ответа, едет
+        // немедленно, не досиживая свой срок.
+        let mut effects = self.resume_discovery(peer_ik)?;
+        if appeared {
+            // **Первым — незаконченное рукопожатие, и только потом всё
+            // остальное.** Сообщения без сессии всё равно упрутся в неё,
+            // а ответ, ушедший вторым, заставил бы собеседника ждать лишний
+            // круг. Именно этот случай и разбирается в `unsent_replies`:
+            // мы поздоровались в ответ, когда отвечать было некуда,
+            // и вот собеседника стало слышно.
+            effects.extend(self.resend_reply(peer_ik, via));
+            // И то, что не уехало раньше: он снова в сети.
+            effects.extend(self.retry_deferred(Some(peer_ik))?);
+            // Недокачанные файлы спрашиваются здесь же — но только если
+            // сессия уже есть: просьба без прямого канала уйдёт в никуда,
+            // а рукопожатие позовёт нас ещё раз.
+            //
+            // Эфиру Bluetooth это правило достаётся как есть, хотя файлы
+            // им пока не ездят (0.4.4): спросить их можно и по нему —
+            // поедут они той ступенью, которую выберет §5.4, а не этой.
+            effects.extend(self.resume_files(now_ms, peer_ik)?);
+        }
+        Ok(effects)
+    }
+
+    /// Запоминает ответ на рукопожатие до доказательства, что он дошёл.
+    ///
+    /// На пару «собеседник и ступень» хранится **один** ответ, и новый
+    /// вытесняет прежний: сессия на семейство тоже одна, и второй ответ
+    /// означает, что первый уже не нужен. Без этого правила запись росла бы
+    /// на каждое повторное рукопожатие — то есть ровно там, где связь и так
+    /// плоха.
+    fn remember_reply(&mut self, peer_ik: [u8; 32], via: Transport, frame: &[u8]) {
+        self.unsent_replies.retain(|held| held.peer_ik != peer_ik || held.via != via);
+        self.unsent_replies.push(UnsentReply { peer_ik, via, frame: frame.to_vec() });
+    }
+
+    /// Забывает ответ: доказано, что собеседник его получил.
+    fn forget_reply(&mut self, peer_ik: [u8; 32], via: Transport) {
+        self.unsent_replies.retain(|held| held.peer_ik != peer_ik || held.via != via);
+    }
+
+    /// Отправляет запомненный ответ заново — собеседника снова слышно.
+    ///
+    /// Запись при этом **остаётся**: слышимость не есть доставка. Уйдёт она
+    /// только по [`Engine::forget_reply`], то есть по первому кадру сессии —
+    /// единственному доказательству, которое у нас бывает.
+    fn resend_reply(&mut self, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
+        let Some(held) =
+            self.unsent_replies.iter().find(|held| held.peer_ik == peer_ik && held.via == via)
+        else {
+            return Vec::new();
+        };
+        tracing::info!(
+            peer = %short_ik(&peer_ik),
+            ?via,
+            "ответ на рукопожатие уходит заново: собеседника снова слышно"
+        );
+        vec![Effect::Send { peer_ik, via, frame: held.frame.clone(), handoff: None }]
     }
 
     /// Обнаружение ответило (или кончился срок) — двигаем отложенное.
@@ -12505,8 +12666,19 @@ impl<S: Store> Engine<S> {
         counter: u64,
         frame: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
+        // Собеседник узнаётся до изменяемого заимствования, и порядок здесь
+        // не вкусовой: `bound` держит реестр сессий до конца разбора, а
+        // забыть ответ надо у себя, то есть тронуть ядро целиком.
+        let peer_ik =
+            self.sessions.get(session_id).ok_or(EngineError::UnknownPeer)?.session.peer_ik;
+
+        // Кадр по сессии — доказательство того, что ответ на рукопожатие
+        // дошёл: без него сессии у собеседника не было бы вовсе. Хранить
+        // его дальше незачем, а переотправить потом — значит послать шаг
+        // рукопожатия в уже работающую переписку.
+        self.forget_reply(peer_ik, via);
+
         let bound = self.sessions.get_mut(session_id).ok_or(EngineError::UnknownPeer)?;
-        let peer_ik = bound.session.peer_ik;
 
         // §7.3, шаг 3: ключ выводится ровно для позиции `counter`, и только
         // после успешной проверки тега достраиваются пропущенные.
@@ -12559,6 +12731,15 @@ impl<S: Store> Engine<S> {
         // приходится нести с собой: `woken` подмешивается к каждому.
         let mut woken =
             if via == Transport::Lan { self.note_lan_presence(peer_ik)? } else { Vec::new() };
+        // Здесь же — и имя связи, которой кадр пришёл.
+        //
+        // **После проверки тега, и ни строкой раньше.** Номер сессии лежит
+        // в заголовке открыто (§7.1), и назови мы связь по нему одному,
+        // любой желающий прислал бы мусор с чужим номером — и наши ответы
+        // поехали бы в его канал вместо канала собеседника. Прочесть он их
+        // не смог бы, а вот переписку оборвал бы начисто. Сошедшийся тег —
+        // единственное, что отличает собеседника от того, кто назвался им.
+        woken.push(Effect::Attributed { peer_ik, via });
         // А **отложенное** будится на любой ступени, и вот почему.
         //
         // Свидетельство здесь одно и то же на всех транспортах: кадр

@@ -247,9 +247,16 @@ fn frame_kind(frame: &[u8]) -> String {
 }
 
 /// Читающая задача: разбирает поток на кадры и отдаёт их ядру.
+///
+/// `link` — номер принятой связи, если у ступени связи счётные и в них
+/// можно **ответить**. Нужен он одному эфиру: телефон объявляется
+/// приватным адресом, набрать его в ответ нельзя, а открытый им канал
+/// двусторонний. У остальных ступеней `None` — см.
+/// [`TransportEvent::Received::link`].
 pub(crate) fn spawn_read_loop<R>(
     mut reader: R,
     via: Transport,
+    link: Option<u64>,
     events: mpsc::Sender<TransportEvent>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -279,8 +286,10 @@ pub(crate) fn spawn_read_loop<R>(
             let event = TransportEvent::Received {
                 via,
                 // Транспорт не знает, кто прислал: личность даёт рукопожатие
-                // (§8.2), а не адрес.
+                // (§8.2), а не адрес. Номер связи — это «откуда», а не
+                // «от кого», и одно другим не становится.
                 peer_hint: None,
+                link,
                 frame,
             };
             if events.send(event).await.is_err() {
@@ -299,6 +308,23 @@ pub(crate) fn spawn_read_loop<R>(
 ///
 /// Не задача, а будущее: [`Link::dialing`] запускает её **после** набора,
 /// внутри своей задачи, и второй `spawn` там был бы лишним.
+/// Пишет один кадр: байт класса, тело, сброс.
+///
+/// Отдельной функцией ради одного — **сохранить ошибку**. Тремя
+/// `.is_ok()` подряд она терялась, и связь закрывалась без объяснения;
+/// разница видна только тогда, когда что-то пошло не так, то есть
+/// ровно тогда, когда журнал и нужен.
+///
+/// Про обязательность сброса — см. разбор в теле цикла записи.
+async fn write_frame<W>(writer: &mut W, class: SizeClass, frame: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(&[tag_of(class)]).await?;
+    writer.write_all(frame).await?;
+    writer.flush().await
+}
+
 async fn write_loop<W>(
     mut writer: W,
     mut urgent: mpsc::Receiver<Vec<u8>>,
@@ -351,10 +377,27 @@ async fn write_loop<W>(
         // в одну неполную ячейку на кадр — а стоила бы правила, которое
         // держится в голове: «отправлено, если следом идёт ещё что-то».
         // Такие правила и порождают ошибки вроде этой.
-        let written = writer.write_all(&[tag_of(class)]).await.is_ok()
-            && writer.write_all(&frame).await.is_ok()
-            && writer.flush().await.is_ok();
-        if !written {
+        if let Err(error) = write_frame(&mut writer, class, &frame).await {
+            // **Вслух, и это не украшение журнала.** Здесь стояло
+            // `.is_ok() && .is_ok() && .is_ok()`, то есть сама ошибка
+            // выбрасывалась, а связь закрывалась молча. Ядро при этом
+            // узнавало «оборвалось» — и правильно, — но **почему**
+            // оборвалось, не знал никто.
+            //
+            // На LAN и onion это почти не мешало: там запись не падает
+            // на ровном месте. На радио падает, и первым же выходом
+            // в эфир (0.4) стоило часа разбирательства: набор сообщал
+            // «канал открыт», кадр уходил в очередь, а дальше стояла
+            // тишина и семь сообщений разом объявлялись недоставимыми.
+            // Ошибка системы, потерянная вот этой строкой, и была
+            // ответом.
+            tracing::warn!(
+                ?via,
+                ?class,
+                ?error,
+                kind = %frame_kind(&frame),
+                "кадр не записан — связь закрыта"
+            );
             let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
             break;
         }
@@ -477,7 +520,7 @@ mod tests {
         // о себе ничего не сообщает.
         let (writer, reader) = tokio::io::duplex(SizeClass::S.frame_len() * 2);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        spawn_read_loop(reader, Transport::Onion, events_tx);
+        spawn_read_loop(reader, Transport::Onion, None, events_tx);
 
         // Новости самой связи уезжают в отдельный канал: этот тест смотрит
         // на приём, а не на набор.
@@ -492,9 +535,10 @@ mod tests {
         link.send(frame.clone()).await.expect("кадр принят");
 
         match events_rx.recv().await.expect("событие о приёме") {
-            TransportEvent::Received { via, peer_hint, frame: got } => {
+            TransportEvent::Received { via, peer_hint, link, frame: got } => {
                 assert_eq!(via, Transport::Onion);
                 assert!(peer_hint.is_none(), "адрес не говорит, кто это (§8.2)");
+                assert!(link.is_none(), "у onion принятых связей нет: ответ едет своим набором");
                 assert_eq!(got, frame, "кадр обязан доехать байт в байт");
             }
             other => panic!("ожидалось событие о приёме, пришло {other:?}"),

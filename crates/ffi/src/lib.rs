@@ -37,7 +37,20 @@ use ratatosk_transport::{onion::arti::OnionRunner, Switched};
 // снято потому, что сборка с обоими признаками всё равно бывает — а вот
 // меш теперь свой раннер имеет во всякой.
 use ratatosk_transport::Disabled;
-use ratatosk_transport::{LanConfig, LanRunner, Transports, YggConfig, YggRunner, YGG_PORT};
+use ratatosk_transport::{
+    BridgedAir, BtConfig, BtRunner, LanConfig, LanRunner, Transports, YggConfig, YggRunner,
+    YGG_PORT,
+};
+
+use crate::bluetooth::FfiBluetooth;
+
+/// Эфир Bluetooth (0.4): радио приходит от платформы, правила остаются
+/// здесь.
+///
+/// Модуль, а не место в этом файле: граница с радио — свой договор
+/// из шести вызовов и восьми событий, и держать его посреди переписки
+/// значило бы прятать.
+pub mod bluetooth;
 
 /// Второй экран телефона (§13.4) — отдельным объектом.
 ///
@@ -218,6 +231,16 @@ pub enum FfiTransport {
     /// Локальная сеть (§5.1). По умолчанию **выключена**: маяк в эфире
     /// выдаёт присутствие устройства всем, кто слушает.
     Lan,
+    /// Канал L2CAP поверх Bluetooth LE (0.4). По умолчанию **выключен**:
+    /// объявлять себя и слушать эфир стоит батареи постоянно, а на Android
+    /// сканирование вдобавок спрашивает отдельное разрешение. UI обязан
+    /// сказать об этом рядом с переключателем.
+    ///
+    /// **В этой сборке ступень не поднимается ни при каких настройках.**
+    /// Она заведена в лестнице §5.4 и честно отвечает «не поднята»:
+    /// раннера ещё нет, написан только протокольный слой. Показывать её
+    /// человеку как рабочую нельзя (§14).
+    Bt,
     /// Меш Yggdrasil (0.2). По умолчанию **выключен**: узел меша переносит
     /// чужой трафик, то есть тратит батарею и трафик человека на чужие
     /// пакеты. UI обязан сказать об этом рядом с переключателем.
@@ -241,6 +264,7 @@ impl From<FfiTransport> for ratatosk_proto::Transport {
     fn from(value: FfiTransport) -> ratatosk_proto::Transport {
         match value {
             FfiTransport::Lan => ratatosk_proto::Transport::Lan,
+            FfiTransport::Bt => ratatosk_proto::Transport::Bt,
             FfiTransport::Ygg => ratatosk_proto::Transport::Ygg,
             FfiTransport::Onion => ratatosk_proto::Transport::Onion,
             FfiTransport::Nostr => ratatosk_proto::Transport::Nostr,
@@ -253,6 +277,7 @@ impl From<ratatosk_proto::Transport> for FfiTransport {
     fn from(value: ratatosk_proto::Transport) -> FfiTransport {
         match value {
             ratatosk_proto::Transport::Lan => FfiTransport::Lan,
+            ratatosk_proto::Transport::Bt => FfiTransport::Bt,
             ratatosk_proto::Transport::Ygg => FfiTransport::Ygg,
             ratatosk_proto::Transport::Onion => FfiTransport::Onion,
             ratatosk_proto::Transport::Nostr => FfiTransport::Nostr,
@@ -1357,6 +1382,13 @@ struct Opened {
 pub struct RatatoskClient {
     opened: Opened,
     observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>>,
+    /// Ручка эфира: через неё платформа вручает радио и сообщает о нём.
+    ///
+    /// Заводится **до** потока ядра и живёт рядом с ним, а не внутри:
+    /// радио приходит от службы, которая поднимается своим чередом, и
+    /// ждать её открытием базы нельзя. Мост от этого не страдает — он
+    /// и рассчитан на то, что радио появится позже.
+    bluetooth: Arc<FfiBluetooth>,
 }
 
 #[uniffi::export]
@@ -1398,6 +1430,12 @@ impl RatatoskClient {
         let device_key = to_device_key(device_key)?;
         let observer: Arc<Mutex<Option<Arc<dyn EventObserver>>>> = Arc::new(Mutex::new(None));
         let pump_observer = Arc::clone(&observer);
+        // Мост эфира заводится здесь, а не в потоке ядра: клиенту он нужен
+        // сразу после открытия, а поток к тому времени только начнёт
+        // поднимать базу. Один и тот же мост уезжает в ступень и остаётся
+        // у клиента — второй был бы мостом в никуда.
+        let bt_air = BridgedAir::new();
+        let core_air = bt_air.clone();
 
         // Канал на одно сообщение: поток отчитывается об исходе запуска
         // ровно раз, а дальше живёт своей жизнью.
@@ -1439,7 +1477,8 @@ impl RatatoskClient {
                 };
                 runtime.block_on(async move {
                     let started =
-                        start(PathBuf::from(db_path), pin, device_key, display_name).await;
+                        start(PathBuf::from(db_path), pin, device_key, display_name, core_air)
+                            .await;
                     let (mut driver, opened, events) = match started {
                         Ok(parts) => parts,
                         Err(error) => {
@@ -1463,7 +1502,11 @@ impl RatatoskClient {
             .recv()
             .map_err(|_| RatatoskError::internal("поток ядра завершился при запуске"))??;
 
-        Ok(Arc::new(RatatoskClient { opened, observer }))
+        Ok(Arc::new(RatatoskClient {
+            opened,
+            observer,
+            bluetooth: Arc::new(FfiBluetooth::new(bt_air)),
+        }))
     }
 
     /// Подписывает UI на события.
@@ -1471,6 +1514,19 @@ impl RatatoskClient {
         if let Ok(mut slot) = self.observer.lock() {
             *slot = Some(observer);
         }
+    }
+
+    /// Ручка эфира Bluetooth (0.4.7).
+    ///
+    /// Через неё платформа вручает своё радио и сообщает о нём. Отдельным
+    /// объектом намеренно: эфиром занимается служба переднего плана
+    /// с разрешениями, и давать ей весь клиент значило бы давать ей
+    /// переписку.
+    ///
+    /// Ступень при этом включается **не здесь**, а настройками транспортов,
+    /// как и все прочие: радио — это про «чем», а не про «включено ли».
+    pub fn bluetooth(&self) -> Arc<FfiBluetooth> {
+        Arc::clone(&self.bluetooth)
     }
 
     /// Отпечаток собственной идентичности (§3).
@@ -3244,6 +3300,14 @@ type NostrSide = ratatosk_transport::nostr::NostrRunner;
 #[cfg(not(feature = "nostr"))]
 type NostrSide = Disabled;
 
+/// Раннер эфира Bluetooth — один на все сборки.
+///
+/// Признака у него нет и не нужно: раннер собирается везде, а различается
+/// **радио** под ним. На телефоне это мост в платформу ([`BridgedAir`]),
+/// и приходит он снаружи; `bluer` сюда не входит и войти не может —
+/// он обвязка BlueZ.
+type BtSide = BtRunner<BridgedAir>;
+
 /// Набор транспортов этой сборки.
 ///
 /// Псевдоним, а не тип по месту: состав транспортов виден в сигнатурах,
@@ -3254,13 +3318,20 @@ type NostrSide = Disabled;
 /// аккаунта обязано быть мгновенным. Без признака там
 /// [`ratatosk_transport::Disabled`], и это не заглушка, а правда о сборке:
 /// §5.4 обязан узнать, что ступень не сработала, и перейти к следующей.
+///
+/// Bluetooth стоит настоящий — поверх моста в платформу (0.4.7).
+/// `Disabled` здесь был бы не «правдой о сборке», а ошибкой: раннер
+/// у ступени есть, и отсутствует не он, а радио. Радио же приходит
+/// от клиента вызовом [`bluetooth::FfiBluetooth::set_radio`], и пока
+/// его не вручили, ступень честно объявляется потерянной — то есть
+/// §5.4 узнаёт правду, а не тишину.
 #[cfg(feature = "tor")]
-type Runners = Transports<LanRunner, YggRunner, Switched<OnionRunner>, NostrSide, MailSide>;
+type Runners = Transports<LanRunner, BtSide, YggRunner, Switched<OnionRunner>, NostrSide, MailSide>;
 
-/// Набор транспортов сборки без Tor: локальная сеть и, если собраны,
-/// реле nostr и почта.
+/// Набор транспортов сборки без Tor: локальная сеть, эфир, меш и, если
+/// собраны, реле nostr и почта.
 #[cfg(not(feature = "tor"))]
-type Runners = Transports<LanRunner, YggRunner, Disabled, NostrSide, MailSide>;
+type Runners = Transports<LanRunner, BtSide, YggRunner, Disabled, NostrSide, MailSide>;
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
@@ -3268,6 +3339,7 @@ async fn start(
     pin: Option<String>,
     device_key: Option<[u8; 32]>,
     display_name: String,
+    bt_air: BridgedAir,
 ) -> Result<(Driver<SqliteStore, Runners>, Opened, EventStream), RatatoskError> {
     let (mut store, db_key) =
         vault::open_encrypted(&db_path, unlock_of(pin.as_deref(), device_key.as_ref()))
@@ -3310,6 +3382,15 @@ async fn start(
     // привязка идёт при включении, и удаётся она только при поднятом демоне.
     // Имени нет — раннер честно откажет, а настройки назовут его на ходу.
     let ygg = YggRunner::start(YggConfig { enabled: false, port: YGG_PORT }, &card.ygg)
+        .await
+        .map_err(RatatoskError::internal)?;
+
+    // Эфир Bluetooth (0.4). Заводится **выключенным**, как и локальная
+    // сеть: включает его ядро первым шагом драйвера, если человек ступень
+    // разрешил. Радио при этом может быть ещё не вручено — служба
+    // с разрешениями поднимается своим чередом, — и это нормальное
+    // состояние: ступень тогда честно объявляется потерянной.
+    let bt = BtRunner::start(bt_air, BtConfig::default(), card.ik)
         .await
         .map_err(RatatoskError::internal)?;
 
@@ -3381,14 +3462,14 @@ async fn start(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, nostr, mail)
+        Transports::new(lan, bt, ygg, onion, nostr, mail)
     };
     // Без признака `tor` onion честно отказывает, а почта работает: §5.3
     // по умолчанию идёт через Tor, но умеет и напрямую.
     #[cfg(not(feature = "tor"))]
     let runner = {
         let _ = &tor_handle;
-        Transports::new(lan, ygg, Disabled, nostr, mail)
+        Transports::new(lan, bt, ygg, Disabled, nostr, mail)
     };
 
     let (driver, handle, events) = Driver::new(engine, runner);

@@ -160,11 +160,12 @@ fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Eve
                 Effect::Notify(event) => events.push(event),
                 Effect::Connect { .. }
                 | Effect::SetTransportEnabled { .. }
-                | Effect::WatchLanPeers(_)
+                | Effect::WatchPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
+                | Effect::Attributed { .. }
                 | Effect::NetworkChanged => {}
             }
         }
@@ -581,6 +582,196 @@ fn a_message_waits_for_discovery_instead_of_failing_instantly() {
             .iter()
             .any(|e| matches!(e, Effect::Send { via: ratatosk_proto::Transport::Lan, .. })),
         "собеседник нашёлся, а сообщение не поехало: {produced:?}"
+    );
+}
+
+#[test]
+fn an_advert_in_the_air_makes_the_contact_addressable_in_bluetooth() {
+    // 0.4: адресуемость шестой ступени даёт эфир, а не карточка. Проверка
+    // ровно про это — и про то, что два эфира не слиты в один признак:
+    // устройство бывает слышно в Bluetooth и невидимо в локальной сети
+    // (разные сети Wi-Fi, гостевая с изоляцией клиентов), и наоборот.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    assert!(!alice.contacts()[&peer_ik].availability.seen_on_bt, "эфир пока молчал");
+
+    alice.step(1_000, Input::SeenOnBt { peer_ik }).expect("объявление опознано");
+
+    let availability = alice.contacts()[&peer_ik].availability;
+    assert!(availability.seen_on_bt, "опознанное объявление и есть адрес этой ступени");
+    assert!(
+        !availability.seen_on_lan,
+        "слышимость в эфире не делает адресуемой локальную сеть: эфиры разные"
+    );
+}
+
+/// Оставляет узлу единственную ступень §5.4 — эфир — и делает собеседника
+/// в нём слышимым.
+///
+/// Без этого ступень выбирал бы случай: карточка соседа везёт onion, LAN
+/// стоит выше эфира, и проверка про Bluetooth уехала бы куда угодно.
+/// А здесь важно именно то, каким семейством связана сессия: ответ на
+/// рукопожатие живёт ровно в нём.
+/// Эффекты возвращаются **все**, и это не удобство, а условие
+/// работоспособности. Рукопожатие уезжает не обязательно из отправки текста:
+/// карточка объявляется заново при добавлении (§4.3), а отложенное трогается
+/// с места, едва собеседника стало слышно. Выброси эффекты здесь — и тест
+/// будет искать первый шаг там, где его уже нет. На этом уже спотыкался
+/// `introduce_and_settle`, и запись о том стоит двумя сотнями строк выше.
+fn air_only(node: &mut Node, peer_ik: [u8; 32]) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    effects.extend(
+        node.step(
+            0,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Onion,
+                enabled: false,
+            }),
+        )
+        .expect("onion выключается"),
+    );
+    effects.extend(
+        node.step(
+            0,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается"),
+    );
+    effects.extend(
+        node.step(0, Input::TransportReady { transport: ratatosk_proto::Transport::Bt })
+            .expect("радио поднялось"),
+    );
+    effects.extend(node.step(0, Input::SeenOnBt { peer_ik }).expect("объявление услышано"));
+    effects
+}
+
+/// Кадры, ушедшие эфиром, — в том порядке, в каком ядро их отдало.
+fn air_sends(effects: &[Effect]) -> Vec<Vec<u8>> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send { via: ratatosk_proto::Transport::Bt, frame, .. } => Some(frame.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_handshake_answer_nobody_could_send_goes_out_when_the_peer_is_heard() {
+    // **Разбор тихой поломки со стенда.** Отвечающая сторона заводит сессию
+    // в тот же миг, как разобрала первый шаг, а ответ уходит одним
+    // `Effect::Send`: не вышло — и всё. У нас сессия есть, у собеседника
+    // её нет, и каждый наш кадр он выбрасывает как «неизвестная сессия»,
+    // а мы об этом не узнаём — кадр не расшифрован, сказать нам некому.
+    //
+    // В эфире это не редкость, а обычное дело: собеседник услышал нас
+    // раньше, чем мы его, набрал канал и поздоровался, — а отвечать нам
+    // некуда, его объявления мы ещё не поймали. В журнале стенда «адреса
+    // нет» стояло в той же миллисекунде, что и принятое рукопожатие.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+
+    let first =
+        air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия уходит эфиром");
+
+    // Боб слышит первый шаг из эфира и отвечает туда же.
+    let answered = bob
+        .step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("рукопожатие разобрано");
+    let reply = air_sends(&answered).first().cloned().expect("ответ уходит той же ступенью");
+
+    // А уехать ему некуда: объявления Алисы Боб ещё не поймал.
+    bob.step(1_200, Input::ConnectFailed { peer_ik: alice_ik, via: ratatosk_proto::Transport::Bt })
+        .expect("транспорт отказал");
+
+    // Вот теперь объявление услышано.
+    let heard =
+        bob.step(1_300, Input::SeenOnBt { peer_ik: alice_ik }).expect("объявление опознано");
+    assert!(
+        air_sends(&heard).contains(&reply),
+        "ответ на рукопожатие обязан уехать, едва собеседника стало слышно: {heard:?}"
+    );
+}
+
+#[test]
+fn a_handshake_answer_that_did_arrive_is_not_sent_a_second_time() {
+    // Обратная сторона той же правки, и без неё она была бы хуже болезни:
+    // ответ, который дошёл, обязан быть забыт. Иначе каждое новое появление
+    // собеседника в эфире вбрасывало бы шаг рукопожатия в уже работающую
+    // переписку.
+    //
+    // Доказательство доставки у нас ровно одно — **кадр по сессии**: без
+    // ответа сессии у собеседника не было бы вовсе. Поэтому сцена доведена
+    // до второго сообщения Алисы: на первом Боб по сессии не получает
+    // ничего — текст едет внутри рукопожатия (§8.2), а квитанцию Боб шлёт
+    // сам. Доказывать доставку там просто нечем.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let alice_ik = alice.own_card().ik;
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+
+    let first =
+        air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия уходит эфиром");
+    let answered = bob
+        .step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("рукопожатие разобрано");
+    let reply = air_sends(&answered).first().cloned().expect("ответ");
+
+    // Ответ (и квитанция следом) доезжают до Алисы — по порядку: без
+    // рукопожатия квитанцию не расшифровать.
+    let mut from_alice = Vec::new();
+    for frame in air_sends(&answered) {
+        from_alice.extend(
+            alice
+                .step(1_200, Input::Received { via: ratatosk_proto::Transport::Bt, frame })
+                .expect("ответ разобран"),
+        );
+    }
+    // Рукопожатие сошлось — Алиса досылает всё, что ждало сессию, и пишет
+    // ещё раз. Это уже кадры по сессии, и один из них и есть доказательство.
+    from_alice.extend(send_text(&mut alice, &bob, 1_300, "и тебе"));
+    for frame in air_sends(&from_alice) {
+        bob.step(1_400, Input::Received { via: ratatosk_proto::Transport::Bt, frame })
+            .expect("кадр сессии принят");
+    }
+
+    let heard =
+        bob.step(1_500, Input::SeenOnBt { peer_ik: alice_ik }).expect("объявление опознано");
+    assert!(
+        !air_sends(&heard).contains(&reply),
+        "ответ уже дошёл — повторять его значит вбросить рукопожатие в живую сессию: {heard:?}"
+    );
+}
+
+#[test]
+fn an_advert_heard_before_the_contact_was_added_is_not_lost() {
+    // Контакт и его слышимость приходят разными путями — командой от UI
+    // и событием транспорта, — и порядок между ними не гарантирован.
+    // Потерянная отметка означала бы, что сообщение уедет почтой тому,
+    // кто сидит за столом напротив: объявление прозвучало, а мы его
+    // не запомнили и следующего ждём четверть часа.
+    //
+    // У локальной сети это правило есть с самого начала; здесь проверяется,
+    // что второй эфир получил его же, а не «почти такое».
+    let mut alice = node(1, "alice");
+    let peer_ik = Identity::from_seed([9u8; 32]).public().ik;
+
+    alice.step(0, Input::SeenOnBt { peer_ik }).expect("объявление раньше контакта");
+    let added = lan_only_contact(&mut alice, 9);
+    assert_eq!(added, peer_ik, "тот же собеседник");
+
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "отметку эфира, услышанную до добавления контакта, потеряли"
     );
 }
 
@@ -5333,11 +5524,12 @@ fn pump_many(
                 Effect::Notify(event) => events.push(event),
                 Effect::Connect { .. }
                 | Effect::SetTransportEnabled { .. }
-                | Effect::WatchLanPeers(_)
+                | Effect::WatchPeers(_)
                 | Effect::SetMailAccount(_)
                 | Effect::SetYgg(_)
                 | Effect::SetNostr(_)
                 | Effect::CreateMailAccount { .. }
+                | Effect::Attributed { .. }
                 | Effect::NetworkChanged => {}
             }
         }

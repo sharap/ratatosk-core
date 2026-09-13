@@ -591,6 +591,25 @@ pub struct DeviceStatus {
 /// после `select!`, а не внутри его ветки.
 enum Wake {
     Input(Input),
+    /// Кадр, пришедший **счётной связью**: её номер надо запомнить.
+    ///
+    /// Отдельная ветка, а не поле у [`Wake::Input`], по той же причине,
+    /// что у [`Wake::TorReady`]: до ядра в ветке `select!` не дотянуться,
+    /// а номер связи нужен **после** шага ядра — когда оно назовёт
+    /// собеседника ([`Effect::Attributed`]). Помнит номер драйвер: ядру
+    /// он не нужен и знать его не должно, это дело транспорта.
+    ///
+    /// Счётные связи есть у одной ступени — эфира (0.4), — и только там
+    /// набрать собеседника в ответ нельзя: приватный адрес телефона
+    /// проворачивается, а сопряжения у нас нет.
+    Frame {
+        /// Что подать ядру.
+        input: Input,
+        /// Какой ступенью кадр пришёл.
+        via: Transport,
+        /// Каким номером связи.
+        link: u64,
+    },
     Query(Query),
     Chore(Chore),
     Timers,
@@ -897,6 +916,19 @@ impl DriverHandle {
     /// Внешний `None` — драйвер остановлен, внутренний — такого файла нет.
     /// Полученным [`FileReader`] можно пользоваться из любого потока и
     /// сколько угодно долго: ядро в чтении не участвует.
+    ///
+    /// Пара к [`DriverHandle::open_file_blocking`] — для тех, кто уже внутри
+    /// рантайма. Блокирующий вариант там не годится вовсе: `blocking_send`
+    /// внутри асинхронной задачи роняет поток рантайма паникой, и стенд,
+    /// позвавший его из своего цикла, умер бы на первой же попытке открыть
+    /// вложение.
+    pub async fn open_file(&self, file_id: FileId) -> Option<Option<FileReader>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::OpenFile { file_id, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// То же, блокируя вызывающий поток.
     pub fn open_file_blocking(&self, file_id: FileId) -> Option<Option<FileReader>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::OpenFile { file_id, reply })).ok()?;
@@ -981,6 +1013,16 @@ impl DriverHandle {
     }
 
     /// Читает порог автоматического приёма файлов.
+    ///
+    /// Внешний `None` — драйвер остановлен, внутренний — порога нет
+    /// и каждый файл спрашивается.
+    pub async fn auto_accept(&self) -> Option<Option<u64>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::AutoAccept { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// То же, блокируя вызывающий поток.
     pub fn auto_accept_blocking(&self) -> Option<Option<u64>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::AutoAccept { reply })).ok()?;
@@ -1083,6 +1125,15 @@ pub struct Driver<S: Store, R: Runner> {
     /// `BTreeMap` ради одного свойства: ближайший срок — это `keys().next()`,
     /// то есть цикл всегда знает, до какого момента спать.
     timers: BTreeMap<u64, Vec<u64>>,
+    /// Связь, которой пришёл разбираемый сейчас кадр.
+    ///
+    /// Живёт ровно один шаг ядра: поставлено перед подачей кадра, снято
+    /// после. Дольше держать нельзя и незачем — следующий кадр приедет
+    /// своей связью, а `Effect::Attributed` без кадра не появляется.
+    ///
+    /// Здесь, а не в ядре, потому что номер связи — дело транспорта:
+    /// §13.3 не пускает наверх то, что ниже границы, и правильно делает.
+    arrived_on: Option<(Transport, u64)>,
 }
 
 impl<S: Store, R: Runner> Driver<S, R> {
@@ -1101,6 +1152,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             nostr_relays: None,
             mail_failure: None,
             timers: BTreeMap::new(),
+            arrived_on: None,
         };
         let handle = DriverHandle { requests: requests_tx };
         (driver, handle, EventStream { notices: notices_rx })
@@ -1183,6 +1235,14 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         self.mail_failure = None;
                     }
                     self.tolerate(input).await?;
+                }
+                // Номер связи держится ровно на время шага: ядро назовёт
+                // собеседника этим же шагом, и `apply` сложит одно с другим.
+                Wake::Frame { input, via, link } => {
+                    self.arrived_on = Some((via, link));
+                    let outcome = self.tolerate(input).await;
+                    self.arrived_on = None;
+                    outcome?;
                 }
                 Wake::Query(query) => self.answer(query),
                 Wake::Chore(chore) => self.do_chore(chore).await,
@@ -1763,8 +1823,11 @@ impl<S: Store, R: Runner> Driver<S, R> {
             // сработала ли ступень, скажет её готовность, а не отказ
             // на настройку.
             | Effect::SetNostr(_)
-            | Effect::WatchLanPeers(_)
+            | Effect::WatchPeers(_)
             | Effect::NetworkChanged
+            // Имя связи — дело двоих, транспорта и ядра; человеку тут
+            // сказать нечего, а отказ означает лишь, что канал уже закрылся.
+            | Effect::Attributed { .. }
             | Effect::SetTimer { .. }
             | Effect::Notify(_) => Refusal::Silent,
         };
@@ -1785,8 +1848,21 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Effect::CreateMailAccount { url, via_tor } => {
                 Some(TransportCommand::CreateMailAccount { url, via_tor })
             }
-            Effect::WatchLanPeers(peers) => Some(TransportCommand::WatchLanPeers(peers)),
+            Effect::WatchPeers(peers) => Some(TransportCommand::WatchPeers(peers)),
             Effect::NetworkChanged => Some(TransportCommand::NetworkChanged),
+            // Ядро назвало собеседника, драйвер помнит номер связи —
+            // вместе это и есть имя канала. Порознь ни то ни другое
+            // не годится: ядру номер знать незачем, транспорту имя
+            // взять неоткуда.
+            Effect::Attributed { peer_ik, via } => match self.arrived_on {
+                // Ступень сверяется нарочно: кадр пришёл одной связью,
+                // а ядро в том же шаге могло разобрать и что-то другое.
+                Some((on, link)) if on == via => {
+                    Some(TransportCommand::BindLink { peer_ik, via, link })
+                }
+                // Счётных связей у этой ступени нет — и называть нечего.
+                _ => None,
+            },
             Effect::SetTimer { after_ms, token } => {
                 self.timers.entry(now_ms.saturating_add(after_ms)).or_default().push(token);
                 None
@@ -1975,6 +2051,11 @@ fn own_card_of(card: &ContactCard) -> OwnCard {
 /// с нулевой меткой — то есть событие молча выбрасывалось.
 fn translate(event: TransportEvent) -> Wake {
     let input = match event {
+        // Кадр со счётной связью уходит своей веткой: её номер понадобится
+        // после шага ядра, а `Wake::Input` его не везёт.
+        TransportEvent::Received { via, link: Some(link), frame, .. } => {
+            return Wake::Frame { input: Input::Received { via, frame }, via, link }
+        }
         TransportEvent::Received { via, frame, .. } => Input::Received { via, frame },
         TransportEvent::Connected { peer_ik, via } => Input::Connected { peer_ik, via },
         // Два разных факта, и сливать их в один вход было ошибкой: обрыв
@@ -1982,6 +2063,7 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::Disconnected { peer_ik, via } => Input::ConnectionLost { peer_ik, via },
         TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectFailed { peer_ik, via },
         TransportEvent::SeenOnLan { peer_ik } => Input::SeenOnLan { peer_ik },
+        TransportEvent::SeenOnBt { peer_ik } => Input::SeenOnBt { peer_ik },
         TransportEvent::TorReady { onion } => return Wake::TorReady(onion),
         TransportEvent::TorProgress { fraction, note, blocked } => {
             return Wake::Notice(Event::TorStatus { fraction, note, blocked })
@@ -2071,6 +2153,40 @@ mod tests {
         assert!(
             matches!(wake, Wake::Input(Input::TransportLost { transport: Transport::Onion })),
             "«ступень отвалилась» обязано доходить до ядра, а не только до журнала"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_a_countable_link_keeps_its_number() {
+        // Номер связи нужен **после** шага ядра: это ядро скажет, чей был
+        // кадр, а номер к тому времени обязан быть у драйвера под рукой.
+        // Потеряй его разбор события — и ответ телефону поехал бы набором,
+        // которого он не принимает (приватный адрес проворачивается).
+        let wake = translate(TransportEvent::Received {
+            via: Transport::Bt,
+            peer_hint: None,
+            link: Some(7),
+            frame: vec![0u8; 8],
+        });
+        assert!(
+            matches!(wake, Wake::Frame { via: Transport::Bt, link: 7, .. }),
+            "номер связи обязан пережить разбор события"
+        );
+    }
+
+    #[test]
+    fn a_frame_without_a_link_goes_the_plain_way() {
+        // У прочих ступеней счётных связей нет, и заводить ради них вторую
+        // ветку значило бы держать ветку, которая никогда не сработает.
+        let wake = translate(TransportEvent::Received {
+            via: Transport::Lan,
+            peer_hint: None,
+            link: None,
+            frame: vec![0u8; 8],
+        });
+        assert!(
+            matches!(wake, Wake::Input(Input::Received { via: Transport::Lan, .. })),
+            "кадр без номера идёт обычным путём"
         );
     }
 

@@ -1689,10 +1689,8 @@ fn settings_reach_the_runners_before_the_switches() {
         .position(|e| matches!(e, Effect::SetTransportEnabled { .. }))
         .expect("выключатели обязаны быть");
     for (at, effect) in effects.iter().enumerate() {
-        let setting = matches!(
-            effect,
-            Effect::SetYgg(_) | Effect::SetMailAccount(_) | Effect::WatchLanPeers(_)
-        );
+        let setting =
+            matches!(effect, Effect::SetYgg(_) | Effect::SetMailAccount(_) | Effect::WatchPeers(_));
         assert!(
             !setting || at < switch,
             "настройка {effect:?} стоит {at}-й, после выключателя на {switch}-м"

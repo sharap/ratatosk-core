@@ -895,10 +895,12 @@ impl Runner for YggRunner {
             TransportCommand::SetYgg(setup) => self.set_setup(setup).await,
             TransportCommand::NetworkChanged => self.network_changed().await,
             TransportCommand::SetEnabled { .. }
-            | TransportCommand::WatchLanPeers(_)
+            | TransportCommand::WatchPeers(_)
             | TransportCommand::SetMailAccount(_)
             | TransportCommand::SetNostr(_)
             | TransportCommand::CreateMailAccount { .. } => Err(TransportError::Unavailable),
+            // Принятых связей у этой ступени нет: отвечать в них нечего.
+            TransportCommand::BindLink { .. } => Err(TransportError::Unavailable),
         }
     }
 
@@ -1005,7 +1007,7 @@ fn spawn_accept_loop(
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
-                    spawn_read_loop(stream, Transport::Ygg, events.clone());
+                    spawn_read_loop(stream, Transport::Ygg, None, events.clone());
                 }
                 // Исчерпание дескрипторов лечится ожиданием, а не выходом
                 // из цикла: выйдя, транспорт замолчал бы навсегда.
@@ -1175,7 +1177,7 @@ fn spawn_node_accept_loop(
                     // Раз на соединение, а не на кадр: соединений единицы,
                     // а повтор ядро отбрасывает молча.
                     let _ = events.send(TransportEvent::Ready { transport: Transport::Ygg }).await;
-                    spawn_read_loop(conn, Transport::Ygg, events.clone());
+                    spawn_read_loop(conn, Transport::Ygg, None, events.clone());
                 }
                 Err(error) => {
                     tracing::debug!(?error, "меш: приём закрыт, узел остановлен");

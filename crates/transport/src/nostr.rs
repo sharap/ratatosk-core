@@ -345,10 +345,12 @@ impl Runner for NostrRunner {
             // не является.
             TransportCommand::Connect { .. } | TransportCommand::Disconnect { .. } => Ok(()),
             TransportCommand::SetEnabled { .. }
-            | TransportCommand::WatchLanPeers(_)
+            | TransportCommand::WatchPeers(_)
             | TransportCommand::SetYgg(_)
             | TransportCommand::SetMailAccount(_)
             | TransportCommand::CreateMailAccount { .. } => Err(TransportError::Unavailable),
+            // Принятых связей у этой ступени нет: отвечать в них нечего.
+            TransportCommand::BindLink { .. } => Err(TransportError::Unavailable),
         }
     }
 
@@ -764,6 +766,8 @@ async fn on_note(state: &mut State, note: Note, events: &mpsc::Sender<TransportE
                     // а личность устанавливает рукопожатие §8.2. Ровно
                     // так же поступает почта с заголовком `From:`.
                     peer_hint: None,
+                    // Связей у реле нет: ответ уедет своей публикацией.
+                    link: None,
                     frame,
                 };
                 let _ = events.send(event).await;

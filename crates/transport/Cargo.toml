@@ -45,6 +45,9 @@ webpki-roots = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
+# Шестая ступень (0.4): объявление BLE и сокеты L2CAP. Только Linux —
+# это обвязка BlueZ, — и потому под признаком, не в умолчании.
+bluer = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 ygg_stream = { workspace = true, optional = true }
 # Только ради `get_peers_json`: состав пиров библиотека отдаёт строкой.
@@ -93,6 +96,26 @@ chatmail-net = [
     "dep:futures",
 ]
 lan = ["dep:mdns-sd"]
+# Живой эфир Bluetooth (0.4). **Не в `default`**, и причин две.
+#
+# Первая та же, что у `onion-arti`, `chatmail-net` и `nostr`: чужой API
+# проверяется сборкой, и пока он не сошёлся, остальное дерево обязано
+# оставаться зелёным.
+#
+# Вторая своя: `bluer` — обвязка BlueZ, то есть **только Linux**. Android
+# сюда не входит и войти не может: там объявление и сокет — это Java
+# (0.4.6), и радио оттуда приходит мостом (`bluetooth::bridge`), который
+# собирается **без** этого признака. Включать его в сборке под телефон
+# нельзя — она не соберётся, и это честнее, чем ступень, которой там нет.
+#
+# Без признака раннер остаётся и остаётся полным: мост собирается всегда,
+# а вот радио ему никто не вручает, и ступень честно объявляется
+# потерянной. Ровно то, что видно в `/who` строкой `bt: работает=нет`.
+bt = [
+    # Обзор `bluer` отдаёт потоком futures, а не tokio.
+    "dep:futures",
+    "dep:bluer",
+]
 # Ступень поверх реле nostr (0.3). **Не в `default`**, и по той же причине,
 # что `onion-arti` и `chatmail-net`: пока чужой API не сошёлся сборкой,
 # остальное дерево обязано оставаться зелёным.

@@ -3,10 +3,11 @@
 //! **Не гонка.** Строгая последовательность с таймаутами:
 //!
 //! 1. Если LAN включён и контакт в нём виден → LAN.
-//! 2. Иначе, если включён меш Yggdrasil и ключ контакта известен → ygg (0.2).
-//! 3. Иначе попытка соединения с onion-адресом, таймаут 45 с.
-//! 4. Иначе, если известен ключ nostr → событие на реле (0.3).
-//! 5. Если не удалось → отправка почтой.
+//! 2. Иначе, если Bluetooth включён и контакт виден в эфире → BT (0.4).
+//! 3. Иначе, если включён меш Yggdrasil и ключ контакта известен → ygg (0.2).
+//! 4. Иначе попытка соединения с onion-адресом, таймаут 45 с.
+//! 5. Иначе, если известен ключ nostr → событие на реле (0.3).
+//! 6. Если не удалось → отправка почтой.
 //!
 //! Одновременная отправка одним и тем же сообщением по нескольким транспортам
 //! запрещена. Дублирование на приёме допускается и разрешается дедупликацией
@@ -23,8 +24,8 @@
 //! сессии никогда. Сессия, начатая в LAN, при потере связи не продолжается
 //! через onion — устанавливается новая. Иначе локальный наблюдатель связывает
 //! LAN-присутствие с onion-активностью. Это правило действует и для канала
-//! десктоп—телефон (§13.4). Семейств три: LAN, Tor (onion, nostr и почта)
-//! и меш Yggdrasil — см. [`SessionBinding`].
+//! десктоп—телефон (§13.4). Семейств четыре: LAN, Tor (onion, nostr и почта),
+//! меш Yggdrasil и Bluetooth — см. [`SessionBinding`].
 
 /// Таймаут попытки соединения с onion-сервисом (§5.4).
 pub const ONION_CONNECT_TIMEOUT_MS: u64 = 45_000;
@@ -93,6 +94,35 @@ pub const YGG_CONNECT_TIMEOUT_MS: u64 = 8_000;
 /// групповые — чаще всего нет.
 pub const YGG_RECEIPT_TIMEOUT_MS: u64 = 2 * YGG_CONNECT_TIMEOUT_MS;
 
+/// Таймаут соединения по Bluetooth (0.4).
+///
+/// Десять секунд, и складываются они не из одного набора. Само соединение
+/// L2CAP после того, как устройство найдено, устанавливается за доли
+/// секунды — но найти его надо: объявление BLE вещается с интервалом,
+/// а сканирование слушает окнами, и встреча этих двух расписаний занимает
+/// секунды, а не миллисекунды. Двух секунд, как у локальной сети, здесь
+/// не хватило бы на само обнаружение.
+///
+/// И не сорок пять, как у onion: цепочек встречи в эфире нет, собеседник
+/// либо в комнате, либо нет. Десять секунд — это «мы его слышали, и он
+/// не ответил», а за ступенью стоит меш, и его восемь секунд человек
+/// оплатит следом.
+///
+/// **Число выбрано до измерения и подлежит пересчёту.** Замер скорости
+/// канала (`HANDOFF.md`, 6з) считает байты в секунду, а не время набора,
+/// так что этот срок он не закрывает; свою цифру он даст сроку ожидания
+/// квитанции при больших кадрах.
+pub const BT_CONNECT_TIMEOUT_MS: u64 = 10_000;
+
+/// Сколько ждать ответа собеседника после того, как кадр ушёл по Bluetooth.
+///
+/// Вдвое против набора — по тому же доводу, что у меша и у onion:
+/// соединения односторонние (`ARCHITECTURE.md`, 5ц), и ответ приезжает
+/// по тому соединению, которое собеседник должен сперва набрать сам,
+/// то есть отыскав нас в эфире заново. Общий инвариант держит
+/// `every_direct_rung_waits_longer_than_it_dials`.
+pub const BT_RECEIPT_TIMEOUT_MS: u64 = 2 * BT_CONNECT_TIMEOUT_MS;
+
 /// Сколько ждать квитанции по локальной сети, прежде чем считать попытку
 /// неудавшейся (§5.4, §9.4).
 ///
@@ -130,11 +160,100 @@ pub const LAN_RECEIPT_TIMEOUT_MS: u64 = 5_000;
 // при свидетельстве, что собеседник в сети, — например, после недавнего
 // удачного обмена прямым каналом. Без такого свидетельства повтор — гадание.
 
+/// Скромная скорость ступени — байт в секунду.
+///
+/// **Не «сколько она может», а «на сколько можно рассчитывать».** Число
+/// участвует только в сроках ожидания, и ошибаться ему положено в одну
+/// сторону: срок, выданный с запасом, стоит терпения; срок, выданный
+/// впритык, объявляет неудавшейся передачу, которая идёт.
+///
+/// `None` у асинхронных ступеней и не по недосмотру: у почты и реле
+/// ответа не бывает вовсе, ждать там нечего ни секунду, ни час.
+///
+/// Откуда числа:
+///
+/// * **эфир** — измерено на стенде (`HANDOFF.md`, 6з). Кадр в 64 КиБ
+///   проходит круг с квитанцией за 370–510 мс, мебибайт идёт около сорока
+///   секунд; двадцать килобайт в секунду — нижняя из наблюдавшихся
+///   скоростей, округлённая вниз;
+/// * **onion и меш** — те же тридцать килобайт в секунду, что уже стоят
+///   в `files::stall_ms`: одна цепочка Tor через три реле это не канал,
+///   а обещание канала. Второе такое число, разошедшееся с первым, стоило
+///   бы поломки, которую не найти;
+/// * **локальная сеть** — мегабайт в секунду. Настоящая скорость там
+///   на порядок выше, но срок от неё не зависит: мебибайт добавит одну
+///   секунду к пяти, и этого довольно.
+#[must_use]
+pub const fn floor_bytes_per_sec(transport: Transport) -> Option<u64> {
+    match transport {
+        Transport::Lan => Some(1024 * 1024),
+        Transport::Bt => Some(20 * 1024),
+        Transport::Ygg | Transport::Onion => Some(30 * 1024),
+        Transport::Nostr | Transport::Mail => None,
+    }
+}
+
+/// Сколько ждать ответа на кадр **такого размера**.
+///
+/// # Зачем размер, если у ступени уже есть свой срок
+///
+/// Потому что срок ступени — это срок для мелкого кадра, и для мебибайта
+/// он неверен на порядок. Ровно это и поймал первый выход в эфир (0.4):
+/// кадр класса L не укладывался в двадцать секунд, ядро объявляло попытку
+/// неудавшейся, молчание в ответ на отправленный кадр закрывало сессию —
+/// и после каждого длинного текста в журнале стояло новое рукопожатие.
+/// Снаружи это «длинный текст идёт сорок секунд и рвёт переписку».
+///
+/// Ошибка той же формы, что однажды стоила поставки на меше: там срок
+/// ожидания был короче **набора**, здесь — короче **передачи**. И вывод
+/// тот же: срок обязан считаться от того, что делается, а не от одного
+/// лишь имени транспорта.
+///
+/// # Что складывается
+///
+/// Базовый срок ступени плюс время самого кадра при её скромной скорости.
+/// Обратная квитанция в счёт не идёт: она кадр класса S, и на фоне
+/// базового срока её время — шум.
+#[must_use]
+pub fn receipt_timeout_ms(transport: Transport, frame_len: usize) -> Option<u64> {
+    let base = match transport {
+        Transport::Lan => LAN_RECEIPT_TIMEOUT_MS,
+        Transport::Bt => BT_RECEIPT_TIMEOUT_MS,
+        Transport::Ygg => YGG_RECEIPT_TIMEOUT_MS,
+        Transport::Onion => ONION_REPLY_TIMEOUT_MS,
+        // Асинхронные ступени ответа не дают, и срок здесь означал бы
+        // «объявляем недоставленным то, что доставлено».
+        Transport::Nostr | Transport::Mail => return None,
+    };
+    let speed = floor_bytes_per_sec(transport)?;
+    let carry = (frame_len as u64).saturating_mul(1_000) / speed;
+    Some(base.saturating_add(carry))
+}
+
 /// Транспорт (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Transport {
     /// Локальная сеть. По умолчанию выключена (§5.1).
     Lan,
+    /// Канал L2CAP поверх Bluetooth LE (0.4). По умолчанию выключен.
+    ///
+    /// Единственная ступень, которой не нужна никакая инфраструктура:
+    /// ни точки доступа, ни интернета — только два устройства в одной
+    /// комнате. И она же продолжение личной встречи, на которой и так
+    /// сканируют QR (§4.2).
+    ///
+    /// Адресуемость у неё как у локальной сети и не как у всех прочих:
+    /// даёт её не карточка, а эфир. Собеседник годен, только если его
+    /// объявление слышно **сейчас** ([`crate::bluetooth`]); иначе
+    /// сканирование — секунды и батарея — тратилось бы на человека
+    /// за тысячу километров.
+    ///
+    /// Выключена по умолчанию, и причин две. Первая — плата: объявлять
+    /// себя и слушать эфир стоит батареи постоянно, а не в момент
+    /// отправки. Вторая — разрешения: на Android сканирование BLE
+    /// спрашивает у человека отдельное разрешение, и спрашивать его
+    /// за того, кто ступенью не пользуется, нельзя.
+    Bt,
     /// Меш Yggdrasil (0.2). По умолчанию выключен.
     ///
     /// **Здесь было написано неверно, и это стоит помнить.** Причиной
@@ -190,9 +309,15 @@ impl Transport {
     /// живёт всё время разговора, кадры идут в обе стороны, квитанция
     /// возвращается за те же десятки миллисекунд, что и по локальной сети.
     /// Отличает его от почты ровно то же, что и onion, — синхронность.
+    ///
+    /// Bluetooth прямой по тому же признаку: L2CAP CoC — это поток, живущий
+    /// всё время разговора. Медленный поток остаётся потоком; «прямой»
+    /// отвечает на вопрос «дождёмся ли мы ответа по этому же каналу»,
+    /// а не «быстро ли». Файлы, впрочем, им пока не ездят, и решает это
+    /// не прямизна, а [`crate::files::may_send_over`].
     #[must_use]
     pub const fn is_direct(self) -> bool {
-        matches!(self, Transport::Lan | Transport::Ygg | Transport::Onion)
+        matches!(self, Transport::Lan | Transport::Bt | Transport::Ygg | Transport::Onion)
     }
 
     /// Короткое имя для журнала.
@@ -204,6 +329,7 @@ impl Transport {
     pub const fn label(self) -> &'static str {
         match self {
             Transport::Lan => "lan",
+            Transport::Bt => "bt",
             Transport::Ygg => "ygg",
             Transport::Onion => "onion",
             Transport::Nostr => "nostr",
@@ -217,6 +343,18 @@ impl Transport {
 pub struct PeerAvailability {
     /// Контакт виден в LAN по маяку mDNS (§5.1).
     pub seen_on_lan: bool,
+    /// Контакт слышен в эфире по объявлению BLE (0.4).
+    ///
+    /// Пара к [`PeerAvailability::seen_on_lan`], и заведена отдельным полем,
+    /// а не признаком «виден где-нибудь рядом», нарочно: это два разных
+    /// эфира с разными сроками жизни. Устройство может быть слышно
+    /// в Bluetooth и невидимо в локальной сети (разные Wi-Fi, гостевая
+    /// сеть с изоляцией клиентов) и наоборот (Bluetooth выключен).
+    ///
+    /// Кто это поле заполняет — раннер Bluetooth, опознавший объявление
+    /// маяком ([`crate::bluetooth::Advert::matches`]). Пока раннера нет,
+    /// поле остаётся ложным всегда, и ступень честно не годится ни разу.
+    pub seen_on_bt: bool,
     /// Какие транспорты включены на этом устройстве.
     ///
     /// Не «есть ли адрес», а «разрешено ли им пользоваться»: это выбор
@@ -292,11 +430,18 @@ impl TransportSet {
             // И шестнадцать по той же причине: nostr стоит на лестнице
             // между onion и почтой, а бит получает следующий свободный.
             Transport::Nostr => 16,
+            // Bluetooth стоит на лестнице вторым, а бит берёт шестой
+            // свободный — правило то же и держится уже третью ступень
+            // подряд. Байт при этом заполнен наполовину: седьмая ступень
+            // возьмёт 64, восьмая 128, а девятой понадобится второй байт
+            // и запись на диск пошире. Это не забота 0.4, но знать,
+            // где предел, стоит заранее.
+            Transport::Bt => 32,
         }
     }
 
     /// Все известные биты — маска для чтения с диска.
-    const KNOWN: u8 = 1 | 2 | 4 | 8 | 16;
+    const KNOWN: u8 = 1 | 2 | 4 | 8 | 16 | 32;
 
     /// Пустой набор: не разрешён ни один транспорт.
     #[must_use]
@@ -411,6 +556,11 @@ impl Rung {
     /// Значит включённой локальной сети довольно, даже когда адреса ещё
     /// нет вовсе.
     ///
+    /// **Bluetooth — то же исключение и по той же причине** (0.4):
+    /// адресуемость даёт эфир, а не карточка, и объявление может
+    /// прозвучать, как только собеседник войдёт в комнату. Забыть его
+    /// здесь значило бы выбросить сообщение тому, кто сидит рядом.
+    ///
     /// # Почему это живёт здесь, а не в ядре
     ///
     /// Потому что это решение **по ступеням**, а ядро перечисляло их
@@ -422,7 +572,8 @@ impl Rung {
     /// устройствах с одним мешем — всегда.
     #[must_use]
     pub const fn may_open(self) -> bool {
-        self.addressable || (self.enabled && matches!(self.transport, Transport::Lan))
+        self.addressable
+            || (self.enabled && matches!(self.transport, Transport::Lan | Transport::Bt))
     }
 
     /// Почему ступень не годится — или что она годится.
@@ -498,8 +649,8 @@ impl RungState {
 /// забыть нельзя.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reachability {
-    /// Ступени по порядку §5.4: LAN, ygg, onion, nostr, почта.
-    pub rungs: [Rung; 5],
+    /// Ступени по порядку §5.4: LAN, BT, ygg, onion, nostr, почта.
+    pub rungs: [Rung; 6],
 }
 
 impl Reachability {
@@ -515,6 +666,23 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Lan),
                     ready: peer.ready.contains(Transport::Lan),
                     addressable: peer.seen_on_lan,
+                },
+                // Bluetooth сразу за локальной сетью, и порядок этот
+                // не про скорость: LAN быстрее на два порядка и берёт
+                // своё, когда он есть. Дело в том, что за этой ступенью
+                // не стоит никто третий. Меш, onion, nostr и почта — все
+                // требуют интернета; Bluetooth не требует ничего. Значит
+                // в комнате без сети он единственный, кто вообще может
+                // повезти кадр, и место его — до всех, кому нужна сеть.
+                //
+                // Плата за это место — батарея: ступень адресуема, только
+                // пока объявление слышно, а слышно оно, только пока мы
+                // сканируем. Поэтому она и выключена по умолчанию.
+                Rung {
+                    transport: Transport::Bt,
+                    enabled: peer.enabled.contains(Transport::Bt),
+                    ready: peer.ready.contains(Transport::Bt),
+                    addressable: peer.seen_on_bt,
                 },
                 // Ygg выше onion, потому что он **прямой и быстрый**:
                 // десятки миллисекунд против секунд у трёх реле Tor,
@@ -708,23 +876,24 @@ impl Attempt {
     /// Именно ответа, а не соединения: соединение к этому моменту уже
     /// установлено, и его срок отмерил транспорт. Разница существенна
     /// для onion — см. [`ONION_REPLY_TIMEOUT_MS`].
+    ///
+    /// Срок **мелкого** кадра: надбавки за размер здесь нет. Этого хватает
+    /// рукопожатию (§8.2) и квитанциям (§9.4), а вот сообщению — не всегда,
+    /// и на этот случай есть [`Attempt::timeout_ms_for`]. Разъезжаться им
+    /// нечем: оба считает одна функция.
     #[must_use]
     pub fn timeout_ms(&self) -> Option<u64> {
-        match self.tried.last() {
-            Some(Transport::Onion) => Some(ONION_REPLY_TIMEOUT_MS),
-            // У меша свой срок, а не общий с локальной сетью. Здесь стояло
-            // «Ygg меряется по локальной сети», и это была ошибка: набор
-            // в меше длится восемь секунд, а срок стоял пятисекундный —
-            // то есть ступень бросали раньше, чем она успевала отказать.
-            // Разбор — у `YGG_RECEIPT_TIMEOUT_MS`.
-            Some(Transport::Ygg) => Some(YGG_RECEIPT_TIMEOUT_MS),
-            Some(Transport::Lan) => Some(LAN_RECEIPT_TIMEOUT_MS),
-            // Почта асинхронна по устройству: ждать её «ответа» бессмысленно.
-            // Nostr — ровно так же: событие ложится на реле и лежит там,
-            // пока собеседник не зайдёт. Срок ожидания здесь означал бы
-            // «объявляем недоставленным то, что доставлено», как и у почты.
-            Some(Transport::Nostr | Transport::Mail) | None => None,
-        }
+        self.timeout_ms_for(0)
+    }
+
+    /// То же, но для кадра известного размера.
+    ///
+    /// Мебибайт на медленной ступени едет десятки секунд, и срок, выданный
+    /// по имени транспорта, объявил бы его неудавшимся на середине пути —
+    /// см. [`receipt_timeout_ms`], там же разбор живой поломки.
+    #[must_use]
+    pub fn timeout_ms_for(&self, frame_len: usize) -> Option<u64> {
+        self.tried.last().copied().and_then(|t| receipt_timeout_ms(t, frame_len))
     }
 }
 
@@ -750,6 +919,19 @@ pub enum SessionBinding {
     /// интернета и переживает уход из локальной сети. К Tor тем более:
     /// общего у них нет ничего, кроме того что оба не LAN.
     Ygg = 2,
+    /// Сессия живёт в эфире Bluetooth (0.4).
+    ///
+    /// Четвёртое семейство, и соблазн прислонить его к LAN — «оба ведь
+    /// местные» — надо снять сразу. Местные они для **разных**
+    /// наблюдателей: в локальной сети нас видит тот, кто смотрит трафик
+    /// на проводе или на точке доступа, в эфире — тот, кто стоит рядом
+    /// с приёмником. Продолжись сессия из эфира в локальной сети, эти двое
+    /// связали бы одно с другим: устройство, слышимое в комнате, получило
+    /// бы адрес в сети. Ровно того §5.4 и не хочет.
+    ///
+    /// Код 3 оказался свободен потому, что nostr в 0.3 своего семейства
+    /// не завёл, — а не потому, что его держали для Bluetooth.
+    Bt = 3,
 }
 
 impl SessionBinding {
@@ -758,6 +940,7 @@ impl SessionBinding {
     pub const fn of(transport: Transport) -> SessionBinding {
         match transport {
             Transport::Lan => SessionBinding::Lan,
+            Transport::Bt => SessionBinding::Bt,
             Transport::Ygg => SessionBinding::Ygg,
             // Почта тоже идёт поверх Tor (§5.3), поэтому она в том же
             // семействе, что и onion, и смешивать её с LAN так же нельзя.
@@ -798,6 +981,7 @@ impl SessionBinding {
             0 => Some(SessionBinding::Lan),
             1 => Some(SessionBinding::Tor),
             2 => Some(SessionBinding::Ygg),
+            3 => Some(SessionBinding::Bt),
             _ => None,
         }
     }
@@ -812,6 +996,7 @@ mod tests {
     fn full() -> PeerAvailability {
         PeerAvailability {
             seen_on_lan: true,
+            seen_on_bt: true,
             enabled: everything(),
             ready: everything(),
             has_ygg: true,
@@ -827,8 +1012,14 @@ mod tests {
     /// `everything()` продолжал возвращать четыре бита, «всё включено»
     /// означало «всё, кроме nostr», и половина проверок ниже проверяла
     /// не то, что написано в их названиях. Перечисление забыть нельзя.
-    const ALL: [Transport; 5] =
-        [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Nostr, Transport::Mail];
+    const ALL: [Transport; 6] = [
+        Transport::Lan,
+        Transport::Bt,
+        Transport::Ygg,
+        Transport::Onion,
+        Transport::Nostr,
+        Transport::Mail,
+    ];
 
     /// Набор со всеми транспортами.
     fn everything() -> TransportSet {
@@ -870,12 +1061,24 @@ mod tests {
         // §5.1: по умолчанию LAN выключен, даже если контакт виден.
         let peer = without(Transport::Lan);
         let mut a = Attempt::new();
-        assert_eq!(a.next(peer), Some(Decision::Use(Transport::Ygg)), "следующая ступень — меш");
+        assert_eq!(
+            a.next(peer),
+            Some(Decision::Use(Transport::Bt)),
+            "следующая ступень — эфир (0.4)"
+        );
+
+        // Без эфира — меш, как было до 0.4.
+        let mut a = Attempt::new();
+        assert_eq!(
+            a.next(without_all(&[Transport::Lan, Transport::Bt])),
+            Some(Decision::Use(Transport::Ygg)),
+            "за эфиром меш"
+        );
 
         // А без меша — onion, как было до 0.2.
         let mut a = Attempt::new();
         assert_eq!(
-            a.next(without_all(&[Transport::Lan, Transport::Ygg])),
+            a.next(without_all(&[Transport::Lan, Transport::Bt, Transport::Ygg])),
             Some(Decision::Use(Transport::Onion))
         );
     }
@@ -926,7 +1129,7 @@ mod tests {
         rising.set(Transport::Onion, false);
         let peer = PeerAvailability {
             ready: rising,
-            ..without_all(&[Transport::Lan, Transport::Ygg, Transport::Nostr])
+            ..without_all(&[Transport::Lan, Transport::Bt, Transport::Ygg, Transport::Nostr])
         };
 
         let mut a = Attempt::new();
@@ -939,7 +1142,7 @@ mod tests {
         // А когда поднялся — он снова ступень, и притом первая из оставшихся.
         let mut a = Attempt::new();
         assert_eq!(
-            a.next(without_all(&[Transport::Lan, Transport::Ygg])),
+            a.next(without_all(&[Transport::Lan, Transport::Bt, Transport::Ygg])),
             Some(Decision::Use(Transport::Onion))
         );
     }
@@ -950,7 +1153,8 @@ mod tests {
         // не «пробуется и отказывает», а выпадает из лестницы целиком:
         // иначе каждое сообщение платило бы за него сроком ожидания,
         // а человек видел бы «не доставлено» вместо «выключено».
-        let peer = without_all(&[Transport::Onion, Transport::Ygg, Transport::Nostr]);
+        let peer =
+            without_all(&[Transport::Bt, Transport::Onion, Transport::Ygg, Transport::Nostr]);
         let mut a = Attempt::new();
         assert_eq!(a.next(peer), Some(Decision::Use(Transport::Lan)), "первая ступень на месте");
         assert_eq!(
@@ -981,7 +1185,7 @@ mod tests {
         // Незнакомые биты отбрасываются: запись могла лечь более новой
         // версией, и включать по ней транспорт, которого в этой сборке нет,
         // нечем.
-        assert_eq!(TransportSet::from_bits(0b1111_1111), TransportSet::from_bits(0b0001_1111));
+        assert_eq!(TransportSet::from_bits(0b1111_1111), TransportSet::from_bits(0b0011_1111));
 
         // Выключение действительно выключает, а не «почти».
         set.set(Transport::Onion, false);
@@ -1011,7 +1215,7 @@ mod tests {
         // Ключ в карточке — это и есть адресуемость меша. Без него ступень
         // не «пробуется и отказывает», а выпадает, как и всякая другая:
         // иначе каждое сообщение платило бы за неё сроком.
-        let peer = PeerAvailability { has_ygg: false, ..full() };
+        let peer = PeerAvailability { has_ygg: false, seen_on_bt: false, ..full() };
         let view = Reachability::of(peer);
         assert_eq!(view.rung(Transport::Ygg).state(), RungState::NoAddress);
         assert!(!view.rung(Transport::Ygg).usable());
@@ -1049,13 +1253,19 @@ mod tests {
     #[test]
     fn a_binding_survives_a_round_trip_through_a_number() {
         // Числа уезжают в столбец `binding` и возвращаются оттуда.
-        for binding in [SessionBinding::Lan, SessionBinding::Tor, SessionBinding::Ygg] {
+        for binding in
+            [SessionBinding::Lan, SessionBinding::Tor, SessionBinding::Ygg, SessionBinding::Bt]
+        {
             assert_eq!(SessionBinding::from_code(binding.code()), Some(binding));
         }
         // Незнакомое число — запись более новой сборки. Поднимать по нему
         // сессию нечем: продолжив её транспортом, которого мы не знаем,
         // мы отправили бы кадр не туда.
-        assert_eq!(SessionBinding::from_code(3), None);
+        //
+        // Здесь стояло `from_code(3) == None`. Тройку занял Bluetooth (0.4),
+        // и утверждение переехало на четвёрку — но смысл его прежний
+        // и проверяет он то же самое: границу известного.
+        assert_eq!(SessionBinding::from_code(4), None);
         assert_eq!(SessionBinding::from_code(u8::MAX), None);
     }
 
@@ -1074,7 +1284,7 @@ mod tests {
         // Меш выключается вместе с LAN: он стоит между ними, и с ним
         // попытка ушла бы на него — а срок у него свой, короткий.
         let mut a = Attempt::new();
-        a.next(without_all(&[Transport::Lan, Transport::Ygg]));
+        a.next(without_all(&[Transport::Lan, Transport::Bt, Transport::Ygg]));
         assert_eq!(a.timeout_ms(), Some(ONION_REPLY_TIMEOUT_MS));
 
         // А у меша срок свой. Здесь стояло «меш ждёт как локальная сеть»,
@@ -1088,12 +1298,83 @@ mod tests {
         // быть, — и потому не поймало ничего. Общий инвариант проверяет
         // `every_direct_rung_waits_longer_than_it_dials`.
         let mut a = Attempt::new();
-        a.next(without(Transport::Lan));
+        a.next(without_all(&[Transport::Lan, Transport::Bt]));
         assert_eq!(a.timeout_ms(), Some(YGG_RECEIPT_TIMEOUT_MS), "у меша свой срок");
         assert!(
             ONION_REPLY_TIMEOUT_MS >= 2 * ONION_CONNECT_TIMEOUT_MS,
             "в срок ответа обязан помещаться целый чужой набор, и наш тоже"
         );
+    }
+
+    /// Кадр класса L — мебибайт (§5.5). Числом, а не через `SizeClass`:
+    /// политика не зависит от провода, и тянуть его сюда ради одной
+    /// константы значило бы связать их навсегда.
+    const BULKY: usize = 1024 * 1024;
+
+    #[test]
+    fn a_deadline_holds_the_whole_frame_it_waits_for() {
+        // **Главный инвариант сроков, дубль второй.** Первый (`…dials`)
+        // держит «срок обязан пережить набор»; этот — «срок обязан пережить
+        // сам кадр».
+        //
+        // Ошибка, которую он стережёт, стоила живой поставки: мебибайт
+        // по эфиру не укладывался в двадцать секунд, ядро объявляло попытку
+        // неудавшейся, молчание в ответ на кадр закрывало сессию — и после
+        // каждого длинного текста в журнале стояло новое рукопожатие.
+        // Снаружи «длинный текст идёт сорок секунд и рвёт переписку».
+        for transport in ALL {
+            let Some(speed) = floor_bytes_per_sec(transport) else {
+                continue;
+            };
+            let flight = BULKY as u64 * 1_000 / speed;
+            let waited = receipt_timeout_ms(transport, BULKY).expect("у прямой ступени срок есть");
+            assert!(
+                waited >= flight,
+                "{}: кадр летит {flight} мс, а ждём мы {waited}",
+                transport.label()
+            );
+            // И сверх того — столько же, сколько ждали бы мелкий кадр:
+            // передача кончилась, а ответ ещё идёт, и его дорога от размера
+            // не зависит.
+            assert!(waited >= flight + receipt_timeout_ms(transport, 0).expect("базовый срок"));
+        }
+    }
+
+    #[test]
+    fn the_deadline_grows_with_the_frame_and_not_by_accident() {
+        // Порядок величин важнее самих чисел: у эфира мебибайт обязан
+        // добавить десятки секунд, а не доли.
+        let small = receipt_timeout_ms(Transport::Bt, 4 * 1024).expect("срок");
+        let bulky = receipt_timeout_ms(Transport::Bt, BULKY).expect("срок");
+        assert!(bulky > small + 40_000, "мебибайт в эфире стоит десятков секунд: {bulky} мс");
+
+        // А в локальной сети тот же кадр почти ничего не добавляет:
+        // разница ступеней — в скорости, и срок обязан её признавать.
+        let lan = receipt_timeout_ms(Transport::Lan, BULKY).expect("срок");
+        assert!(lan < LAN_RECEIPT_TIMEOUT_MS + 2_000, "по локальной сети мебибайт это секунда");
+        assert!(bulky > lan, "эфир медленнее локальной сети, и сроки это знают");
+    }
+
+    #[test]
+    fn an_asynchronous_rung_has_no_deadline_at_any_size() {
+        // Ни при каком размере: у почты и реле ответа не бывает вовсе,
+        // и срок означал бы «объявляем недоставленным то, что доставлено».
+        for transport in [Transport::Nostr, Transport::Mail] {
+            for size in [0, 4 * 1024, BULKY] {
+                assert_eq!(receipt_timeout_ms(transport, size), None, "{transport:?} {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_small_frame_deadline_is_the_one_it_always_was() {
+        // Надбавка за размер не должна была тронуть прежние сроки:
+        // рукопожатие и квитанции — кадры класса S, и ждать их дольше
+        // незачем.
+        assert_eq!(receipt_timeout_ms(Transport::Lan, 0), Some(LAN_RECEIPT_TIMEOUT_MS));
+        assert_eq!(receipt_timeout_ms(Transport::Bt, 0), Some(BT_RECEIPT_TIMEOUT_MS));
+        assert_eq!(receipt_timeout_ms(Transport::Ygg, 0), Some(YGG_RECEIPT_TIMEOUT_MS));
+        assert_eq!(receipt_timeout_ms(Transport::Onion, 0), Some(ONION_REPLY_TIMEOUT_MS));
     }
 
     #[test]
@@ -1155,7 +1436,11 @@ mod tests {
         assert!(SessionBinding::of(Transport::Nostr).allows(Transport::Mail));
         assert!(!SessionBinding::of(Transport::Lan).allows(Transport::Nostr));
         assert!(!SessionBinding::of(Transport::Ygg).allows(Transport::Nostr));
-        assert_eq!(SessionBinding::from_code(3), None, "четвёртого семейства не завелось");
+        // Четвёртого семейства nostr не завёл — код 3 остался свободен
+        // и достался Bluetooth только в 0.4. Утверждение про сам код
+        // переехало в `a_binding_survives_a_round_trip_through_a_number`:
+        // здесь проверяется nostr, а не нумерация.
+        assert_eq!(SessionBinding::of(Transport::Nostr).code(), SessionBinding::Tor.code());
     }
 
     #[test]
@@ -1183,6 +1468,7 @@ mod tests {
         // Ровно это и было у меша: набор восемь секунд, срок пять.
         for (transport, dial, wait) in [
             (Transport::Lan, LAN_CONNECT_TIMEOUT_MS, LAN_RECEIPT_TIMEOUT_MS),
+            (Transport::Bt, BT_CONNECT_TIMEOUT_MS, BT_RECEIPT_TIMEOUT_MS),
             (Transport::Ygg, YGG_CONNECT_TIMEOUT_MS, YGG_RECEIPT_TIMEOUT_MS),
             (Transport::Onion, ONION_CONNECT_TIMEOUT_MS, ONION_REPLY_TIMEOUT_MS),
         ] {
@@ -1260,21 +1546,30 @@ mod tests {
         // Обратная сторона правила, и без неё оно не значило бы ничего:
         // обещание «отправим позже» там, где ехать некуда и не станет,
         // — выдумка, которую §14 запрещает прямо.
+        // Выключить приходится обе ступени эфира — и локальную сеть,
+        // и Bluetooth: обе обещают адрес, которого сейчас нет, и любой
+        // одной довольно, чтобы ждать было чего.
         let nowhere = PeerAvailability {
-            enabled: everything().without(Transport::Lan),
+            enabled: everything().without(Transport::Lan).without(Transport::Bt),
             ready: everything(),
             ..Default::default()
         };
         assert!(
             !Reachability::of(nowhere).may_open(),
-            "ни одного адреса и LAN выключен — это «не доставлено», а не «ждём»"
+            "ни одного адреса, и оба эфира выключены — это «не доставлено», а не «ждём»"
         );
 
         // И ровно одна разница между «ждём» и «не доставлено» в этом наборе —
         // выключатель локальной сети. Пара утверждений стоит рядом нарочно:
         // порознь каждое верно и без правила, вместе — только с ним.
-        let lan_on = PeerAvailability { enabled: everything(), ..nowhere };
+        let lan_on = PeerAvailability { enabled: everything().without(Transport::Bt), ..nowhere };
         assert!(Reachability::of(lan_on).may_open(), "включённый LAN обещает маяк");
+
+        // То же самое и про эфир Bluetooth, и это не повтор: у него своё
+        // поле адресуемости, и забыть его в `may_open` было бы отдельной
+        // поломкой — сообщение выбрасывалось бы тому, кто сидит рядом.
+        let bt_on = PeerAvailability { enabled: everything().without(Transport::Lan), ..nowhere };
+        assert!(Reachability::of(bt_on).may_open(), "включённый Bluetooth обещает объявление");
     }
 
     #[test]
@@ -1296,9 +1591,75 @@ mod tests {
     #[test]
     fn direct_and_indirect_are_classified() {
         assert!(Transport::Lan.is_direct());
+        assert!(Transport::Bt.is_direct());
         assert!(Transport::Onion.is_direct());
         assert!(!Transport::Nostr.is_direct());
         assert!(!Transport::Mail.is_direct());
+    }
+
+    #[test]
+    fn bluetooth_stands_right_after_the_lan() {
+        // Порядок ступеней — и есть §5.4, и проверять его надо не глазами.
+        // Ниже локальной сети, потому что LAN быстрее на два порядка;
+        // выше всех прочих, потому что за эфиром не стоит никто: меш,
+        // onion, nostr и почта требуют интернета, а он требует комнаты.
+        let mut a = Attempt::new();
+        let mut order = Vec::new();
+        while let Some(Decision::Use(t)) = a.next(full()) {
+            order.push(t);
+        }
+        assert_eq!(order[0], Transport::Lan, "локальная сеть остаётся первой");
+        assert_eq!(order[1], Transport::Bt, "эфир — сразу за ней");
+    }
+
+    #[test]
+    fn bluetooth_without_a_voice_in_the_air_is_not_a_step() {
+        // Адресуемость эфира — это эфир, а не карточка: собеседник годен,
+        // только пока его объявление слышно. Иначе сканирование — секунды
+        // и батарея — тратилось бы на человека за тысячу километров.
+        let peer = PeerAvailability { seen_on_bt: false, ..full() };
+        let view = Reachability::of(peer);
+        assert_eq!(view.rung(Transport::Bt).state(), RungState::NoAddress);
+        assert!(!view.rung(Transport::Bt).usable());
+
+        let mut a = Attempt::new();
+        assert_eq!(a.next(peer), Some(Decision::Use(Transport::Lan)));
+        assert_eq!(
+            a.next(peer),
+            Some(Decision::Use(Transport::Ygg)),
+            "молчащий эфир пропускается, а не тратится"
+        );
+    }
+
+    #[test]
+    fn bluetooth_is_a_family_of_its_own() {
+        // Ни LAN, ни Tor, ни меш. Соблазн прислонить эфир к локальной сети
+        // — «оба ведь местные» — обманчив: местные они для разных
+        // наблюдателей, и общая сессия связала бы устройство, слышимое
+        // в комнате, с адресом в сети.
+        assert_ne!(SessionBinding::of(Transport::Bt), SessionBinding::Lan);
+        assert_ne!(SessionBinding::of(Transport::Bt), SessionBinding::Tor);
+        assert_ne!(SessionBinding::of(Transport::Bt), SessionBinding::Ygg);
+        assert!(SessionBinding::of(Transport::Bt).allows(Transport::Bt));
+        assert!(!SessionBinding::of(Transport::Bt).allows(Transport::Lan));
+        assert!(!SessionBinding::of(Transport::Lan).allows(Transport::Bt));
+    }
+
+    #[test]
+    fn a_bluetooth_only_contact_is_worth_waiting_for() {
+        // Та же поломка, что однажды съела сообщения контакта, доступного
+        // только через меш: ступень, которую забыли в `may_open`, делает
+        // сообщение недоставимым — и оно выбрасывается, ни разу не попав
+        // в очередь ожидания. У эфира это выглядело бы особенно глупо:
+        // собеседник сидит рядом и вот-вот объявится.
+        let air_only = PeerAvailability {
+            enabled: TransportSet::none().with(Transport::Bt),
+            ..Default::default()
+        };
+        assert!(
+            Reachability::of(air_only).may_open(),
+            "эфир включён — объявление может прозвучать в любую минуту"
+        );
     }
 
     #[test]
@@ -1363,10 +1724,11 @@ mod tests {
                 seen_on_lan: bits & 8 != 0,
                 enabled,
                 ready,
-                // Меш и nostr из этого перебора выведены намеренно: он
-                // перебирает пары «включено — готово» у onion и почты,
+                // Меш, эфир и nostr из этого перебора выведены намеренно:
+                // он перебирает пары «включено — готово» у onion и почты,
                 // а ступени посередине только удвоили бы прогон, ничего
                 // не проверив. Их разбирают проверки рядом.
+                seen_on_bt: false,
                 has_ygg: false,
                 has_onion: bits & 16 != 0,
                 has_nostr: false,
@@ -1395,6 +1757,7 @@ mod tests {
         enabled.set(Transport::Onion, true);
         let rising = PeerAvailability {
             seen_on_lan: false,
+            seen_on_bt: false,
             enabled,
             ready: TransportSet::none(),
             has_ygg: false,
@@ -1439,6 +1802,7 @@ mod tests {
         enabled.set(Transport::Lan, false);
         let peer = PeerAvailability {
             seen_on_lan: false,
+            seen_on_bt: false,
             enabled,
             ready: everything(),
             has_ygg: false,
@@ -1449,13 +1813,15 @@ mod tests {
         let rungs = Reachability::of(peer);
 
         assert_eq!(rungs.rung(Transport::Lan).state(), RungState::Disabled);
+        assert_eq!(rungs.rung(Transport::Bt).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Ygg).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Onion).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Nostr).state(), RungState::NoAddress);
         assert_eq!(rungs.rung(Transport::Mail).state(), RungState::Usable);
         assert_eq!(
             rungs.refusal(),
-            "lan=выключен ygg=адреса нет onion=адреса нет nostr=адреса нет mail=годен"
+            "lan=выключен bt=адреса нет ygg=адреса нет onion=адреса нет nostr=адреса нет \
+             mail=годен"
         );
     }
 
@@ -1467,6 +1833,7 @@ mod tests {
         // строки было нечем.
         let peer = PeerAvailability {
             seen_on_lan: false,
+            seen_on_bt: false,
             has_ygg: false,
             has_onion: false,
             has_nostr: false,
@@ -1480,7 +1847,8 @@ mod tests {
         assert_eq!(rungs.rising(), None, "и ждать нечего: подниматься нечему");
         assert_eq!(
             rungs.refusal(),
-            "lan=адреса нет ygg=адреса нет onion=адреса нет nostr=адреса нет mail=адреса нет"
+            "lan=адреса нет bt=адреса нет ygg=адреса нет onion=адреса нет nostr=адреса нет \
+             mail=адреса нет"
         );
     }
 

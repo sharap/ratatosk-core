@@ -1,0 +1,1405 @@
+//! Bluetooth: канал L2CAP в одной комнате (0.4).
+//!
+//! **По умолчанию ступень выключена.** Она стоит батареи постоянно —
+//! объявлять себя и слушать эфир нужно всё время, а не в момент отправки, —
+//! и на Android спрашивает отдельное разрешение. Умолчание в коде совпадает
+//! с умолчанием в продукте: [`BtConfig::default`] возвращает выключенное
+//! состояние.
+//!
+//! Обнаружение: объявление BLE с записью маяка и номером PSM
+//! ([`ratatosk_proto::bluetooth`]). Статический опознаватель в эфир
+//! не транслируется никогда — ни `IK`, ни магия, ни имя устройства.
+//!
+//! Кадрирование общее с локальной сетью и живёт в [`crate::link`]: канал
+//! L2CAP CoC — поток байт, и от TCP он отличается ровно тем, чем открыт.
+//! Ни своего формата, ни нарезки на части (в отличие от nostr) ступени
+//! не нужно.
+//!
+//! # Порядок подъёма, и он не произволен
+//!
+//! 1. слушающий сокет — **первым**: его номер PSM едет в объявлении,
+//!    и объявить себя раньше значит объявить номер, которого нет;
+//! 2. объявление — вторым, и только после него ступень объявляется
+//!    готовой ([`TransportEvent::Ready`]). До этого мгновения §5.4 её
+//!    не выбирает: ступень, объявленная готовой раньше времени, сжигает
+//!    попытку — транспорт после отказа не повторяется;
+//! 3. сканирование — третьим. Оно нужно, чтобы **набирать**, а не чтобы
+//!    быть найденным, и без него ступень работает вполсилы: нас найдут,
+//!    мы никого.
+//!
+//! # Соединения односторонние — но у эфира с оговоркой
+//!
+//! Правило общее: транспорт не знает, кто к нему подключился — личность
+//! устанавливает рукопожатие (§8.2), а не адрес радио, — и потому каждая
+//! сторона набирает своё соединение и пишет только в него.
+//!
+//! **В эфире к этому пришлось добавить ответ в принятый канал.** Не ради
+//! экономии, а потому что иначе ступень не работает с телефоном вовсе:
+//! Android объявляется приватным адресом, который проворачивается,
+//! а разрешить такой адрес умеет только сопряжённое устройство —
+//! сопряжения же у нас нет и не будет. Набор в ответ поэтому не удаётся
+//! никогда: на стенде это десять секунд тишины на каждую попытку и
+//! рукопожатие, которое не сходится.
+//!
+//! Правило §8.2 при этом цело: транспорт по-прежнему не знает, чей это
+//! канал. Он приносит **номер** ([`TransportEvent::Received::link`]),
+//! а имя каналу называет ядро, разобрав пришедший им кадр
+//! ([`TransportCommand::BindLink`]). Направление здесь и есть суть:
+//! личность спускается сверху, а не выводится из адреса радио.
+//!
+//! # Радио два, ступень одна
+//!
+//! На Linux эфиром правит `bluer` ([`local`]), на Android — Java
+//! по ту сторону границы §13.3 ([`bridge`]). Общее у них всё, кроме
+//! самого радио: формат объявления, опознание маяком, выбор канала
+//! по классу кадра, сроки. Разделены они трейтом [`Air`] — нарочно
+//! узким: поднять, погасить, набрать.
+//!
+//! # Чего здесь нет
+//!
+//! **GATT-сервера нет ни на одной стороне.** Номер PSM, ради которого
+//! его обычно и поднимают, едет в объявлении.
+//!
+//! **Адаптер мы не включаем.** Выключенный Bluetooth — это выбор человека,
+//! и трогать его переключатель за него нельзя: ступень честно не
+//! поднимается и говорит почему.
+
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ratatosk_crypto::identity::beacon;
+use ratatosk_proto::transport_policy::Transport;
+use ratatosk_wire::SizeClass;
+use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
+
+use crate::link::Link;
+use crate::runner::{Runner, TransportCommand, TransportError, TransportEvent};
+
+#[cfg(feature = "bt")]
+pub mod local;
+
+pub mod bridge;
+
+/// Настройки ступени.
+///
+/// Одно поле, и это не заготовка под будущее: настраивать в эфире нечего.
+/// Ни адреса, ни ключа, ни списка серверов — ступень адресуется эфиром,
+/// а не карточкой (0.4.2).
+#[derive(Debug, Clone)]
+pub struct BtConfig {
+    /// Объявлять ли себя и слушать ли эфир.
+    pub enabled: bool,
+}
+
+impl Default for BtConfig {
+    fn default() -> Self {
+        // 0.4.2: «Ступень выключена по умолчанию.»
+        BtConfig { enabled: false }
+    }
+}
+
+/// Где слушает собеседник.
+///
+/// Платформенных типов здесь намеренно нет: раннер живёт и в сборке
+/// без признака `bt`, а `bluer` — только с ним. Перевод в адрес `bluer`
+/// делает модуль эфира, и только он.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtAddress {
+    /// Адрес радио, шесть байт.
+    pub addr: [u8; 6],
+    /// Случайный ли это адрес.
+    ///
+    /// У BLE он почти всегда случайный и меняется вместе с объявлением —
+    /// в этом и смысл. Но набирать надо тем же типом, каким устройство
+    /// объявилось: адрес того же вида, прочитанный как публичный,
+    /// не найдётся.
+    pub random: bool,
+    /// Номер канала L2CAP, на котором собеседник слушает.
+    pub psm: u16,
+}
+
+/// Известные адреса контактов в эфире.
+///
+/// Заполняется сканированием, читается отправкой. Как и в локальной сети,
+/// адрес здесь не приходит в карточке (§4.1) и не может: он меняется
+/// вместе с объявлением каждые четверть часа.
+pub type Directory = Arc<Mutex<BTreeMap<[u8; 32], BtAddress>>>;
+
+/// Чьи маяки сопоставлять. Приходит из ядра командой
+/// [`TransportCommand::WatchPeers`].
+pub type Watched = Arc<Mutex<Vec<[u8; 32]>>>;
+
+/// Запись маяка: соль и значение (§5.1).
+pub type BeaconRecord = [u8; 16];
+
+/// Что слышно в эфире прямо сейчас — независимо от того, ждём мы этого
+/// собеседника или нет.
+///
+/// Та же нужда, что и в локальной сети: объявление могло прозвучать
+/// **раньше**, чем ядро сказало, чьи маяки искать. Без этого буфера контакт,
+/// добавленный только что, ждал бы следующего объявления — а объявление
+/// вещается интервалами, и это секунды впустую там, где человек стоит
+/// рядом и смотрит на экран.
+pub type Heard = Arc<Mutex<Vec<(BeaconRecord, BtAddress)>>>;
+
+/// Сколько объявлений помнить.
+///
+/// В комнате устройств единицы, в вагоне метро — сотни, и это не
+/// преувеличение: BLE вещает всякий наушник. Помнить их все незачем,
+/// а безграничный список — способ занять память чужим эфиром. Сюда
+/// попадают только объявления **нашей** длины под нашим кодом
+/// производителя, так что наушники отсеиваются раньше.
+const HEARD_CAPACITY: usize = 64;
+
+/// Сколько принятых каналов ждут, пока ядро назовёт их собеседника.
+///
+/// Восемь: столько устройств в одной комнате — уже много, а очередь эта
+/// живёт доли секунды, ровно до разбора первого пришедшего кадра.
+/// Переполнение означает, что к нам ломятся быстрее, чем мы читаем,
+/// и лишний канал честнее уронить, чем расти памятью на чужом эфире.
+const ACCEPTED_QUEUE: usize = 8;
+
+/// Радио — всё, что раннер не умеет сам.
+///
+/// # Зачем этот трейт вообще
+///
+/// Реализаций эфира две, и они не похожи ничем, кроме назначения.
+/// На Linux это [`local`] — `bluer`, сокеты L2CAP, свои задачи. На Android
+/// радио живёт **за границей §13.3**: объявлять, сканировать и открывать
+/// каналы там умеет только Java, и Rust получает от неё готовые байты
+/// ([`bridge`]).
+///
+/// Всё остальное у них общее и обязано остаться общим: опознание маяком,
+/// справочник услышанного, выбор канала по классу кадра, сроки. Две копии
+/// этого разошлись бы на первой же правке — и разошлись бы молча, потому
+/// что каждая работала бы «у себя».
+///
+/// Поэтому трейт нарочно узкий: **поднять, погасить, набрать**. Всё, что
+/// можно решить выше, решается выше.
+///
+/// # Поток нужен только на запись
+///
+/// Соединения односторонние (см. заголовок модуля): мы пишем в тот канал,
+/// который набрали сами, а читаем из того, который набрали нам. Поэтому
+/// набор отдаёт `AsyncWrite`, и ничего сверх него от потока не требуется;
+/// входящие каналы до раннера доходят уже разобранными на кадры.
+pub trait Air: Send + 'static {
+    /// Куда писать кадры набранного канала.
+    type Stream: AsyncWrite + Unpin + Send + 'static;
+
+    /// Поднимает эфир: занять канал, объявиться, начать слушать.
+    ///
+    /// **Не ждёт радио.** Возврат означает «начали», а не «работает»:
+    /// исход приезжает ядру событием ([`TransportEvent::Ready`] либо
+    /// [`TransportEvent::Lost`]). Ждать здесь нельзя — `Driver::apply`
+    /// дожидается каждой команды в теле своего цикла.
+    fn raise(&mut self, setup: AirSetup<Self::Stream>);
+
+    /// Гасит эфир немедленно: человек выключил ступень именно затем,
+    /// чтобы перестать быть слышимым.
+    fn lower(&mut self);
+
+    /// Набирает канал к услышанному собеседнику.
+    ///
+    /// Будущее **не заимствует эфир**: набор уезжает в задачу связи
+    /// ([`Link::dialing`]), которая живёт своей жизнью и переживает
+    /// и выключение ступени, и сам раннер.
+    fn dial(&self, target: BtAddress) -> DialFuture<Self::Stream>;
+}
+
+/// Обещание канала: набор идёт в фоне и заимствовать эфир не вправе.
+pub type DialFuture<S> = Pin<Box<dyn Future<Output = Result<S, TransportError>> + Send>>;
+
+/// Всё, что радио нужно знать о раннере, — одной записью.
+///
+/// Записью, а не пятью доводами: состав здесь будет меняться (у Android
+/// уже сейчас своя нужда — отдавать наверх готовые кадры), и пять доводов
+/// пришлось бы править в трёх местах на каждую перемену.
+pub struct AirSetup<S> {
+    /// Свой `IK` — из него выводится объявляемый маяк.
+    pub my_ik: [u8; 32],
+    /// Чьи маяки опознавать.
+    pub watched: Watched,
+    /// Куда складывать услышанное до того, как контакт добавлен.
+    pub heard: Heard,
+    /// Куда складывать опознанные адреса.
+    pub directory: Directory,
+    /// Куда сообщать о происходящем.
+    pub events: mpsc::Sender<TransportEvent>,
+    /// Куда отдавать **пишущие половины принятых каналов**.
+    ///
+    /// # Зачем принятому каналу вообще запись
+    ///
+    /// Соединения у нас односторонние, и в сети это работает: адрес
+    /// собеседника постоянен, набрать его в ответ можно всегда. В эфире —
+    /// нет. Телефон объявляется **приватным адресом**, который
+    /// проворачивается, а разрешить такой адрес умеет только сопряжённое
+    /// устройство; сопряжения у нас нет и не будет (§8.2). Набор в ответ
+    /// на телефон поэтому не удаётся вовсе — проверено стендом: десять
+    /// секунд тишины на каждую попытку.
+    ///
+    /// Канал же, который телефон открыл к нам, двусторонний по устройству
+    /// L2CAP. Мы просто в него не писали.
+    ///
+    /// # Чей он — радио по-прежнему не знает
+    ///
+    /// Сюда едет **номер и перо**, а не собеседник. Имя каналу называет
+    /// ядро ([`TransportCommand::BindLink`]), разобрав пришедший им кадр.
+    /// Иначе транспорт узнавал бы собеседника по адресу радио, чего §8.2
+    /// не разрешает ни при каких удобствах.
+    pub accepted: mpsc::Sender<(u64, S)>,
+}
+
+/// Опознаёт объявление и, если это знакомый, запоминает адрес.
+///
+/// **Одна на обе реализации эфира, и это не экономия строк.** Правило
+/// здесь протокольное: объявление опознаётся перебором известных `IK`
+/// по маяку (§5.1, 0.4.3), и живёт оно выше границы §13.3 — там, где
+/// ему и место. Радио, которое опознаёт контакты само, было бы радио,
+/// знающим, кто с кем переписывается.
+///
+/// Возвращает тех, кого узнали: событие о них шлёт вызывающий — у него
+/// свой способ дотянуться до ядра.
+pub fn note_advert<S>(
+    setup: &AirSetup<S>,
+    payload: &[u8],
+    addr: [u8; 6],
+    random: bool,
+) -> Vec<[u8; 32]> {
+    let Ok(parsed) = ratatosk_proto::bluetooth::parse(payload) else {
+        return Vec::new();
+    };
+    let seen = BtAddress { addr, random, psm: parsed.psm };
+    remember(&setup.heard, parsed.record, seen);
+
+    let slot = beacon::slot(unix_seconds());
+    let peers: Vec<[u8; 32]> = setup.watched.lock().map(|w| w.clone()).unwrap_or_default();
+    let mut found = Vec::new();
+    for peer_ik in peers {
+        if !parsed.matches(&peer_ik, slot) {
+            continue;
+        }
+        let fresh = match setup.directory.lock() {
+            Ok(mut directory) => directory.insert(peer_ik, seen) != Some(seen),
+            Err(_) => false,
+        };
+        if fresh {
+            tracing::debug!(psm = seen.psm, "эфир: контакт объявился");
+        }
+        found.push(peer_ik);
+    }
+    found
+}
+
+/// Кладёт услышанное в кольцо ограниченной длины.
+fn remember(heard: &Heard, record: BeaconRecord, addr: BtAddress) {
+    let Ok(mut heard) = heard.lock() else { return };
+    if let Some(slot) = heard.iter_mut().find(|(known, _)| *known == record) {
+        slot.1 = addr;
+        return;
+    }
+    if heard.len() >= HEARD_CAPACITY {
+        heard.remove(0);
+    }
+    heard.push((record, addr));
+}
+
+/// Раннер шестой ступени.
+///
+/// Заводится всегда, даже в сборке без признака `bt` и на машине без
+/// адаптера: состав транспортов задан типами, и второй его вид означал бы
+/// вторую сборку драйвера. Без эфира он честно отказывает — и это правда
+/// о сборке, а не заглушка.
+pub struct BtRunner<A: Air> {
+    /// Радио: `bluer` на Linux, мост в Java на Android.
+    air: A,
+    events_tx: mpsc::Sender<TransportEvent>,
+    events_rx: mpsc::Receiver<TransportEvent>,
+    /// Срочные каналы: тексты, квитанции, рукопожатия, лица и превью.
+    links: BTreeMap<[u8; 32], Link>,
+    /// Объёмные каналы: только кадры класса L.
+    ///
+    /// Второй канал к тому же собеседнику и тому же PSM — см. разбор
+    /// у [`BtRunner::ensure_link`]. Заводится лениво: пока объёмного
+    /// кадра не было, его нет.
+    bulk: BTreeMap<[u8; 32], Link>,
+    directory: Directory,
+    watched: Watched,
+    heard: Heard,
+    /// Принятые каналы, которым ядро ещё не назвало собеседника.
+    ///
+    /// Их называет [`TransportCommand::BindLink`]: радио знает «откуда»,
+    /// а «от кого» — только рукопожатие (§8.2).
+    unbound: BTreeMap<u64, A::Stream>,
+    /// Принятые каналы, уже названные. Отвечать в них можно и нужно.
+    bound: BTreeMap<[u8; 32], (u64, Link)>,
+    accepted_rx: mpsc::Receiver<(u64, A::Stream)>,
+    accepted_tx: mpsc::Sender<(u64, A::Stream)>,
+    /// Нужен объявлению: маяк выводится из него.
+    my_ik: [u8; 32],
+    enabled: bool,
+}
+
+impl<A: Air> BtRunner<A> {
+    /// Заводит раннер поверх названного радио. Эфир при этом ещё
+    /// не поднимается.
+    ///
+    /// Асинхронного здесь нет ничего, и функция всё-таки `async`: так её
+    /// зовут рядом с остальными (`LanRunner::start`, `YggRunner::start`),
+    /// и день, когда подъём эфира понадобится прямо здесь, не потребует
+    /// править вызовы.
+    #[allow(clippy::unused_async)]
+    pub async fn start(
+        air: A,
+        config: BtConfig,
+        my_ik: [u8; 32],
+    ) -> Result<BtRunner<A>, TransportError> {
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let (accepted_tx, accepted_rx) = mpsc::channel(ACCEPTED_QUEUE);
+        let mut runner = BtRunner {
+            air,
+            events_tx,
+            events_rx,
+            links: BTreeMap::new(),
+            bulk: BTreeMap::new(),
+            unbound: BTreeMap::new(),
+            bound: BTreeMap::new(),
+            accepted_rx,
+            accepted_tx,
+            directory: Arc::new(Mutex::new(BTreeMap::new())),
+            watched: Arc::new(Mutex::new(Vec::new())),
+            heard: Arc::new(Mutex::new(Vec::new())),
+            my_ik,
+            enabled: false,
+        };
+        if config.enabled {
+            runner.set_enabled(true);
+        }
+        Ok(runner)
+    }
+
+    /// Забирает принятые каналы, которые радио успело отдать.
+    ///
+    /// Не задачей и не в отдельном потоке: очередь разбирается в тех же
+    /// точках, где раннер и так работает. Канал, полежавший в ней лишнюю
+    /// миллисекунду, ничего не теряет — читают его с самого начала,
+    /// а перо нужно только для ответа.
+    fn collect_accepted(&mut self) {
+        while let Ok((link, writer)) = self.accepted_rx.try_recv() {
+            tracing::debug!(link, "эфир: принятый канал ждёт имени");
+            self.unbound.insert(link, writer);
+        }
+    }
+
+    /// Адрес контакта в эфире, если он слышен.
+    #[must_use]
+    pub fn address_of(&self, peer_ik: &[u8; 32]) -> Option<BtAddress> {
+        self.directory.lock().ok()?.get(peer_ik).copied()
+    }
+
+    /// Записывает адрес контакта, минуя сканирование.
+    ///
+    /// Нужно ровно тому же, чему нужен `LanRunner::note_address`: ручной
+    /// проверке передачи, когда обнаружение почему-то не работает.
+    /// Обнаружение и передача — разные механизмы, и первый не должен быть
+    /// условием проверки второго.
+    pub fn note_address(&self, peer_ik: [u8; 32], addr: BtAddress) {
+        if let Ok(mut directory) = self.directory.lock() {
+            directory.insert(peer_ik, addr);
+        }
+    }
+
+    /// Поднимает или гасит эфир.
+    ///
+    /// **Не ждёт радио.** Подъём — это сессия D-Bus, адаптер, сокет
+    /// и объявление; всё это уезжает в задачу, а исход приезжает событием
+    /// ([`TransportEvent::Ready`] или [`TransportEvent::Lost`]). Ждать здесь
+    /// нельзя: `Driver::apply` дожидается каждой команды в теле своего
+    /// цикла — см. заголовок [`Runner`].
+    fn set_enabled(&mut self, on: bool) {
+        if on == self.enabled {
+            return;
+        }
+        self.enabled = on;
+
+        if on {
+            self.air.raise(AirSetup {
+                my_ik: self.my_ik,
+                watched: Arc::clone(&self.watched),
+                heard: Arc::clone(&self.heard),
+                directory: Arc::clone(&self.directory),
+                events: self.events_tx.clone(),
+                accepted: self.accepted_tx.clone(),
+            });
+        } else {
+            // Уход из эфира обязан быть немедленным: человек выключил
+            // ступень именно затем, чтобы перестать быть слышимым. Всё,
+            // что знает радио, уходит вместе с ним — объявление, сокет,
+            // сканирование.
+            self.air.lower();
+            self.forget_everything();
+        }
+    }
+
+    /// Забывает услышанное: адреса эфира живут ровно столько, сколько эфир.
+    fn forget_everything(&mut self) {
+        self.links.clear();
+        self.bulk.clear();
+        // Принятые каналы уходят вместе с эфиром: радио их закрыло,
+        // а перья, оставшиеся у нас, писали бы в никуда.
+        self.unbound.clear();
+        self.bound.clear();
+        if let Ok(mut directory) = self.directory.lock() {
+            directory.clear();
+        }
+        if let Ok(mut heard) = self.heard.lock() {
+            heard.clear();
+        }
+    }
+
+    /// Связь с контактом — существующая или набираемая.
+    ///
+    /// Не ждёт соединения: набор уезжает в свою задачу ([`Link::dialing`]),
+    /// а кадры до его конца ждут в полосах записи. Ровно то же устройство,
+    /// что у локальной сети, и ровно по той же причине.
+    ///
+    /// Функция одна на обе сборки. Без признака `bt` набирать нечем,
+    /// и это выражено не второй копией функции, а тем, что набор сразу
+    /// отказывает: ядро получает `ConnectFailed` — то же событие, каким
+    /// приехал бы недозвон, — и §5.4 идёт дальше по лестнице.
+    ///
+    /// # Каналов два, и это дешевле, чем кажется
+    ///
+    /// Объёмный кадр (класс L, мебибайт) едет **отдельным каналом L2CAP**
+    /// к тому же собеседнику и тому же PSM. Причина простая: пишущая
+    /// задача, начав мебибайт, не может прерваться — читающая сторона
+    /// стоит на `read_exact` и вставленный посреди кадр приняла бы
+    /// за продолжение. На локальной сети это доли миллисекунды и незаметно,
+    /// в эфире — десятки секунд, в которые не уедут ни квитанция,
+    /// ни ответ.
+    ///
+    /// Разрезать объёмный кадр на части было бы вторым решением той же
+    /// задачи — и оно требует разметки в потоке, то есть нового формата
+    /// у **всех** потоковых ступеней сразу. Второй канал не требует
+    /// ничего: принимающая сторона читает кадры одинаково из любого
+    /// канала и про их число не знает вовсе.
+    ///
+    /// Заводится он лениво — пока объёмного кадра не было, второго канала
+    /// нет, — и закрывается вместе со всем остальным.
+    fn ensure_link(&mut self, peer_ik: [u8; 32], bulky: bool) -> Result<Link, TransportError> {
+        let held = if bulky { &mut self.bulk } else { &mut self.links };
+        if let Some(link) = held.get(&peer_ik) {
+            if !link.is_closed() {
+                return Ok(link.clone());
+            }
+            held.remove(&peer_ik);
+        }
+
+        // **Принятый канал — раньше набора, и это не оптимизация.**
+        // Он уже открыт, уже работает и не зависит от адреса радио —
+        // а адрес у телефона приватный и проворачивается, и набор к нему
+        // не удаётся вовсе. Сперва отвечаем туда, откуда с нами заговорили.
+        //
+        // Объёмный кадр сюда не пускается: мебибайт, начатый в общем
+        // канале, задержал бы за собой и квитанции, и ответы (0.4.4).
+        // Ему по-прежнему нужен свой канал — а если набрать его некуда,
+        // ниже стоит оговорка.
+        if !bulky {
+            if let Some((_, held)) = self.bound.get(&peer_ik) {
+                if !held.is_closed() {
+                    return Ok(held.clone());
+                }
+                self.bound.remove(&peer_ik);
+            }
+        }
+
+        // Разделять эти два исхода в журнале обязательно. «Адреса нет»
+        // означает, что собеседника **не слышно прямо сейчас** — эфир
+        // работает, ждать нечего; «канал не открылся» означает обратное:
+        // слышно, а подойти не смогли. Одно чинится приближением
+        // к собеседнику, другое — разбором того, что ответило радио.
+        let Some(target) = self.address_of(&peer_ik) else {
+            // Оговорка про объёмный кадр: свой канал ему набрать не из чего,
+            // а принятый — вот он. Медленнее, чем своим каналом, но это
+            // единственная разница; молчать вместо передачи хуже.
+            if bulky {
+                if let Some((_, held)) = self.bound.get(&peer_ik) {
+                    if !held.is_closed() {
+                        tracing::info!(
+                            peer = %short(&peer_ik),
+                            "эфир: объёмный кадр пойдёт принятым каналом — набрать свой некуда"
+                        );
+                        return Ok(held.clone());
+                    }
+                    self.bound.remove(&peer_ik);
+                }
+            }
+            tracing::info!(
+                peer = %short(&peer_ik),
+                "эфир: адреса нет — объявление этого контакта сейчас не слышно"
+            );
+            return Err(TransportError::NoAddress);
+        };
+        tracing::info!(
+            peer = %short(&peer_ik),
+            адрес = %radio_address(&target.addr),
+            случайный = target.random,
+            psm = target.psm,
+            "эфир: набираем канал"
+        );
+        let directory = Arc::clone(&self.directory);
+        let heard = Arc::clone(&self.heard);
+        let dial = self.air.dial(target);
+        let link = Link::dialing(
+            async move {
+                match dial.await {
+                    Ok(stream) => Ok(stream),
+                    Err(error) => {
+                        forget_address(&directory, &heard, peer_ik);
+                        Err(error)
+                    }
+                }
+            },
+            peer_ik,
+            Transport::Bt,
+            self.events_tx.clone(),
+        );
+        let held = if bulky { &mut self.bulk } else { &mut self.links };
+        held.insert(peer_ik, link.clone());
+        Ok(link)
+    }
+
+    /// Сверяет уже услышанные объявления с обновлённым списком контактов.
+    ///
+    /// То же, чего не хватало локальной сети без буфера [`Heard`]: контакт,
+    /// добавленный после того как его устройство уже объявилось, иначе ждал
+    /// бы следующего объявления.
+    fn rematch_heard(&self, peers: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let heard: Vec<(BeaconRecord, BtAddress)> =
+            self.heard.lock().map(|h| h.clone()).unwrap_or_default();
+        if heard.is_empty() {
+            return Vec::new();
+        }
+
+        let slot = beacon::slot(unix_seconds());
+        let mut found = Vec::new();
+        for (record, addr) in heard {
+            for ik in peers {
+                if beacon::matches(&record, ik, slot) {
+                    if let Ok(mut directory) = self.directory.lock() {
+                        directory.insert(*ik, addr);
+                    }
+                    if !found.contains(ik) {
+                        found.push(*ik);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Сообщает ядру о неудаче, а не только возвращает ошибку.
+    ///
+    /// Без события §5.4 узнал бы об отказе лишь по таймауту — двадцать
+    /// секунд там, где ответ уже есть.
+    async fn report_failure(&self, peer_ik: [u8; 32]) {
+        forget_address(&self.directory, &self.heard, peer_ik);
+        let _ = self
+            .events_tx
+            .send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt })
+            .await;
+    }
+}
+
+/// Забывает адрес, по которому не удалось соединиться.
+///
+/// Адрес в эфире — это не свойство контакта, а последнее, что мы о нём
+/// слышали, и устаревает он быстрее, чем в локальной сети: адрес BLE
+/// ротируется вместе с объявлением. Не дозвонившись, держать его дальше
+/// нельзя — каждая следующая попытка упиралась бы в ту же дыру, платя
+/// за неё полным сроком набора.
+///
+/// Свободной функцией, а не методом: звать её приходится и из задачи
+/// набора, у которой раннера нет и быть не может.
+fn forget_address(directory: &Directory, heard: &Heard, peer_ik: [u8; 32]) {
+    let stale = match directory.lock() {
+        Ok(mut directory) => directory.remove(&peer_ik),
+        Err(_) => None,
+    };
+    let Some(stale) = stale else { return };
+    if let Ok(mut heard) = heard.lock() {
+        heard.retain(|(_, addr)| *addr != stale);
+    }
+}
+
+/// Адрес радио в привычном виде `AA:BB:CC:DD:EE:FF`.
+///
+/// Свой, а не чужой `Display`: тип адреса здесь наш (`[u8; 6]`), и печатать
+/// его надо так же, как печатает `bluetoothctl`, — иначе журнал стенда
+/// не свести с журналом системы, а сводить их придётся.
+fn radio_address(addr: &[u8; 6]) -> String {
+    addr.iter().map(|byte| format!("{byte:02X}")).collect::<Vec<_>>().join(":")
+}
+
+/// Первые четыре байта ключа — столько же, сколько печатает ядро.
+fn short(peer_ik: &[u8; 32]) -> String {
+    peer_ik[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Объёмный ли это кадр — то есть нужен ли ему свой канал.
+///
+/// Спрашивается класс, а не длина. Длина у класса L и так одна (§5.5),
+/// но класс — это то, чем кадры различает весь остальной провод, и второе
+/// правило рядом с первым однажды разошлось бы с ним.
+///
+/// Свободной функцией, а не методом: раннер здесь ни при чём, вопрос
+/// целиком про кадр.
+fn is_bulky(frame: &[u8]) -> bool {
+    SizeClass::from_frame_len(frame.len()).is_ok_and(|class| class == SizeClass::L)
+}
+
+/// Текущее время в секундах Unix — вход для номера слота маяка.
+fn unix_seconds() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+impl<A: Air> Runner for BtRunner<A> {
+    async fn execute(&mut self, command: TransportCommand) -> Result<(), TransportError> {
+        match command {
+            // Имя принятому каналу. Единственный путь, которым транспорт
+            // узнаёт, чей это канал, — и путь этот идёт сверху: разобрать
+            // кадр может только ядро (§8.2).
+            TransportCommand::BindLink { peer_ik, via: Transport::Bt, link } => {
+                self.collect_accepted();
+                // Имя приходит на **каждый** разобранный кадр, а не только
+                // на первый: связь заводится не только рукопожатием. Значит
+                // «эту связь уже назвали» — обычное дело, а не беда, и
+                // говорить о нём в журнале незачем.
+                if let Some((known, held)) = self.bound.get(&peer_ik) {
+                    if *known == link && !held.is_closed() {
+                        return Ok(());
+                    }
+                }
+                let Some(writer) = self.unbound.remove(&link) else {
+                    // Канал закрылся раньше, чем ядро успело его назвать.
+                    // Не беда: отвечать будем набором.
+                    tracing::debug!(link, "эфир: канала с таким номером больше нет");
+                    return Ok(());
+                };
+                tracing::info!(
+                    peer = %short(&peer_ik),
+                    link,
+                    "эфир: принятый канал назван — отвечаем в него"
+                );
+                // Через тот же `Link::dialing`, что и набранный: набор
+                // здесь уже удался, а полосы, кадрирование и новость ядру
+                // о связи нужны ровно те же. Второй способ завести связь
+                // означал бы второй путь, по которому она заводится **без**
+                // новости ядру.
+                let held = Link::dialing(
+                    async move { Ok::<_, TransportError>(writer) },
+                    peer_ik,
+                    Transport::Bt,
+                    self.events_tx.clone(),
+                );
+                self.bound.insert(peer_ik, (link, held));
+                Ok(())
+            }
+            TransportCommand::BindLink { .. } => Err(TransportError::Unavailable),
+            TransportCommand::Send { peer, via, frame, .. } => {
+                self.collect_accepted();
+                if via != Transport::Bt || !self.enabled {
+                    // Вслух, и вот почему. Ядро от этого отказа ведёт
+                    // доставку дальше по лестнице — то есть снаружи
+                    // «выключенная ступень» и «ступень, которая молча
+                    // не работает» выглядят одинаково: сообщение просто
+                    // не уехало эфиром. Строка здесь стоит дешевле, чем
+                    // круг разбирательства.
+                    tracing::info!(
+                        включена = self.enabled,
+                        ступень = via.label(),
+                        "эфир: отправку не берём"
+                    );
+                    return Err(TransportError::Unavailable);
+                }
+                // Объёмный кадр едет **своим каналом**, а не своей полосой
+                // в общем. Разбор — у `ensure_link`.
+                let bulky = is_bulky(&frame);
+                match self.ensure_link(peer.ik, bulky) {
+                    Ok(link) => match link.send(frame).await {
+                        Ok(()) => Ok(()),
+                        // Забитая очередь — не обрыв: канал жив, просто
+                        // пишет медленнее, чем в него кладут. На медленном
+                        // радио это будет случаться чаще, чем где-либо ещё,
+                        // и лечить затор разрывом было бы худшим из ответов.
+                        Err(TransportError::Busy) => Err(TransportError::Busy),
+                        Err(error) => {
+                            // Закрывается тот канал, который сломался,
+                            // а не оба: объёмная передача и переписка
+                            // живут теперь порознь, и разрыв одного
+                            // не повод ронять другой.
+                            if bulky {
+                                self.bulk.remove(&peer.ik);
+                            } else {
+                                self.links.remove(&peer.ik);
+                            }
+                            self.report_failure(peer.ik).await;
+                            Err(error)
+                        }
+                    },
+                    Err(error) => {
+                        self.report_failure(peer.ik).await;
+                        Err(error)
+                    }
+                }
+            }
+            TransportCommand::Connect { peer, via } => {
+                if via != Transport::Bt || !self.enabled {
+                    return Err(TransportError::Unavailable);
+                }
+                // Соединение заводится срочное: объёмное откроется тогда,
+                // когда появится объёмный кадр, и ни минутой раньше.
+                match self.ensure_link(peer.ik, false) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        self.report_failure(peer.ik).await;
+                        Err(error)
+                    }
+                }
+            }
+            TransportCommand::Disconnect { peer } => {
+                self.links.remove(&peer.ik);
+                self.bulk.remove(&peer.ik);
+                // И принятый канал тоже: «с этим собеседником больше
+                // не говорим» относится ко всем трём одинаково.
+                self.bound.remove(&peer.ik);
+                Ok(())
+            }
+            // Чужой транспорт сюда попасть не может — составной раннер
+            // разводит по адресату, — но проверка стоит: молча включиться
+            // по чужой команде хуже, чем отказать.
+            TransportCommand::SetEnabled { transport: Transport::Bt, enabled } => {
+                self.set_enabled(enabled);
+                Ok(())
+            }
+            TransportCommand::SetEnabled { .. } => Err(TransportError::Unavailable),
+            // **Смена сети эфира не касается, и это не лень.** Команда
+            // говорит «адреса поменялись» — про IP. У радио адресов этого
+            // рода нет вовсе: объявление ротируется своим чередом, канал
+            // живёт своей связью. Переподняться здесь значило бы оборвать
+            // исправный разговор из-за того, что телефон ушёл с Wi-Fi
+            // на сотовую сеть.
+            TransportCommand::NetworkChanged => Ok(()),
+            // Список контактов — общий у двух эфиров: и маяк mDNS, и
+            // объявление BLE опознаются одним и тем же перебором `IK`.
+            // Поэтому команда одна на всех, а не своя у каждого.
+            TransportCommand::WatchPeers(peers) => {
+                // Сначала пересматриваем услышанное, потом запоминаем
+                // список: так новый контакт находится сразу, а не со
+                // следующим объявлением.
+                let found = self.rematch_heard(&peers);
+                if let Ok(mut watched) = self.watched.lock() {
+                    *watched = peers;
+                }
+                for peer_ik in found {
+                    let _ = self.events_tx.send(TransportEvent::SeenOnBt { peer_ik }).await;
+                }
+                Ok(())
+            }
+            // Почтовые и прочие настройки эфира не касаются. Сюда они
+            // не доходят — составной раннер разводит по адресату, — но
+            // молчаливое согласие с чужой командой хуже отказа.
+            TransportCommand::SetMailAccount(_)
+            | TransportCommand::CreateMailAccount { .. }
+            | TransportCommand::SetYgg(_)
+            | TransportCommand::SetNostr(_) => Err(TransportError::Unavailable),
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<TransportEvent> {
+        self.events_rx.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::bridge::{BridgedAir, BtRadio};
+    use super::*;
+    use crate::runner::PeerAddress;
+
+    /// Радио, которого нет: записывает, что ему велели.
+    ///
+    /// **Ради него мост и писался так, как написан.** Настоящее радио есть
+    /// только на устройстве, а мост — это правила: кто кому что говорит
+    /// и в каком порядке. Правила проверяются здесь целиком, до всякого
+    /// телефона.
+    #[derive(Default)]
+    struct FakeRadio {
+        started: AtomicBool,
+        advertised: Mutex<Vec<Vec<u8>>>,
+        opened: Mutex<Vec<(u64, Vec<u8>, bool, u16)>>,
+        written: Mutex<Vec<(u64, Vec<u8>)>>,
+        closed: Mutex<Vec<u64>>,
+        stopped: AtomicBool,
+    }
+
+    impl BtRadio for FakeRadio {
+        fn start(&self) {
+            self.started.store(true, Ordering::Relaxed);
+        }
+
+        fn advertise(&self, payload: Vec<u8>) {
+            self.advertised.lock().expect("замок").push(payload);
+        }
+
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+
+        fn open(&self, channel: u64, addr: Vec<u8>, random: bool, psm: u16) {
+            self.opened.lock().expect("замок").push((channel, addr, random, psm));
+        }
+
+        fn write(&self, channel: u64, bytes: Vec<u8>) {
+            self.written.lock().expect("замок").push((channel, bytes));
+        }
+
+        fn close(&self, channel: u64) {
+            self.closed.lock().expect("замок").push(channel);
+        }
+    }
+
+    fn peer(ik: [u8; 32]) -> PeerAddress {
+        PeerAddress {
+            ik,
+            onion: None,
+            chatmail: None,
+            ygg: None,
+            nostr: None,
+            nostr_relays: Vec::new(),
+        }
+    }
+
+    /// Раннер поверх моста с поддельным радио — и само радио рядом.
+    async fn runner_with_radio() -> (BtRunner<BridgedAir>, Arc<FakeRadio>, BridgedAir) {
+        let air = BridgedAir::new();
+        let radio = Arc::new(FakeRadio::default());
+        air.set_radio(radio.clone());
+        let runner = BtRunner::start(air.clone(), BtConfig::default(), [1u8; 32])
+            .await
+            .expect("раннер заводится всегда");
+        (runner, radio, air)
+    }
+
+    /// Раннер без радио: платформа его ещё не вручила.
+    async fn runner() -> BtRunner<BridgedAir> {
+        BtRunner::start(BridgedAir::new(), BtConfig::default(), [1u8; 32])
+            .await
+            .expect("раннер заводится всегда")
+    }
+
+    /// Ждёт события о принятом кадре, пропуская всё, что до него.
+    ///
+    /// Очередь событий у ступени одна, и в ней перед кадром стоит
+    /// готовность — ступень объявилась раньше, чем что-то приехало.
+    /// Проверка про кадр не должна знать, сколько именно событий перед
+    /// ним: их число — не её предмет, и завтра оно изменится.
+    async fn next_frame(bt: &mut BtRunner<BridgedAir>) -> Option<TransportEvent> {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), bt.next_event())
+                .await
+                .expect("кадр обязан собраться");
+            match event {
+                Some(TransportEvent::Received { .. }) | None => return event,
+                Some(_) => continue,
+            }
+        }
+    }
+
+    /// Ждёт условия, не усыпляя проверку надолго.
+    ///
+    /// Мост живёт задачами, и «уже случилось» наступает не в тот же миг.
+    /// Сон на фиксированное время сделал бы проверку то медленной,
+    /// то шаткой; уступка планировщику — ни то ни другое.
+    async fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..1_000 {
+            if done() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn the_rung_is_off_until_someone_turns_it_on() {
+        // §14 и 0.4.2: ступень выключена по умолчанию, и выключенная она
+        // отказывает, а не молчит. Молчаливый успех означал бы, что §5.4
+        // считает кадр ушедшим и к следующей ступени не переходит.
+        let mut bt = runner().await;
+        let sent = bt
+            .execute(TransportCommand::Send {
+                peer: peer([2u8; 32]),
+                via: Transport::Bt,
+                frame: vec![0u8; 4096],
+                handoff: None,
+            })
+            .await;
+        assert!(matches!(sent, Err(TransportError::Unavailable)), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rung_without_a_radio_says_so_instead_of_pretending() {
+        // Мост без радио — обычное состояние: клиент открывает ядро
+        // раньше, чем платформа успевает вручить своё радио. Включённая
+        // в этот миг ступень обязана объявиться **потерянной**, иначе
+        // §5.4 будет выбирать её и жечь на ней попытки.
+        let mut bt = runner().await;
+        bt.set_enabled(true);
+        assert!(
+            matches!(bt.next_event().await, Some(TransportEvent::Lost { transport })
+                if transport == Transport::Bt),
+            "ступень без радио обязана объявиться потерянной"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_platform_gets_our_advert_and_the_core_gets_readiness() {
+        // Порядок 0.4.3: номер канала знает только платформа, объявление
+        // собирает только Rust. Значит подъём — это две половины, и
+        // готовность объявляется после второй.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        assert!(radio.started.load(Ordering::Relaxed), "сокет поднимается первым");
+        assert!(
+            radio.advertised.lock().expect("замок").is_empty(),
+            "номера ещё нет — и объявления"
+        );
+
+        air.on_ready(0x0080);
+        let advertised = radio.advertised.lock().expect("замок").clone();
+        assert_eq!(advertised.len(), 1, "объявление одно");
+        assert_eq!(
+            advertised[0].len(),
+            ratatosk_proto::bluetooth::PAYLOAD_LEN,
+            "нагрузка нашей длины — она же и номер версии формата"
+        );
+        assert!(
+            matches!(bt.next_event().await, Some(TransportEvent::Ready { transport })
+                if transport == Transport::Bt),
+            "после объявления ступень готова"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heard_advert_becomes_an_address_and_an_event() {
+        // Опознание живёт по эту сторону границы: платформа приносит байты
+        // и адрес, а чьи они — решает маяк.
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        let peer_ik = [7u8; 32];
+        bt.execute(TransportCommand::WatchPeers(vec![peer_ik])).await.expect("список принят");
+
+        let record = beacon::record(&peer_ik, beacon::slot(unix_seconds()), [3u8; 8]);
+        let payload = ratatosk_proto::bluetooth::payload(&record, 0x0091).expect("номер годный");
+        air.on_heard(&payload, [1, 2, 3, 4, 5, 6], true);
+
+        assert_eq!(
+            bt.address_of(&peer_ik),
+            Some(BtAddress { addr: [1, 2, 3, 4, 5, 6], random: true, psm: 0x0091 })
+        );
+        assert!(
+            matches!(bt.next_event().await, Some(TransportEvent::SeenOnBt { peer_ik: got })
+                if got == peer_ik),
+            "опознанное объявление обязано доехать до ядра"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_strangers_advert_is_heard_and_forgotten() {
+        // Под нашим кодом производителя вещает кто угодно. Разбор это
+        // переживает, а знакомство даёт только маяк.
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        bt.execute(TransportCommand::WatchPeers(vec![[7u8; 32]])).await.expect("список");
+
+        let stranger = beacon::record(&[9u8; 32], beacon::slot(unix_seconds()), [1u8; 8]);
+        let payload = ratatosk_proto::bluetooth::payload(&stranger, 0x0090).expect("номер");
+        air.on_heard(&payload, [9; 6], true);
+
+        assert_eq!(bt.address_of(&[7u8; 32]), None, "чужие байты контактом не стали");
+    }
+
+    #[tokio::test]
+    async fn a_frame_reaches_the_platform_through_the_bridge() {
+        // **Главная проверка моста.** Кадр, отданный ядром, обязан дойти
+        // до радио — через набор, ожидание открытия и насос. Радио здесь
+        // поддельное, а путь настоящий: те же очереди, те же задачи.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [7u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0081 });
+
+        let sent = bt
+            .execute(TransportCommand::Send {
+                peer: peer(peer_ik),
+                via: Transport::Bt,
+                frame: vec![7u8; SizeClass::S.frame_len()],
+                handoff: None,
+            })
+            .await;
+        assert!(sent.is_ok(), "кадр принят в очередь: {sent:?}");
+
+        // Платформе велено открыть канал — и с теми самыми адресом
+        // и номером, которые пришли из объявления.
+        assert!(wait_for(|| !radio.opened.lock().expect("замок").is_empty()).await);
+        let (channel, addr, random, psm) = radio.opened.lock().expect("замок")[0].clone();
+        assert_eq!(addr, vec![1u8; 6]);
+        assert!(random);
+        assert_eq!(psm, 0x0081);
+
+        // Пока канал не открылся, в него ничего не пишется: обещание
+        // платформы — не канал.
+        assert!(radio.written.lock().expect("замок").is_empty());
+
+        air.on_opened(channel);
+        assert!(
+            wait_for(|| {
+                let written = radio.written.lock().expect("замок");
+                written.iter().map(|(_, bytes)| bytes.len()).sum::<usize>()
+                    >= SizeClass::S.frame_len() + 1
+            })
+            .await,
+            "кадр обязан доехать до радио целиком"
+        );
+        // Первым байтом на проводе идёт класс кадра (`link`), дальше сам
+        // кадр. Проверяется именно это: мост ничего не добавляет от себя.
+        let written: Vec<u8> =
+            radio.written.lock().expect("замок").iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(written.len(), SizeClass::S.frame_len() + 1, "класс плюс кадр");
+    }
+
+    #[tokio::test]
+    async fn the_platform_calls_from_threads_that_know_nothing_of_tokio() {
+        // **Проверка, которой не было, и она стоила поставки.** Мост зовут
+        // с потоков платформы: обзор BLE отвечает со своего потока Java,
+        // чтение сокета — со своего. Контекста tokio у них нет и быть
+        // не может, а `tokio::spawn` без контекста — не ошибка, а паника;
+        // паника через границу FFI роняет приложение целиком.
+        //
+        // Прежние проверки этого поймать не могли: в них всё звалось
+        // изнутри `#[tokio::test]`, то есть из единственного места,
+        // где контекст есть всегда.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Обе точки, где мост заводит задачу: ротация объявления
+                // и сборщик кадров входящего канала.
+                air.on_ready(0x0080);
+                air.on_incoming(5);
+                air.on_bytes(5, vec![7u8; 32]);
+                air.on_closed(5);
+                air.on_lost("и это тоже приезжает оттуда");
+            });
+        });
+
+        assert!(
+            !radio.advertised.lock().expect("замок").is_empty(),
+            "объявление собралось — значит поток платформы пережил вызов"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_channel_closed_by_the_platform_breaks_the_link() {
+        // **Ради этой проверки исходящий поток и устроен без трубы.**
+        // Труба принимала бы запись, пока в ней есть место, — и связь
+        // считала бы кадры записанными в канал, которого уже нет. Снаружи
+        // это выглядит хуже всего: «отправляется» на мёртвом канале,
+        // и §5.4 ждёт квитанцию полный срок вместо того, чтобы шагнуть
+        // на следующую ступень.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+        let peer_ik = [7u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0081 });
+
+        let frame = vec![7u8; SizeClass::S.frame_len()];
+        bt.execute(TransportCommand::Send {
+            peer: peer(peer_ik),
+            via: Transport::Bt,
+            frame: frame.clone(),
+            handoff: None,
+        })
+        .await
+        .expect("кадр принят в очередь");
+        assert!(wait_for(|| !radio.opened.lock().expect("замок").is_empty()).await);
+        let channel = radio.opened.lock().expect("замок")[0].0;
+        air.on_opened(channel);
+        assert!(wait_for(|| !radio.written.lock().expect("замок").is_empty()).await);
+
+        air.on_closed(channel);
+        // Связь узнаёт об обрыве записью, а не догадкой: пока писать
+        // нечего, и узнавать не о чем. Поэтому второй кадр — часть
+        // проверки, а не её обстановка.
+        let _ = bt
+            .execute(TransportCommand::Send {
+                peer: peer(peer_ik),
+                via: Transport::Bt,
+                frame,
+                handoff: None,
+            })
+            .await;
+        assert!(
+            wait_for(|| bt.links.get(&peer_ik).is_none_or(Link::is_closed)).await,
+            "обрыв канала обязан дойти до связи, а не остаться у платформы"
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_from_the_platform_become_frames() {
+        // Обратная дорога: платформа отдаёт куски по мере чтения сокета,
+        // а ядро ждёт целых кадров. Куски нарочно рваные — именно так
+        // и читается сокет.
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+        air.on_incoming(77);
+
+        let mut wire = vec![0u8; SizeClass::S.frame_len() + 1];
+        // Байт класса — тот же, что пишет `link`: у класса S это ноль.
+        wire[0] = 0;
+        wire[1] = 0x01;
+        for chunk in wire.chunks(500) {
+            air.on_bytes(77, chunk.to_vec());
+        }
+
+        // Готовность лежит в очереди первой — её и объявили первой.
+        // Пропускать её приходится явно: очередь у ступени одна, и кадр
+        // встанет в неё **за** готовностью, а не вместо неё.
+        let got = next_frame(&mut bt).await;
+        assert!(
+            matches!(got, Some(TransportEvent::Received { via, ref frame, .. })
+                if via == Transport::Bt && frame.len() == SizeClass::S.frame_len()),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turning_the_rung_off_stops_the_radio_and_forgets_the_air() {
+        // Выключение обязано быть немедленным: человек нажал именно затем,
+        // чтобы перестать быть слышимым. И адреса эфира живут ровно
+        // столько, сколько эфир: объявление ротируется, и услышанное
+        // четверть часа назад устарело.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+        let peer_ik = [7u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0081 });
+
+        bt.set_enabled(false);
+        assert!(radio.stopped.load(Ordering::Relaxed), "радио остановлено");
+        assert_eq!(bt.address_of(&peer_ik), None, "эфир погас — и адреса погасли");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_transport_is_refused_and_not_obeyed() {
+        // Составной раннер разводит команды по адресату, и сюда чужая
+        // попасть не может. Проверка всё равно нужна: молча включиться
+        // по чужой команде хуже, чем отказать.
+        let mut bt = runner().await;
+        for command in [
+            TransportCommand::SetEnabled { transport: Transport::Lan, enabled: true },
+            TransportCommand::SetEnabled { transport: Transport::Nostr, enabled: true },
+        ] {
+            assert!(matches!(bt.execute(command).await, Err(TransportError::Unavailable)));
+        }
+        assert!(!bt.enabled);
+    }
+
+    #[tokio::test]
+    async fn a_contact_added_late_is_matched_against_what_was_already_heard() {
+        // Объявление могло прозвучать раньше, чем ядро сказало, чьи маяки
+        // искать. Без буфера услышанного контакт ждал бы следующего —
+        // секунды впустую там, где человек стоит рядом.
+        let bt = runner().await;
+        let peer_ik = [7u8; 32];
+        let slot = beacon::slot(unix_seconds());
+        let record = beacon::record(&peer_ik, slot, [3u8; 8]);
+        let addr = BtAddress { addr: [1, 2, 3, 4, 5, 6], random: true, psm: 0x0080 };
+        bt.heard.lock().expect("замок").push((record, addr));
+
+        assert_eq!(bt.address_of(&peer_ik), None, "пока никого не ждём — и адреса нет");
+        assert_eq!(bt.rematch_heard(&[peer_ik]), vec![peer_ik]);
+        assert_eq!(bt.address_of(&peer_ik), Some(addr));
+    }
+
+    #[tokio::test]
+    async fn a_named_incoming_channel_answers_instead_of_dialing() {
+        // **Разбор поломки со связкой телефон↔десктоп.** Телефон
+        // объявляется приватным адресом, который проворачивается;
+        // разрешить такой адрес умеет только сопряжённое устройство,
+        // а сопряжения у нас нет и не будет (§8.2). Набор в ответ поэтому
+        // не удаётся вовсе — на стенде это десять секунд тишины на каждую
+        // попытку, и рукопожатие не сходится никогда.
+        //
+        // Канал же, который телефон открыл к нам, двусторонний. Проверяется
+        // ровно это: названный канал берётся вместо набора, и радио
+        // никто ни о чём не просит.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [7u8; 32];
+        // Адрес **есть** — и всё равно не используется: принятый канал
+        // старше. Иначе проверка доказывала бы лишь то, что набирать
+        // нечем.
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0081 });
+        air.on_incoming(77);
+
+        bt.execute(TransportCommand::BindLink { peer_ik, via: Transport::Bt, link: 77 })
+            .await
+            .expect("ядро назвало канал");
+
+        bt.execute(TransportCommand::Send {
+            peer: peer(peer_ik),
+            via: Transport::Bt,
+            frame: vec![7u8; SizeClass::S.frame_len()],
+            handoff: None,
+        })
+        .await
+        .expect("кадр принят в очередь");
+
+        assert!(
+            wait_for(|| {
+                let written = radio.written.lock().expect("замок");
+                written.iter().filter(|(channel, _)| *channel == 77).count() > 0
+            })
+            .await,
+            "ответ обязан уйти принятым каналом"
+        );
+        assert!(
+            radio.opened.lock().expect("замок").is_empty(),
+            "набирать было незачем: канал уже открыт и назван"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_incoming_channel_is_not_used_for_anyone() {
+        // Обратная сторона: пока ядро канал не назвало, писать в него
+        // нельзя **никому**. Транспорт не знает, кто к нему подключился,
+        // и догадка здесь означала бы, что личность даёт адрес радио,
+        // а не рукопожатие (§8.2).
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+        air.on_incoming(77);
+
+        let peer_ik = [7u8; 32];
+        let sent = bt
+            .execute(TransportCommand::Send {
+                peer: peer(peer_ik),
+                via: Transport::Bt,
+                frame: vec![7u8; SizeClass::S.frame_len()],
+                handoff: None,
+            })
+            .await;
+        assert!(matches!(sent, Err(TransportError::NoAddress)), "{sent:?}");
+        assert!(
+            radio.written.lock().expect("замок").is_empty(),
+            "безымянный канал не принадлежит никому"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bulky_frame_gets_a_channel_of_its_own() {
+        // Пишущая задача, начав мебибайт, прерваться не может: читающая
+        // сторона стоит на чтении кадра целиком. В эфире это десятки
+        // секунд, в которые не уедут ни квитанция, ни ответ.
+        let (mut bt, _radio, _air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        let peer_ik = [2u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0080 });
+
+        bt.ensure_link(peer_ik, false).expect("адрес известен");
+        bt.ensure_link(peer_ik, true).expect("адрес тот же");
+        assert_eq!(bt.links.len(), 1, "срочный канал один");
+        assert_eq!(bt.bulk.len(), 1, "и объёмный свой");
+
+        bt.ensure_link(peer_ik, true).expect("та же связь");
+        assert_eq!(bt.bulk.len(), 1, "объёмный канал не размножается");
+        assert_eq!(bt.links.len(), 1, "и срочный тоже");
+    }
+
+    #[tokio::test]
+    async fn the_two_channels_close_together() {
+        // `Disconnect` приходит без `via` и означает «с этим собеседником
+        // больше не говорим». Оставленный объёмный канал держал бы радио
+        // открытым после того, как переписка закрыта.
+        let (mut bt, _radio, _air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        let peer_ik = [2u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0080 });
+        bt.ensure_link(peer_ik, false).expect("срочный");
+        bt.ensure_link(peer_ik, true).expect("объёмный");
+
+        bt.execute(TransportCommand::Disconnect { peer: peer(peer_ik) }).await.expect("разрыв");
+        assert!(bt.links.is_empty() && bt.bulk.is_empty(), "закрыты оба");
+    }
+
+    #[tokio::test]
+    async fn a_class_tells_which_channel_a_frame_takes() {
+        // Разделение считается по классу кадра, и только по нему.
+        assert!(is_bulky(&vec![0u8; SizeClass::L.frame_len()]));
+        assert!(!is_bulky(&vec![0u8; SizeClass::M.frame_len()]));
+        assert!(!is_bulky(&vec![0u8; SizeClass::S.frame_len()]));
+        // Кадр не нашего размера объёмным не считается: разбирать его
+        // всё равно некому, а ошибиться в сторону срочной полосы
+        // безопаснее — там кадр хотя бы дождётся своей очереди.
+        assert!(!is_bulky(&[0u8; 3]));
+    }
+
+    #[tokio::test]
+    async fn a_changed_network_does_not_touch_the_air() {
+        // Смена сети — это про IP. Эфир от неё не меняется, и рвать
+        // исправный разговор из-за ухода телефона с Wi-Fi нельзя.
+        let mut bt = runner().await;
+        let peer_ik = [7u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [1; 6], random: true, psm: 0x0081 });
+        bt.execute(TransportCommand::NetworkChanged).await.expect("эфиру это безразлично");
+        assert!(bt.address_of(&peer_ik).is_some(), "адрес в эфире сменой сети не устаревает");
+    }
+
+    #[tokio::test]
+    async fn the_watch_list_is_shared_with_the_lan_and_not_copied() {
+        // Одна команда на оба эфира: список контактов у них общий, и
+        // вторая его копия разошлась бы с первой при первом же добавлении
+        // контакта.
+        let mut bt = runner().await;
+        let peer_ik = [7u8; 32];
+        let record = beacon::record(&peer_ik, beacon::slot(unix_seconds()), [5u8; 8]);
+        let addr = BtAddress { addr: [2; 6], random: false, psm: 0x00ff };
+        bt.heard.lock().expect("замок").push((record, addr));
+
+        bt.execute(TransportCommand::WatchPeers(vec![peer_ik])).await.expect("список принят");
+        assert_eq!(bt.address_of(&peer_ik), Some(addr));
+        assert!(
+            matches!(bt.next_event().await, Some(TransportEvent::SeenOnBt { peer_ik: got })
+                if got == peer_ik),
+            "услышанное раньше списка обязано доехать до ядра событием"
+        );
+    }
+}

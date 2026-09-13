@@ -671,7 +671,7 @@ where
             // СВЕРИТЬ: конструктор `Connected`.
             let connected = tor_cell::relaycell::msg::Connected::new_empty();
             match request.accept(connected).await {
-                Ok(stream) => spawn_read_loop(stream, Transport::Onion, events.clone()),
+                Ok(stream) => spawn_read_loop(stream, Transport::Onion, None, events.clone()),
                 Err(error) => {
                     tracing::debug!(?error, "входящий поток не принят");
                 }

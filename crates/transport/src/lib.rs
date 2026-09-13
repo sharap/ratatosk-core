@@ -4,9 +4,11 @@
 //! времени. Ядро (`ratatosk-core`) отдаёт сюда готовые кадры и получает
 //! обратно события — оно не знает, что такое TCP.
 //!
-//! Три транспорта §5 и четвёртый из 0.2:
+//! Три транспорта §5, четвёртый из 0.2 и шестой из 0.4:
 //!
 //! * [`lan`] — mDNS с ротируемым маяком, по умолчанию **выключен** (§5.1);
+//! * [`bluetooth`] — объявление BLE и канал L2CAP, по умолчанию
+//!   **выключен** (0.4);
 //! * [`ygg`] — меш Yggdrasil поверх внешнего демона, по умолчанию
 //!   **выключен** (0.2);
 //! * [`onion`] — встроенный arti, onion-сервис v3 (§5.2);
@@ -35,6 +37,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bluetooth;
 pub mod chatmail;
 pub mod lan;
 mod link;
@@ -51,6 +54,10 @@ pub mod switched;
 pub mod tls;
 pub mod ygg;
 
+pub use bluetooth::bridge::{BridgedAir, BtRadio};
+#[cfg(feature = "bt")]
+pub use bluetooth::local::LocalAir;
+pub use bluetooth::{Air, BtAddress, BtConfig, BtRunner};
 pub use lan::{LanConfig, LanDirectory, LanRunner};
 pub use multi::{Disabled, Transports};
 pub use runner::{PeerAddress, Runner, TransportCommand, TransportError, TransportEvent};

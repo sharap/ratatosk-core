@@ -1447,7 +1447,7 @@ fn the_watched_beacons_include_the_paired_desktop() {
     let watched = effects
         .iter()
         .find_map(|effect| match effect {
-            Effect::WatchLanPeers(peers) => Some(peers.clone()),
+            Effect::WatchPeers(peers) => Some(peers.clone()),
             _ => None,
         })
         .expect("список маяков обязан обновиться");

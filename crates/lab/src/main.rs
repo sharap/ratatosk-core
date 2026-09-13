@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 
 use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD};
 use ratatosk_codec::{ContactCard, YGG_KEY_LEN};
-use ratatosk_core::driver::{Driver, DriverHandle, EventStream};
+use ratatosk_core::driver::{Driver, DriverHandle, EventStream, FileView};
 use ratatosk_core::{
     vault, Command, CompanionClient, CompanionCommand, CompanionDriver, CompanionEvent,
     CompanionHandle, Engine, Event, OsEntropy, SelfAddresses,
@@ -133,6 +133,14 @@ const YGG_NODE_BUILT_IN: bool = cfg!(feature = "ygg-node");
 /// и повторять этот урок третий раз незачем.
 const NOSTR_BUILT_IN: bool = cfg!(feature = "nostr");
 
+/// Собран ли живой эфир Bluetooth (0.4).
+///
+/// Тот же урок, третий раз подряд: без раннера ступень включается,
+/// настройка ложится на диск, и всё это выглядит как работающая ступень,
+/// которая почему-то молчит. Разница здесь только в том, что настраивать
+/// в эфире нечего — значит и сказать про несобранную ступень надо прямее.
+const BT_BUILT_IN: bool = cfg!(feature = "bt");
+
 /// Чем собран этот стенд — одной строкой в шапку.
 ///
 /// Печатается всегда, а не только когда чего-то нет: строка «почта: нет»
@@ -146,7 +154,8 @@ fn build_line() -> String {
         "меш: только демон (свой узел — --features ygg-node)"
     };
     let nostr = if NOSTR_BUILT_IN { "nostr" } else { "nostr НЕТ (--features nostr)" };
-    format!("LAN, {tor}, {mail}, {nostr}, {node}")
+    let bt = if BT_BUILT_IN { "bluetooth" } else { "bluetooth НЕТ (--features bt)" };
+    format!("LAN, {bt}, {tor}, {mail}, {nostr}, {node}")
 }
 
 struct Args {
@@ -418,7 +427,7 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
     .await?;
     // Телефон объявляется от своего `IK`, и без этой строки его маяк
     // не с чем было бы сравнить.
-    lan.execute(TransportCommand::WatchLanPeers(vec![phone_ik])).await?;
+    lan.execute(TransportCommand::WatchPeers(vec![phone_ik])).await?;
     // Порт снимается **до** сборки составного раннера: `lan` уезжает в него
     // целиком, а число нужно ещё дважды — в шапке и в подсказке `/devaddr`.
     let lan_port = lan.port();
@@ -492,12 +501,12 @@ async fn run_companion(args: &Args, uri: &str) -> Result<(), Box<dyn std::error:
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, nostr, Disabled)
+        Transports::new(lan, Disabled, ygg, onion, nostr, Disabled)
     };
     #[cfg(not(feature = "tor"))]
     let mut runner = {
         let _ = &tor_handle;
-        Transports::new(lan, ygg, Disabled, nostr, Disabled)
+        Transports::new(lan, Disabled, ygg, Disabled, nostr, Disabled)
     };
 
     // **Включать приходится своей рукой.** У терминала нет ядра, а
@@ -1638,6 +1647,28 @@ async fn run<S: Store + 'static>(
     )
     .await?;
 
+    // Эфир Bluetooth (0.4). Заводится **выключенным**, как и локальная
+    // сеть: включает его ядро первым шагом драйвера, если человек эту
+    // ступень разрешил. Сокет и объявление при этом не трогаются вовсе —
+    // радио поднимается только на `SetEnabled`.
+    //
+    // Радио у ступени два, и стенд выбирает своё признаком сборки. С `bt`
+    // это `bluer` — настоящий эфир этой машины. Без него берётся мост,
+    // тот же, каким пользуется Android, и берётся он **без радио**: мост
+    // без радио честно объявляет ступень потерянной. Заглушки ради этого
+    // заводить не пришлось — отказ и так получается настоящий, а не
+    // написанный отдельно.
+    #[cfg(feature = "bt")]
+    let air = ratatosk_transport::LocalAir::new();
+    #[cfg(not(feature = "bt"))]
+    let air = ratatosk_transport::BridgedAir::new();
+    let bt = ratatosk_transport::BtRunner::start(
+        air,
+        ratatosk_transport::BtConfig::default(),
+        engine.own_card().ik,
+    )
+    .await?;
+
     // Ручка общего Tor-клиента — одна на обе ветки и на оба транспорта.
     // Onion-раннер кладёт в неё клиента, когда поднимется; почта берёт его
     // оттуда, а своего второго не заводит (§5.2: второй bootstrap — это
@@ -1697,7 +1728,7 @@ async fn run<S: Store + 'static>(
                 .await
             }
         });
-        Transports::new(lan, ygg, onion, nostr, mail)
+        Transports::new(lan, bt, ygg, onion, nostr, mail)
     };
     #[cfg(not(feature = "tor"))]
     let runner = {
@@ -1705,7 +1736,7 @@ async fn run<S: Store + 'static>(
         // молчаливый успех. Ровно это увидит §5.4 и перейдёт к следующей
         // ступени.
         let _ = (&layout, &onion, &tor_handle);
-        Transports::new(lan, ygg, Disabled, nostr, mail)
+        Transports::new(lan, bt, ygg, Disabled, nostr, mail)
     };
 
     println!("узел     : {}", args.name);
@@ -1746,7 +1777,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2173,6 +2204,16 @@ async fn console(
                     }
                     continue;
                 }
+                // Имя команды целиком, а не по началу строки: `/find`
+                // и `/file` различаются одной буквой, и «начинается на»
+                // однажды увело бы поиск в отправку файла.
+                if is_file_command(&line) {
+                    if peer.is_none() {
+                        peer = sole_contact(&handle).await;
+                    }
+                    file_command(&handle, &line, peer).await;
+                    continue;
+                }
                 if line == "/react" || line.starts_with("/react ") {
                     // Реагируем на **последнее** сообщение чата, а не на
                     // названный идентификатор: набирать тридцать два знака
@@ -2476,6 +2517,11 @@ async fn console(
                     ygg_command(&handle, rest).await;
                     continue;
                 }
+                if line == "/bt" || line.starts_with("/bt ") {
+                    let rest = line.strip_prefix("/bt").unwrap_or_default().trim();
+                    bt_command(&handle, rest).await;
+                    continue;
+                }
                 if line == "/nostr" || line.starts_with("/nostr ") {
                     let rest = line.strip_prefix("/nostr").unwrap_or_default().trim();
                     nostr_command(&handle, rest).await;
@@ -2551,8 +2597,16 @@ async fn console(
                     let with_envelope = text.len() + ratatosk_proto::files::ENVELOPE_RESERVE_BYTES;
                     match ratatosk_proto::SizeClass::smallest_for(with_envelope) {
                         Some(ratatosk_proto::SizeClass::L) => {
-                            println!("    класс кадра L — ступень nostr его не везёт (0.3.5),");
-                            println!("    доставка уйдёт ниже по лестнице §5.4, то есть почтой");
+                            // Кто именно не везёт класс L, называется
+                            // поимённо, и это не педантизм: строка
+                            // «уйдёт почтой» была написана, когда ступень
+                            // была одна, и после эфира (0.4) стала
+                            // неправдой — он класс L везёт, своим каналом.
+                            // Стенд, говорящий человеку неправду про
+                            // маршрут, хуже стенда молчащего.
+                            println!("    класс кадра L — его не везёт nostr (0.3.5),");
+                            println!("    остальные ступени везут; эфир — отдельным каналом,");
+                            println!("    и мебибайт по нему идёт около тридцати секунд (0.4.4)");
                         }
                         Some(class) => println!("    класс кадра {class:?}"),
                         None => println!("    столько не влезает ни в один класс кадра"),
@@ -2904,6 +2958,7 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         for rung in &contact.reachability.rungs {
             let name = match rung.transport {
                 ratatosk_proto::Transport::Lan => "LAN  ",
+                ratatosk_proto::Transport::Bt => "bt   ",
                 ratatosk_proto::Transport::Ygg => "ygg  ",
                 ratatosk_proto::Transport::Onion => "onion",
                 ratatosk_proto::Transport::Nostr => "nostr",
@@ -2961,6 +3016,7 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
 fn via_name(via: ratatosk_proto::Transport) -> &'static str {
     match via {
         ratatosk_proto::Transport::Lan => "по LAN",
+        ratatosk_proto::Transport::Bt => "по Bluetooth",
         ratatosk_proto::Transport::Ygg => "через меш",
         ratatosk_proto::Transport::Onion => "через onion",
         ratatosk_proto::Transport::Nostr => "через реле nostr",
@@ -3282,6 +3338,333 @@ async fn ygg_command(handle: &DriverHandle, rest: &str) {
             println!("  /ygg peer clear         — очистить список");
         }
     }
+}
+
+/// Вложения ли это — по имени команды целиком.
+///
+/// Отдельной функцией, чтобы список имён стоял один раз: разбор ниже
+/// узнаёт их по первому слову, и второй такой список разошёлся бы
+/// с первым на первой же новой команде.
+fn is_file_command(line: &str) -> bool {
+    let head = line.split_whitespace().next().unwrap_or_default();
+    matches!(head, "/file" | "/files" | "/accept" | "/pause" | "/decline" | "/save" | "/auto")
+}
+
+/// Вложения (§10) на стенде: отправить, принять, сохранить, сверить.
+///
+/// # Зачем стенду файлы
+///
+/// Затем же, зачем `/long`: проверять не «дошло ли вообще», а **что
+/// именно дошло**. Файл — единственное, что ездит чанками (§10.2),
+/// то есть с окном, подтверждениями и возобновлением после обрыва;
+/// ни текст, ни лицо этой дороги не проходят. До этих команд её нельзя
+/// было пройти руками вовсе.
+///
+/// Команд шесть, и все короткие:
+///
+/// * `/file <путь>` — отправить файл;
+/// * `/files` — что за вложения в этом чате и сколько уже приехало;
+/// * `/accept <id>`, `/pause <id>`, `/decline <id>` — судьба входящего;
+/// * `/save <id> <путь>` — собрать принятое на диск и назвать сумму;
+/// * `/auto [байт|off]` — порог автоприёма.
+///
+/// Идентификатор — тот же короткий вид, что печатает стенд (`/files`):
+/// хватает префикса, полные тридцать два знака набирать не надо.
+async fn file_command(handle: &DriverHandle, line: &str, peer: Option<[u8; 32]>) {
+    let mut words = line.split_whitespace();
+    let command = words.next().unwrap_or_default();
+    let rest: Vec<&str> = words.collect();
+
+    // Порог автоприёма чата не требует: он один на все.
+    if command == "/auto" {
+        let limit = match rest.first().copied() {
+            None => {
+                // Без довода — показать, что стоит сейчас. Порог живёт
+                // в ядре и переживает перезапуск, так что помнить его
+                // стенду нечем и незачем.
+                match handle.auto_accept().await {
+                    Some(Some(bytes)) => println!("< автоприём до {bytes} Б; крупнее — спросим"),
+                    Some(None) => println!("< автоприёма нет: каждый файл спрашиваем"),
+                    None => println!("< ядро остановлено"),
+                }
+                println!("    поменять: /auto <байт> либо /auto off");
+                return;
+            }
+            Some("off") => None,
+            Some(number) => match number.parse::<u64>() {
+                Ok(bytes) => Some(bytes),
+                Err(_) => {
+                    println!("< нужно число байт либо off");
+                    return;
+                }
+            },
+        };
+        if handle.send(Command::SetAutoAcceptBytes(limit)).await.is_ok() {
+            match limit {
+                Some(bytes) => println!("< автоприём до {bytes} Б; крупнее — спросим"),
+                None => println!("< автоприёма нет: каждый файл спрашиваем"),
+            }
+        }
+        return;
+    }
+
+    let Some(ik) = peer else {
+        println!("< некому: сперва /add <карточка>");
+        return;
+    };
+    let chat = Engine::<MemoryStore>::chat_id_for(&ik);
+
+    if command == "/file" {
+        let Some(path) = rest.first() else {
+            println!("< /file <путь к файлу>");
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        // Сумма считается **до** отправки и печатается сразу: сверять
+        // её потом не с чем, если не знать, что отправляли.
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                println!("< шлём файл: {} Б, сумма {}", bytes.len(), sum_of(&bytes));
+                println!("    ход передачи — строками «файл …: принято/всего»");
+            }
+            Err(error) => {
+                println!("< файла не прочесть: {error}");
+                return;
+            }
+        }
+        // Превью стенд не готовит: §10.3 велит делать его клиенту,
+        // а декодер изображений в процессе с ключами — большая
+        // поверхность атаки. Без превью собеседник решает по имени
+        // и размеру, и для стенда это честнее, чем картинка,
+        // собранная лишь бы была.
+        let files = vec![ratatosk_core::OutgoingFile { path, preview: None }];
+        if handle.send(Command::SendFiles { chat, files, text: String::new() }).await.is_err() {
+            println!("< ядро остановлено");
+        }
+        return;
+    }
+
+    // Всё остальное работает с уже известным вложением.
+    let known = files_of(handle, chat).await;
+    if command == "/files" {
+        if known.is_empty() {
+            println!("< вложений в этом чате нет");
+            return;
+        }
+        for view in &known {
+            let file = &view.file;
+            let done = if view.received_chunks >= file.chunk_total {
+                "целиком"
+            } else {
+                "качается"
+            };
+            println!(
+                "< {} {} — {} Б, чанков {}/{} ({done})",
+                short(&file.file_id),
+                file.name,
+                file.size_bytes,
+                view.received_chunks,
+                file.chunk_total
+            );
+        }
+        println!("    принять: /accept <id>   сохранить: /save <id> <путь>");
+        return;
+    }
+
+    let Some(prefix) = rest.first().copied() else {
+        println!("< нужен идентификатор вложения — посмотрите /files");
+        return;
+    };
+    let Some(view) = pick_file(&known, prefix) else {
+        println!("< такого вложения в чате нет: /files покажет, какие есть");
+        return;
+    };
+    let file_id = view.file.file_id;
+
+    match command {
+        "/accept" => {
+            if handle.send(Command::AcceptFile { file_id }).await.is_ok() {
+                println!("< принимаем {}", short(&file_id));
+            }
+        }
+        // Пауза и отказ различаются тем, что остаётся, и стенд обязан
+        // это проговаривать: у человека в руках две кнопки, и одна
+        // из них необратима.
+        "/pause" => {
+            if handle.send(Command::PauseFile { file_id }).await.is_ok() {
+                println!("< приостановлено; /accept продолжит с той же дырки");
+            }
+        }
+        "/decline" => {
+            if handle.send(Command::DeclineFile { file_id }).await.is_ok() {
+                println!("< отказано; принятые куски удалены");
+            }
+        }
+        "/save" => {
+            let Some(target) = rest.get(1) else {
+                println!("< /save <id> <путь>");
+                return;
+            };
+            save_file(handle, file_id, std::path::PathBuf::from(target)).await;
+        }
+        other => println!("< не понял «{other}»"),
+    }
+}
+
+/// Вложения чата — все, какие знает ядро.
+///
+/// Спрашиваются вместе с сообщениями: отдельного запроса «дай файлы чата»
+/// у драйвера нет, и заводить его ради стенда незачем — окна в двадцать
+/// сообщений хватает на любую проверку руками.
+async fn files_of(handle: &DriverHandle, chat: ratatosk_core::ChatId) -> Vec<FileView> {
+    let Some(messages) = handle.messages(chat, 20).await else {
+        return Vec::new();
+    };
+    messages.into_iter().flat_map(|view| view.files).collect()
+}
+
+/// Находит вложение по началу идентификатора.
+///
+/// Совпадение обязано быть **единственным**: два файла с общим префиксом
+/// — редкость, но «взяли первый попавшийся» в стенде для проверки файлов
+/// было бы ошибкой ровно того рода, которую он ищет.
+fn pick_file<'a>(known: &'a [FileView], prefix: &str) -> Option<&'a FileView> {
+    let prefix = prefix.trim().to_lowercase();
+    let mut found = known
+        .iter()
+        .filter(|view| data_encoding::HEXLOWER.encode(&view.file.file_id).starts_with(&prefix));
+    let first = found.next()?;
+    match found.next() {
+        None => Some(first),
+        Some(_) => {
+            println!("< таких вложений несколько — назовите больше знаков");
+            None
+        }
+    }
+}
+
+/// Собирает принятое вложение на диск и называет его сумму.
+///
+/// **Ради этой функции всё и затевалось.** «Файл принят» без сборки
+/// проверяет только счётчик чанков; целость содержимого проверяет сумма,
+/// сверенная с той, что напечатал отправитель.
+///
+/// Чтение уезжает в `spawn_blocking`: чанки читаются с диска и
+/// расшифровываются, и делать это в цикле рантайма значило бы держать
+/// стенд неотзывчивым всё время сборки.
+async fn save_file(handle: &DriverHandle, file_id: [u8; 16], target: std::path::PathBuf) {
+    let Some(reader) = handle.open_file(file_id).await else {
+        println!("< ядро остановлено");
+        return;
+    };
+    let Some(reader) = reader else {
+        println!("< такого вложения ядро не знает");
+        return;
+    };
+
+    let done = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        for index in 0..reader.chunk_total() {
+            match reader.chunk(index) {
+                Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+                // Дырка в середине — обычное состояние недокачанного
+                // файла, и говорить о ней надо номером: по нему видно,
+                // докуда дошло.
+                Ok(None) => return Err(format!("чанка {index} ещё нет — файл не целиком")),
+                Err(error) => return Err(format!("чанк {index} не читается: {error}")),
+            }
+        }
+        std::fs::write(&target, &bytes).map_err(|error| format!("не записать: {error}"))?;
+        Ok((target, bytes.len(), sum_of(&bytes)))
+    })
+    .await;
+
+    match done {
+        Ok(Ok((path, len, sum))) => {
+            println!("< сохранено: {} Б, сумма {sum}", len);
+            println!("    {}", path.display());
+            println!("    сверьте сумму с той, что напечатал отправитель");
+        }
+        Ok(Err(why)) => println!("< не собрали: {why}"),
+        Err(_) => println!("< сборка упала"),
+    }
+}
+
+/// Контрольная сумма для сверки глазами — начало BLAKE3.
+///
+/// Восьми байт хватает: сверяет их человек, а не протокол, и защищаться
+/// ею не от кого — обе стороны свои. Полные тридцать два байта человек
+/// сверять не станет, а не сверенная сумма не значит ничего.
+fn sum_of(bytes: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(&blake3::hash(bytes).as_bytes()[..8])
+}
+
+/// `/bt` — шестая ступень: эфир Bluetooth (0.4).
+///
+/// Настраивать здесь нечего, и это не упущение: ступень адресуется эфиром,
+/// а не карточкой. Поэтому команд всего три — посмотреть, включить,
+/// выключить.
+///
+/// `/bt on` включает ступень §5.4; радио при этом поднимается не сразу —
+/// сессия D-Bus, адаптер, сокет и объявление занимают доли секунды,
+/// и до конца этого ступень честно «не поднята». Смотреть исход надо
+/// повторным `/bt`, а не по тому, что команда вернулась.
+async fn bt_command(handle: &DriverHandle, rest: &str) {
+    match rest.split_whitespace().next() {
+        None => bt_show(handle).await,
+        Some(word @ ("on" | "off")) => {
+            let enabled = word == "on";
+            let sent = handle
+                .send(Command::SetTransportEnabled {
+                    transport: ratatosk_proto::Transport::Bt,
+                    enabled,
+                })
+                .await;
+            if sent.is_ok() {
+                if enabled {
+                    // Цена — **до** включения, как у меша и у nostr (§14).
+                    // Здесь она не про приватность графа, а про заряд
+                    // и про разрешения на телефоне.
+                    println!(
+                        "< эфир стоит заряда постоянно: объявлять себя и слушать надо всё                          время, а не в момент отправки"
+                    );
+                }
+                bt_show(handle).await;
+            }
+        }
+        Some(other) => println!("< не понял «{other}»: /bt [on|off]"),
+    }
+}
+
+/// `/bt` без доводов — что со ступенью прямо сейчас.
+async fn bt_show(handle: &DriverHandle) {
+    if !BT_BUILT_IN {
+        // Первой строкой и до всего остального: без раннера включать
+        // нечего, а выглядит это как ступень, которая молчит.
+        println!("< ВНИМАНИЕ: эфира нет в этой сборке — пересоберите с --features bt");
+        println!("  ступень ниже включается, но радио поднимать некому");
+    }
+    let Some(status) = handle.transports().await else {
+        println!("< ядро остановлено");
+        return;
+    };
+    let transport = ratatosk_proto::Transport::Bt;
+    println!(
+        "< bluetooth: включена={} работает={}",
+        yes(status.enabled.contains(transport)),
+        yes(status.ready.contains(transport))
+    );
+    if status.enabled.contains(transport) && !status.ready.contains(transport) {
+        // Три разные беды выглядят одинаково — «не поднята», — и
+        // различить их можно только журналом: он называет причину
+        // словами чужого крейта.
+        println!("  радио ещё не поднялось или не поднялось вовсе:");
+        println!("  адаптер выключен? `bluetoothctl show` и `rfkill list`");
+        println!("  причина пишется в журнал строкой «эфир не поднялся»");
+    }
+    println!("  адрес в карточке ступени не нужен: собеседника слышно или нет — /who");
+    println!("  файлы ездят: объёмный кадр идёт своим каналом (0.4.4)");
+    println!("  слышно становится не сразу: объявление ловится секундами, а не мгновенно");
 }
 
 /// `/nostr` — состояние ступени и её настройка (0.3).

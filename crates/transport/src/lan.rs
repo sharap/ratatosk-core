@@ -89,7 +89,7 @@ impl Default for LanConfig {
 type Directory = Arc<Mutex<BTreeMap<[u8; 32], SocketAddr>>>;
 
 /// Чьи маяки сопоставлять. Приходит из ядра командой
-/// [`TransportCommand::WatchLanPeers`].
+/// [`TransportCommand::WatchPeers`].
 type Watched = Arc<Mutex<Vec<[u8; 32]>>>;
 
 /// Полная TXT-запись маяка: `nonce ‖ значение` (§5.1).
@@ -478,7 +478,7 @@ impl Runner for LanRunner {
             }
             TransportCommand::SetEnabled { .. } => Err(TransportError::Unavailable),
             TransportCommand::NetworkChanged => self.restart().await,
-            TransportCommand::WatchLanPeers(peers) => {
+            TransportCommand::WatchPeers(peers) => {
                 // Сначала пересматриваем уже услышанное, потом запоминаем
                 // список. Порядок неважен для результата, но так очевидно,
                 // что новый контакт находится сразу, а не со следующим анонсом.
@@ -495,6 +495,8 @@ impl Runner for LanRunner {
             | TransportCommand::CreateMailAccount { .. }
             | TransportCommand::SetYgg(_)
             | TransportCommand::SetNostr(_) => Err(TransportError::Unavailable),
+            // Принятых связей у этой ступени нет: отвечать в них нечего.
+            TransportCommand::BindLink { .. } => Err(TransportError::Unavailable),
         }
     }
 
@@ -509,7 +511,7 @@ fn spawn_accept_loop(listener: TcpListener, events: mpsc::Sender<TransportEvent>
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
-                    spawn_read_loop(stream, Transport::Lan, events.clone());
+                    spawn_read_loop(stream, Transport::Lan, None, events.clone());
                 }
                 // Исчерпание дескрипторов лечится ожиданием, а не выходом
                 // из цикла: выйдя, транспорт замолчал бы навсегда.

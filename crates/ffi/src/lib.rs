@@ -135,7 +135,7 @@ pub enum RatatoskError {
 
 /// Почему передача файла стоит (§10.3).
 ///
-/// **Из пяти причин действия требует ровно одна.** Остальные четыре
+/// **Из шести причин действия требует ровно одна.** Остальные пять
 /// означают «файл не потерян, поедет сам»; [`FfiFileWaitReason::
 /// MailboxFull`] означает «освободите место, иначе не поедет». Показать
 /// их одинаково — соврать человеку в единственном случае, когда он может
@@ -155,6 +155,12 @@ pub enum FfiFileWaitReason {
     MailboxFull,
     /// Спросили — собеседник молчит.
     Silent,
+    /// Ступень занята другими передачами, этот файл ждёт своей очереди.
+    ///
+    /// Очередь заведена нарочно: параллель на узком канале ничего
+    /// не ускоряет. Показывать такой файл зависшим нельзя — он движется,
+    /// просто не сейчас.
+    Queued,
 }
 
 /// Переводит причину наружу.
@@ -167,6 +173,7 @@ const fn wait_reason_of(reason: ratatosk_proto::files::FileWait) -> FfiFileWaitR
         FileWait::Handshaking => FfiFileWaitReason::Handshaking,
         FileWait::MailboxFull => FfiFileWaitReason::MailboxFull,
         FileWait::Silent => FfiFileWaitReason::Silent,
+        FileWait::Queued => FfiFileWaitReason::Queued,
     }
 }
 
@@ -180,6 +187,7 @@ const fn wait_reason_back(reason: FfiFileWaitReason) -> ratatosk_proto::files::F
         FfiFileWaitReason::Handshaking => FileWait::Handshaking,
         FfiFileWaitReason::MailboxFull => FileWait::MailboxFull,
         FfiFileWaitReason::Silent => FileWait::Silent,
+        FfiFileWaitReason::Queued => FileWait::Queued,
     }
 }
 
@@ -1217,12 +1225,24 @@ impl FfiFileReader {
     /// Расшифрованный кусок. `None` — показать нечего.
     ///
     /// Куски идут подряд, от нуля до `chunk_total() - 1`; размер каждого,
-    /// кроме последнего, — [`chunk_bytes`].
+    /// кроме последнего, — [`FfiFileReader::chunk_bytes`].
     ///
     /// Вызывать **не из UI-потока**: расшифровка мебибайта — это работа.
     /// Ядру она больше не мешает, а вот отрисовке помешает.
     pub fn chunk(&self, index: u64) -> Result<Option<Vec<u8>>, RatatoskError> {
         self.reader.chunk(index).map_err(|error| RatatoskError::internal(error.to_string()))
+    }
+
+    /// Каким куском нарезан **этот** файл.
+    ///
+    /// Своё число у каждого файла, а не общее: по эфиру кусок вчетверо
+    /// меньше килобайта (класс L туда не доходит вовсе), а у пересланного
+    /// нарезку выбрал чужой аппарат. Свободная функция [`chunk_bytes`]
+    /// отвечает на другой вопрос — «каким куском режем **мы** прямо
+    /// сейчас», — и для показа принятого файла не годится.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u32 {
+        self.reader.chunk_bytes()
     }
 }
 
@@ -1323,10 +1343,22 @@ pub struct FfiFile {
     /// Собран целиком.
     pub complete: bool,
     /// Сколько чанков уже принято — и сколько всего. Это и есть ход передачи;
-    /// в байтах он получается умножением на [`chunk_bytes`].
+    /// в байтах он получается умножением на [`FfiFile::chunk_bytes`].
+    ///
+    /// **Умножать на свободную функцию [`chunk_bytes`] нельзя**, и это
+    /// не придирка: нарезка у файла своя (§10.2), у принятого по эфиру она
+    /// в двести с лишним раз мельче, а у пересланного вообще выбрана чужим
+    /// аппаратом. Общим числом ход такой передачи показался бы завершённым
+    /// задолго до конца.
     pub received_chunks: u64,
     /// Сколько чанков всего.
     pub chunk_total: u64,
+    /// Каким куском нарезан **этот** файл — размер всех, кроме последнего.
+    ///
+    /// Нужен ровно затем, чтобы показать ход передачи в байтах, и берётся
+    /// из записи файла, а не из настроек: резал его тот, кто отправлял,
+    /// и своей ступенью.
+    pub chunk_bytes: u32,
     /// Есть ли превью, которое можно показать (§10.3).
     pub has_preview: bool,
 }
@@ -2998,6 +3030,7 @@ impl RatatoskClient {
                     accepted: view.file.accepted,
                     complete: view.file.complete,
                     chunk_total: view.file.chunk_total,
+                    chunk_bytes: view.file.chunk_bytes,
                     has_preview: view.file.preview.is_some(),
                 })
                 .collect(),
@@ -4183,7 +4216,15 @@ pub fn max_forward_ids() -> u32 {
     u32::try_from(ratatosk_proto::MAX_FORWARD_IDS).unwrap_or(u32::MAX)
 }
 
-/// Размер куска файла в байтах — то, чем ходит [`FfiFileReader::chunk`].
+/// Размер куска файла в байтах — **умолчание провода**, а не правда
+/// о конкретном файле.
+///
+/// Годится, чтобы прикинуть, на сколько кусков разойдётся файл, который
+/// мы собираемся отправить по обычной сети. Для показа хода **принятого**
+/// файла брать его нельзя: нарезку выбирает отправитель по своей ступени
+/// (§10.2), и у приехавшего по эфиру она мельче в двести с лишним раз.
+/// Своё число у файла отдают [`FfiFile::chunk_bytes`]
+/// и [`FfiFileReader::chunk_bytes`].
 #[uniffi::export]
 #[must_use]
 pub fn chunk_bytes() -> u32 {

@@ -452,6 +452,7 @@ mod tests {
 
     fn offer() -> files::FileOffer {
         files::FileOffer {
+            chunk_bytes: files::CHUNK_BYTES,
             file_id: [6u8; 16],
             name: "кот.jpg".into(),
             size_bytes: 1024,

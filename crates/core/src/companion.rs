@@ -1206,6 +1206,13 @@ pub struct CompanionClient {
     /// уходит первым, и ответ с бо́льшим номером означает, что до него
     /// очередь дошла, а до нашего не дойдёт никогда.
     hello: Option<u64>,
+    /// Сборщик кусков (§9.3).
+    ///
+    /// Терминал разговаривает через те же ступени, что и люди, — в том
+    /// числе через эфир, где потолок кадра ниже страницы истории. Без
+    /// сборщика такой ответ приезжал бы кусками, а показать было бы
+    /// нечего: каждый кусок по отдельности — не разговор терминала.
+    fragments: ratatosk_proto::fragment::Reassembler,
     /// Сопряжение отозвано: телефон сказал об этом сам (§13.4).
     ///
     /// **Дорога в один конец.** Обратно из этого состояния терминал
@@ -1394,6 +1401,7 @@ impl CompanionClient {
             next_id: 1,
             outstanding: BTreeMap::new(),
             cache: Cache::new(),
+            fragments: ratatosk_proto::fragment::Reassembler::new(),
             hello: None,
             own_onion: String::new(),
             own_ygg: Vec::new(),
@@ -2178,7 +2186,19 @@ impl CompanionClient {
             return vec![ClientEffect::Show(ClientEvent::Ignored("конверт не разобрался"))];
         };
         let envelope = envelope.into_parts().1;
+        if envelope.payload_type == PayloadType::Fragment {
+            return self.on_fragment(now_ms, &envelope);
+        }
+        self.deliver(&envelope)
+    }
 
+    /// Показывает разобранный конверт — приехавший целым или собранный.
+    ///
+    /// Отдельно от [`CompanionClient::on_frame`] ровно ради второго случая:
+    /// собранный конверт обязан пройти те же ветки, что и приехавший целым,
+    /// и разойдись эти два места — половина ответов показывалась бы, а
+    /// половина нет.
+    fn deliver(&mut self, envelope: &Envelope) -> Vec<ClientEffect> {
         match envelope.payload_type {
             PayloadType::CompanionResponse => self.on_response(&envelope.payload),
             PayloadType::CompanionNotice => self.on_notice(&envelope.payload),
@@ -2186,6 +2206,47 @@ impl CompanionClient {
             // сборка, либо ошибка на той стороне; показывать человеку нечего.
             _ => vec![ClientEffect::Show(ClientEvent::Ignored("не разговор терминала"))],
         }
+    }
+
+    /// Пришёл кусок (§9.3).
+    ///
+    /// Срок сборки — прямого канала: почты у терминала нет и быть не может,
+    /// он разговаривает только по живой связи.
+    fn on_fragment(&mut self, now_ms: u64, envelope: &Envelope) -> Vec<ClientEffect> {
+        use ratatosk_proto::fragment;
+
+        let Some(header) = envelope.fragment else {
+            return vec![ClientEffect::Show(ClientEvent::Ignored("кусок без заголовка"))];
+        };
+        let ratatosk_codec::Value::Bytes(part) = &envelope.payload else {
+            return vec![ClientEffect::Show(ClientEvent::Ignored("кусок не байты"))];
+        };
+        let accepted = self.fragments.accept(
+            header.uid,
+            header.index,
+            header.total,
+            part,
+            fragment::REASSEMBLY_TTL_DIRECT_MS,
+            now_ms,
+        );
+        let Ok(fragment::Accepted::Complete(assembled)) = accepted else {
+            // Неполная сборка — не новость: кусков ещё будет. Отказ — тоже
+            // не новость для человека: показывать «кусок не принят» значит
+            // показывать внутренности провода.
+            return Vec::new();
+        };
+        let Ok(whole) = Envelope::decode(&assembled) else {
+            return vec![ClientEffect::Show(ClientEvent::Ignored(
+                "собранный конверт не разобрался",
+            ))];
+        };
+        let whole = whole.into_parts().1;
+        if whole.payload_type == PayloadType::Fragment {
+            // Куски из кусков не собираются, и глубина здесь ограничивается,
+            // а не обсуждается: рекурсия на входе — это чужой выбор глубины.
+            return vec![ClientEffect::Show(ClientEvent::Ignored("кусок внутри куска"))];
+        }
+        self.deliver(&whole)
     }
 
     fn on_handshake(&mut self, now_ms: u64, step: u64, frame: &[u8]) -> Vec<ClientEffect> {

@@ -660,6 +660,83 @@ fn air_sends(effects: &[Effect]) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn a_long_text_goes_over_the_air_in_pieces_and_arrives_whole() {
+    // **Ради чего вся §9.3.** Класс кадра — это потолок содержания, и
+    // в эфире он равен четырём килобайтам: класс M теряет пятую часть
+    // кадров, класс L до телефона не доходит вовсе (0.4.8). Длинное
+    // сообщение до этой правки не доезжало никак; теперь оно уезжает
+    // кусками и собирается обратно — причём получатель об этом не знает,
+    // у него в переписке обычное сообщение.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    // Эфир — единственная ступень у обоих. У Боба он тоже включается:
+    // иначе кадр приезжает ступенью, которой у него нет.
+    air_only(&mut bob, alice.own_card().ik);
+    let mut opening = air_only(&mut alice, bob.own_card().ik);
+
+    // **Сперва короткое слово, и это не разминка.** Пока сессии нет,
+    // уезжает только первый шаг рукопожатия, а сообщение стоит в очереди:
+    // резать нечего, пока нечем запечатывать. Замерять кадры до этого
+    // места значило бы считать рукопожатие.
+    opening.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, opening);
+    assert_eq!(alice.session_count(), 1, "сессия обязана сойтись до замера");
+
+    // Сорок килобайт: в кадр класса S не влезает ни при каком паддинге,
+    // и это сообщение, которое человек вполне может написать.
+    let long = "ё".repeat(20_000);
+    let outgoing = send_text(&mut alice, &bob, 2_000, &long);
+
+    let frames = air_sends(&outgoing);
+    assert!(
+        frames.len() > 2,
+        "длинный текст обязан уехать несколькими кадрами, а уехал {}",
+        frames.len()
+    );
+    for frame in &frames {
+        // **Главное число проверки.** Резать бесполезно, если куски
+        // не влезают в тот класс, который ступень действительно возит.
+        assert!(
+            frame.len() <= ratatosk_wire::SizeClass::S.frame_len(),
+            "кадр эфира занял {} при потолке {}",
+            frame.len(),
+            ratatosk_wire::SizeClass::S.frame_len()
+        );
+    }
+
+    let events = pump(&mut alice, &mut bob, 2_000, outgoing);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "собранное сообщение обязано показаться как обычное: {events:?}"
+    );
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["привет".to_owned(), long],
+        "и совпасть с отправленным до байта"
+    );
+}
+
+#[test]
+fn a_short_text_over_the_air_still_goes_in_one_frame() {
+    // Обратная сторона предыдущей проверки: резать то, что и так доезжает,
+    // значило бы платить лишними кадрами за ничто — а в эфире кадр стоит
+    // дороже всего.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    air_only(&mut bob, alice.own_card().ik);
+    let mut opening = air_only(&mut alice, bob.own_card().ik);
+    opening.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, opening);
+
+    let outgoing = send_text(&mut alice, &bob, 2_000, "ещё раз");
+    assert_eq!(air_sends(&outgoing).len(), 1, "короткий текст режется только зря");
+
+    pump(&mut alice, &mut bob, 2_000, outgoing);
+    assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned(), "ещё раз".to_owned()]);
+}
+
+#[test]
 fn a_handshake_answer_nobody_could_send_goes_out_when_the_peer_is_heard() {
     // **Разбор тихой поломки со стенда.** Отвечающая сторона заводит сессию
     // в тот же миг, как разобрала первый шаг, а ответ уходит одним
@@ -748,20 +825,41 @@ fn a_queue_waiting_for_a_session_mints_one_handshake_and_repeats_it() {
         "рукопожатие уже в пути — третьему сообщению слать нечего: {third:?}"
     );
 
-    // И главное: собеседник видит **одно** рукопожатие, а не два. Повтор
-    // ловит `HandshakeReplayGuard`, ответ уходит прежний, сессия одна.
+    // И главное — то, ради чего всё: стороны обязаны сойтись на **одной**
+    // сессии, сколько бы раз повтор ни съездил.
+    //
+    // Сличать ответы побайтно тут нельзя, и это не мелочь. Кадр рукопожатия
+    // каждый раз собирается с новой солью (`handshake_frame`), так что
+    // повторный ответ — другие байты при том же сообщении Noise. Защита
+    // от повторов это знает: она берёт отпечаток с **сообщения**, а не
+    // с кадра. Проверять надо исход, а не форму.
     let answered = bob
         .step(1_400, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
         .expect("первый шаг разобран");
-    let reply = air_sends(&answered).first().cloned().expect("ответ уходит эфиром");
+    assert!(!air_sends(&answered).is_empty(), "ответ уходит эфиром: {answered:?}");
     let again = bob
         .step(1_500, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
         .expect("повтор разобран");
+    let repeat = air_sends(&again).first().cloned().expect("на повтор тоже отвечают");
+
+    // Алиса принимает **второй** ответ — ровно тот случай, что убил прогон
+    // на стенде: отвечающая сторона ответила несколько раз, начинающая
+    // взяла один из них. Сессия обязана получиться та же, а не вторая.
+    let settled =
+        alice.step(1_600, Input::Received { via: ratatosk_proto::Transport::Bt, frame: repeat });
+    let settled = settled.expect("ответ разобран");
+
+    // Доказательство — не в счётчиках, а в том, что слово доезжает: три
+    // сообщения ждали сессии, и все три обязаны уехать этой самой.
+    pump(&mut alice, &mut bob, 1_700, settled);
     assert_eq!(
-        air_sends(&again).first(),
-        Some(&reply),
-        "на повтор уходит прежний ответ, а не новый: {again:?}"
+        inbox(&bob, &alice),
+        vec!["первое".to_owned(), "второе".to_owned(), "третье".to_owned()],
+        "очередь обязана уехать той сессией, на которой сошлись обе стороны"
     );
+    // И счётом: на стенде их стало четыре, по одной на каждый первый шаг.
+    assert_eq!(bob.session_count(), 1, "у отвечающей стороны сессия одна");
+    assert_eq!(alice.session_count(), 1, "и у начинающей тоже");
 }
 
 #[test]
@@ -4488,7 +4586,7 @@ fn a_reader_outlives_the_core_and_reads_beside_it() {
         receive_a_file(&mut alice, &alice_blobs, &mut bob, "/tmp/albom.zip", content.len());
 
     let reader = bob.open_file(&file_id).unwrap().expect("вложение открылось");
-    assert_eq!(reader.chunk_total(), files::chunk_count(content.len() as u64));
+    assert_eq!(reader.chunk_total(), files::chunk_count(content.len() as u64, files::CHUNK_BYTES));
     assert!(!reader.own(), "принятое вложение — не своё");
 
     // Читаем первый кусок, потом даём ядру поработать, потом дочитываем.
@@ -4540,6 +4638,65 @@ fn a_sent_attachment_opens_from_its_source() {
         reader.chunk(0).is_err(),
         "исчезнувший исходник обязан отличаться от «показать нечего»"
     );
+}
+
+#[test]
+fn an_attachment_cut_by_someone_else_is_read_by_their_narezka() {
+    // **Проверка про пересылку, хотя пересылки тут нет.** У пересланного
+    // файла нарезку выбрал тот, кто отправлял его первым, — по своей
+    // ступени, не по нашей. Пока размер чанка выводился из пары «размер,
+    // число кусков» перебором **наших** двух, чужая нарезка молча
+    // подменялась своей: читатель брал куски по мебибайту там, где их
+    // резали по две с половиной тысячи байт, и отдавал испорченный файл
+    // вместо отказа.
+    //
+    // Две с половиной тысячи — число нарочно чужое: ни `AIR_CHUNK_BYTES`,
+    // ни `CHUNK_BYTES`. Перебору его взять неоткуда, а столбцу — прямо
+    // из записи.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+
+    let chunk = 2_500usize;
+    let content = payload_of(chunk * 3 + 17);
+    alice_blobs.lock().unwrap().seed("/tmp/chuzhoe.bin", content.clone());
+
+    // Сообщение заводится настоящей отправкой, а не руками: вложению нужна
+    // строка сообщения, а собирать её по полям значило бы однажды разойтись
+    // со схемой.
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "чужая нарезка");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let chat = Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik);
+    let msg_id = alice.store().messages(&chat, 10, None).unwrap()[0].msg_id;
+
+    let file_id = [0xEE; 16];
+    alice
+        .store_mut()
+        .put_file(&ratatosk_store::StoredFile {
+            file_id,
+            msg_id,
+            name: "chuzhoe.bin".into(),
+            size_bytes: content.len() as u64,
+            chunk_total: 4,
+            chunk_bytes: u32::try_from(chunk).unwrap(),
+            key: [7u8; 32],
+            preview: None,
+            ordinal: 0,
+            incoming: false,
+            source_path: Some("/tmp/chuzhoe.bin".to_owned()),
+            accepted: true,
+            complete: true,
+        })
+        .expect("вложение легло");
+
+    let reader = alice.open_file(&file_id).unwrap().expect("вложение открывается");
+    assert_eq!(reader.chunk_total(), 4);
+    assert_eq!(
+        reader.chunk(0).unwrap().expect("первый кусок на месте").len(),
+        chunk,
+        "кусок обязан быть той длины, какой его резали, а не нашей"
+    );
+    assert_eq!(assembled(&alice, &file_id), content, "и файл собирается до байта");
 }
 
 #[test]
@@ -6454,6 +6611,208 @@ fn a_forwarded_file_reaches_the_third_person_without_re_encrypting_anything() {
         bob.store().file(&original).unwrap().is_some(),
         "файл читает пересланная копия — уносить его нельзя"
     );
+}
+
+/// Отправляет несколько файлов одним сообщением.
+fn send_files(node: &mut Node, peer: &Node, now_ms: u64, paths: &[&str]) -> Vec<Effect> {
+    node.step(
+        now_ms,
+        Input::Command(Command::SendFiles {
+            chat: Engine::<MemoryStore>::chat_id_for(&peer.own_card().ik),
+            files: paths
+                .iter()
+                .map(|path| OutgoingFile { path: (*path).into(), preview: None })
+                .collect(),
+            text: "три файла".into(),
+        }),
+    )
+    .expect("отправка файлов принята")
+}
+
+/// Сколько раз получатель сказал «ждёт очереди ступени».
+fn waiting_in_queue(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, Event::FileWaitsForChannel { reason, .. }
+                if *reason == FileWait::Queued)
+        })
+        .count()
+}
+
+#[test]
+fn the_air_carries_one_file_at_a_time_and_the_rest_wait_their_turn() {
+    // **Идея со стенда: ограничить одновременные загрузки.** Параллель
+    // на узком канале ничего не ускоряет — три файла по эфиру приедут
+    // ровно за то же время, что и по очереди, только все три в конце.
+    // Зато цена есть: окна складываются (три по тринадцать чанков
+    // на очередь записи в тридцать два), сроки молчания идут вразнобой,
+    // а потерянный кадр бьёт по всем трём сразу.
+    //
+    // Проверяется здесь не «предел где-то есть», а то, ради чего он
+    // заводился: очередь обязана **разбираться сама**. Предел без
+    // пробуждения — это не очередь, а три недоехавших файла.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+
+    // Эфир — единственная ступень у обоих, и предел там один файл.
+    assert_eq!(files::parallel_files(Transport::Bt), 1, "разбор проверки держится на этом числе");
+    air_only(&mut bob, alice.own_card().ik);
+    let mut outgoing = air_only(&mut alice, bob.own_card().ik);
+
+    let air = files::chunk_bytes_for(Transport::Bt);
+    let paths = ["/tmp/raz.bin", "/tmp/dva.bin", "/tmp/tri.bin"];
+    let contents: Vec<Vec<u8>> = (1..=3).map(|n| payload_of(air * n + n)).collect();
+    for (path, content) in paths.iter().zip(&contents) {
+        alice_blobs.lock().unwrap().seed(*path, content.clone());
+    }
+
+    outgoing.extend(send_files(&mut alice, &bob, 1_000, &paths));
+    let events = pump(&mut alice, &mut bob, 1_000, outgoing);
+
+    // Кто-то из троих обязан был услышать «ждёт очереди»: все три сразу
+    // по эфиру не пускают.
+    assert!(
+        waiting_in_queue(&events) > 0,
+        "при пределе в один файл остальные обязаны встать в очередь: {events:?}"
+    );
+
+    // И всё-таки доехали **все три**, до байта. Это и есть разница между
+    // очередью и потерей.
+    let msg_id = *ids_in(&bob, &alice).last().expect("сообщение с вложениями");
+    let received = bob.store().files_of(&msg_id).expect("вложения");
+    assert_eq!(received.len(), 3, "вложений обязано быть три");
+    for file in &received {
+        assert!(file.complete, "файл {} так и не собрался", file.name);
+    }
+    let mut got: Vec<Vec<u8>> =
+        received.iter().map(|file| assembled(&bob, &file.file_id)).collect();
+    let mut want = contents.clone();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want, "очередь обязана довезти то же самое, что и параллель");
+}
+
+#[test]
+fn a_wide_rung_does_not_queue_what_it_can_carry_at_once() {
+    // Обратная сторона: предел не должен наказывать широкий канал.
+    // По локальной сети десяток мелких картинок гуськом — заметная
+    // и ничем не оправданная задержка, поэтому там их четыре.
+    assert!(
+        files::parallel_files(Transport::Lan) >= 3,
+        "локальная сеть обязана вести несколько передач разом"
+    );
+
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .unwrap();
+    // **Нарочно поднимаем локальную сеть.** По умолчанию у пары включён
+    // только onion, а у него предел одновременных передач равен одному
+    // (§10.2): проверка про широкую ступень, поставленная на узкой,
+    // проверяла бы обратное тому, что написано в её имени. Сперва она
+    // ровно этим и упала.
+    lan_up(&mut alice, &bob);
+    lan_up(&mut bob, &alice);
+
+    let paths = ["/tmp/a.bin", "/tmp/b.bin", "/tmp/v.bin"];
+    for (n, path) in paths.iter().enumerate() {
+        alice_blobs.lock().unwrap().seed(*path, payload_of(1_000 + n));
+    }
+
+    let outgoing = send_files(&mut alice, &bob, 1_000, &paths);
+    let events = pump(&mut alice, &mut bob, 1_000, outgoing);
+    assert_eq!(
+        waiting_in_queue(&events),
+        0,
+        "три файла по локальной сети обязаны ехать разом, а не по очереди"
+    );
+
+    // И доехали.
+    let msg_id = *ids_in(&bob, &alice).last().expect("сообщение с вложениями");
+    for file in bob.store().files_of(&msg_id).expect("вложения") {
+        assert!(file.complete, "файл {} так и не собрался", file.name);
+    }
+}
+
+#[test]
+fn a_forwarded_file_keeps_the_narezka_it_arrived_with() {
+    // **Ради чего заводилась колонка (миграция 0026).** Файл, приехавший
+    // по эфиру, нарезан по три с половиной килобайта: класс L до телефона
+    // не доходит вовсе. Переслать его дальше — значит предложить третьему
+    // человеку **ту же** нарезку: чанки уже лежат по своим номерам,
+    // и перенумеровать их можно только перечитав файл целиком.
+    //
+    // Пока размер не хранился, здесь стояло своё умолчание — мебибайт.
+    // Третий просил куски по мебибайту, а их не существовало; передача
+    // вставала на первом же. Ровно это и было записано как «пересылка
+    // по эфиру не заработает».
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    let mut vera = node(3, "vera");
+    introduce(&mut alice, &mut bob);
+    introduce(&mut bob, &mut vera);
+
+    for who in [&mut bob, &mut vera] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+
+    // Эфир у Алисы включён — значит она режет по-эфирному (§10.2),
+    // и нарезка эта поедет дальше сама, без нашей помощи.
+    let air = files::chunk_bytes_for(Transport::Bt);
+    alice
+        .step(
+            950,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается");
+
+    let content = payload_of(air * 3 + 11);
+    alice_blobs.lock().unwrap().seed("/tmp/melko.bin", content.clone());
+
+    let effects = send_file(&mut alice, &bob, 1_000, "/tmp/melko.bin");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let original = only_file(&bob, &alice);
+    let at_bob = bob.store().file(&original).unwrap().unwrap();
+    assert_eq!(
+        at_bob.chunk_bytes as usize, air,
+        "у принятого файла нарезка та, какой его резал отправитель"
+    );
+    assert!(at_bob.complete, "и он собрался");
+
+    // Боб → Вера. Нарезка обязана уехать вместе с файлом.
+    let with_file = *ids_in(&bob, &alice).last().expect("сообщение с вложением");
+    let effects = bob
+        .step(
+            2_000,
+            Input::Command(Command::ForwardMessages {
+                chat: Engine::<MemoryStore>::chat_id_for(&vera.own_card().ik),
+                msg_ids: vec![with_file],
+            }),
+        )
+        .expect("пересылка принята");
+    pump(&mut bob, &mut vera, 2_000, effects);
+
+    let forwarded = only_file(&vera, &bob);
+    let at_vera = vera.store().file(&forwarded).unwrap().unwrap();
+    assert_eq!(
+        at_vera.chunk_bytes, at_bob.chunk_bytes,
+        "третьему человеку обязана достаться та же нарезка, а не наше умолчание"
+    );
+    assert_eq!(
+        at_vera.chunk_total, at_bob.chunk_total,
+        "а значит и то же число кусков: по ним он их и просит"
+    );
+    assert!(at_vera.complete, "пересланный мелко нарезанный файл обязан собраться");
+    assert_eq!(assembled(&vera, &forwarded), content, "и совпасть с исходным до байта");
 }
 
 #[test]

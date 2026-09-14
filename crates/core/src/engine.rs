@@ -336,6 +336,28 @@ struct Sending {
     peer_ik: [u8; 32],
     /// Сколько всего чанков.
     chunk_total: u64,
+    /// Каким чанком нарезан файл (§10.2).
+    ///
+    /// Нужен на **каждый** кусок: им режется исходник. Хранится вместе
+    /// с файлом — разбор у [`ratatosk_store::StoredFile::chunk_bytes`].
+    chunk_bytes: usize,
+    /// Когда про эту передачу спрашивали в последний раз.
+    ///
+    /// Просто растущий номер, не время: сравнивать его нужно только
+    /// с такими же, а часы для этого не годятся — `now_ms` на проводе
+    /// тестов не движется вовсе, да и две просьбы в одну миллисекунду
+    /// в жизни обычное дело.
+    ///
+    /// **На нём держится очерёдность отдачи, и без него была взаимная
+    /// блокировка.** Разбор — у [`Engine::sender_lane_has_room`].
+    asked_seq: u64,
+    /// Размер файла — чтобы спросить ступень, не ходя за ним в базу.
+    ///
+    /// Ступень выбирает [`Engine::file_channel`], а ему нужен размер:
+    /// §10.3 не пускает крупный файл почтой. Спрашивают его при переборе
+    /// очереди передач, то есть на каждый чанк, — а обращение к хранилищу
+    /// на каждый чанк это уже работа.
+    size_bytes: u64,
     /// Получатель подтвердил всё **до** этого номера.
     acked_upto: u64,
     /// Сколько чанков уже отправлено.
@@ -622,6 +644,16 @@ enum HandshakeStep {
     Exhausted,
 }
 
+/// Сколько байт уедет за одну отправку — всеми её кадрами сразу.
+///
+/// Срок доставки считается от размера (§5.4, `timeout_ms_for`), а
+/// с фрагментацией (§9.3) сообщение уезжает не одним кадром, а несколькими.
+/// Срок по размеру **первого** куска объявил бы отправку неудавшейся
+/// заведомо раньше, чем уедет последний.
+fn total_len(frames: &[Vec<u8>]) -> usize {
+    frames.iter().map(Vec::len).sum()
+}
+
 /// Доводит попытку до указанной ступени §5.4, отметив пройденные.
 ///
 /// Нужна там, где транспорт выбран не лестницей, а обстоятельствами:
@@ -815,6 +847,12 @@ pub struct Engine<S: Store> {
     dedup: DedupWindow,
     reassembler: Reassembler,
     handshake_guard: HandshakeReplayGuard,
+    /// Сборщик конвертов, приехавших кусками (§9.3).
+    ///
+    /// Живёт в памяти и переживать перезапуск не обязан: незавершённая
+    /// сборка после него всё равно бесполезна — недостающие куски придут
+    /// в сессии, которой уже нет. Свои пределы и сроки сборщик держит сам.
+    fragments: ratatosk_proto::fragment::Reassembler,
     rekey: RekeyPolicy,
     contacts: BTreeMap<[u8; 32], Contact>,
     by_chat: BTreeMap<ChatId, [u8; 32]>,
@@ -1055,6 +1093,56 @@ pub struct Engine<S: Store> {
     /// здесь — движение файла. Просьба, которая исправно уезжает в пустоту,
     /// удачей не является, и ровно её отступление и должно разредить.
     file_attempts: BTreeMap<FileId, u32>,
+    /// Какую ступень занимает каждая идущая **входящая** передача (§10.2).
+    ///
+    /// Это и есть учёт одновременных загрузок: предел
+    /// [`ratatosk_proto::files::parallel_files`] считает записи этой карты
+    /// по ступеням. Ключ — файл, значение — ступень, которой он сейчас
+    /// едет; запись появляется на ушедшей просьбе и исчезает, когда файл
+    /// собрался, отклонён, приостановлен или удалён.
+    ///
+    /// **На весь аппарат, а не на собеседника**, и это не упрощение:
+    /// канал у ступени один на всех. Две загрузки от разных людей
+    /// по эфиру толкаются в той же очереди записи, что и две от одного.
+    file_lane: BTreeMap<FileId, Transport>,
+    /// На какой-то ступени освободилось место — очередь стоит перебрать.
+    ///
+    /// Признак, а не список ступеней, и это упрощение с причиной. Какая
+    /// именно ступень освободилась, пробуждению знать незачем: занятость
+    /// оно всё равно спрашивает заново у каждой очередной передачи —
+    /// ступень к тому времени могла и смениться (§5.4). Список же
+    /// требовал бы на каждом снятии передачи правильно назвать ступень,
+    /// и первое же место, назвавшее не ту, теряло бы очередь навсегда.
+    /// Одно из таких мест уже нашлось: отдача снимала запись о передаче,
+    /// не отмечая ничего вовсе.
+    ///
+    /// Разбирается один раз в конце шага ([`Engine::wake_queued_files`]).
+    /// Разбирать на месте нельзя: разбуженная передача вправе тут же
+    /// завершиться — у пустого файла или у собранного перед самым
+    /// перезапуском, — и освободить место снова. Получилась бы рекурсия,
+    /// глубину которой задаёт не наш код, а содержимое очереди.
+    lanes_freed: bool,
+    /// Входящие файлы, которым отказала калитка одновременных загрузок.
+    ///
+    /// **Именно те, кому отказали, и никто больше.** Здесь стоял перебор
+    /// всех незаконченных файлов, и это было кольцо: пробуждение
+    /// переспрашивало с признаком «начните сначала» и те передачи, которые
+    /// шли своим чередом, отматывая отправителю окно назад. Каждый такой
+    /// заход порождал новые чанки, новые чанки — новые подтверждения,
+    /// и провод переставал сходиться. Список ровно тех, кого завернули,
+    /// делает пробуждение точным: разбудили — вычеркнули.
+    file_queued: BTreeSet<FileId>,
+    /// Растущий номер просьбы — им упорядочивается отдача.
+    ///
+    /// Разбор у [`Engine::sender_lane_has_room`]; коротко — очерёдность
+    /// обязана следовать за тем, кто **спрашивает**, иначе отправитель
+    /// держит место за передачей, о которой никто не просит.
+    asked_seq: u64,
+    /// Отдачи, которым отказала та же калитка со стороны отправителя.
+    ///
+    /// Пара «файл и получатель»: в группе у одного файла получателей
+    /// несколько, и завёрнут может быть один из них.
+    sending_queued: BTreeSet<(FileId, [u8; 32])>,
     /// Сколько сообщений легло в историю с прошлой уборки (§12).
     ///
     /// В памяти, а не на диске, и это не забывчивость: счётчик — способ
@@ -1180,6 +1268,13 @@ struct Upload {
     name: String,
     size_bytes: u64,
     chunk_total: u64,
+    /// Каким куском файл нарезан — тем же числом мерится каждый приходящий.
+    ///
+    /// Выбран один раз, при `FileOffer`, и дальше не меняется: номера
+    /// кусков десктоп уже получил, и передумать после этого значило бы
+    /// перенумеровать то, что он уже шлёт. Переживает перезапуск в
+    /// `staged_files`.
+    chunk_bytes: u32,
     /// Ключ файла (§10.1). Придумывает **телефон**: границу устройства
     /// ключевой материал не пересекает (§13.4), и десктоп его не видит.
     key: [u8; 32],
@@ -1236,6 +1331,7 @@ impl<S: Store> Engine<S> {
             dedup: DedupWindow::default(),
             reassembler: Reassembler::new(),
             handshake_guard: HandshakeReplayGuard::default(),
+            fragments: ratatosk_proto::fragment::Reassembler::new(),
             rekey: RekeyPolicy::default(),
             contacts: BTreeMap::new(),
             by_chat: BTreeMap::new(),
@@ -1282,6 +1378,11 @@ impl<S: Store> Engine<S> {
             sending: Vec::new(),
             file_timers: BTreeMap::new(),
             file_attempts: BTreeMap::new(),
+            file_lane: BTreeMap::new(),
+            lanes_freed: false,
+            file_queued: BTreeSet::new(),
+            asked_seq: 0,
+            sending_queued: BTreeSet::new(),
             messages_since_compaction: 0,
             schedule: Schedule::default(),
             announced: None,
@@ -1475,8 +1576,93 @@ impl<S: Store> Engine<S> {
                 return Err(error);
             }
         });
+        // Освободившиеся ступени разбираются **здесь**, одним местом
+        // и после всего остального. Разбор целиком — у `wake_queued_files`;
+        // коротко: разбуженная передача вправе тут же сойти со ступени
+        // снова, и делать это внутри шага значило бы уйти в рекурсию
+        // такой глубины, какую задаёт очередь файлов, а не наш код.
+        match self.wake_queued_files(now_ms) {
+            Ok(woken) => effects.extend(woken),
+            // Отказ здесь не отменяет уже сделанного шага: очередь файлов —
+            // не то, ради чего стоит выбрасывать разобранный кадр. Ступени
+            // остаются помеченными и разберутся на следующем шаге.
+            Err(error) => tracing::warn!(?error, "очередь файлов не разобралась"),
+        }
         self.note_for_companion(&effects);
         effects.extend(self.flush_companion_notices(now_ms));
+        Ok(effects)
+    }
+
+    /// Пускает на освободившуюся ступень следующие передачи (§10.2).
+    ///
+    /// # Почему это один раз в конце шага, а не на месте
+    ///
+    /// Потому что разбуженная передача вправе завершиться в тот же миг —
+    /// у пустого файла, у собранного перед самым перезапуском, у того,
+    /// чей последний кусок уже лежит. Завершившись, она снова освобождает
+    /// ту же ступень. Буди мы прямо в `finish_file`, глубину рекурсии
+    /// задавала бы длина очереди файлов, а не наш код.
+    ///
+    /// Здесь же всё плоско: помеченные ступени забираются разом, каждая
+    /// разбирается один раз, а то, что освободилось по ходу разбора,
+    /// достанется следующему шагу. Шаг этот всегда есть: своей отправкой
+    /// разбуженная передача его и породит.
+    ///
+    /// # Будятся только те, кого завернули
+    ///
+    /// Здесь стоял перебор всех незаконченных файлов, и это было кольцо.
+    /// Просьба про файл уходит с признаком «начните сначала», и признак
+    /// этот отматывает отправителю окно назад — к нашей первой дырке.
+    /// Переспрашивая передачи, которые шли своим чередом, пробуждение
+    /// заставляло слать заново уже отправленное; новые чанки приносили
+    /// новые подтверждения, каждое подтверждение — новое пробуждение,
+    /// и провод переставал сходиться (тесты на несколько вложений
+    /// в одном сообщении упёрлись в предел шагов).
+    ///
+    /// Поэтому очередь ведётся поимённо: `file_queued` на приёме,
+    /// `sending_queued` на отдаче. Завернули — вписали, разбудили —
+    /// вычеркнули, завернули снова — вписали снова. Файл, идущий своим
+    /// чередом, в этих списках не значится и трогать его незачем.
+    ///
+    /// # Обе стороны
+    ///
+    /// Сперва отдача, потом приём, и порядок тут не случаен. Отдача
+    /// продолжается **молча** — получатель уже спросил, и досылать можно
+    /// сразу. Приём же начинается с просьбы, то есть с кадра в эфир,
+    /// и пускать его вперёд значило бы занять ступень новой передачей
+    /// прежде, чем на ней доедет начатая.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn wake_queued_files(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
+        if !std::mem::take(&mut self.lanes_freed) {
+            return Ok(Vec::new());
+        }
+        let mut effects = Vec::new();
+
+        // Отдача: чьи-то чанки ждут только того, чтобы их досылали.
+        // Список забирается целиком — завёрнутые снова впишут себя сами.
+        for (file_id, peer_ik) in std::mem::take(&mut self.sending_queued) {
+            // Записи о передаче могло уже не стать: получатель отказался,
+            // файл удалили. Тогда и досылать нечего.
+            if !self.sending.iter().any(|s| s.file_id == file_id && s.peer_ik == peer_ik) {
+                continue;
+            }
+            let Some(file) = self.store.file(&file_id)? else { continue };
+            effects.extend(self.pump_file(now_ms, &file, peer_ik)?);
+        }
+
+        // Приём: те, кому мы ответили «ждёт очереди», и только они.
+        for file_id in std::mem::take(&mut self.file_queued) {
+            let Some(file) = self.store.file(&file_id)? else { continue };
+            if file.complete || !file.incoming || !file.accepted {
+                continue;
+            }
+            // «Начните сначала»: у отправителя об этой передаче ещё ничего
+            // нет — мы её и не начинали.
+            effects.extend(self.ask_for_file(now_ms, &file, true)?);
+        }
         Ok(effects)
     }
 
@@ -1939,6 +2125,7 @@ impl<S: Store> Engine<S> {
                 name: staged.name,
                 size_bytes: staged.size_bytes,
                 chunk_total: staged.chunk_total,
+                chunk_bytes: staged.chunk_bytes,
                 key: staged.key,
                 preview: staged.preview,
                 have,
@@ -3601,9 +3788,12 @@ impl<S: Store> Engine<S> {
     /// о том, чьи они, — подобрать их сможет только сверка каталога с базой
     /// ([`Engine::sweep_orphan_files`]).
     fn forget_file(&mut self, file_id: &FileId) {
-        self.sending.retain(|s| s.file_id != *file_id);
+        self.drop_sending(|s| s.file_id == *file_id);
         self.file_timers.remove(file_id);
         self.file_attempts.remove(file_id);
+        self.file_queued.remove(file_id);
+        self.sending_queued.retain(|(id, _)| id != file_id);
+        self.leave_lane(file_id);
         let _ = self.blobs.remove(file_id);
         let _ = self.store.delete_file(file_id);
     }
@@ -4386,7 +4576,11 @@ impl<S: Store> Engine<S> {
         let file_id = self.entropy.msg_id();
         let mut key = [0u8; 32];
         self.entropy.fill(&mut key);
-        let chunk_total = files::chunk_count(size_bytes);
+        let chunk_bytes = self.chunk_bytes_now();
+        let chunk_total = files::chunk_count(size_bytes, chunk_bytes);
+        // Число едет с выгрузкой на диск и в память: перезапуск телефона
+        // посреди неё не должен менять нарезку, о которой уже договорились.
+        let chunk_bytes = u32::try_from(chunk_bytes).unwrap_or(u32::MAX);
         // **На диск, а не только в память.** Перезапуск телефона посреди
         // выгрузки стирал её целиком; с пятью файлами это потеря четырёх
         // выгруженных ради пятого (`ARCHITECTURE.md`, 5вб).
@@ -4396,6 +4590,7 @@ impl<S: Store> Engine<S> {
             name: name.to_owned(),
             size_bytes,
             chunk_total,
+            chunk_bytes,
             key,
             preview: preview.clone(),
             started_ms: now_ms,
@@ -4406,6 +4601,7 @@ impl<S: Store> Engine<S> {
             name: name.to_owned(),
             size_bytes,
             chunk_total,
+            chunk_bytes,
             key,
             preview,
             have: BTreeSet::new(),
@@ -4434,8 +4630,6 @@ impl<S: Store> Engine<S> {
         index: u64,
         bytes: &[u8],
     ) -> Result<companion::Response, EngineError> {
-        use ratatosk_proto::files;
-
         let Some(upload) = self.uploads.iter().find(|u| u.file_id == file_id) else {
             return Ok(companion::Response::Refused(
                 "про этот файл телефон не договаривался".to_owned(),
@@ -4447,16 +4641,21 @@ impl<S: Store> Engine<S> {
         // Длина куска задана размером файла, и проверить её обязан тот, кто
         // размер объявлял. Иначе «файл на гигабайт» приехал бы гигабайтом
         // в одном куске и мегабайтом в остальных.
+        // Размером **этого** файла, а не своим умолчанием: нарезка у него
+        // своя (§10.2), и мерить чужим числом значило бы отвергнуть
+        // законный кусок. Число записано при `FileOffer` и лежит рядом —
+        // выводить его из размера и числа кусков больше не нужно.
+        let chunk = upload.chunk_bytes as usize;
         let last = index + 1 == upload.chunk_total;
         let expected = if last {
-            let tail = upload.size_bytes % files::CHUNK_BYTES as u64;
+            let tail = upload.size_bytes % chunk as u64;
             if tail == 0 && upload.size_bytes != 0 {
-                files::CHUNK_BYTES
+                chunk
             } else {
-                usize::try_from(tail).unwrap_or(files::CHUNK_BYTES)
+                usize::try_from(tail).unwrap_or(chunk)
             }
         } else {
-            files::CHUNK_BYTES
+            chunk
         };
         if bytes.len() != expected {
             return Ok(companion::Response::Refused(
@@ -4606,9 +4805,11 @@ impl<S: Store> Engine<S> {
         };
         let chat = first.chat;
 
+        let chunk_bytes = self.chunk_bytes_now();
         let offers: Vec<files::FileOffer> = uploads
             .iter()
             .map(|upload| files::FileOffer {
+                chunk_bytes,
                 file_id: upload.file_id,
                 name: upload.name.clone(),
                 size_bytes: upload.size_bytes,
@@ -4775,6 +4976,9 @@ impl<S: Store> Engine<S> {
                 // в каком человек выбрал файлы.
                 ordinal: u32::try_from(at).unwrap_or(u32::MAX),
                 chunk_total: upload.chunk_total,
+                // Нарезка, о которой договорились на `FileOffer`, а не
+                // нынешняя ступень: куски уже лежат нарезанные ею.
+                chunk_bytes: upload.chunk_bytes,
                 key: upload.key,
                 preview: upload.preview,
                 // Не входящий: качать его не надо, он уже здесь.
@@ -4819,6 +5023,12 @@ impl<S: Store> Engine<S> {
         self.store.set_accepted(&file_id, false)?;
         self.file_timers.remove(&file_id);
         self.file_attempts.remove(&file_id);
+        // Место на ступени отдаётся сразу: приостановленный файл её больше
+        // не занимает, и держать её за ним значило бы наказать очередь
+        // за чужое решение. Из очереди он тоже уходит: человек сказал
+        // «не сейчас», и будить его нечего.
+        self.file_queued.remove(&file_id);
+        self.leave_lane(&file_id);
         let received = self.store.received_chunks(&file_id)?;
         Ok(vec![Effect::Notify(Event::FileProgress { file_id, received, total: file.chunk_total })])
     }
@@ -4925,6 +5135,10 @@ impl<S: Store> Engine<S> {
             // места установки сессии это делают. Заведи мы здесь ещё
             // и таймер, он взводил бы сам себя, пока собеседника нет.
             FileRoute::Handshake(route) => {
+                // **Ступень отдаётся, раз ехать всё равно не на чем.**
+                // Иначе файл, чей собеседник ушёл на час, держал бы место
+                // в очереди весь этот час — и ничем бы его не занимал.
+                self.leave_lane(&file.file_id);
                 let mut effects = vec![Effect::Notify(Event::FileWaitsForChannel {
                     file_id: file.file_id,
                     reason: FileWait::Handshaking,
@@ -4934,16 +5148,18 @@ impl<S: Store> Engine<S> {
                 return Ok(effects);
             }
             FileRoute::TooBig => {
+                self.leave_lane(&file.file_id);
                 return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
                     file_id: file.file_id,
                     reason: FileWait::TooBig,
-                })])
+                })]);
             }
             FileRoute::Nowhere => {
+                self.leave_lane(&file.file_id);
                 return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
                     file_id: file.file_id,
                     reason: FileWait::Nowhere,
-                })])
+                })]);
             }
         };
         if via == Transport::Mail && self.mail_limits.crowded() {
@@ -4957,9 +5173,34 @@ impl<S: Store> Engine<S> {
             // И вот это — единственный случай, в котором человек может
             // что-то сделать. Пока причина не ехала, ему говорили «ждёт
             // канала», то есть «сиди и жди», — §14 такого не разрешает.
+            // И здесь тоже: чанкам некуда лечь — значит ступень свободна
+            // для того, кому есть куда.
+            self.leave_lane(&file.file_id);
             return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
                 file_id: file.file_id,
                 reason: FileWait::MailboxFull,
+            })]);
+        }
+
+        // **Калитка одновременных загрузок (§10.2), и она здесь одна
+        // на всё.** Просит всегда получатель — значит не спросили, и
+        // отправитель окна не открыл: обе стороны сдержаны одним условием
+        // в одном месте.
+        //
+        // Срок молчания при этом **не заводится**, и это то же правило,
+        // что у полного ящика выше: ждать нечего, пока не освободится
+        // ступень, а разбудит очередь `wake_queued_files` — сразу, как
+        // только предыдущая передача сойдёт с неё.
+        if !self.lane_has_room(&file.file_id, via) {
+            // Записываемся в очередь **поимённо**. Пробуждение пойдёт
+            // по этому списку и только по нему: перебирать все
+            // незаконченные файлы значило бы переспрашивать и те, что идут
+            // своим чередом, — а просьба с признаком «начните сначала»
+            // отматывает отправителю окно назад.
+            self.file_queued.insert(file.file_id);
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                file_id: file.file_id,
+                reason: FileWait::Queued,
             })]);
         }
 
@@ -4970,8 +5211,40 @@ impl<S: Store> Engine<S> {
             PayloadType::FileRequest,
             ratatosk_proto::files::request_payload(file.file_id, next, stalled),
         )?;
+        // Место на ступени занимается **ушедшей просьбой**, а не согласием
+        // человека: до просьбы канал ничем не занят, и держать за файлом
+        // место всё то время, пока собеседника нет, значило бы отдать
+        // ступень тому, кто ею не пользуется.
+        self.file_lane.insert(file.file_id, via);
+        self.file_queued.remove(&file.file_id);
         effects.extend(self.watch_for_stall(file.file_id, via));
         Ok(effects)
+    }
+
+    /// Есть ли на ступени место под ещё одну входящую передачу (§10.2).
+    ///
+    /// Файл, уже занимающий эту ступень, place не отнимает у себя самого:
+    /// просьба про него уходит на каждое подтверждение, и считай мы её
+    /// заново, передача с пределом в одну остановилась бы после первого
+    /// же окна.
+    fn lane_has_room(&self, file_id: &FileId, via: Transport) -> bool {
+        if self.file_lane.get(file_id) == Some(&via) {
+            return true;
+        }
+        let busy = self.file_lane.values().filter(|lane| **lane == via).count();
+        busy < ratatosk_proto::files::parallel_files(via)
+    }
+
+    /// Снимает файл со ступени и отмечает, что там освободилось место.
+    ///
+    /// Одно место на все исходы передачи — собрался, отклонён,
+    /// приостановлен, удалён, — потому что забыть его в одном из четырёх
+    /// значит потерять слот навсегда: ступень числилась бы занятой файлом,
+    /// которого больше нет, и следующая загрузка не начиналась бы никогда.
+    fn leave_lane(&mut self, file_id: &FileId) {
+        if self.file_lane.remove(file_id).is_some() {
+            self.lanes_freed = true;
+        }
     }
 
     /// Ставит срок молчания по файлу.
@@ -5017,8 +5290,8 @@ impl<S: Store> Engine<S> {
         };
         let envelope =
             Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
-        let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
+        let frames = self.seal_for(session_id, via, &envelope.encode()?)?;
+        Ok(Self::sends(peer_ik, via, frames))
     }
 
     /// Проверяет вложения и готовит предложения (§10.1).
@@ -5042,12 +5315,42 @@ impl<S: Store> Engine<S> {
     ///
     /// [`ratatosk_proto::files::FileError`] на любом из пределов;
     /// [`EngineError::TextTooLong`] на подписи.
+    /// Каким чанком резать файл, который мы предлагаем прямо сейчас.
+    ///
+    /// # Спрашивается «включён», а не «слышен», и это нарочно
+    ///
+    /// Размер пинуется в предложении навсегда (§10.2), а ступень выберет
+    /// §5.4 — потом, и не раз. Значит размер обязан годиться для **худшей
+    /// ступени, на которую файл может попасть**, а не для той, которая
+    /// выглядит вероятной сейчас. Слышен ли собеседник в эфире в эту
+    /// секунду, ничего не говорит о том, куда передача свалится через
+    /// минуту.
+    ///
+    /// Поэтому правило грубое и намеренно осторожное: **эфир включён —
+    /// режем мелко**. Мелкий чанк проходит везде, просто большими файлами
+    /// и большим числом кругов; крупный по эфиру не проходит вовсе, и файл
+    /// не доезжает совсем.
+    ///
+    /// Цена названа честно: пока Bluetooth включён, мелко режутся и файлы,
+    /// уходящие по локальной сети. Пропускная способность от этого
+    /// не страдает — окно считается в байтах (§10.2), — платим накладными
+    /// расходами конверта на чанк.
+    fn chunk_bytes_now(&self) -> usize {
+        if self.enabled.contains(Transport::Bt) {
+            ratatosk_proto::files::AIR_CHUNK_BYTES
+        } else {
+            ratatosk_proto::files::CHUNK_BYTES
+        }
+    }
+
     fn prepare_offers(
         &mut self,
         files: &[OutgoingFile],
         text: &str,
     ) -> Result<Vec<ratatosk_proto::files::FileOffer>, EngineError> {
         use ratatosk_proto::files;
+
+        let chunk_bytes = self.chunk_bytes_now();
 
         if files.is_empty() || files.len() > files::MAX_FILES_PER_MESSAGE {
             return Err(files::FileError::TooMany.into());
@@ -5082,6 +5385,7 @@ impl<S: Store> Engine<S> {
             let mut key = [0u8; 32];
             self.entropy.fill(&mut key);
             offers.push(files::FileOffer {
+                chunk_bytes,
                 file_id,
                 name,
                 size_bytes,
@@ -5118,7 +5422,20 @@ impl<S: Store> Engine<S> {
                 // Порядок, в каком человек выбрал файлы: он приехал списком
                 // и другого источника у него нет.
                 ordinal: u32::try_from(at).unwrap_or(u32::MAX),
-                chunk_total: ratatosk_proto::files::chunk_count(offer.size_bytes),
+                // **Размером из предложения, а не своей константой.**
+                // Нумерация чанков обязана совпасть у обеих сторон, а своя
+                // константа разошлась бы с чужой в тот же миг, когда
+                // собеседник выберет другой размер (§10.2).
+                chunk_total: ratatosk_proto::files::chunk_count(
+                    offer.size_bytes,
+                    offer.chunk_bytes,
+                ),
+                // **И сам размер тоже, а не только выведенное из него число.**
+                // Нарезка обязана пережить перезапуск: передача продолжается
+                // с того чанка, на котором встала, и восстанавливать размер
+                // перебором своих кандидатов у пересланного файла нечем —
+                // резал его не мой аппарат и не по моей ступени.
+                chunk_bytes: u32::try_from(offer.chunk_bytes).unwrap_or(u32::MAX),
                 key: offer.key,
                 preview: offer.preview.clone(),
                 incoming: false,
@@ -5270,7 +5587,9 @@ impl<S: Store> Engine<S> {
                 records.push(attached);
                 continue;
             }
-            let chunk_total = ratatosk_proto::files::chunk_count(offer.size_bytes);
+            // Размером из предложения — см. разбор у отправляющей стороны.
+            let chunk_total =
+                ratatosk_proto::files::chunk_count(offer.size_bytes, offer.chunk_bytes);
             let record = StoredFile {
                 file_id: offer.file_id,
                 msg_id,
@@ -5280,6 +5599,8 @@ impl<S: Store> Engine<S> {
                 // их выбрал отправитель. Своего мнения у получателя тут нет.
                 ordinal: u32::try_from(records.len()).unwrap_or(u32::MAX),
                 chunk_total,
+                // Размером из предложения — он чужой, и своего у нас тут нет.
+                chunk_bytes: u32::try_from(offer.chunk_bytes).unwrap_or(u32::MAX),
                 key: offer.key,
                 preview: offer.preview,
                 incoming: true,
@@ -5427,9 +5748,15 @@ impl<S: Store> Engine<S> {
         // второго отматывает отправку первому.
         let position =
             self.sending.iter().position(|s| s.file_id == file_id && s.peer_ik == peer_ik);
+        // Номер просьбы растёт на **каждую**, и по нему решается очерёдность
+        // отдачи: кого спросили позже, тот и едет. Разбор — у
+        // `sender_lane_has_room`.
+        self.asked_seq = self.asked_seq.saturating_add(1);
+        let asked_seq = self.asked_seq;
         let sending = match position {
             Some(at) => {
                 let sending = &mut self.sending[at];
+                sending.asked_seq = asked_seq;
                 // Получатель сам сказал, что имеет в виду, — гадать не о чем.
                 // «Ничего не дошло» отматывает отправку назад; подтверждение
                 // только двигает окно, потому что то, что уже в полёте,
@@ -5450,8 +5777,14 @@ impl<S: Store> Engine<S> {
                     file_id,
                     peer_ik,
                     chunk_total: file.chunk_total,
+                    // Нарезкой, записанной вместе с файлом: у пересланного
+                    // она чужая, и вывести её из размера и числа кусков
+                    // нечем — резал его не мой аппарат и не по моей ступени.
+                    chunk_bytes: file.chunk_bytes as usize,
+                    size_bytes: file.size_bytes,
                     acked_upto: next_index,
                     sent_upto: next_index,
+                    asked_seq,
                 };
                 self.sending.push(sending);
                 sending
@@ -5462,10 +5795,85 @@ impl<S: Store> Engine<S> {
             // Получатель сказал, что у него всё. Больше **этой** передаче
             // ничего не нужно — а остальным участникам группы ещё нужно,
             // и их окна остаются.
-            self.sending.retain(|s| s.file_id != file_id || s.peer_ik != peer_ik);
+            self.drop_sending(|s| s.file_id == file_id && s.peer_ik == peer_ik);
             return Ok(Vec::new());
         }
         self.pump_file(now_ms, &file, peer_ik)
+    }
+
+    /// Снимает записи об отдаче и отмечает, что место освободилось.
+    ///
+    /// Одно место на все три случая — получатель всё подтвердил, исходник
+    /// пропал, файл удалён, — потому что забыть отметку в одном из них
+    /// значит потерять очередь отдачи навсегда: ступень числилась бы
+    /// занятой передачей, которой больше нет, и следующая не началась бы
+    /// никогда. Ровно это тут и было, пока записи снимались `retain`-ом
+    /// на месте.
+    ///
+    /// Из очереди ожидающих снятое уходит тем же движением: будить
+    /// передачу, которой не существует, незачем.
+    fn drop_sending(&mut self, gone: impl Fn(&Sending) -> bool) {
+        // Список снимаемых собирается до всякой правки: перебирать одно
+        // поле, держа второе на изменении, — задача для проверяльщика
+        // заимствований, а не для читателя.
+        let doomed: Vec<(FileId, [u8; 32])> = self
+            .sending
+            .iter()
+            .filter(|sending| gone(sending))
+            .map(|sending| (sending.file_id, sending.peer_ik))
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        self.sending.retain(|s| !gone(s));
+        for key in &doomed {
+            self.sending_queued.remove(key);
+        }
+        self.lanes_freed = true;
+    }
+
+    /// Есть ли на ступени место под ещё одну **отдачу** (§10.2).
+    ///
+    /// # Очерёдность — по тому, кого спросили позже, и это не вкусовщина
+    ///
+    /// Здесь стояло «кто раньше завёл запись, тот и едет», и это была
+    /// **взаимная блокировка**, найденная прогоном. Пределов на канал два:
+    /// получатель решает, какие файлы просить, отправитель — каким отдавать.
+    /// Считая по-разному, они выбирают разные файлы. Получатель просит B;
+    /// отправитель держит свой единственный слот за A, потому что запись
+    /// о нём старше. A никто не просит — он стоит в очереди получателя.
+    /// B не отдают. Никто не двигается, и лечится это только сроком,
+    /// которого нет.
+    ///
+    /// Правило «кого спросили позже» снимает это по построению: у самой
+    /// свежей просьбы впереди никого, значит она проходит **всегда**.
+    /// Отправитель поэтому не может отказать всем сразу — он обслуживает
+    /// того, кто спрашивает.
+    ///
+    /// Голодания у этого правила тоже нет, и причина приятная: идущая
+    /// передача сама себя обновляет — каждое подтверждение приходит
+    /// просьбой (§10.2), и номер у неё растёт. Значит начатое доезжает
+    /// до конца, а не уступает место на каждом чанке. Застрявший же
+    /// получатель вернётся по сроку молчания и станет самым свежим.
+    fn sender_lane_has_room(&self, file_id: FileId, peer_ik: [u8; 32]) -> bool {
+        let Some(mine) = self.sending.iter().find(|s| s.file_id == file_id && s.peer_ik == peer_ik)
+        else {
+            return false;
+        };
+        let Some(lane) = self.file_channel(&peer_ik, mine.size_bytes) else {
+            // Канала нет — отказывать нечему: `pump_file` разберётся сам
+            // и скажет человеку, чего именно ждёт.
+            return true;
+        };
+        let limit = ratatosk_proto::files::parallel_files(lane);
+        // Сколько таких же передач спрашивали **позже** нашей.
+        let ahead = self
+            .sending
+            .iter()
+            .filter(|other| other.asked_seq > mine.asked_seq)
+            .filter(|other| self.file_channel(&other.peer_ik, other.size_bytes) == Some(lane))
+            .count();
+        ahead < limit
     }
 
     /// Досылает чанки одному получателю, пока его окно не закрылось.
@@ -5487,6 +5895,21 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         };
         let sending = self.sending[index];
+        // **Та же калитка, что и на приёме, только с другой стороны.**
+        // Предел получателя один собеседник не удержит: в группе файл
+        // просят несколько человек сразу, и каждый из них считает свою
+        // передачу единственной. Пять окон на одном радио — ровно то,
+        // ради чего предел и заводился.
+        //
+        // Отказ здесь молчаливый и ничего не ломает: запись о передаче
+        // остаётся, получатель уже спросил, и как только ступень
+        // освободится, `wake_queued_files` досылает чанки сам — без
+        // второй просьбы и без ожидания срока молчания.
+        if !self.sender_lane_has_room(file.file_id, peer_ik) {
+            self.sending_queued.insert((file.file_id, peer_ik));
+            return Ok(Vec::new());
+        }
+        self.sending_queued.remove(&(file.file_id, peer_ik));
         let Some(via) = self.file_channel(&sending.peer_ik, file.size_bytes) else {
             // Канала нет — чанкам ехать не на чем. Получатель спросит
             // снова, когда канал появится; своего расписания у отправителя нет.
@@ -5511,8 +5934,11 @@ impl<S: Store> Engine<S> {
         // Окно берётся у транспорта, которым сейчас едем: у почты оно шире
         // (круг минутный, узким окном сто мегабайт не увезти) и означает
         // вдобавок «столько чужого ящика мы заняли».
-        let limit =
-            sending.chunk_total.min(sending.acked_upto.saturating_add(files::chunk_window(via)));
+        // Окно спрашивается в **байтах** и переводится в чанки по размеру
+        // чанка этой передачи: связывать одно с другим значило бы получить
+        // восемь килобайт в полёте, как только чанк станет мелким (§10.2).
+        let window = files::chunk_window(via, sending.chunk_bytes);
+        let limit = sending.chunk_total.min(sending.acked_upto.saturating_add(window));
         let mut effects = Vec::new();
         let mut next = sending.sent_upto;
         while next < limit {
@@ -5528,14 +5954,14 @@ impl<S: Store> Engine<S> {
             // проход дал бы те же байты, потратив на это гигабайт работы.
             let sealed = match source.as_deref() {
                 Some(path) => {
-                    let offset = next * files::CHUNK_BYTES as u64;
+                    let offset = next * sending.chunk_bytes as u64;
                     // Отказ чтения и пустой ответ — один и тот же случай:
                     // файла там больше нет или он стал короче. Отказ **не**
                     // поднимается выше: это не поломка ядра, а исчезнувший
                     // исходник, и сказать о нём надо человеку.
                     let plain = self
                         .blobs
-                        .read_at(std::path::Path::new(path), offset, files::CHUNK_BYTES)
+                        .read_at(std::path::Path::new(path), offset, sending.chunk_bytes)
                         .unwrap_or_default();
                     if plain.is_empty() {
                         Vec::new()
@@ -5553,7 +5979,8 @@ impl<S: Store> Engine<S> {
                 //
                 // Окна убираются **у всех** получателей, а не только
                 // у этого: исходник пропал не для кого-то одного.
-                self.sending.retain(|s| s.file_id != file.file_id);
+                let gone = file.file_id;
+                self.drop_sending(|s| s.file_id == gone);
                 effects.push(Effect::Notify(Event::HonestNotice {
                     text: crate::honest::FILE_SOURCE_GONE,
                 }));
@@ -5565,8 +5992,8 @@ impl<S: Store> Engine<S> {
                 PayloadType::FileChunk,
                 files::chunk_payload(file.file_id, next, &sealed),
             );
-            let frame = self.seal_for(session_id, &envelope.encode()?)?;
-            effects.push(Effect::Send { peer_ik: sending.peer_ik, via, frame, handoff: None });
+            let frames = self.seal_for(session_id, via, &envelope.encode()?)?;
+            effects.extend(Self::sends(sending.peer_ik, via, frames));
             next += 1;
         }
         if let Some(slot) =
@@ -5650,6 +6077,9 @@ impl<S: Store> Engine<S> {
         self.file_attempts.remove(&file_id);
 
         let received = self.store.received_chunks(&file_id)?;
+        // Нарезкой **этого** файла, а не своим умолчанием: от неё зависит,
+        // как часто подтверждать (§10.2). Лежит она рядом с файлом.
+        let chunk_bytes = file.chunk_bytes as usize;
         let mut effects = vec![Effect::Notify(Event::FileProgress {
             file_id,
             received,
@@ -5665,7 +6095,7 @@ impl<S: Store> Engine<S> {
         // Подтверждение — «принял, шлите дальше», а не «начните заново»:
         // у отправителя в полёте ещё несколько чанков, и пересылать их
         // не нужно. Различие едет флагом, а не угадывается на той стороне.
-        if received % files::ack_every(via) == 0 {
+        if received % files::ack_every(via, chunk_bytes) == 0 {
             effects.extend(self.ask_for_file(now_ms, &file, false)?);
         } else {
             effects.extend(self.watch_for_stall(file_id, via));
@@ -5678,6 +6108,8 @@ impl<S: Store> Engine<S> {
         self.store.complete_file(&file.file_id)?;
         self.file_timers.remove(&file.file_id);
         self.file_attempts.remove(&file.file_id);
+        self.file_queued.remove(&file.file_id);
+        self.leave_lane(&file.file_id);
         Ok(vec![Effect::Notify(Event::FileProgress {
             file_id: file.file_id,
             received: file.chunk_total,
@@ -6210,6 +6642,7 @@ impl<S: Store> Engine<S> {
             *file_id,
             file.key,
             file.chunk_total,
+            file.chunk_bytes,
             file.size_bytes,
             file.source_path.map(std::path::PathBuf::from),
             self.blobs.reader(),
@@ -6417,7 +6850,18 @@ impl<S: Store> Engine<S> {
                 .files_of(msg_id)?
                 .into_iter()
                 .filter(|file| file.complete)
+                // **Пересланный файл сохраняет прежний размер чанка,
+                // и теперь он у нас есть.** Файл уже нарезан: принятые
+                // чанки лежат по номерам, и перенумеровать их означало бы
+                // перечитать его целиком. Размер, которым его резал первый
+                // отправитель, лежит в записи файла с миграции 0026 —
+                // до неё его брать было неоткуда, и здесь стояло своё
+                // умолчание. Оно и делало пересылку по эфиру неработающей:
+                // эфирный файл, нарезанный по три с половиной килобайта,
+                // предлагался следующему как нарезанный по мебибайту,
+                // и тот просил куски, которых нет.
                 .map(|file| ratatosk_proto::files::FileOffer {
+                    chunk_bytes: file.chunk_bytes as usize,
                     file_id: file.file_id,
                     name: file.name,
                     size_bytes: file.size_bytes,
@@ -7377,8 +7821,8 @@ impl<S: Store> Engine<S> {
             PayloadType::Receipt,
             receipt.payload(msg_ids),
         );
-        let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik, via, frame, handoff: None }])
+        let frames = self.seal_for(session_id, via, &envelope.encode()?)?;
+        Ok(Self::sends(peer_ik, via, frames))
     }
 
     /// Выставляет статус доставки и сообщает о нём UI (§9.4).
@@ -7782,6 +8226,17 @@ impl<S: Store> Engine<S> {
         pairing_public: [u8; 32],
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Кусок (§9.3) — не «не тот разговор», а часть его. Разговор
+        // терминала возит превью и куски выгружаемого файла, и по эфиру
+        // они в кадр не влезают. Собрав все, приходим сюда же с целым
+        // конвертом — и дальше он неотличим от приехавшего целым.
+        if envelope.payload_type == PayloadType::Fragment {
+            let Some(whole) = self.reassemble(now_ms, via, pairing_public, envelope)? else {
+                return Ok(Vec::new());
+            };
+            return self.on_device_frame(now_ms, via, pairing_public, &whole);
+        }
+
         // Устройство говорит только просьбами. Ответ и новость идут в другую
         // сторону, всё остальное — не его разговор: терминал, приславший
         // текстовое сообщение «как контакт», либо сломан, либо не тот,
@@ -11056,8 +11511,8 @@ impl<S: Store> Engine<S> {
         };
         let envelope =
             Envelope::new(self.entropy.msg_id(), self.clock.now(now_ms)?, payload_type, payload);
-        let frame = self.seal_for(session_id, &envelope.encode()?)?;
-        Ok(vec![Effect::Send { peer_ik: pairing_public, via, frame, handoff: None }])
+        let frames = self.seal_for(session_id, via, &envelope.encode()?)?;
+        Ok(Self::sends(pairing_public, via, frames))
     }
 
     /// Адрес сопряжённого устройства, если оно его называло (§13.4).
@@ -11424,9 +11879,36 @@ impl<S: Store> Engine<S> {
             return Ok(effects);
         };
 
-        let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let (handoff, timer) = self.arm_send(delivery, transport, frame.len());
-        Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
+        let frames = self.seal_for(session_id, transport, &delivery.envelope)?;
+        let (handoff, timer) = self.arm_send(delivery, transport, total_len(&frames));
+        let mut effects = Self::delivery_sends(delivery.peer_ik, transport, frames, handoff);
+        effects.push(timer);
+        Ok(effects)
+    }
+
+    /// Раскладывает кадры доставки: метка передачи — на последнем.
+    ///
+    /// **Почему на последнем, а не на первом.** Метка ждёт ответа сервера
+    /// «письмо принято», и сообщение принято тогда, когда принят последний
+    /// его кусок: собрать его из неполного набора нельзя. На первом кадре
+    /// метка объявила бы «отправлено» на середине отправки.
+    fn delivery_sends(
+        peer_ik: [u8; 32],
+        via: Transport,
+        frames: Vec<Vec<u8>>,
+        handoff: Option<u64>,
+    ) -> Vec<Effect> {
+        let last = frames.len().saturating_sub(1);
+        frames
+            .into_iter()
+            .enumerate()
+            .map(|(at, frame)| Effect::Send {
+                peer_ik,
+                via,
+                frame,
+                handoff: if at == last { handoff } else { None },
+            })
+            .collect()
     }
 
     /// Ставит отправке срок и решает, ждать ли подтверждения передачи.
@@ -11842,15 +12324,59 @@ impl<S: Store> Engine<S> {
         Ok(crate::frames::handshake(step, message, nonce)?)
     }
 
-    fn seal_for(&mut self, session_id: u64, envelope: &[u8]) -> Result<Vec<u8>, EngineError> {
-        let bound = self.sessions.get_mut(session_id).ok_or(EngineError::UnknownPeer)?;
-        let frame = crate::frames::seal(&mut bound.session, envelope)?;
+    /// Запечатывает конверт для сессии — одним кадром или несколькими.
+    ///
+    /// Несколькими он выходит, когда конверт не влезает в потолок ступени
+    /// (§9.3): тогда [`fragment::carriers`] режет **закодированный** конверт
+    /// на несущие, и каждая едет своим кадром. Получатель собирает их
+    /// обратно, и собранный конверт неотличим от приехавшего целым.
+    ///
+    /// Резать решает ступень, а не размер сам по себе: один и тот же конверт
+    /// по проводу едет целиком, а по эфиру — кусками, потому что до Android
+    /// класс L не доходит вовсе (0.4.8). Поэтому `via` здесь обязателен
+    /// и не имеет разумного значения по умолчанию.
+    ///
+    /// **Порядок кадров значим.** Цепочка сессии продвигается на каждый
+    /// кадр, и кадры обязаны уйти в том порядке, в каком запечатаны, —
+    /// вызывающий раскладывает их в [`Effect::Send`] подряд и не меняет
+    /// местами.
+    fn seal_for(
+        &mut self,
+        session_id: u64,
+        via: Transport,
+        envelope: &[u8],
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        // Источник случайности отдаётся резаку целиком: и номера кусков,
+        // и метку сборки он чеканит сам — **и только если резать пришлось**.
+        // Черпать заранее нельзя: случайность у ядра одна на всё, в тестах
+        // она засеяна, и лишний зачерпнутый номер сдвинул бы все следующие.
+        let entropy = &mut self.entropy;
+        let carriers = ratatosk_proto::fragment::carriers(envelope, via, || entropy.msg_id())?;
 
-        // Запись до возврата кадра, а не после его отправки: см. пояснение
+        let bound = self.sessions.get_mut(session_id).ok_or(EngineError::UnknownPeer)?;
+        let mut frames = Vec::with_capacity(carriers.len());
+        for carrier in &carriers {
+            frames.push(crate::frames::seal(&mut bound.session, carrier)?);
+        }
+
+        // Запись до возврата кадров, а не после их отправки: см. пояснение
         // к `persist_session`. Между продвижением цепочки и записью не должно
         // быть ничего, что может не вернуться.
         self.persist_session(session_id)?;
-        Ok(frame)
+        Ok(frames)
+    }
+
+    /// Раскладывает запечатанные кадры в отправки одной ступенью.
+    ///
+    /// Отдельная функция, потому что мест четыре и в каждом соблазн
+    /// написать `frames.remove(0)`: пока фрагментация не срабатывала,
+    /// разница была бы незаметна — и обнаружилась бы на первом же длинном
+    /// сообщении по эфиру пропажей всех кусков, кроме первого.
+    fn sends(peer_ik: [u8; 32], via: Transport, frames: Vec<Vec<u8>>) -> Vec<Effect> {
+        frames
+            .into_iter()
+            .map(|frame| Effect::Send { peer_ik, via, frame, handoff: None })
+            .collect()
     }
 
     // --- приём --------------------------------------------------------------
@@ -12237,9 +12763,11 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         };
 
-        let frame = self.seal_for(session_id, &delivery.envelope)?;
-        let (handoff, timer) = self.arm_send(delivery, transport, frame.len());
-        Ok(vec![Effect::Send { peer_ik: delivery.peer_ik, via: transport, frame, handoff }, timer])
+        let frames = self.seal_for(session_id, transport, &delivery.envelope)?;
+        let (handoff, timer) = self.arm_send(delivery, transport, total_len(&frames));
+        let mut effects = Self::delivery_sends(delivery.peer_ik, transport, frames, handoff);
+        effects.push(timer);
+        Ok(effects)
     }
 
     /// Откладывает попытку до ответа обнаружения — или не откладывает.
@@ -13155,6 +13683,116 @@ impl<S: Store> Engine<S> {
         Ok(text.clone())
     }
 
+    /// Принимает кусок разрезанного конверта и, собрав все, разбирает его.
+    ///
+    /// Возвращает `None`, пока куски ещё не все, — и тогда же, когда кусок
+    /// не годится: отбрасывать его §7.3 велит молча, и отличать «ещё рано»
+    /// от «не годится» вызывающему незачем, потому что делать он в обоих
+    /// случаях обязан одно и то же — ничего.
+    ///
+    /// # Собранное не может снова оказаться куском, и это проверяется
+    ///
+    /// Свой отправитель режет один раз, так что вложенных кусков у него
+    /// не бывает. Но кадры приходят от собеседника, а собеседник бывает
+    /// каким угодно: вложи он кусок в кусок — и разбор ушёл бы в рекурсию
+    /// такой глубины, какую задал чужой. Это не порча данных, а падение
+    /// по стеку, то есть отказ всего приложения от одного кадра.
+    ///
+    /// Поэтому глубина не рассуждается, а ограничивается: собранный
+    /// конверт типа «кусок» отбрасывается. Ничего законного этим
+    /// не теряется — своих таких не бывает.
+    fn reassemble(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Option<Envelope>, EngineError> {
+        use ratatosk_proto::fragment;
+
+        let Some(header) = envelope.fragment else {
+            // Тип говорит «кусок», а заголовка нет — по такому кадру нечего
+            // собирать. Это не наш отправитель; §7.3 велит отбросить молча.
+            tracing::debug!("кусок конверта без заголовка сборки — отброшен");
+            return Ok(None);
+        };
+        let ratatosk_codec::Value::Bytes(part) = &envelope.payload else {
+            tracing::debug!("кусок конверта не байтами — отброшен");
+            return Ok(None);
+        };
+
+        // Срок сборки зависит от ступени: по прямому каналу недостающий
+        // кусок за десять минут уже не придёт, по почте вполне может прийти
+        // через неделю (§9.3).
+        let ttl = if via == Transport::Mail {
+            fragment::REASSEMBLY_TTL_MAIL_MS
+        } else {
+            fragment::REASSEMBLY_TTL_DIRECT_MS
+        };
+        let accepted = match self.fragments.accept(
+            header.uid,
+            header.index,
+            header.total,
+            part,
+            ttl,
+            now_ms,
+        ) {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Отказ сборщика — это его защита, а не наша поломка:
+                // куски вне диапазона, разное число кусков у одной
+                // сборки, переполнение бюджета. Все три §9.3 велит
+                // отбрасывать, и все три приходят от собеседника.
+                tracing::debug!(?error, "кусок конверта отвергнут сборщиком");
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                return Ok(None);
+            }
+        };
+
+        let fragment::Accepted::Complete(assembled) = accepted else {
+            return Ok(None);
+        };
+        let Ok(raw) = Envelope::decode(&assembled) else {
+            tracing::debug!("собранный конверт не разобрался — сборка отброшена");
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        };
+        let whole = raw.into_parts().1;
+        if whole.payload_type == PayloadType::Fragment {
+            tracing::debug!("собранный конверт снова оказался куском — отброшен");
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        }
+        tracing::debug!(
+            kind = ?whole.payload_type,
+            кусков = header.total,
+            "конверт собран из кусков"
+        );
+        Ok(Some(whole))
+    }
+
+    /// Кусок конверта от собеседника (§9.3).
+    ///
+    /// # Почему собранное уходит обратно в [`Engine::deliver`]
+    ///
+    /// Потому что после сборки это обычный конверт, и второй путь для него
+    /// означал бы вторую копию всего разбора — пятнадцать типов нагрузки,
+    /// окно дедупликации, часы §9.1, квитанции §9.4. Разойдись эти две
+    /// копии однажды — и «пришло целым» работало бы не так, как «пришло
+    /// кусками», причём молча.
+    fn on_fragment(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(whole) = self.reassemble(now_ms, via, peer_ik, envelope)? else {
+            return Ok(Vec::new());
+        };
+        self.deliver(now_ms, via, peer_ik, whole)
+    }
+
     fn deliver(
         &mut self,
         now_ms: u64,
@@ -13173,6 +13811,11 @@ impl<S: Store> Engine<S> {
             PayloadType::Retract => self.on_retract(now_ms, via, peer_ik, &envelope),
             PayloadType::Edit => self.on_edit(now_ms, via, peer_ik, &envelope),
             PayloadType::Reaction => self.on_reaction(now_ms, via, peer_ik, &envelope),
+            // **Кусок конверта, не поместившегося в кадр (§9.3).** Своего
+            // содержания у него нет: он несёт байты другого конверта.
+            // Собрав все, разбираем исходный конверт и идём с ним сюда же
+            // — с этого места он неотличим от приехавшего целым.
+            PayloadType::Fragment => self.on_fragment(now_ms, via, peer_ik, &envelope),
             // Неизвестный тип не повод терять сообщение целиком, но и
             // показать его нечем: молча пропускаем (§9.1).
             PayloadType::Unknown(_) => Ok(Vec::new()),

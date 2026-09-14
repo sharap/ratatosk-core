@@ -54,6 +54,7 @@ pub struct FileReader {
     /// как сессионный, и оставлять его в освобождённой памяти незачем.
     key: Zeroizing<FileKey>,
     chunk_total: u64,
+    chunk_bytes: u32,
     size_bytes: u64,
     /// Путь к исходнику — у **своего**, отправленного файла.
     ///
@@ -72,6 +73,7 @@ impl std::fmt::Debug for FileReader {
         f.debug_struct("FileReader")
             .field("file_id", &self.file_id)
             .field("chunk_total", &self.chunk_total)
+            .field("chunk_bytes", &self.chunk_bytes)
             .field("size_bytes", &self.size_bytes)
             .field("own", &self.source.is_some())
             .finish_non_exhaustive()
@@ -84,11 +86,20 @@ impl FileReader {
         file_id: FileId,
         key: FileKey,
         chunk_total: u64,
+        chunk_bytes: u32,
         size_bytes: u64,
         source: Option<PathBuf>,
         bytes: Box<dyn ChunkSource + Send + Sync>,
     ) -> FileReader {
-        FileReader { file_id, key: Zeroizing::new(key), chunk_total, size_bytes, source, bytes }
+        FileReader {
+            file_id,
+            key: Zeroizing::new(key),
+            chunk_total,
+            chunk_bytes,
+            size_bytes,
+            source,
+            bytes,
+        }
     }
 
     /// Идентификатор файла.
@@ -115,10 +126,22 @@ impl FileReader {
         self.source.is_some()
     }
 
+    /// Каким куском нарезан этот файл — размер всех, кроме последнего.
+    ///
+    /// Своё число у каждого файла: отправитель выбирает его по своей
+    /// ступени (§10.2), и у пересланного оно и вовсе чужое. Нужно показу —
+    /// чтобы считать ход передачи в байтах, а не в кусках.
+    #[must_use]
+    pub fn chunk_bytes(&self) -> u32 {
+        self.chunk_bytes
+    }
+
     /// Расшифрованный кусок. `None` — показать нечего.
     ///
     /// Куски идут подряд, от нуля до `chunk_total - 1`; все, кроме
-    /// последнего, длиной `CHUNK_BYTES`.
+    /// последнего, длиной в чанк этого файла. Размер чанка у файла свой
+    /// (§10.2) и хранится вместе с ним: у пересланного он чужой, и вывести
+    /// его из размера и числа кусков нечем.
     ///
     /// `None` возвращается на три разных случая, и различать их клиенту
     /// не нужно: номер за концом файла, кусок ещё не приехал, кусок
@@ -142,8 +165,9 @@ impl FileReader {
 
         // Своё вложение лежит открытым текстом там, где его положил человек:
         // расшифровывать нечего, надо просто взять кусок.
-        let offset = index * ratatosk_proto::files::CHUNK_BYTES as u64;
-        let plain = self.bytes.read_at(source, offset, ratatosk_proto::files::CHUNK_BYTES)?;
+        let chunk = self.chunk_bytes as usize;
+        let offset = index * u64::from(self.chunk_bytes);
+        let plain = self.bytes.read_at(source, offset, chunk)?;
         if plain.is_empty() {
             return Ok(None);
         }

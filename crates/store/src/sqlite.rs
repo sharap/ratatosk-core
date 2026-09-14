@@ -473,6 +473,7 @@ impl SqliteStore {
                 row.get::<_, i64>(9)? != 0,
                 row.get::<_, i64>(10)? != 0,
                 row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
             ))
         })?;
 
@@ -491,6 +492,7 @@ impl SqliteStore {
                 accepted,
                 complete,
                 ordinal,
+                chunk_bytes,
             ) = row?;
             let file_id: FileId =
                 file_id.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?;
@@ -516,6 +518,15 @@ impl SqliteStore {
                 name,
                 size_bytes,
                 chunk_total,
+                // Отрицательного и нулевого здесь взяться неоткуда: столбец
+                // пишем только мы, а миграция 0026 проставила старые записи
+                // тем же правилом, каким их резали. Но читать чужое число
+                // как своё без проверки нельзя: порченая база обязана давать
+                // отказ, а не деление на ноль у того, кто считает смещение.
+                chunk_bytes: u32::try_from(chunk_bytes)
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| StoreError::Backend("размер чанка вне диапазона".into()))?,
                 key,
                 preview,
                 incoming,
@@ -1836,8 +1847,8 @@ impl Store for SqliteStore {
         self.conn.execute(
             "INSERT OR IGNORE INTO files (
                  file_id, name_enc, size_bytes, chunk_total, file_key_enc,
-                 preview_enc, incoming, source_path, accepted, complete
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 preview_enc, incoming, source_path, accepted, complete, chunk_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 &file.file_id[..],
                 name_enc,
@@ -1849,6 +1860,7 @@ impl Store for SqliteStore {
                 file.source_path.as_deref(),
                 i64::from(file.accepted),
                 i64::from(file.complete),
+                i64::from(file.chunk_bytes),
             ],
         )?;
         self.attach_file(&file.msg_id, &file.file_id, file.ordinal)
@@ -1863,7 +1875,7 @@ impl Store for SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT files.file_id, COALESCE(link.msg_id, zeroblob(16)), name_enc, size_bytes,
                     chunk_total, file_key_enc, preview_enc, incoming, source_path, accepted,
-                    complete, COALESCE(link.ordinal, 0)
+                    complete, COALESCE(link.ordinal, 0), chunk_bytes
                FROM files
                LEFT JOIN (
                     SELECT file_id, msg_id, ordinal FROM message_files
@@ -1880,7 +1892,7 @@ impl Store for SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT files.file_id, message_files.msg_id, name_enc, size_bytes, chunk_total,
                     file_key_enc, preview_enc, incoming, source_path, accepted, complete,
-                    message_files.ordinal
+                    message_files.ordinal, chunk_bytes
                FROM message_files
                JOIN files ON files.file_id = message_files.file_id
               WHERE message_files.msg_id = ?1
@@ -2045,8 +2057,8 @@ impl Store for SqliteStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO staged_files (
                  file_id, chat_id, name_enc, size_bytes, chunk_total,
-                 file_key_enc, preview_enc, started_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 file_key_enc, preview_enc, started_ms, chunk_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 &staged.file_id[..],
                 &staged.chat_id[..],
@@ -2056,6 +2068,7 @@ impl Store for SqliteStore {
                 key_enc,
                 preview_enc,
                 sql_types::to_sql(staged.started_ms),
+                i64::from(staged.chunk_bytes),
             ],
         )?;
         Ok(())
@@ -2064,7 +2077,7 @@ impl Store for SqliteStore {
     fn staged_uploads(&self) -> Result<Vec<StagedUpload>> {
         let mut statement = self.conn.prepare(
             "SELECT file_id, chat_id, name_enc, size_bytes, chunk_total,
-                    file_key_enc, preview_enc, started_ms
+                    file_key_enc, preview_enc, started_ms, chunk_bytes
                FROM staged_files ORDER BY started_ms, file_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2077,6 +2090,7 @@ impl Store for SqliteStore {
                 row.get::<_, Vec<u8>>(5)?,
                 row.get::<_, Option<Vec<u8>>>(6)?,
                 sql_types::from_sql(row.get(7)?),
+                row.get::<_, i64>(8)?,
             ))
         })?;
 
@@ -2091,6 +2105,7 @@ impl Store for SqliteStore {
                 key_enc,
                 preview_enc,
                 started_ms,
+                chunk_bytes,
             ) = row?;
             let file_id: FileId =
                 file_id.try_into().map_err(|_| StoreError::Backend("file_id не 16 байт".into()))?;
@@ -2118,6 +2133,13 @@ impl Store for SqliteStore {
                 name,
                 size_bytes,
                 chunk_total,
+                // Тот же разбор, что у `files.chunk_bytes`: нулю и
+                // отрицательному здесь взяться неоткуда, но порченая база
+                // обязана давать отказ, а не деление на ноль.
+                chunk_bytes: u32::try_from(chunk_bytes)
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| StoreError::Backend("размер куска вне диапазона".into()))?,
                 key,
                 preview,
                 started_ms,
@@ -2192,7 +2214,7 @@ impl Store for SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT files.file_id, COALESCE(link.msg_id, zeroblob(16)), name_enc, size_bytes,
                     chunk_total, file_key_enc, preview_enc, incoming, source_path, accepted,
-                    complete, COALESCE(link.ordinal, 0)
+                    complete, COALESCE(link.ordinal, 0), chunk_bytes
                FROM files
                LEFT JOIN (
                     SELECT file_id, msg_id, ordinal FROM message_files

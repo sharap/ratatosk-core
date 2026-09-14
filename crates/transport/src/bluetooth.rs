@@ -1222,7 +1222,25 @@ impl<A: Air> Runner for BtRunner<A> {
                 }
             }
             TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt } => {
-                self.dialed.remove(peer_ik);
+                // **Считается набор, а не отказ, и это правка поломки.**
+                //
+                // Здесь стоял безусловный счёт, и выдержка кормила сама
+                // себя. Отказ уезжает событием **на каждый кадр**, которому
+                // не нашлось связи ([`BtRunner::report_failure`]), а кадров
+                // в очереди бывает сорок. На стенде из одного неудавшегося
+                // набора получалось сорок две «неудачи» за тридцать
+                // миллисекунд — и выдержка с первого же раза прыгала
+                // на потолок в две минуты. Собеседник, стоящий рядом,
+                // на две минуты становился недостижим ни за что.
+                //
+                // Набор был или нет, говорит `dialed`: запись туда кладёт
+                // [`BtRunner::ensure_link`] ровно перед тем, как тронуть
+                // радио. Нет записи — значит радио не трогали, и считать
+                // нечего. Ровно та же проверка, что у удавшейся связи
+                // рядом, и по той же причине.
+                if !self.dialed.remove(peer_ik) {
+                    return Some(event);
+                }
                 let vain = self.undialable.entry(*peer_ik).or_default();
                 vain.fails = vain.fails.saturating_add(1);
                 let wait = Vain::wait(vain.fails);
@@ -1866,7 +1884,10 @@ mod tests {
             .await
             .expect("второй канал назван");
 
-        // Набирать нечем — об этом раннер узнаёт отказом.
+        // Набирать нечем — об этом раннер узнаёт отказом. Отметка о наборе
+        // тут обязательна: отказ, которому не предшествовал набор, больше
+        // не считается вовсе (см. разбор у `next_event`).
+        bt.dialed.insert(peer_ik);
         let _ =
             bt.events_tx.send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt }).await;
         next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))
@@ -2120,6 +2141,45 @@ mod tests {
         assert_eq!(radio.opened.lock().expect("замок").len(), 1, "и всё ещё ни одного набора");
     }
 
+    #[tokio::test]
+    async fn refusals_that_never_touched_the_radio_do_not_count() {
+        // **Разбор выдержки, кормившей саму себя.** Отказ уезжает событием
+        // на **каждый** кадр, которому не нашлось связи, а кадров в очереди
+        // бывает сорок. На стенде из одного неудавшегося набора выходило
+        // сорок две «неудачи» за тридцать миллисекунд, и выдержка с первого
+        // же раза прыгала на потолок в две минуты: собеседник, стоящий
+        // рядом, становился недостижим ни за что.
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [13u8; 32];
+        for _ in 0..40 {
+            let _ = bt
+                .events_tx
+                .send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt })
+                .await;
+            next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))
+                .await
+                .expect("новость об отказе");
+        }
+        assert!(!bt.waiting_out(&peer_ik), "радио не трогали — считать нечего");
+
+        // А вот набор, который правда был, считается — и ровно один раз.
+        bt.dialed.insert(peer_ik);
+        let _ =
+            bt.events_tx.send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt }).await;
+        next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))
+            .await
+            .expect("новость об отказе");
+        assert!(bt.waiting_out(&peer_ik), "набор был и не удался — выдержка пошла");
+        assert_eq!(
+            bt.undialable.get(&peer_ik).map(|vain| vain.fails),
+            Some(1),
+            "неудача одна: сорок отказов до неё радио не касались"
+        );
+    }
+
     #[test]
     fn the_wait_between_vain_dials_grows_and_then_stops() {
         // Утроение, а не удвоение: беда здесь не «занято, зайди позже»,
@@ -2145,6 +2205,9 @@ mod tests {
         air.on_ready(0x0080);
 
         let peer_ik = [11u8; 32];
+        // Набор был: без этой отметки отказ не считается вовсе (проверка
+        // рядом), и проверять было бы нечего.
+        bt.dialed.insert(peer_ik);
         let _ =
             bt.events_tx.send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt }).await;
         next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))

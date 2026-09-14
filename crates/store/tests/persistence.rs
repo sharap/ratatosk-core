@@ -772,6 +772,7 @@ fn file(n: u8, msg: u8, incoming: bool) -> ratatosk_store::StoredFile {
         name: format!("файл {n}.pdf"),
         size_bytes: 5_000,
         chunk_total: 3,
+        chunk_bytes: 2_000,
         key: [n.wrapping_add(1); 32],
         preview: None,
         ordinal: 0,
@@ -945,6 +946,66 @@ fn an_unfinished_file_survives_a_restart() {
 }
 
 #[test]
+fn a_foreign_narezka_survives_a_restart_and_is_not_guessed() {
+    // **Ради чего столбец.** Размер чанка выбирает тот, кто отправляет
+    // файл первым, по своей ступени. У пересланного он поэтому бывает
+    // чужим — не равным ни одному из наших двух. Выводить его из пары
+    // «размер, число кусков», как делалось до 0026, значило бы у такого
+    // файла вывести **наш** размер: смещения поехали бы с первого куска,
+    // и наружу это вышло бы не отказом, а испорченным файлом.
+    //
+    // Числа взяты нарочно чужие: 2500 не равно ни 3765, ни 1 048 245.
+    let db = TempDb::new("file-narezka");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_message(&message(1, 100)).unwrap();
+        let mut foreign = file(2, 1, true);
+        foreign.size_bytes = 10_000;
+        foreign.chunk_total = 4;
+        foreign.chunk_bytes = 2_500;
+        store.put_file(&foreign).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let back = store.file(&[2u8; 16]).unwrap().expect("запись на месте");
+    assert_eq!(back.chunk_bytes, 2_500, "нарезка обязана вернуться той же, какой легла");
+    assert_eq!(back.chunk_total, 4, "и число кусков вместе с ней");
+
+    // И через список сообщения — тем же числом: два пути чтения записи
+    // обязаны говорить одно, иначе передача пойдёт одной нарезкой,
+    // а показ другой.
+    let of_message = store.files_of(&[1u8; 16]).unwrap();
+    assert_eq!(of_message.len(), 1);
+    assert_eq!(of_message[0].chunk_bytes, 2_500, "оба пути чтения обязаны сходиться");
+}
+
+#[test]
+fn a_staged_upload_keeps_the_narezka_it_agreed_on() {
+    // Телефон назначил номера кусков, когда договаривался о выгрузке,
+    // и мерить приходящие обязан тем же числом. Переживи перезапуск
+    // только число кусков — и первый же кусок после него был бы отвергнут
+    // как «не той длины», причём законный.
+    let db = TempDb::new("staged-narezka");
+
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        let mut air = staged(5, 1_000);
+        air.size_bytes = 10_000;
+        air.chunk_total = 3;
+        air.chunk_bytes = 3_765;
+        store.put_staged(&air).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let back = store.staged_uploads().unwrap();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].chunk_bytes, 3_765, "нарезка выгрузки обязана пережить перезапуск");
+}
+
+#[test]
 fn deleting_a_message_takes_its_files_and_their_chunk_tally() {
     let db = TempDb::new("file-del");
     let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
@@ -972,6 +1033,7 @@ fn staged(n: u8, started_ms: u64) -> ratatosk_store::StagedUpload {
         name: format!("выгрузка {n}.pdf"),
         size_bytes: 5_000,
         chunk_total: 3,
+        chunk_bytes: 2_000,
         key: [n.wrapping_add(1); 32],
         preview: None,
         started_ms,

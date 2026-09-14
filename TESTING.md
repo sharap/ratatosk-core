@@ -1089,7 +1089,10 @@ cargo test -p ratatosk-transport
 | `a_file_too_large_for_mail_says_it_waits_for_a_channel` | предел почты — про время: описание уезжает, содержимое ждёт, и обе стороны знают, чего ждут |
 | `a_chunk_letter_fits_the_limit` | письмо с чанком помещается в предел; проверено сборкой настоящего письма, а не формулой |
 | `the_mail_window_is_the_storage_limit` | окно занимает считаные проценты скупого ящика — и не зависит от размера файла |
-| `the_stall_deadline_outlasts_a_window_on_every_transport` | срок молчания длиннее круга у каждого транспорта, включая почту с её двойным путём |
+| `the_stall_deadline_outlasts_a_window_but_not_by_much` | срок молчания длиннее круга у каждого транспорта (включая почту с её двойным путём) — **и не намного**: оторвавшись от окна, он стоит потерянного кадра целиком |
+| `a_lost_frame_in_the_air_costs_seconds_and_not_minutes` | эфирный срок поимённо: потеря кадра обязана стоить секунд — десять минут человек считает поломкой |
+| `the_air_carries_one_file_at_a_time_and_the_rest_wait_their_turn` | предел одновременных загрузок (§10.2): по эфиру едет один файл, остальные стоят в очереди — **и очередь разбирается сама**, все три доезжают до байта |
+| `a_wide_rung_does_not_queue_what_it_can_carry_at_once` | обратная сторона: по локальной сети три файла обязаны ехать разом, а не гуськом. **Ступень поднимается явно** — на паре по умолчанию включён onion с пределом в один, и проверка молча проверяла бы обратное своему имени |
 | `the_backoff_grows_and_stops` | брошенная почтовая передача не шлёт письмо каждые полчаса вечно |
 | `a_stingy_letter_limit_keeps_files_off_the_mail` | сервер с малым `SIZE` убирает почту из выбора канала для файла — а сообщения ходят |
 | `a_mailbox_with_no_room_stops_asking_for_chunks` | тесный **свой** ящик останавливает приём; освободившееся место возобновляет его само |
@@ -1178,7 +1181,7 @@ cargo test -p ratatosk-transport
 | `everything_switched_off_is_undeliverable_not_silence` | §14: некуда — значит некуда, и сказать надо сразу |
 | `a_set_survives_a_round_trip_through_a_byte` | набор уезжает в `meta` одним байтом и возвращается оттуда |
 | `a_switched_off_transport_stays_switched_off_after_a_restart` | выключатель «до следующего запуска» не означает ничего |
-| `the_stall_deadline_outlasts_a_window_on_the_slowest_transport` | срок короче времени передачи не ускоряет возобновление, а ломает его: «загружается и никогда не догружается» |
+| `the_stall_deadline_outlasts_a_window_but_not_by_much` | срок короче времени передачи не ускоряет возобновление, а ломает его («загружается и никогда не догружается»); срок намного длиннее — «зависает на определённой стадии» |
 | `a_file_over_the_threshold_waits_for_the_button` | до нажатия — ни байта на диск |
 | `a_declined_file_leaves_nothing_behind` | отказ убирает и запись, и байты |
 | `several_files_ride_on_one_message` | несколько вложений в одном сообщении |

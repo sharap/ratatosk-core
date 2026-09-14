@@ -974,6 +974,7 @@ fn awaiting_decision_with_preview(
             name: "видео.mp4".into(),
             size_bytes: files::CHUNK_BYTES as u64 * chunk_total,
             chunk_total,
+            chunk_bytes: files::CHUNK_BYTES as u32,
             key: [3u8; 32],
             preview,
             ordinal: 0,

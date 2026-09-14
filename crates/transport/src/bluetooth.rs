@@ -1421,6 +1421,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_radio_handed_after_the_rung_was_raised_starts_by_itself() {
+        // **Порядок, в котором это происходит на Android всегда.** Ступень
+        // поднимается из сохранённых настроек в первые миллисекунды после
+        // открытия хранилища, а радио вручает служба, которой ещё надо
+        // подняться самой. `raise` к этому моменту уже отработал впустую —
+        // радио не было, — и позвать его второй раз некому: `SetEnabled`
+        // больше не придёт, а `NetworkChanged` эфиру безразличен.
+        //
+        // Снаружи это выглядело так: Bluetooth включён, а ступень мертва
+        // до ручного переключения в настройках.
+        let air = BridgedAir::new();
+        let mut bt = BtRunner::start(air.clone(), BtConfig::default(), [1u8; 32])
+            .await
+            .expect("раннер заводится всегда");
+        bt.set_enabled(true);
+        // Ступень честно объявилась потерянной — поднимать было нечем.
+        assert!(
+            matches!(bt.next_event().await, Some(TransportEvent::Lost { transport })
+                if transport == Transport::Bt),
+            "без радио ступень обязана объявиться потерянной"
+        );
+
+        // А теперь радио приходит. Опоздавшее — но ступень-то включена.
+        let radio = Arc::new(FakeRadio::default());
+        air.set_radio(radio.clone());
+        assert!(
+            radio.started.load(Ordering::Relaxed),
+            "опоздавшее радио обязано запуститься само: второго `raise` не будет"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_radio_handed_before_the_rung_is_raised_waits_for_it() {
+        // Обратная сторона: вручить радио — не то же самое, что включить
+        // ступень. Человек мог её выключить, и запускать радио за него
+        // значило бы вернуть его в эфир без спроса.
+        let air = BridgedAir::new();
+        let radio = Arc::new(FakeRadio::default());
+        air.set_radio(radio.clone());
+        assert!(
+            !radio.started.load(Ordering::Relaxed),
+            "ступень не поднята — радио запускать нечего и незачем"
+        );
+    }
+
+    #[tokio::test]
     async fn the_platform_gets_our_advert_and_the_core_gets_readiness() {
         // Порядок 0.4.3: номер канала знает только платформа, объявление
         // собирает только Rust. Значит подъём — это две половины, и

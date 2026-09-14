@@ -86,6 +86,16 @@ impl Home {
     fn blobs(&self) -> PathBuf {
         self.0.join("files")
     }
+
+    /// Каталог под **исходники** отправляемых файлов.
+    ///
+    /// Отдельно от хранилища чанков нарочно: файл, который человек
+    /// отправляет, лежит там, куда его положил хозяин, и ядро его
+    /// не копирует (§10.2). Подмени мы это хранилищем — и проверка
+    /// не заметила бы, что исходник читается своим путём.
+    fn source(&self) -> PathBuf {
+        self.0.join("source")
+    }
 }
 
 impl Drop for Home {
@@ -447,6 +457,128 @@ impl Stand {
         });
     }
 
+    /// Отправляет файл: кладёт его на диск узла и просит ядро отправить.
+    ///
+    /// Байты настоящие и лежат настоящим файлом — иначе проверялась бы
+    /// не передача, а заглушка: отправитель читает исходник с диска
+    /// по смещению (§10.2), и ровно это здесь и должно работать.
+    fn send_file(&mut self, who: NodeId, chat: [u8; 16], name: &str, bytes: &[u8]) {
+        let path = self.sim.node(who).home.source().join(name);
+        std::fs::create_dir_all(path.parent().expect("у файла есть каталог"))
+            .expect("каталог исходников");
+        std::fs::write(&path, bytes).expect("исходник ложится на диск");
+        self.sim.act(who, |node, ctx| {
+            node.command(
+                ctx,
+                Command::SendFiles {
+                    chat,
+                    files: vec![ratatosk_core::OutgoingFile { path: path.clone(), preview: None }],
+                    text: String::new(),
+                },
+            );
+        });
+    }
+
+    /// Принимает все входящие вложения без вопросов — как порог §10.2.
+    fn accept_everything(&mut self, who: NodeId) {
+        self.sim.act(who, |node, ctx| {
+            node.command(
+                ctx,
+                Command::SetAutoAcceptBytes(Some(ratatosk_proto::files::MAX_FILE_BYTES)),
+            );
+        });
+    }
+
+    /// Собранное содержимое принятого вложения с таким именем.
+    ///
+    /// `None` — вложения с таким именем нет или оно не собрано. Различать
+    /// эти два случая вызывающему незачем: и то и другое означает «файл
+    /// не доехал», а именно это проверки и спрашивают.
+    fn received_file(&self, who: NodeId, chat: [u8; 16], name: &str) -> Option<Vec<u8>> {
+        let node = self.sim.node(who).engine();
+        let messages = node.store().messages(&chat, 200, None).ok()?;
+        for message in messages {
+            for file in node.store().files_of(&message.msg_id).ok()? {
+                if !file.incoming || file.name != name || !file.complete {
+                    continue;
+                }
+                let reader = node.open_file(&file.file_id).ok()??;
+                let mut whole = Vec::with_capacity(file.size_bytes as usize);
+                for index in 0..reader.chunk_total() {
+                    whole.extend_from_slice(&reader.chunk(index).ok()??);
+                }
+                return Some(whole);
+            }
+        }
+        None
+    }
+
+    /// Оставляет всем узлам единственную ступень — эфир.
+    ///
+    /// Именно ту, на которой живут все находки этой дуги: кадр там мелкий,
+    /// очередь записи короткая, предел одновременных передач равен одному,
+    /// и кадры теряются по-настоящему (профиль `LinkProfile::BT`).
+    fn air_only(&mut self) {
+        self.sim.net_mut().set_enabled(TransportKind::Lan, false);
+        self.sim.net_mut().set_enabled(TransportKind::Onion, false);
+        self.sim.net_mut().set_enabled(TransportKind::Mail, false);
+        self.sim.net_mut().set_enabled(TransportKind::Bt, true);
+        let count = u16::try_from(self.sim.len()).expect("узлов не больше 65535");
+        for i in 0..count {
+            let who = NodeId(i);
+            self.sim.act(who, |node, ctx| {
+                for transport in [Transport::Onion, Transport::Mail] {
+                    let effects = node
+                        .engine_mut()
+                        .step(
+                            ctx.now_ms(),
+                            Input::Command(Command::SetTransportEnabled {
+                                transport,
+                                enabled: false,
+                            }),
+                        )
+                        .expect("ступень выключается");
+                    node.apply(ctx, effects);
+                }
+                let effects = node
+                    .engine_mut()
+                    .step(
+                        ctx.now_ms(),
+                        Input::Command(Command::SetTransportEnabled {
+                            transport: Transport::Bt,
+                            enabled: true,
+                        }),
+                    )
+                    .expect("эфир включается");
+                node.apply(ctx, effects);
+                let effects = node
+                    .engine_mut()
+                    .step(ctx.now_ms(), Input::TransportReady { transport: Transport::Bt })
+                    .expect("радио поднялось");
+                node.apply(ctx, effects);
+            });
+        }
+        // Маяки: в эфире адресуемость даёт объявление, а не карточка (0.4).
+        let keys: Vec<(NodeId, [u8; 32])> =
+            (0..count).map(|i| (NodeId(i), self.sim.node(NodeId(i)).ik())).collect();
+        for (who, _) in &keys {
+            for (other, ik) in &keys {
+                if other == who {
+                    continue;
+                }
+                let peer_ik = *ik;
+                self.sim.act(*who, |node, ctx| {
+                    let effects = node
+                        .engine_mut()
+                        .step(ctx.now_ms(), Input::SeenOnBt { peer_ik })
+                        .expect("объявление услышано");
+                    node.apply(ctx, effects);
+                });
+            }
+        }
+        self.settle();
+    }
+
     /// Пересылает названные сообщения в чат — хоть в групповой, хоть в 1:1.
     fn forward(&mut self, who: NodeId, chat: [u8; 16], msg_ids: &[[u8; 16]]) {
         let msg_ids = msg_ids.to_vec();
@@ -735,6 +867,146 @@ const C: NodeId = NodeId(2);
 const D: NodeId = NodeId(3);
 
 // --- разговор двоих ---------------------------------------------------------
+
+#[test]
+fn files_cross_in_the_air_in_both_directions() {
+    // **Разбор со стенда: «файлы ходят, но как-то в одну сторону».**
+    //
+    // Файлов в стенде не было вовсе — ни одного сценария, — и это само
+    // по себе объяснение тому, почему файловые поломки доезжали до живых
+    // устройств. Провод `pair.rs` проверяет протокол без потерь и без
+    // времени; здесь есть и то и другое: профиль эфира теряет два кадра
+    // из тысячи, сроки молчания выходят по-настоящему, а предел
+    // одновременных передач на этой ступени равен одному (§10.2).
+    //
+    // Встречное движение здесь и есть проверка: у обеих передач один
+    // канал, одни сроки и один предел.
+    let mut stand = Stand::without_mail(0x5749, 2);
+    stand.air_only();
+    stand.accept_everything(A);
+    stand.accept_everything(B);
+
+    let chat_from_a = stand.chat_with(B);
+    let chat_from_b = stand.chat_with(A);
+
+    // Размеры взяты так, чтобы окно эфира (тринадцать чанков) закрывалось
+    // не на первом же куске: иначе проверялась бы отправка, а не передача.
+    let air = ratatosk_proto::files::chunk_bytes_for(Transport::Bt);
+    let there: Vec<u8> = (0..air * 20 + 7).map(|i| (i % 251) as u8).collect();
+    let back: Vec<u8> = (0..air * 17 + 3).map(|i| ((i * 7) % 241) as u8).collect();
+
+    stand.send_file(A, chat_from_a, "tuda.bin", &there);
+    stand.send_file(B, chat_from_b, "obratno.bin", &back);
+    stand.settle();
+
+    assert_eq!(
+        stand.received_file(B, chat_from_b, "tuda.bin").as_deref(),
+        Some(there.as_slice()),
+        "файл туда обязан доехать целиком"
+    );
+    assert_eq!(
+        stand.received_file(A, chat_from_a, "obratno.bin").as_deref(),
+        Some(back.as_slice()),
+        "и обратный тоже — «ходят в одну сторону» это и есть поломка"
+    );
+}
+
+#[test]
+fn several_files_cross_in_a_lossy_air() {
+    // То же встречное движение, но по-настоящему тесно: по три файла
+    // с каждой стороны и потери вдесятеро выше обычных для эфира.
+    //
+    // Десять кадров из тысячи — это не выдумка ради строгости: столько
+    // теряет приёмный путь Android на классе M (0.4.8), и хотя чанки
+    // теперь класса S, запас проверить дешевле, чем объяснять потом.
+    // Каждая потеря стоит срока молчания, а срок — очереди: вот здесь
+    // и видно, разбирается она или встаёт.
+    let mut stand = Stand::without_mail(0x574a, 2);
+    stand.air_only();
+    stand
+        .sim
+        .net_mut()
+        .set_profile(TransportKind::Bt, LinkProfile { loss_permille: 20, ..LinkProfile::BT });
+    stand.accept_everything(A);
+    stand.accept_everything(B);
+
+    let chat_from_a = stand.chat_with(B);
+    let chat_from_b = stand.chat_with(A);
+    let air = ratatosk_proto::files::chunk_bytes_for(Transport::Bt);
+
+    let mut sent: Vec<(NodeId, [u8; 16], String, Vec<u8>)> = Vec::new();
+    for n in 1..=3usize {
+        let there: Vec<u8> = (0..air * (n + 4) + n).map(|i| ((i + n) % 251) as u8).collect();
+        let back: Vec<u8> = (0..air * (n + 2) + n).map(|i| ((i * 3 + n) % 241) as u8).collect();
+        sent.push((B, chat_from_b, format!("tuda{n}.bin"), there));
+        sent.push((A, chat_from_a, format!("obratno{n}.bin"), back));
+    }
+    for (who, chat, name, bytes) in &sent {
+        // Отправляет тот, кто **не** назван: названный — получатель.
+        let from = if *who == A { B } else { A };
+        let chat_from_sender = if from == A { chat_from_a } else { chat_from_b };
+        let _ = chat;
+        stand.send_file(from, chat_from_sender, name, bytes);
+    }
+    stand.settle();
+
+    for (who, chat, name, bytes) in &sent {
+        assert_eq!(
+            stand.received_file(*who, *chat, name).as_deref(),
+            Some(bytes.as_slice()),
+            "файл {name} не доехал целиком"
+        );
+    }
+}
+
+#[test]
+fn a_silent_sender_does_not_block_the_whole_receiving_side() {
+    // **Запирание канала.** Предел одновременных загрузок на эфире — один
+    // файл (§10.2). Пока файл числится идущим, следующий стоит в очереди;
+    // а числится он идущим и тогда, когда отдавать его перестали.
+    //
+    // Собеседник, **пропавший из сети**, полосу освобождает сам: канала
+    // до него нет, и `ask_for_file` честно отвечает «ехать некуда». Беда
+    // с тем, кто в сети и молчит, — а это обычное дело: у него исчез
+    // исходник (человек переместил файл), и отдавать ему больше нечего.
+    // Для получателя это неотличимо от потери кадра, и он ждёт: срок
+    // молчания удваивается — восемнадцать секунд, тридцать шесть,
+    // семьдесят две, — а вместе с ним стоит и очередь.
+    //
+    // Без уступки ступени (`YIELD_AFTER_STALLS`) файл от **второго**
+    // собеседника не доезжает никогда.
+    let mut stand = Stand::without_mail(0x574b, 3);
+    stand.air_only();
+    stand.accept_everything(A);
+
+    let air = ratatosk_proto::files::chunk_bytes_for(Transport::Bt);
+    let big: Vec<u8> = (0..air * 40 + 5).map(|i| (i % 251) as u8).collect();
+    let small: Vec<u8> = (0..air * 4 + 9).map(|i| ((i * 5) % 241) as u8).collect();
+
+    // Третий начинает первым и занимает единственную полосу эфира.
+    stand.send_file(C, stand.chat_with(A), "propal.bin", &big);
+    stand.sim.run_for(1_500);
+
+    // И тут его исходник исчезает. Отдавать больше нечего — но сказать
+    // об этом получателю нечем: §10.2 не знает такого сообщения.
+    let source = stand.sim.node(C).home.source().join("propal.bin");
+    std::fs::remove_file(&source).expect("исходник убирается");
+
+    // Второй предлагает свой файл. Он обязан доехать.
+    stand.send_file(B, stand.chat_with(A), "ot_vtorogo.bin", &small);
+
+    // **Ждём временем, а не тишиной.** Брошенная передача переспрашивает
+    // вечно — это её честная работа, — и `settle` тут не дождётся никогда.
+    // Десять минут заведомо больше и передачи мелкого файла, и двух
+    // сроков молчания, после которых полоса уступается.
+    stand.sim.run_for(10 * 60 * 1000);
+
+    assert_eq!(
+        stand.received_file(A, stand.chat_with(B), "ot_vtorogo.bin").as_deref(),
+        Some(small.as_slice()),
+        "файл от живого собеседника обязан доехать, а не стоять за чужой замолчавшей передачей"
+    );
+}
 
 #[test]
 fn two_people_talk() {

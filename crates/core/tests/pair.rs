@@ -101,8 +101,44 @@ fn bare_node(seed: u8, name: &str) -> Node {
 /// и проверяется результат. Доставка мгновенная и без потерь: перестановки
 /// и разрывы — забота симулятора, здесь проверяется сам протокол.
 fn pump(a: &mut Node, b: &mut Node, now_ms: u64, from_a: Vec<Effect>) -> Vec<Event> {
+    pump_both(a, b, now_ms, from_a, Vec::new())
+}
+
+/// Тот же провод, но с эффектами **с обеих сторон сразу**.
+///
+/// Нужен там, где стороны делают что-то навстречу друг другу: обычный
+/// `pump` помечает все начальные эффекты как принадлежащие первому узлу,
+/// и встречную передачу им не выразить — второй узел пришлось бы качать
+/// отдельным заходом, то есть уже после того, как первый закончил. Разница
+/// не умозрительная: у встречных передач общий канал, общие сроки и общие
+/// пределы одновременности (§10.2), и ровно там, где они пересекаются,
+/// живут ошибки, которых по очереди не видно.
+///
+/// Порядок перемежается: по одному эффекту с каждой стороны. Отдать
+/// сперва всё одного узла значило бы снова превратить встречное движение
+/// в последовательное.
+fn pump_both(
+    a: &mut Node,
+    b: &mut Node,
+    now_ms: u64,
+    from_a: Vec<Effect>,
+    from_b: Vec<Effect>,
+) -> Vec<Event> {
     let mut events = Vec::new();
-    let mut queue: VecDeque<(bool, Effect)> = from_a.into_iter().map(|e| (true, e)).collect();
+    let mut queue: VecDeque<(bool, Effect)> = VecDeque::new();
+    let (mut left, mut right) = (from_a.into_iter(), from_b.into_iter());
+    loop {
+        let (one, two) = (left.next(), right.next());
+        if one.is_none() && two.is_none() {
+            break;
+        }
+        if let Some(effect) = one {
+            queue.push_back((true, effect));
+        }
+        if let Some(effect) = two {
+            queue.push_back((false, effect));
+        }
+    }
     // Сроки ожидания копятся отдельно и срабатывают только тогда, когда
     // провод затих. Порядок здесь не косметика: срок прямого канала означает
     // «квитанции нет, попытка не удалась» (§5.4, §9.4), а на мгновенном
@@ -6737,6 +6773,119 @@ fn a_wide_rung_does_not_queue_what_it_can_carry_at_once() {
     for file in bob.store().files_of(&msg_id).expect("вложения") {
         assert!(file.complete, "файл {} так и не собрался", file.name);
     }
+}
+
+/// Принятое вложение с таким именем — среди всех в переписке с этим
+/// собеседником.
+///
+/// Отдельно от `only_file`, который берёт последнее сообщение: во встречной
+/// передаче у каждого узла в чате лежат оба файла, и «последнее сообщение»
+/// у отправителя — его собственное.
+fn incoming_file(node: &Node, peer: &Node, name: &str) -> [u8; 16] {
+    for msg_id in ids_in(node, peer) {
+        for file in node.store().files_of(&msg_id).expect("вложения") {
+            if file.incoming && file.name == name {
+                return file.file_id;
+            }
+        }
+    }
+    panic!("принятого вложения {name} в переписке нет");
+}
+
+#[test]
+fn files_cross_in_the_air_before_either_side_has_a_session() {
+    // **Разбор со стенда: «файлы ходят, но как-то в одну сторону».**
+    // Тот же встречный обмен, что и в проверке рядом, но **до** всякой
+    // сессии: оба узла начинают с рукопожатия, и начинают одновременно.
+    // В эфире это не редкость, а обычное начало разговора — оба услышали
+    // маяк и оба потянулись первыми.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    for who in [&mut alice, &mut bob] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    let mut from_bob = air_only(&mut bob, alice.own_card().ik);
+    let mut from_alice = air_only(&mut alice, bob.own_card().ik);
+
+    let air = files::chunk_bytes_for(Transport::Bt);
+    let there = payload_of(air * 2 + 7);
+    let back = payload_of(air * 3 + 5);
+    alice_blobs.lock().unwrap().seed("/tmp/tuda2.bin", there.clone());
+    bob_blobs.lock().unwrap().seed("/tmp/obratno2.bin", back.clone());
+
+    from_alice.extend(send_file(&mut alice, &bob, 1_000, "/tmp/tuda2.bin"));
+    from_bob.extend(send_file(&mut bob, &alice, 1_000, "/tmp/obratno2.bin"));
+    pump_both(&mut alice, &mut bob, 1_000, from_alice, from_bob);
+
+    let at_bob = incoming_file(&bob, &alice, "tuda2.bin");
+    assert!(bob.store().file(&at_bob).unwrap().unwrap().complete, "файл туда обязан собраться");
+    assert_eq!(assembled(&bob, &at_bob), there, "и совпасть до байта");
+
+    let at_alice = incoming_file(&alice, &bob, "obratno2.bin");
+    assert!(
+        alice.store().file(&at_alice).unwrap().unwrap().complete,
+        "и обратный тоже — встречное начало не повод потерять одну из сторон"
+    );
+    assert_eq!(assembled(&alice, &at_alice), back, "и он до байта");
+}
+
+#[test]
+fn files_cross_in_the_air_in_both_directions_at_once() {
+    // **Проверка со стенда: «файлы ходят, но как-то в одну сторону».**
+    // Пока каждая проверка гоняла файл в одну сторону, узел был либо
+    // отправителем, либо получателем. В жизни он обычно и тот и другой
+    // сразу — и вот тогда становится видно, не мешают ли друг другу два
+    // учёта: полосы приёма (`file_lane`) и записи отдачи (`sending`).
+    //
+    // На эфире это самое тесное место: предел ступени там один файл,
+    // и встречные передачи делят одно радио.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    for who in [&mut alice, &mut bob] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    air_only(&mut bob, alice.own_card().ik);
+    let mut outgoing = air_only(&mut alice, bob.own_card().ik);
+
+    let air = files::chunk_bytes_for(Transport::Bt);
+    let there = payload_of(air * 2 + 7);
+    let back = payload_of(air * 3 + 5);
+    alice_blobs.lock().unwrap().seed("/tmp/tuda.bin", there.clone());
+    bob_blobs.lock().unwrap().seed("/tmp/obratno.bin", back.clone());
+
+    // Сперва сессия — обычным словом. Дальше обе передачи идут по живой
+    // связи, и разница между сторонами, если она есть, будет видна ею,
+    // а не разным устройством рукопожатия.
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, outgoing);
+
+    // **Оба отправляют навстречу, и ни один не ждёт другого.** Эффекты
+    // обеих сторон собираются до всякой прокачки и уезжают вперемешку:
+    // по очереди это давно работало, а вот так — нет.
+    let there_effects = send_file(&mut alice, &bob, 2_000, "/tmp/tuda.bin");
+    let back_effects = send_file(&mut bob, &alice, 2_000, "/tmp/obratno.bin");
+    pump_both(&mut alice, &mut bob, 2_000, there_effects, back_effects);
+
+    // **Принятый** файл, а не последний в чате: у каждого узла в этой
+    // переписке лежат оба — свой отправленный и чужой принятый.
+    let at_bob = incoming_file(&bob, &alice, "tuda.bin");
+    assert!(bob.store().file(&at_bob).unwrap().unwrap().complete, "файл туда обязан собраться");
+    let got_there = assembled(&bob, &at_bob);
+    assert_eq!(got_there.len(), there.len(), "длина файла туда");
+    assert_eq!(got_there, there, "и совпасть до байта");
+
+    let at_alice = incoming_file(&alice, &bob, "obratno.bin");
+    assert!(
+        alice.store().file(&at_alice).unwrap().unwrap().complete,
+        "файл обратно обязан собраться — вот этого на стенде и не хватало"
+    );
+    let got_back = assembled(&alice, &at_alice);
+    assert_eq!(got_back.len(), back.len(), "длина файла обратно");
+    assert_eq!(got_back, back, "и он тоже до байта");
 }
 
 #[test]

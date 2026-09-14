@@ -1122,7 +1122,7 @@ pub struct Engine<S: Store> {
     /// перезапуском, — и освободить место снова. Получилась бы рекурсия,
     /// глубину которой задаёт не наш код, а содержимое очереди.
     lanes_freed: bool,
-    /// Входящие файлы, которым отказала калитка одновременных загрузок.
+    /// Входящие файлы, ждущие места на ступени, — **в порядке ожидания**.
     ///
     /// **Именно те, кому отказали, и никто больше.** Здесь стоял перебор
     /// всех незаконченных файлов, и это было кольцо: пробуждение
@@ -1131,7 +1131,14 @@ pub struct Engine<S: Store> {
     /// заход порождал новые чанки, новые чанки — новые подтверждения,
     /// и провод переставал сходиться. Список ровно тех, кого завернули,
     /// делает пробуждение точным: разбудили — вычеркнули.
-    file_queued: BTreeSet<FileId>,
+    ///
+    /// **Список, а не множество, и порядок в нём несущий.** Уступившая
+    /// ступень передача встаёт в хвост, а свободное место достаётся
+    /// голове — иначе уступка не значит ничего: замолчавший файл, отпустив
+    /// полосу, тут же забирал её обратно, потому что в тот миг она была
+    /// свободна. Проверено прогоном: без очереди файл от живого
+    /// собеседника не доезжал за десять минут ни разу.
+    file_queued: Vec<FileId>,
     /// Растущий номер просьбы — им упорядочивается отдача.
     ///
     /// Разбор у [`Engine::sender_lane_has_room`]; коротко — очерёдность
@@ -1380,7 +1387,7 @@ impl<S: Store> Engine<S> {
             file_attempts: BTreeMap::new(),
             file_lane: BTreeMap::new(),
             lanes_freed: false,
-            file_queued: BTreeSet::new(),
+            file_queued: Vec::new(),
             asked_seq: 0,
             sending_queued: BTreeSet::new(),
             messages_since_compaction: 0,
@@ -3791,7 +3798,7 @@ impl<S: Store> Engine<S> {
         self.drop_sending(|s| s.file_id == *file_id);
         self.file_timers.remove(file_id);
         self.file_attempts.remove(file_id);
-        self.file_queued.remove(file_id);
+        self.file_queued.retain(|id| id != file_id);
         self.sending_queued.retain(|(id, _)| id != file_id);
         self.leave_lane(file_id);
         let _ = self.blobs.remove(file_id);
@@ -5027,7 +5034,7 @@ impl<S: Store> Engine<S> {
         // не занимает, и держать её за ним значило бы наказать очередь
         // за чужое решение. Из очереди он тоже уходит: человек сказал
         // «не сейчас», и будить его нечего.
-        self.file_queued.remove(&file_id);
+        self.file_queued.retain(|id| *id != file_id);
         self.leave_lane(&file_id);
         let received = self.store.received_chunks(&file_id)?;
         Ok(vec![Effect::Notify(Event::FileProgress { file_id, received, total: file.chunk_total })])
@@ -5197,7 +5204,7 @@ impl<S: Store> Engine<S> {
             // незаконченные файлы значило бы переспрашивать и те, что идут
             // своим чередом, — а просьба с признаком «начните сначала»
             // отматывает отправителю окно назад.
-            self.file_queued.insert(file.file_id);
+            self.enqueue_file(file.file_id);
             return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
                 file_id: file.file_id,
                 reason: FileWait::Queued,
@@ -5216,9 +5223,21 @@ impl<S: Store> Engine<S> {
         // место всё то время, пока собеседника нет, значило бы отдать
         // ступень тому, кто ею не пользуется.
         self.file_lane.insert(file.file_id, via);
-        self.file_queued.remove(&file.file_id);
+        self.file_queued.retain(|id| *id != file.file_id);
         effects.extend(self.watch_for_stall(file.file_id, via));
         Ok(effects)
+    }
+
+    /// Ставит файл в хвост очереди ожидания, если его там ещё нет.
+    ///
+    /// Повторной записи быть не должно: просьба про один файл уходит много
+    /// раз, и каждый отказ добавлял бы его в очередь заново — она росла бы
+    /// на каждом подтверждении, а место доставалось бы тому, кого завернули
+    /// чаще, а не тому, кто ждёт дольше.
+    fn enqueue_file(&mut self, file_id: FileId) {
+        if !self.file_queued.contains(&file_id) {
+            self.file_queued.push(file_id);
+        }
     }
 
     /// Есть ли на ступени место под ещё одну входящую передачу (§10.2).
@@ -6108,7 +6127,7 @@ impl<S: Store> Engine<S> {
         self.store.complete_file(&file.file_id)?;
         self.file_timers.remove(&file.file_id);
         self.file_attempts.remove(&file.file_id);
-        self.file_queued.remove(&file.file_id);
+        self.file_queued.retain(|id| *id != file.file_id);
         self.leave_lane(&file.file_id);
         Ok(vec![Effect::Notify(Event::FileProgress {
             file_id: file.file_id,
@@ -6127,6 +6146,37 @@ impl<S: Store> Engine<S> {
         // Счётчик растёт здесь, до просьбы: просьба его и прочитает.
         let attempt = self.file_attempts.entry(file_id).or_insert(0);
         *attempt = attempt.saturating_add(1);
+        let fruitless = *attempt;
+
+        // **Замолчавшая передача уступает ступень**, и это не вежливость,
+        // а починка запирания. Предел одновременных загрузок на эфире
+        // равен одному (§10.2), и пока этот файл числится идущим, все
+        // остальные стоят в очереди — в том числе те, чьи отправители
+        // прямо сейчас в эфире и готовы отдавать. Собеседник же, ушедший
+        // посреди передачи, не возвращается вовсе, а срок у него
+        // удваивается: через несколько минут приём стоит целиком за файлом,
+        // которого никто не отдаёт.
+        //
+        // Уступив, передача не пропадает: `ask_for_file` тут же попробует
+        // занять место снова, и если очередь пуста — займёт. А если
+        // не пуста, встанет в неё и вернётся, когда место освободится.
+        if fruitless >= ratatosk_proto::files::YIELD_AFTER_STALLS {
+            // **И не спрашиваем в этот же раз.** Спросив, мы забрали бы
+            // только что отпущенное место обратно: в этот миг оно свободно,
+            // и калитка пустила бы нас, не заглянув в очередь. Ровно так
+            // первая редакция уступки и не сработала — проверено прогоном.
+            //
+            // Вместо просьбы — хвост очереди. Разберёт её `wake_queued_files`
+            // в конце шага, по порядку ожидания: голова получит место,
+            // а мы вернёмся, когда оно освободится снова.
+            self.leave_lane(&file_id);
+            self.enqueue_file(file_id);
+            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+                file_id,
+                reason: FileWait::Queued,
+            })]);
+        }
+
         // Срок вышел — значит за всё это время не пришло ничего. Вот теперь
         // отправителю и правда надо начать с названного номера.
         let mut effects = self.ask_for_file(now_ms, &file, true)?;

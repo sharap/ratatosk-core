@@ -55,7 +55,7 @@ pub mod tls;
 pub mod ygg;
 
 pub use bluetooth::bridge::{BridgedAir, BtRadio};
-#[cfg(feature = "bt")]
+#[cfg(all(feature = "bt", target_os = "linux"))]
 pub use bluetooth::local::LocalAir;
 pub use bluetooth::{Air, BtAddress, BtConfig, BtRunner};
 pub use lan::{LanConfig, LanDirectory, LanRunner};

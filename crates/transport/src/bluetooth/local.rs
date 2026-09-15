@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bluer::adv::{Advertisement, Type as AdvType};
-use bluer::l2cap::{SocketAddr as L2capAddr, Stream, StreamListener};
+use bluer::l2cap::{Socket as L2capSocket, SocketAddr as L2capAddr, Stream, StreamListener};
 use bluer::{Adapter, AdapterEvent, Address, AddressType, DiscoveryFilter, DiscoveryTransport};
 use futures::StreamExt;
 use ratatosk_crypto::identity::beacon;
@@ -36,6 +36,7 @@ use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::AIR_RECV_MTU;
 use super::{
     dial_attempt_limit, note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress,
     DialFuture,
@@ -376,8 +377,21 @@ async fn run(
     let listener = StreamListener::bind(L2capAddr::new(own, own_type, 0))
         .await
         .map_err(|e| refused("сокет L2CAP", e))?;
+    // **MTU приёма — до первого `accept`.** Принятые сокеты наследуют его
+    // у слушающего, и выставленный позже он до них уже не доедет.
+    //
+    // Отказ здесь не смертелен: канал поднимется и с умолчанием BlueZ,
+    // просто собеседник будет резать кадры на семь пакетов. Молчать
+    // об этом нельзя — разбирать потом придётся по почерку.
+    ask_recv_mtu(listener.as_ref(), "слушающий");
     let psm = listener.as_ref().local_addr().map_err(|e| refused("номер канала", e))?.psm;
-    tracing::info!(psm, адрес = %own, тип = ?own_type, "эфир: канал L2CAP занят");
+    tracing::info!(
+        psm,
+        адрес = %own,
+        тип = ?own_type,
+        mtu = AIR_RECV_MTU,
+        "эфир: канал L2CAP занят"
+    );
 
     let _accepting = Stopped(spawn_accept_loop(listener, events.clone(), setup.accepted.clone()));
     let _scanning = Stopped(spawn_scan_loop(adapter.clone(), setup, airtime));
@@ -785,6 +799,60 @@ async fn settle(stream: &Stream, budget: Duration) -> Result<Duration, Transport
     }
 }
 
+/// Просит у сокета наш MTU приёма и говорит, если не дали.
+///
+/// Отдельной функцией, потому что мест два — слушающий сокет и набранный,
+/// — и разойдись они, половина каналов возила бы кадры целиком, а половина
+/// кусками. Такую разницу ловят не логикой, а неделей на стенде.
+fn ask_recv_mtu(socket: &L2capSocket<Stream>, whose: &str) {
+    if let Err(error) = socket.set_recv_mtu(AIR_RECV_MTU) {
+        // Не отказ: канал поднимется и с умолчанием BlueZ. Но кадр тогда
+        // приедет несколькими пакетами вместо одного, и знать об этом надо
+        // заранее, а не выводить потом из почерка порчи.
+        tracing::warn!(
+            %error,
+            сокет = whose,
+            просили = AIR_RECV_MTU,
+            "эфир: MTU приёма выставить не удалось — кадры поедут кусками"
+        );
+        return;
+    }
+    // **Читаем обратно, а не верим просьбе.** Ядро вправе дать меньше,
+    // и разница между «попросили» и «дали» — это ровно то число, по
+    // которому потом видно, одним пакетом едет кадр или семью. Гадать
+    // о нём по чужому ядру нечего: пусть говорит само.
+    match socket.recv_mtu() {
+        Ok(given) => tracing::info!(
+            сокет = whose,
+            просили = AIR_RECV_MTU,
+            дали = given,
+            "эфир: MTU приёма выставлен"
+        ),
+        Err(error) => tracing::debug!(%error, сокет = whose, "эфир: MTU приёма не спросился"),
+    }
+}
+
+/// Набирает канал, выставив MTU приёма **до** соединения.
+///
+/// `Stream::connect` завёл бы сокет сам, и вклиниться было бы некуда:
+/// MTU обязан стоять до того, как стороны о нём договорятся. Поэтому
+/// сокет собирается здесь по частям — ровно теми же тремя шагами, что
+/// и внутри `bluer`, плюс наш четвёртый между вторым и третьим.
+async fn connect_with_mtu(sa: L2capAddr) -> std::io::Result<Stream> {
+    let socket = L2capSocket::<Stream>::new_stream()?;
+    // Привязка к «любому своему» адресу того же вида, что у цели:
+    // сокет обязан быть привязан до соединения, а какой именно адрес
+    // адаптера возьмётся — решает система.
+    let local = if sa.addr_type == AddressType::BrEdr {
+        L2capAddr::any_br_edr()
+    } else {
+        L2capAddr::any_le()
+    };
+    socket.bind(local)?;
+    ask_recv_mtu(&socket, "набранный");
+    socket.connect(sa).await
+}
+
 /// Набирает канал к услышанному собеседнику.
 ///
 /// Отказ здесь **называется целиком**, и это не избыточность журнала.
@@ -860,7 +928,7 @@ async fn dial(
         // висящий дольше `connect` не «медленный», он мёртвый, и следующая
         // попытка упрётся в тот же адрес. Сколько именно ждать — решено
         // выше по адресу, а не здесь.
-        match tokio::time::timeout(left.min(attempt), Stream::connect(sa)).await {
+        match tokio::time::timeout(left.min(attempt), connect_with_mtu(sa)).await {
             Ok(Ok(stream)) => break stream,
             // «Операция уже идёт» — не отказ, а **занятость**: к этому
             // устройству уже тянут связь, и через мгновение она либо

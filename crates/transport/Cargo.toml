@@ -45,13 +45,20 @@ webpki-roots = { workspace = true, optional = true }
 async-imap = { workspace = true, optional = true }
 async-smtp = { workspace = true, optional = true }
 mdns-sd = { workspace = true, optional = true }
-# Шестая ступень (0.4): объявление BLE и сокеты L2CAP. Только Linux —
-# это обвязка BlueZ, — и потому под признаком, не в умолчании.
-bluer = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 ygg_stream = { workspace = true, optional = true }
 # Только ради `get_peers_json`: состав пиров библиотека отдаёт строкой.
 serde_json = { workspace = true, optional = true }
+
+# Шестая ступень (0.4): объявление BLE и сокеты L2CAP.
+#
+# **В целевой таблице, а не в общей**, потому что `bluer` — обвязка BlueZ,
+# то есть Linux и только Linux. Признак `bt` при этом разрешено включать
+# где угодно: вне Linux он не подтянет ничего, и десктопная сборка на трёх
+# платформах идёт одной и той же командой. Android сюда не входит и войти
+# не может — там радио приходит мостом (0.4.6).
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { workspace = true, optional = true }
 
 [features]
 default = ["onion", "chatmail", "lan"]
@@ -111,6 +118,14 @@ lan = ["dep:mdns-sd"]
 # Без признака раннер остаётся и остаётся полным: мост собирается всегда,
 # а вот радио ему никто не вручает, и ступень честно объявляется
 # потерянной. Ровно то, что видно в `/who` строкой `bt: работает=нет`.
+#
+# **Вне Linux признак безвреден, а не запрещён**, и это правка.
+# `bluer` объявлен в целевой таблице (`cfg(target_os = "linux")`), поэтому
+# на macOS и Windows он просто не подтягивается: признак включается,
+# ступень собирается мостом, эфира нет. Иначе сборка десктопного
+# компаньона была бы разной на трёх платформах — «здесь с признаком,
+# там без», — и первая же забытая разница вышла бы «библиотека
+# не собирается, а почему, непонятно».
 bt = [
     # Обзор `bluer` отдаёт потоком futures, а не tokio.
     "dep:futures",

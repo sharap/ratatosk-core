@@ -3356,7 +3356,51 @@ type NostrSide = Disabled;
 /// **радио** под ним. На телефоне это мост в платформу ([`BridgedAir`]),
 /// и приходит он снаружи; `bluer` сюда не входит и войти не может —
 /// он обвязка BlueZ.
+#[cfg(not(all(feature = "bt", target_os = "linux")))]
 type BtSide = BtRunner<BridgedAir>;
+
+/// Раннер эфира в сборке со **своим** радио.
+///
+/// На Linux с признаком `bt` радио есть у нас самих — `bluer` поверх
+/// BlueZ, — и мост тогда не нужен: приходить ему неоткуда, клиент
+/// на десктопе никакого `FfiBtRadio` не реализует. Тот же приём, что
+/// у `tor`, `nostr` и почты: тип раннера выбирает сборка.
+///
+/// Без этой ветки биндинги на Linux собирались на мост **всегда**, и эфира
+/// у десктопного приложения не было вовсе: ступень честно объявлялась
+/// потерянной, потому что радио ей никто не вручал, а вручить его было
+/// некому — `bluer` жил только у стенда.
+#[cfg(all(feature = "bt", target_os = "linux"))]
+type BtSide = BtRunner<ratatosk_transport::LocalAir>;
+
+/// Чем поднимается эфир — проверяется **сборкой**, а не прогоном.
+///
+/// Тип раннера выбирает признак, и ошибка здесь не падает тестом: она
+/// выглядит как работающая сборка, у которой просто нет эфира. Ровно так
+/// оно и было до этой правки — биндинги на Linux собирались на мост
+/// всегда, ступень честно объявлялась потерянной, и понять по прогону,
+/// что радио не то, было нечем.
+///
+/// Поэтому проверка тут не утверждение о значении, а **приведение типа**:
+/// съедет тип раннера обратно на мост — перестанет компилироваться.
+#[cfg(test)]
+mod air_choice {
+    #[cfg(all(feature = "bt", target_os = "linux"))]
+    #[allow(dead_code, reason = "проверка типа, звать её незачем")]
+    fn the_rung_takes_the_local_radio(
+        side: super::BtSide,
+    ) -> super::BtRunner<ratatosk_transport::LocalAir> {
+        side
+    }
+
+    #[cfg(not(all(feature = "bt", target_os = "linux")))]
+    #[allow(dead_code, reason = "проверка типа, звать её незачем")]
+    fn the_rung_takes_the_bridge(
+        side: super::BtSide,
+    ) -> super::BtRunner<ratatosk_transport::BridgedAir> {
+        side
+    }
+}
 
 /// Набор транспортов этой сборки.
 ///
@@ -3440,7 +3484,21 @@ async fn start(
     // разрешил. Радио при этом может быть ещё не вручено — служба
     // с разрешениями поднимается своим чередом, — и это нормальное
     // состояние: ступень тогда честно объявляется потерянной.
-    let bt = BtRunner::start(bt_air, BtConfig::default(), card.ik)
+    //
+    // **Чем поднимается, решает сборка.** На Linux с признаком `bt` это
+    // своё радио (`bluer`), и мост в этой ветке не участвует вовсе —
+    // объект `FfiBluetooth` у клиента остаётся, но радио ему вручать
+    // незачем (см. `bluetooth::FfiBluetooth::set_radio`).
+    #[cfg(all(feature = "bt", target_os = "linux"))]
+    let air = {
+        // Мост заводится у клиента в любой сборке; здесь он не нужен,
+        // и притворяться, что нужен, незачем.
+        let _ = &bt_air;
+        ratatosk_transport::LocalAir::new()
+    };
+    #[cfg(not(all(feature = "bt", target_os = "linux")))]
+    let air = bt_air;
+    let bt = BtRunner::start(air, BtConfig::default(), card.ik)
         .await
         .map_err(RatatoskError::internal)?;
 

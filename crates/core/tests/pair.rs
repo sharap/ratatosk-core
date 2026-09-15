@@ -754,6 +754,63 @@ fn a_long_text_goes_over_the_air_in_pieces_and_arrives_whole() {
 }
 
 #[test]
+fn a_text_at_the_very_limit_still_crosses_the_air() {
+    // **Это и есть `/probe m` со стенда, только без стенда.**
+    //
+    // Замер `m` шлёт текст под завязку класса M — ровно `MAX_TEXT_BYTES`,
+    // — и по эфиру такой текст целым не уезжает никак: потолок там класс S
+    // (§9.3). Уезжает он несущими, и на стенде это выглядит так, будто
+    // «класс M не отправляется, а сообщение всё равно доходит». Так и есть:
+    // доходит его фрагментация.
+    //
+    // Проверка стоит **на самом пределе**, потому что рядом уже есть такая
+    // же на сорок тысяч байт. Сорок тысяч — середина, а ошибки на единицу
+    // живут на краю: предел текста выведен из класса M, кусок несущей —
+    // из класса S, запас несущей — третье число, и сходятся они только
+    // здесь.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+
+    air_only(&mut bob, alice.own_card().ik);
+    let mut opening = air_only(&mut alice, bob.own_card().ik);
+    opening.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, opening);
+    assert_eq!(alice.session_count(), 1, "сессия обязана сойтись до замера");
+
+    // Ровно предел, ни байтом меньше: именно его и берёт замер.
+    let limit = files::MAX_TEXT_BYTES;
+    let long: String = std::iter::repeat('щ').take(limit / 'щ'.len_utf8()).collect();
+    assert!(long.len() <= limit, "текст замера обязан влезать в предел");
+    assert!(limit - long.len() < 'щ'.len_utf8(), "и быть у самого предела");
+
+    let outgoing = send_text(&mut alice, &bob, 2_000, &long);
+    let frames = air_sends(&outgoing);
+    assert!(
+        frames.len() > 10,
+        "предельный текст обязан уехать многими несущими, а уехал {}",
+        frames.len()
+    );
+    for frame in &frames {
+        assert!(
+            frame.len() <= ratatosk_wire::SizeClass::S.frame_len(),
+            "по эфиру не ходит ничего крупнее класса S, а кадр занял {}",
+            frame.len()
+        );
+    }
+
+    let events = pump(&mut alice, &mut bob, 2_000, outgoing);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "собранный предельный текст обязан показаться как обычное сообщение: {events:?}"
+    );
+    assert_eq!(
+        inbox(&bob, &alice),
+        vec!["привет".to_owned(), long],
+        "и совпасть с отправленным до байта"
+    );
+}
+
+#[test]
 fn a_short_text_over_the_air_still_goes_in_one_frame() {
     // Обратная сторона предыдущей проверки: резать то, что и так доезжает,
     // значило бы платить лишними кадрами за ничто — а в эфире кадр стоит

@@ -121,7 +121,35 @@ struct Peer {
     /// Заведена ли у узла почта. Перезапуск обязан поднять его таким же:
     /// узел, у которого ящика не было, после перезапуска его не заводит.
     mail: bool,
+    /// Повторяет ли эфир объявления. Ложь у всех, кроме эфирных сценариев.
+    beacons: bool,
+    /// Когда последний раз объявлялись. Чаще срока маяку незачем.
+    beacon_at_ms: u64,
 }
+
+/// Как часто эфир повторяет объявление.
+///
+/// В живом BLE объявление приходит раз в несколько секунд; тридцать —
+/// с запасом мелко против срока соседства (`PRESENCE_TTL_MS`,
+/// полторы минуты) и достаточно крупно, чтобы не забивать стенд.
+const BEACON_EVERY_MS: u64 = 30_000;
+
+/// **Своего срока у маяка нет, и это главное в его устройстве.**
+///
+/// Взведи маяк сам себя — и стенд не затих бы никогда: `settle` ждёт
+/// тишины, а маяк её не даёт. Ограничить маяк числом кругов тоже
+/// не выходит: первый же `settle` их все и потратил бы, пустив двадцать
+/// минут модельного времени до того, как сценарий начался.
+///
+/// Поэтому маяк едет на чужих колёсах — **на кадрах, и только на них**:
+/// круг объявлений случается, когда узел принял кадр или не дозвался.
+/// Пока в эфире идёт разговор, объявления идут вместе с ним; кончился
+/// разговор — маяк молчит, стенд затихает, и соседство честно гаснет.
+///
+/// На сроках маяк не едет нарочно. Срок соседства выходит ровно тогда,
+/// когда гасить уже пора; объявись стенд в ответ на него — соседство
+/// зажигалось бы заново, следующий срок гасил бы его снова, и эти двое
+/// качали бы друг друга до упора в предел шагов.
 
 /// Ключ базы. Один на все узлы стенда: PIN здесь не изучается, а разные
 /// ключи только добавили бы строк, ничего не проверяя.
@@ -133,7 +161,16 @@ impl Peer {
     fn new(seed: u8, run: u64, mail: bool) -> Peer {
         let home = Home::new(run, u16::from(seed));
         let engine = Peer::open(seed, &home, mail);
-        Peer { engine: Some(engine), peers: BTreeMap::new(), events: Vec::new(), seed, home, mail }
+        Peer {
+            engine: Some(engine),
+            peers: BTreeMap::new(),
+            events: Vec::new(),
+            seed,
+            home,
+            mail,
+            beacons: false,
+            beacon_at_ms: 0,
+        }
     }
 
     /// Открывает ядро на каталоге узла — и при заведении, и при перезапуске.
@@ -219,6 +256,36 @@ impl Peer {
         }
     }
 
+    /// Круг объявлений: узел слышит в эфире всех, кого знает.
+    ///
+    /// **Объявление в эфире повторяется, и без этого повтора соседство
+    /// проверять нечем.** Соседство живёт сроком в полторы минуты, а
+    /// эфирные сценарии идут дольше: срок молчания на этой ступени
+    /// удваивается — восемнадцать секунд, тридцать шесть, семьдесят
+    /// две. Объяви стенд собеседника один раз на старте — и посреди
+    /// сценария тот пропадал бы из эфира, хотя стоит в метре и
+    /// исправно шлёт маяк. Проверки про молчащего отправителя после
+    /// этого проходили бы по неверной причине: полоса освобождалась
+    /// бы не уступкой ступени, а тем, что собеседника «не стало».
+    fn beacon(&mut self, ctx: &mut Ctx<'_>) {
+        if !self.beacons {
+            return;
+        }
+        let now_ms = ctx.now_ms();
+        if now_ms != 0 && now_ms.saturating_sub(self.beacon_at_ms) < BEACON_EVERY_MS {
+            return;
+        }
+        self.beacon_at_ms = now_ms;
+        let peers: Vec<[u8; 32]> = self.peers.keys().copied().collect();
+        for peer_ik in peers {
+            let effects = self
+                .engine_mut()
+                .step(ctx.now_ms(), Input::SeenOnBt { peer_ik })
+                .expect("объявление услышано");
+            self.apply(ctx, effects);
+        }
+    }
+
     fn command(&mut self, ctx: &mut Ctx<'_>, command: Command) {
         let effects = self
             .engine_mut()
@@ -241,6 +308,7 @@ impl Peer {
 
 impl SimNode for Peer {
     fn on_deliver(&mut self, ctx: &mut Ctx<'_>, _from: NodeId, kind: TransportKind, bytes: &[u8]) {
+        self.beacon(ctx);
         let effects = self
             .engine_mut()
             .step(ctx.now_ms(), Input::Received { via: to_proto(kind), frame: bytes.to_vec() })
@@ -254,6 +322,7 @@ impl SimNode for Peer {
     }
 
     fn on_send_failed(&mut self, ctx: &mut Ctx<'_>, to: NodeId, kind: TransportKind) {
+        self.beacon(ctx);
         let Some((&peer_ik, _)) = self.peers.iter().find(|(_, id)| **id == to) else {
             return;
         };
@@ -403,6 +472,12 @@ impl Stand {
 
     /// Даёт сети затихнуть: всё, что в пути, доезжает, все сроки выходят.
     fn settle(&mut self) {
+        // **Эфир объявляется перед тем, как чему-то поехать.** В жизни
+        // маяк не смолкал и всё это время; в стенде же между действиями
+        // человека проходит сколько угодно модельного времени, и застать
+        // соседство погасшим — обычное дело. Круг объявлений здесь и есть
+        // то, что в жизни происходит само.
+        self.beacons();
         match self.sim.run_to_idle(MAX_STEPS) {
             Ok(_) => {}
             Err(done) => panic!(
@@ -410,6 +485,30 @@ impl Stand {
                  (сид {:#x})",
                 self.sim.seed()
             ),
+        }
+    }
+
+    /// Крутит стенд заданное время — и всё это время эфир объявляется.
+    ///
+    /// Отличие от `sim.run_for` ровно в маяке. Десять минут подряд без
+    /// единого объявления — это не «эфир», а «телефон выключили»:
+    /// соседство погасло бы посреди отсчёта, и проверка про молчащего
+    /// отправителя прошла бы по неверной причине — полосу освободило бы
+    /// исчезновение собеседника, а не уступка ступени.
+    fn run_for(&mut self, duration_ms: u64) {
+        let until_ms = self.sim.now_ms() + duration_ms;
+        while self.sim.now_ms() < until_ms {
+            self.beacons();
+            let step_ms = BEACON_EVERY_MS.min(until_ms - self.sim.now_ms());
+            self.sim.run_for(step_ms);
+        }
+    }
+
+    /// Круг объявлений по всем узлам. У неэфирных молчит: `beacons` ложь.
+    fn beacons(&mut self) {
+        let count = u16::try_from(self.sim.len()).expect("узлов не больше 65535");
+        for i in 0..count {
+            self.sim.act(NodeId(i), |node, ctx| node.beacon(ctx));
         }
     }
 
@@ -463,6 +562,10 @@ impl Stand {
     /// не передача, а заглушка: отправитель читает исходник с диска
     /// по смещению (§10.2), и ровно это здесь и должно работать.
     fn send_file(&mut self, who: NodeId, chat: [u8; 16], name: &str, bytes: &[u8]) {
+        // Эфир объявляется перед отправкой: между действиями человека
+        // модельного времени проходит сколько угодно, и застать соседство
+        // погасшим — обычное дело (см. `Stand::settle`).
+        self.beacons();
         let path = self.sim.node(who).home.source().join(name);
         std::fs::create_dir_all(path.parent().expect("у файла есть каталог"))
             .expect("каталог исходников");
@@ -559,22 +662,12 @@ impl Stand {
             });
         }
         // Маяки: в эфире адресуемость даёт объявление, а не карточка (0.4).
-        let keys: Vec<(NodeId, [u8; 32])> =
-            (0..count).map(|i| (NodeId(i), self.sim.node(NodeId(i)).ik())).collect();
-        for (who, _) in &keys {
-            for (other, ik) in &keys {
-                if other == who {
-                    continue;
-                }
-                let peer_ik = *ik;
-                self.sim.act(*who, |node, ctx| {
-                    let effects = node
-                        .engine_mut()
-                        .step(ctx.now_ms(), Input::SeenOnBt { peer_ik })
-                        .expect("объявление услышано");
-                    node.apply(ctx, effects);
-                });
-            }
+        // Заводится маяк, а не одно объявление, — почему именно так,
+        // написано у `Peer::beacon`.
+        for i in 0..count {
+            self.sim.act(NodeId(i), |node, _ctx| {
+                node.beacons = true;
+            });
         }
         self.settle();
     }
@@ -985,7 +1078,7 @@ fn a_silent_sender_does_not_block_the_whole_receiving_side() {
 
     // Третий начинает первым и занимает единственную полосу эфира.
     stand.send_file(C, stand.chat_with(A), "propal.bin", &big);
-    stand.sim.run_for(1_500);
+    stand.run_for(1_500);
 
     // И тут его исходник исчезает. Отдавать больше нечего — но сказать
     // об этом получателю нечем: §10.2 не знает такого сообщения.
@@ -999,7 +1092,7 @@ fn a_silent_sender_does_not_block_the_whole_receiving_side() {
     // вечно — это её честная работа, — и `settle` тут не дождётся никогда.
     // Десять минут заведомо больше и передачи мелкого файла, и двух
     // сроков молчания, после которых полоса уступается.
-    stand.sim.run_for(10 * 60 * 1000);
+    stand.run_for(10 * 60 * 1000);
 
     assert_eq!(
         stand.received_file(A, stand.chat_with(B), "ot_vtorogo.bin").as_deref(),

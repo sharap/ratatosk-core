@@ -2974,6 +2974,22 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         // «не сверен» остаётся упрёком без способа его снять.
         println!("    отпечаток: {}", contact.fingerprint);
 
+        // **Рядом ли он прямо сейчас** — отдельной строкой и первой
+        // из адресных, потому что это самый частый вопрос к списку.
+        // Признак живёт сроком (`PRESENCE_TTL_MS`): полторы минуты тишины,
+        // и он гаснет сам. Строки нет вовсе, когда никого рядом нет, —
+        // «не рядом» у каждого второго контакта было бы шумом.
+        let near: Vec<&str> = [
+            contact.availability.seen_on_lan.then_some("локальная сеть"),
+            contact.availability.seen_on_bt.then_some("эфир"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !near.is_empty() {
+            println!("    рядом: {}", near.join(", "));
+        }
+
         println!("    добавлен: {} мс, карточка версии {}", contact.added_ms, contact.card_version);
         if let Some(onion) = &contact.onion {
             println!("    onion-адрес: {onion}");

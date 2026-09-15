@@ -209,6 +209,15 @@ fn pump_both(
         let Some((owner_first, token)) = timers.pop() else { break };
         let owner = if owner_first { &mut *a } else { &mut *b };
         let produced = owner.step(now_ms, Input::Timer { token }).expect("таймер доставки");
+        // **Сердцебиение провод не крутит.** Срок, который не сделал
+        // ничего, кроме как взвёлся заново, — не часть обмена: так
+        // устроено соседство (`PRESENCE_TTL_MS`), и в живом времени
+        // это удар раз в полторы минуты. Здесь времени нет, `now_ms`
+        // стоит, и такой срок спускался бы подряд до упора в предел
+        // шагов — обмен объявлялся бы кольцом на ровном месте.
+        if produced.len() == 1 && matches!(produced[0], Effect::SetTimer { .. }) {
+            continue;
+        }
         queue.extend(produced.into_iter().map(|e| (owner_first, e)));
     }
     events
@@ -618,6 +627,161 @@ fn a_message_waits_for_discovery_instead_of_failing_instantly() {
             .iter()
             .any(|e| matches!(e, Effect::Send { via: ratatosk_proto::Transport::Lan, .. })),
         "собеседник нашёлся, а сообщение не поехало: {produced:?}"
+    );
+}
+
+/// Сколько тишины гасит соседство — то же число, что у ядра.
+///
+/// Берётся из политики, а не пишется здесь: второе такое число разошлось
+/// бы с первым молча, и проверка сторожила бы не тот срок.
+const NEARBY_TTL: u64 = ratatosk_proto::transport_policy::PRESENCE_TTL_MS;
+
+/// Спускает все сроки, взведённые этими эффектами, и отдаёт то, что вышло.
+///
+/// Метку соседства из внутренностей ядра не достать, да и не надо:
+/// она приезжает обычным `SetTimer`. Спускаются **все** — чужая метка
+/// ничего не делает, и разбирать, какая чья, значило бы повторять здесь
+/// устройство ядра.
+fn fire_timers(node: &mut Node, now_ms: u64, effects: &[Effect]) -> Vec<Effect> {
+    let tokens: Vec<u64> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::SetTimer { token, .. } => Some(*token),
+            _ => None,
+        })
+        .collect();
+    // **Пустой список сроков — это провал проверки, а не ноль работы.**
+    // Проверки соседства устроены так, что ядро трогают именно сроком:
+    // не найдись ни одного, они бы утверждали своё, ничего не спустив,
+    // и прошли бы на сломанном ядре. Так и вышло однажды: отметку
+    // времени убрали, `SetTimer` перестал появляться, и проверка
+    // «свежее свидетельство продлевает соседство» осталась зелёной.
+    assert!(!tokens.is_empty(), "соседство держится сроком, а ни одного не взвелось: {effects:?}");
+    let mut out = Vec::new();
+    for token in tokens {
+        out.extend(node.step(now_ms, Input::Timer { token }).expect("срок"));
+    }
+    out
+}
+
+#[test]
+fn being_nearby_goes_out_when_the_peer_stops_being_heard() {
+    // **Ради чего заведён срок.** Отметка «слышно» ставилась объявлением
+    // и снималась только выключением ступени: собеседник, ушедший
+    // из комнаты, оставался «рядом» до конца сеанса. Показывать такое
+    // человеку нельзя, а §5.4 из-за этого предлагал эфир тому, кого в нём
+    // давно нет, и платил полным сроком набора.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    // **Эффекты собираются с самого начала.** `air_only` сам сообщает
+    // об услышанном объявлении, то есть срок соседства взводится уже там;
+    // второй раз он не взводится — он один на всех, — и метка из более
+    // позднего шага оказалась бы пустой.
+    let mut heard = air_only(&mut alice, peer_ik);
+    heard.extend(alice.step(1_000, Input::SeenOnBt { peer_ik }).expect("объявление опознано"));
+    assert!(alice.contacts()[&peer_ik].availability.seen_on_bt, "услышали — значит рядом");
+
+    // Ещё не срок: в пределах срока соседство держится.
+    let effects = fire_timers(&mut alice, 1_000 + NEARBY_TTL - 1, &heard);
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "до срока собеседник обязан оставаться рядом"
+    );
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Notify(Event::ContactChanged { .. }))),
+        "и новостей о нём быть не должно: ничего не изменилось"
+    );
+
+    // А вот теперь тишина стала долгой. Срок взвёлся заново — тем самым
+    // проходом, который ничего не погасил.
+    let effects = fire_timers(&mut alice, 1_000 + NEARBY_TTL, &effects);
+    assert!(
+        !alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "полторы минуты тишины — и «рядом» перестало быть правдой"
+    );
+    // **И клиент об этом узнаёт.** Без новости список контактов показывал
+    // бы ушедшего рядом до тех пор, пока человек не откроет его заново.
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::Notify(Event::ContactChanged { peer_ik: who })
+            if *who == peer_ik)),
+        "об уходе обязана приехать новость: {effects:?}"
+    );
+}
+
+#[test]
+fn a_frame_keeps_the_peer_nearby_while_the_air_stays_quiet() {
+    // **Разговор не гасит значок**, и это не мелочь. Пока канал открыт,
+    // Android уводит обзор в экономный режим, и объявление собеседника
+    // может не попасться дольше срока. Считай мы свидетельством только
+    // объявление — «рядом» гасло бы посреди беседы, ровно тогда, когда
+    // собеседник ближе всего.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    let mut heard = air_only(&mut alice, peer_ik);
+    heard.extend(alice.step(1_000, Input::SeenOnBt { peer_ik }).expect("объявление опознано"));
+
+    // Свидетельство посвежее — в пределах срока.
+    alice
+        .step(1_000 + NEARBY_TTL - 1, Input::SeenOnBt { peer_ik })
+        .expect("ещё одно свидетельство");
+
+    // Срок, отсчитанный от **первого** объявления, вышел — а собеседник
+    // рядом, потому что слышали его позже.
+    let after = fire_timers(&mut alice, 1_000 + NEARBY_TTL, &heard);
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "свежее свидетельство обязано продлевать соседство"
+    );
+    // **Проверка утверждения о том, чего не случилось, обязана показать,
+    // что проход был.** Убери из ядра соседство целиком — и «признак
+    // на месте» осталось бы правдой, потому что гасить его стало некому.
+    // Взведённый заново срок и есть след прохода: он появляется только
+    // когда кого-то ещё слышно.
+    assert!(
+        after.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "проход по соседству обязан был состояться и взвестись заново: {after:?}"
+    );
+}
+
+#[test]
+fn a_frame_from_the_peer_keeps_him_nearby_without_a_single_advert() {
+    // **То же самое, но свидетельством работает разговор, а не маяк.**
+    // Проверка выше держит соседство объявлениями; эта — кадрами, и
+    // без неё половина замысла остаётся без присмотра. Случай не выдуман:
+    // пока канал открыт, Android уводит обзор в `SCAN_MODE_LOW_POWER`,
+    // и объявления собеседника можно не услышать дольше полутора минут.
+    // Собеседник при этом в метре и активно пишет.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let peer_ik = bob.own_card().ik;
+    air_only(&mut bob, alice.own_card().ik);
+    // Срок соседства взводится здесь, отметкой нуля, — и больше объявлений
+    // в этой проверке не будет ни одного.
+    let mut heard = air_only(&mut alice, peer_ik);
+
+    heard.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, heard.clone());
+    assert_eq!(alice.session_count(), 1, "сессия обязана сойтись до замера");
+
+    // Почти срок — и ровно в этот миг приходит кадр. Ничего, кроме кадра:
+    // объявление в последний раз слышали в нуле.
+    let answer = send_text(&mut bob, &alice, NEARBY_TTL - 1, "и тебе привет");
+    let events = pump_both(&mut alice, &mut bob, NEARBY_TTL - 1, Vec::new(), answer);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "кадр обязан доехать, иначе проверять нечего: {events:?}"
+    );
+
+    // Срок, отсчитанный от объявления, вышел. Собеседник обязан остаться
+    // рядом: слышали его позже — кадром.
+    let after = fire_timers(&mut alice, NEARBY_TTL, &heard);
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "пришедший кадр — свидетельство не хуже объявления, и соседство обязано держаться им"
+    );
+    assert!(
+        after.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "проход по соседству обязан был состояться и взвестись заново: {after:?}"
     );
 }
 

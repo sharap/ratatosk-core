@@ -330,6 +330,49 @@ pub enum EngineError {
 /// файл ни весил.
 ///
 /// [`chunk_window`]: ratatosk_proto::files::chunk_window
+/// Когда контакта слышали в последний раз — по каждому эфиру отдельно.
+///
+/// Раздельно, потому что эфира два и гаснут они порознь: Bluetooth
+/// выключили, а Wi-Fi остался — и наоборот. Слить их в одну отметку
+/// значило бы гасить соседство там, где оно есть.
+#[derive(Debug, Clone, Copy, Default)]
+struct Heard {
+    /// Локальная сеть, мс от эпохи.
+    lan_ms: Option<u64>,
+    /// Эфир Bluetooth, мс от эпохи.
+    bt_ms: Option<u64>,
+}
+
+impl Heard {
+    /// Отметка для этой ступени — изменяемая.
+    ///
+    /// `None` у прочих ступеней, и это не заглушка: у них адрес берётся
+    /// из карточки и от слышимости не зависит вовсе.
+    fn slot(&mut self, via: Transport) -> Option<&mut Option<u64>> {
+        // Перебор полный, а не `_ => None`: появится ступень со
+        // слышимостью — компилятор потребует завести ей отметку,
+        // а не отнесёт молча к тем, у кого адрес в карточке.
+        match via {
+            Transport::Lan => Some(&mut self.lan_ms),
+            Transport::Bt => Some(&mut self.bt_ms),
+            Transport::Ygg | Transport::Onion | Transport::Nostr | Transport::Mail => None,
+        }
+    }
+
+    /// Слышали ли по этой ступени не позже, чем `ttl_ms` назад.
+    fn fresh(self, via: Transport, now_ms: u64, ttl_ms: u64) -> bool {
+        let at = match via {
+            Transport::Lan => self.lan_ms,
+            Transport::Bt => self.bt_ms,
+            Transport::Ygg | Transport::Onion | Transport::Nostr | Transport::Mail => None,
+        };
+        // Часы вправе прыгнуть назад (смена часового пояса, поправка
+        // времени), и отметка из «будущего» не повод объявить собеседника
+        // ушедшим: `saturating_sub` даёт ноль, то есть «только что».
+        at.is_some_and(|at| now_ms.saturating_sub(at) < ttl_ms)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Sending {
     file_id: FileId,
@@ -981,6 +1024,24 @@ pub struct Engine<S: Store> {
     /// слышен в одном эфире и не слышен в другом, и слив их в одно, мы
     /// отдали бы §5.4 ступень, которой нет.
     seen_on_bt: BTreeSet<[u8; 32]>,
+    /// Когда контакта слышали в последний раз — по каждому эфиру.
+    ///
+    /// **Отметка времени, а не признак, и в этом вся правка.** Признак
+    /// `seen_on_*` говорит «слышим», но снимался он только выключением
+    /// ступени: ушедший собеседник числился рядом до конца сеанса.
+    /// Отметка даёт третье состояние — «слышали, но давно», — и по ней
+    /// соседство гаснет само ([`Engine::forget_stale_presence`]).
+    ///
+    /// В памяти, а не на диске, и намеренно: «рядом» переживать перезапуск
+    /// не должно. После него мы не слышали ещё никого, и говорить обратное
+    /// значило бы показать человеку прошлое.
+    heard: BTreeMap<[u8; 32], Heard>,
+    /// Метка таймера, которым гаснет соседство. `None` — гасить нечего.
+    ///
+    /// Одна на всех, а не по контакту: проход дешёвый (десятки записей),
+    /// а метка на контакт означала бы десятки живых таймеров ради того,
+    /// что и так делается одним перебором.
+    presence_timer: Option<u64>,
     /// Открытый ключ нашего узла в меше (0.2). Пусто — меша нет.
     ///
     /// Здесь он живёт **в разобранном виде и в единственном экземпляре**,
@@ -1356,6 +1417,8 @@ impl<S: Store> Engine<S> {
             mail_via_tor: None,
             seen_on_lan: BTreeSet::new(),
             seen_on_bt: BTreeSet::new(),
+            heard: BTreeMap::new(),
+            presence_timer: None,
             // Имя в меше — производная от настроек, а настройки поднимаются
             // с диска в `restore`. До подъёма меша нет, и это верно: базы
             // ещё не читали.
@@ -2732,11 +2795,20 @@ impl<S: Store> Engine<S> {
                     contact.availability.seen_on_lan = false;
                 }
                 self.seen_on_lan.clear();
+                // И отметку времени тоже: иначе включённая заново ступень
+                // считала бы собеседника слышимым по свидетельству, которое
+                // само же и объявила устаревшим.
+                for heard in self.heard.values_mut() {
+                    heard.lan_ms = None;
+                }
             } else {
                 for contact in self.contacts.values_mut() {
                     contact.availability.seen_on_bt = false;
                 }
                 self.seen_on_bt.clear();
+                for heard in self.heard.values_mut() {
+                    heard.bt_ms = None;
+                }
             }
         }
 
@@ -3605,6 +3677,11 @@ impl<S: Store> Engine<S> {
             contact.availability.seen_on_lan = false;
         }
         self.seen_on_lan.clear();
+        // Отметка времени устарела вместе с сетью: слышали мы его **там**,
+        // а мы уже здесь. Эфир Bluetooth к сети не привязан и остаётся.
+        for heard in self.heard.values_mut() {
+            heard.lan_ms = None;
+        }
         // Сеть другая — значит и ответ «здесь его не слышно» относился
         // к прежней. Срок на обнаружение выдаётся заново.
         self.awaited_discovery.clear();
@@ -12533,7 +12610,7 @@ impl<S: Store> Engine<S> {
                 let mut effects = vec![Effect::Attributed { peer_ik, via }];
                 self.remember_reply(peer_ik, via, &frame);
                 effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
-                effects.extend(self.note_presence(peer_ik, via)?);
+                effects.extend(self.note_presence(now_ms, peer_ik, via)?);
                 return Ok(effects);
             }
         };
@@ -12629,7 +12706,7 @@ impl<S: Store> Engine<S> {
 
         // Рукопожатие §8.2 аутентифицировано — значит этой ступенью
         // к нам обратился именно этот собеседник и именно сейчас.
-        effects.extend(self.note_presence(peer_ik, via)?);
+        effects.extend(self.note_presence(now_ms, peer_ik, via)?);
 
         if is_device {
             // **Адрес десктопа — из нагрузки рукопожатия, и больше ниоткуда.**
@@ -12764,7 +12841,7 @@ impl<S: Store> Engine<S> {
         // Отложенное здесь будится ниже и **на любой ступени** — своей
         // строкой, потому что рукопожатие мы начали сами: это мы искали его,
         // а не он объявился. Разница видна в мешe, где объявиться нечем.
-        let mut effects = self.note_presence(peer_ik, via)?;
+        let mut effects = self.note_presence(now_ms, peer_ik, via)?;
         // Имя связи — раньше всего, что по ней поедет. Ответ на рукопожатие
         // мог прийти принятым каналом, и досылка очереди ниже обязана
         // застать его уже названным.
@@ -12869,6 +12946,7 @@ impl<S: Store> Engine<S> {
     /// что ждало канала, спросил тот, кто его открыл (§10.2).
     fn note_presence(
         &mut self,
+        now_ms: u64,
         peer_ik: [u8; 32],
         via: Transport,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -12884,17 +12962,124 @@ impl<S: Store> Engine<S> {
             // нет, и отмечать нечего.
             None => return Ok(Vec::new()),
         };
+        // **Пришедший кадр — свидетельство не хуже объявления**, и отметку
+        // он обновляет всегда, даже когда перехода не было и будить нечего.
+        // Иначе значок гас бы посреди разговора: пока канал открыт, Android
+        // уводит обзор в экономный режим, и объявлений можно не услышать
+        // дольше срока.
+        let mut fresh = self.note_nearby(now_ms, peer_ik, via);
         if !appeared && !self.something_waits_for(peer_ik, via) {
-            return Ok(Vec::new());
+            return Ok(fresh);
         }
         tracing::info!(
             peer = %short_ik(&peer_ik),
             ?via,
             "собеседник достижим: кадр пришёл этой ступенью"
         );
-        let mut effects = self.resume_discovery(peer_ik)?;
-        effects.extend(self.retry_deferred(Some(peer_ik))?);
-        Ok(effects)
+        fresh.extend(self.resume_discovery(peer_ik)?);
+        fresh.extend(self.retry_deferred(Some(peer_ik))?);
+        Ok(fresh)
+    }
+
+    /// Отмечает, что собеседника слышно **сейчас**, и заводит срок.
+    ///
+    /// Зовут её оба свидетельства слышимости — пойманное объявление
+    /// ([`Engine::note_heard`]) и пришедший кадр ([`Engine::note_presence`]),
+    /// — и это не дублирование: кадр говорит то же, что маяк, только
+    /// вернее. Пока идёт разговор, объявления могут и не попадаться:
+    /// Android на время открытого канала уводит обзор в экономный режим.
+    /// Не считай мы кадр за свидетельство — значок гас бы посреди беседы.
+    ///
+    /// Возвращает срок, если его надо взвести. Взводится он один на всех
+    /// и только когда живого ещё не было: срок на каждое объявление
+    /// означал бы десяток таймеров в секунду.
+    fn note_nearby(&mut self, now_ms: u64, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
+        let entry = self.heard.entry(peer_ik).or_default();
+        let Some(slot) = entry.slot(via) else { return Vec::new() };
+        *slot = Some(now_ms);
+        self.arm_presence()
+    }
+
+    /// Взводит срок гашения соседства, если он ещё не взведён.
+    fn arm_presence(&mut self) -> Vec<Effect> {
+        if self.presence_timer.is_some() {
+            return Vec::new();
+        }
+        let token = self.allocate_timer();
+        self.presence_timer = Some(token);
+        vec![Effect::SetTimer {
+            after_ms: ratatosk_proto::transport_policy::PRESENCE_TTL_MS,
+            token,
+        }]
+    }
+
+    /// Гасит соседство у тех, кого давно не слышно (§5.1, 0.4).
+    ///
+    /// # Почему это таймер, а не вычисление на месте
+    ///
+    /// Вычислять свежесть при каждом чтении было бы дешевле и не требовало
+    /// бы ни метки, ни прохода. Но тогда об уходе собеседника никто
+    /// не узнаёт: признак меняется молча, а клиенту нужно **событие** —
+    /// иначе список контактов показывает ушедшего рядом до тех пор, пока
+    /// человек не откроет его заново.
+    ///
+    /// Поэтому проход: он снимает признак и рассылает `ContactChanged`
+    /// ровно по тем, у кого соседство погасло.
+    ///
+    /// # Срок взводится заново, только пока есть кого гасить
+    ///
+    /// Иначе таймер тикал бы вечно на пустом месте. Никого рядом нет —
+    /// метка снимается, и следующее объявление заведёт её снова.
+    fn forget_stale_presence(&mut self, now_ms: u64) -> Vec<Effect> {
+        use ratatosk_proto::transport_policy::PRESENCE_TTL_MS;
+
+        // **Метка забирается, чтобы вернуться той же.** Срок соседства
+        // у узла один, и живёт он, пока хоть кого-то слышно; выдавать
+        // ему новую метку на каждый круг значило бы менять имя вечной
+        // вещи полторы тысячи раз в сутки. Дороже того: у того, кто
+        // держит эту метку снаружи — а так устроены проверки, — она
+        // молча протухала бы каждые полторы минуты, и спущенный срок
+        // не делал бы ничего. Тихо проходящая проверка хуже падающей.
+        let mine = self.presence_timer.take();
+        let mut changed: Vec<[u8; 32]> = Vec::new();
+        let mut anyone_near = false;
+        for (peer_ik, contact) in &mut self.contacts {
+            let heard = self.heard.get(peer_ik).copied().unwrap_or_default();
+            let mut gone = false;
+            for via in ratatosk_proto::transport_policy::presence_rungs() {
+                let fresh = heard.fresh(via, now_ms, PRESENCE_TTL_MS);
+                anyone_near |= fresh;
+                let flag = match via {
+                    Transport::Lan => &mut contact.availability.seen_on_lan,
+                    _ => &mut contact.availability.seen_on_bt,
+                };
+                if *flag && !fresh {
+                    *flag = false;
+                    gone = true;
+                }
+            }
+            if gone {
+                changed.push(*peer_ik);
+            }
+        }
+
+        let mut effects: Vec<Effect> = changed
+            .into_iter()
+            .map(|peer_ik| {
+                tracing::info!(
+                    peer = %short_ik(&peer_ik),
+                    тишина_с = PRESENCE_TTL_MS / 1000,
+                    "собеседника больше не слышно — соседство погасло"
+                );
+                Effect::Notify(Event::ContactChanged { peer_ik })
+            })
+            .collect();
+        if anyone_near {
+            let token = mine.unwrap_or_else(|| self.allocate_timer());
+            self.presence_timer = Some(token);
+            effects.push(Effect::SetTimer { after_ms: PRESENCE_TTL_MS, token });
+        }
+        effects
     }
 
     /// Ждёт ли чего-нибудь этот собеседник именно на этой ступени.
@@ -12974,9 +13159,13 @@ impl<S: Store> Engine<S> {
                 return Ok(Vec::new());
             }
         }
+        // **Отметка времени — на каждое объявление, а не на переход.**
+        // Соседство живёт сроком (`PRESENCE_TTL_MS`), и обновлять его надо
+        // тем, что слышно сейчас, а не тем, что услышали впервые.
+        let mut effects = self.note_nearby(now_ms, peer_ik, via);
         // Собеседник нашёлся — всё, что ждало этого ответа, едет
         // немедленно, не досиживая свой срок.
-        let mut effects = self.resume_discovery(peer_ik)?;
+        effects.extend(self.resume_discovery(peer_ik)?);
         if appeared || self.something_waits_for(peer_ik, via) {
             // **Первым — незаконченное рукопожатие, и только потом всё
             // остальное.** Сообщения без сессии всё равно упрутся в неё,
@@ -13261,6 +13450,12 @@ impl<S: Store> Engine<S> {
             if let Some(contact) = self.contacts.get_mut(&peer_ik) {
                 contact.availability.seen_on_lan = false;
             }
+            // Вместе с признаком — и отметка времени: иначе срок соседства
+            // «воскресил» бы её при ближайшем проходе, и мы снова считали
+            // бы слышимым того, до кого только что не достучались.
+            if let Some(heard) = self.heard.get_mut(&peer_ik) {
+                heard.lan_ms = None;
+            }
             // Громко, потому что последствие тихое и долгое: пока маяк
             // не прозвучит снова — или не придёт кадр, см. `note_presence`
             // — §5.4 не предложит LAN **ни одному** следующему сообщению.
@@ -13348,6 +13543,13 @@ impl<S: Store> Engine<S> {
     /// перейти от объявленного провала к подтверждённой доставке, а лишнюю
     /// копию у получателя съест дедупликация (§9.2).
     fn on_timer(&mut self, now_ms: u64, token: u64) -> Result<Vec<Effect>, EngineError> {
+        // Срок соседства — не про доставку вовсе: он гасит «рядом» у тех,
+        // кого давно не слышно (§5.1, 0.4). Разбирается первым, потому что
+        // ни с чьим другим сроком спутать его нельзя — метка своя и одна.
+        if self.presence_timer == Some(token) {
+            return Ok(self.forget_stale_presence(now_ms));
+        }
+
         // Срок обнаружения — не отказ транспорта, а конец паузы: §5.4 ещё
         // не начинался. Поэтому он разбирается отдельно и раньше.
         let awaiting_discovery = self.outbox.iter().find_map(|d| match d.state {
@@ -13505,7 +13707,7 @@ impl<S: Store> Engine<S> {
         // `tried=[]`. Открытый канал — свидетельство достижимости более
         // сильное, чем объявление: по объявлению ещё надо дозвониться,
         // а по каналу уже можно писать.
-        let mut woken = self.note_presence(peer_ik, via)?;
+        let mut woken = self.note_presence(now_ms, peer_ik, via)?;
         // Здесь же — и имя связи, которой кадр пришёл.
         //
         // **После проверки тега, и ни строкой раньше.** Номер сессии лежит

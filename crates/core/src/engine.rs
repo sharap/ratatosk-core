@@ -1199,7 +1199,11 @@ pub struct Engine<S: Store> {
     /// полосу, тут же забирал её обратно, потому что в тот миг она была
     /// свободна. Проверено прогоном: без очереди файл от живого
     /// собеседника не доезжал за десять минут ни разу.
-    file_queued: Vec<FileId>,
+    /// **Ступень хранится рядом с файлом**, потому что вопрос «ждёт ли
+    /// кто-нибудь» задаётся всегда про **эту** ступень. Ждущий почты
+    /// не повод торопить передачу в эфире: у ступеней разные сроки,
+    /// и общая на всех очередь связала бы несвязанное.
+    file_queued: Vec<(FileId, Transport)>,
     /// Растущий номер просьбы — им упорядочивается отдача.
     ///
     /// Разбор у [`Engine::sender_lane_has_room`]; коротко — очерёдность
@@ -1724,7 +1728,7 @@ impl<S: Store> Engine<S> {
         }
 
         // Приём: те, кому мы ответили «ждёт очереди», и только они.
-        for file_id in std::mem::take(&mut self.file_queued) {
+        for (file_id, _) in std::mem::take(&mut self.file_queued) {
             let Some(file) = self.store.file(&file_id)? else { continue };
             if file.complete || !file.incoming || !file.accepted {
                 continue;
@@ -3875,7 +3879,7 @@ impl<S: Store> Engine<S> {
         self.drop_sending(|s| s.file_id == *file_id);
         self.file_timers.remove(file_id);
         self.file_attempts.remove(file_id);
-        self.file_queued.retain(|id| id != file_id);
+        self.file_queued.retain(|(id, _)| id != file_id);
         self.sending_queued.retain(|(id, _)| id != file_id);
         self.leave_lane(file_id);
         let _ = self.blobs.remove(file_id);
@@ -5111,7 +5115,7 @@ impl<S: Store> Engine<S> {
         // не занимает, и держать её за ним значило бы наказать очередь
         // за чужое решение. Из очереди он тоже уходит: человек сказал
         // «не сейчас», и будить его нечего.
-        self.file_queued.retain(|id| *id != file_id);
+        self.file_queued.retain(|(id, _)| *id != file_id);
         self.leave_lane(&file_id);
         let received = self.store.received_chunks(&file_id)?;
         Ok(vec![Effect::Notify(Event::FileProgress { file_id, received, total: file.chunk_total })])
@@ -5281,11 +5285,20 @@ impl<S: Store> Engine<S> {
             // незаконченные файлы значило бы переспрашивать и те, что идут
             // своим чередом, — а просьба с признаком «начните сначала»
             // отматывает отправителю окно назад.
-            self.enqueue_file(file.file_id);
-            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+            // **Встали в очередь — торопим того, кто ступень держит.**
+            // Без этого ждать пришлось бы весь его разросшийся срок:
+            // отступление считает, как часто спрашивать замолчавшего,
+            // а не как долго не пускать к ступени других.
+            let mut effects = if self.enqueue_file(file.file_id, via) {
+                self.hurry_lane_holders(via)
+            } else {
+                Vec::new()
+            };
+            effects.push(Effect::Notify(Event::FileWaitsForChannel {
                 file_id: file.file_id,
                 reason: FileWait::Queued,
-            })]);
+            }));
+            return Ok(effects);
         }
 
         let mut effects = self.send_file_frame(
@@ -5300,7 +5313,7 @@ impl<S: Store> Engine<S> {
         // место всё то время, пока собеседника нет, значило бы отдать
         // ступень тому, кто ею не пользуется.
         self.file_lane.insert(file.file_id, via);
-        self.file_queued.retain(|id| *id != file.file_id);
+        self.file_queued.retain(|(id, _)| *id != file.file_id);
         effects.extend(self.watch_for_stall(file.file_id, via));
         Ok(effects)
     }
@@ -5311,10 +5324,51 @@ impl<S: Store> Engine<S> {
     /// раз, и каждый отказ добавлял бы его в очередь заново — она росла бы
     /// на каждом подтверждении, а место доставалось бы тому, кого завернули
     /// чаще, а не тому, кто ждёт дольше.
-    fn enqueue_file(&mut self, file_id: FileId) {
-        if !self.file_queued.contains(&file_id) {
-            self.file_queued.push(file_id);
+    fn enqueue_file(&mut self, file_id: FileId, via: Transport) -> bool {
+        if self.file_queued.iter().any(|(id, _)| *id == file_id) {
+            return false;
         }
+        self.file_queued.push((file_id, via));
+        true
+    }
+
+    /// Ждёт ли очереди на **этой** ступени кто-нибудь, кроме названного.
+    fn someone_waits_for_rung(&self, via: Transport, except: FileId) -> bool {
+        self.file_queued.iter().any(|(id, lane)| *lane == via && *id != except)
+    }
+
+    /// Укорачивает срок молчания тем, кто прямо сейчас держит эту ступень.
+    ///
+    /// **Зовётся в тот миг, когда кто-то встал в очередь**, и лечит вот
+    /// что. Срок держащего взведён давно и, если тот молчит не первый
+    /// раз, взведён надолго: отступление удваивает его до двенадцати
+    /// часов. Ждущий об этом узнать не может, и ждал бы он ровно столько,
+    /// сколько мертвецу осталось досидеть.
+    ///
+    /// Трогаются только те, у кого отступление уже началось (`attempt`
+    /// больше нуля). У идущей своим чередом передачи срок и так короткий,
+    /// и обновляет его каждый чанк.
+    ///
+    /// Прежняя метка не снимается, а забывается — отменить таймер драйверу
+    /// нечем; сработав, она не найдёт себя в `file_timers` и ничего
+    /// не сделает. Это то же правило, что и у [`Engine::watch_for_stall`].
+    fn hurry_lane_holders(&mut self, via: Transport) -> Vec<Effect> {
+        let holders: Vec<FileId> = self
+            .file_lane
+            .iter()
+            .filter(|(_, lane)| **lane == via)
+            .map(|(file_id, _)| *file_id)
+            .filter(|file_id| self.file_attempts.get(file_id).is_some_and(|tries| *tries > 0))
+            .collect();
+        let mut effects = Vec::new();
+        for file_id in holders {
+            let token = self.allocate_timer();
+            self.file_timers.insert(file_id, token);
+            tracing::info!(?via, "ступени ждут — укорачиваем срок тому, кто её держит");
+            effects
+                .push(Effect::SetTimer { after_ms: ratatosk_proto::files::stall_ms(via), token });
+        }
+        effects
     }
 
     /// Есть ли на ступени место под ещё одну входящую передачу (§10.2).
@@ -5362,7 +5416,16 @@ impl<S: Store> Engine<S> {
         // нет, ничего не делает. Живой срок у файла всегда один.
         self.file_timers.insert(file_id, token);
         let attempt = self.file_attempts.get(&file_id).copied().unwrap_or(0);
-        let after_ms = ratatosk_proto::files::stall_backoff_ms(via, attempt);
+        // **Пока этой ступени ждут, отступления нет.** Удваивать срок
+        // осмысленно, когда он стоит одних наших просьб; когда он стоит
+        // чужой очереди, платит за него не тот, кто молчит. Поэтому
+        // отступление считает, **как часто спрашивать**, а держать
+        // ступень дольше базового срока оно не даёт.
+        let after_ms = if self.someone_waits_for_rung(via, file_id) {
+            ratatosk_proto::files::stall_ms(via)
+        } else {
+            ratatosk_proto::files::stall_backoff_ms(via, attempt)
+        };
         vec![Effect::SetTimer { after_ms, token }]
     }
 
@@ -6204,7 +6267,7 @@ impl<S: Store> Engine<S> {
         self.store.complete_file(&file.file_id)?;
         self.file_timers.remove(&file.file_id);
         self.file_attempts.remove(&file.file_id);
-        self.file_queued.retain(|id| *id != file.file_id);
+        self.file_queued.retain(|(id, _)| *id != file.file_id);
         self.leave_lane(&file.file_id);
         Ok(vec![Effect::Notify(Event::FileProgress {
             file_id: file.file_id,
@@ -6246,8 +6309,14 @@ impl<S: Store> Engine<S> {
             // Вместо просьбы — хвост очереди. Разберёт её `wake_queued_files`
             // в конце шага, по порядку ожидания: голова получит место,
             // а мы вернёмся, когда оно освободится снова.
+            // Ступень берётся до того, как её отдали: после `leave_lane`
+            // спрашивать уже не у кого. Не нашлась — значит файл её
+            // и не занимал, и вставать ему в очередь незачем.
+            let Some(lane) = self.file_lane.get(&file_id).copied() else {
+                return Ok(Vec::new());
+            };
             self.leave_lane(&file_id);
-            self.enqueue_file(file_id);
+            self.enqueue_file(file_id, lane);
             return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
                 file_id,
                 reason: FileWait::Queued,

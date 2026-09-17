@@ -145,7 +145,21 @@ pub const MAX_GONE_IDS: usize = 256;
 /// «не проверен»: у группы сверки нет и быть не может (§4.2 — про людей),
 /// а `verified` у неё поэтому всегда `false`. Вывести одно из другого
 /// нельзя: несверенный контакт выглядит точно так же.
-pub const WIRE_VERSION: u32 = 20;
+///
+/// Двадцать один — **нарезка вложения**: [`Attachment::chunk_bytes`]
+/// и [`Response::FileOffer::chunk_bytes`]. Оба поля появились, а не сменили
+/// форму: сборка версии 20 разберёт и то и другое как прежде.
+///
+/// Появились они поздно, и опоздание стоило дорого. Своя нарезка у файла
+/// есть с миграции 0026 — в эфире кусок четыре килобайта, на прочих
+/// ступенях мебибайт, — а провод возил только **число** кусков. Десктоп
+/// считал смещение своим умолчанием, и всё сходилось ровно до того дня,
+/// когда на телефоне включили Bluetooth: приём складывал файл
+/// в одиннадцать килобайт тремя кусками в трёх мебибайтах пустоты,
+/// а отдача не ехала вовсе — телефон отвергал кусок за куском как
+/// «не той длины». Снаружи и то и другое выглядело как «файлы через
+/// компаньона приходят битыми».
+pub const WIRE_VERSION: u32 = 21;
 
 /// Наибольшее число сообщений в одной просьбе десктопа.
 ///
@@ -299,6 +313,16 @@ const KEY_PEERS: u64 = 39;
 const KEY_SHARED: u64 = 40;
 /// Кем делятся — личный чат этого человека; отсутствует у своей карточки.
 const KEY_WHO: u64 = 41;
+/// Нарезка вложения — сколько байт в куске (§10.2, миграция 0026).
+///
+/// **Появился поздно, и появление это дорогое.** С миграции 0026 нарезка
+/// у каждого файла своя: в эфире кусок четыре килобайта, на прочих
+/// ступенях мебибайт. Провод её не возил, а десктоп писал кусок по
+/// смещению `index * CHUNK_BYTES` — по своему умолчанию. Совпадало это
+/// ровно до тех пор, пока на телефоне не включили Bluetooth: файл
+/// в одиннадцать килобайт ложился на диск тремя килобайтами в трёх
+/// мебибайтах пустоты. Снаружи — «файлы приходят битыми».
+const KEY_CHUNK_BYTES: u64 = 42;
 
 // Виды запроса, ответа и новости нумеруются **каждый в своей области**,
 // и имена это называют вслух. Сперва все три набора звались `KIND_*`,
@@ -1406,6 +1430,17 @@ pub struct Attachment {
     pub size_bytes: u64,
     /// Сколько всего чанков (§10.2).
     pub chunk_total: u64,
+    /// Сколько байт в чанке — **нарезка этого файла**, а не умолчание.
+    ///
+    /// Без неё десктоп не может сложить куски: смещение считается
+    /// нарезкой, и чужое число раскладывает файл врастопырку.
+    /// Выводиться из размера и числа кусков она не умеет — деление
+    /// с округлением вверх обратимо не всегда.
+    ///
+    /// Отсутствие поля читается как [`crate::files::CHUNK_BYTES`]:
+    /// сборка телефона постарше нарезки не возила, и другой у неё
+    /// не бывало.
+    pub chunk_bytes: u64,
     /// Сколько уже лежит у телефона.
     ///
     /// Не «сколько процентов»: доля — это представление, а §13.3 держит
@@ -1572,6 +1607,16 @@ pub enum Response {
         file_id: crate::files::FileId,
         /// Сколько кусков телефон ждёт.
         chunk_total: u64,
+        /// И какой длины каждый — **нарезка, которую выбрал телефон**.
+        ///
+        /// Выбирает её он (`chunk_bytes_now`) и он же сверяет длину
+        /// каждого присланного куска. Не скажи он её вслух — десктоп
+        /// резал бы исходник своим умолчанием, и телефон отвергал бы
+        /// кусок за куском: выгрузка не ехала бы вовсе.
+        ///
+        /// Отсутствие поля читается как [`crate::files::CHUNK_BYTES`]:
+        /// сборка телефона постарше другой нарезки не знала.
+        chunk_bytes: u64,
     },
     /// Кусок вложения, уже расшифрованный.
     ///
@@ -2397,7 +2442,7 @@ pub fn response_payload(id: u64, response: &Response) -> Value {
             fields.push((Value::Integer(KEY_KIND.into()), Value::Integer(RESPONSE_HELLO.into())));
             fields.push((Value::Integer(KEY_WIRE.into()), Value::Integer((*wire).into())));
         }
-        Response::FileOffer { file_id, chunk_total } => {
+        Response::FileOffer { file_id, chunk_total, chunk_bytes } => {
             fields.push((
                 Value::Integer(KEY_KIND.into()),
                 Value::Integer(RESPONSE_FILE_OFFER.into()),
@@ -2406,6 +2451,10 @@ pub fn response_payload(id: u64, response: &Response) -> Value {
             fields.push((
                 Value::Integer(KEY_CHUNK_TOTAL.into()),
                 Value::Integer((*chunk_total).into()),
+            ));
+            fields.push((
+                Value::Integer(KEY_CHUNK_BYTES.into()),
+                Value::Integer((*chunk_bytes).into()),
             ));
         }
         Response::Staged { files } => {
@@ -2573,6 +2622,10 @@ pub fn response_from_payload(value: &Value) -> Result<(u64, Response), CodecErro
         RESPONSE_FILE_OFFER => Response::FileOffer {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
             chunk_total: canonical::as_u64(canonical::require(map, KEY_CHUNK_TOTAL)?)?,
+            chunk_bytes: match canonical::get(map, KEY_CHUNK_BYTES) {
+                Some(value) => canonical::as_u64(value)?,
+                None => crate::files::CHUNK_BYTES as u64,
+            },
         },
         RESPONSE_HELLO => Response::Hello {
             wire: u32::try_from(canonical::as_u64(canonical::require(map, KEY_WIRE)?)?)
@@ -2956,6 +3009,10 @@ fn files_value(files: &[Attachment]) -> Value {
                             Value::Integer(KEY_CHUNK_TOTAL.into()),
                             Value::Integer(file.chunk_total.into()),
                         ),
+                        (
+                            Value::Integer(KEY_CHUNK_BYTES.into()),
+                            Value::Integer(file.chunk_bytes.into()),
+                        ),
                         (Value::Integer(KEY_HAVE.into()), Value::Integer(file.have_chunks.into())),
                     ]
                     .into_iter()
@@ -3003,6 +3060,10 @@ fn files_from_value(value: &Value) -> Result<Vec<Attachment>, CodecError> {
             name: canonical::as_text(canonical::require(map, KEY_FILE_NAME)?)?.to_owned(),
             size_bytes: canonical::as_u64(canonical::require(map, KEY_SIZE)?)?,
             chunk_total: canonical::as_u64(canonical::require(map, KEY_CHUNK_TOTAL)?)?,
+            chunk_bytes: match canonical::get(map, KEY_CHUNK_BYTES) {
+                Some(value) => canonical::as_u64(value)?,
+                None => crate::files::CHUNK_BYTES as u64,
+            },
             have_chunks: canonical::as_u64(canonical::require(map, KEY_HAVE)?)?,
             accepted: match canonical::get(map, KEY_ACCEPTED) {
                 Some(Value::Bool(accepted)) => *accepted,
@@ -3237,7 +3298,7 @@ mod tests {
     /// они ради истории и ради того, чтобы правка последней строки на месте
     /// бросалась в глаза. Проверяется последняя: она обязана назвать
     /// [`WIRE_VERSION`] и сойтись с тем, что кодировщики строят сейчас.
-    const WIRE_SHAPES: [(u32, u64); 9] = [
+    const WIRE_SHAPES: [(u32, u64); 10] = [
         (12, 0x1ef3_4b21_4945_d1f1),
         (13, 0x9bba_1505_7b0f_b8ed),
         (14, 0x6558_a89b_8e4a_6268),
@@ -3247,8 +3308,17 @@ mod tests {
         (18, 0x5f24_d526_d541_70ce),
         (19, 0x7de1_f453_44f8_5b34),
         (20, 0xc637_afae_ca20_a717),
+        (21, 0xf010_778b_812f_db68),
     ];
 
+    /// **Подсказка сторожа верна до поднятия версии, а не после.**
+    /// Образцы включают `Response::Hello { wire: WIRE_VERSION }`, а форма
+    /// целого числа — это его значение (`shape_of`). Значит поднятая версия
+    /// сама меняет хеш, и число из сообщения, полученного **до** поднятия,
+    /// не подойдёт. Порядок такой: поднять версию, прогнать ещё раз, взять
+    /// названное число. Второй прогон даёт окончательное — версия в нём
+    /// уже не меняется.
+    ///
     /// FNV-1a — та же, что сторожит замороженные миграции.
     ///
     /// Не криптография: подделывать здесь нечего, задача одна — заметить
@@ -3406,6 +3476,7 @@ mod tests {
                     name: "кот.jpg".into(),
                     size_bytes: 3_000_000,
                     chunk_total: 3,
+                    chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                     have_chunks: 1,
                     accepted: false,
                     has_preview: true,
@@ -3415,6 +3486,7 @@ mod tests {
                     name: "otchet.pdf".into(),
                     size_bytes: 900,
                     chunk_total: 1,
+                    chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                     have_chunks: 1,
                     accepted: true,
                     has_preview: false,
@@ -3508,7 +3580,11 @@ mod tests {
             Response::Done,
             Response::Refused("контакта больше нет".into()),
             Response::Hello { wire: WIRE_VERSION },
-            Response::FileOffer { file_id: [4u8; 16], chunk_total: 3 },
+            Response::FileOffer {
+                file_id: [4u8; 16],
+                chunk_total: 3,
+                chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
+            },
             Response::FileChunk { index: 1, bytes: vec![7u8; 100] },
             Response::Staged {
                 files: vec![StagedFile {
@@ -4344,6 +4420,7 @@ mod tests {
                     name: "кот.jpg".into(),
                     size_bytes: 3_000_000,
                     chunk_total: 3,
+                    chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                     have_chunks: 3,
                     accepted: true,
                     has_preview: true,
@@ -4355,6 +4432,7 @@ mod tests {
                     name: "архив.zip".into(),
                     size_bytes: 9_000_000,
                     chunk_total: 9,
+                    chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                     have_chunks: 0,
                     accepted: false,
                     has_preview: false,
@@ -4383,6 +4461,7 @@ mod tests {
             name: "видео.mp4".into(),
             size_bytes: 9,
             chunk_total: 9,
+            chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
             have_chunks: 0,
             accepted: false,
             has_preview: false,
@@ -4425,6 +4504,7 @@ mod tests {
             name: "кот.jpg".into(),
             size_bytes: 3_000_000,
             chunk_total: 3,
+            chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
             have_chunks: 3,
             accepted: true,
             has_preview: true,
@@ -4513,6 +4593,7 @@ mod tests {
                 name: format!("{n}.bin"),
                 size_bytes: 1,
                 chunk_total: 1,
+                chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                 have_chunks: 1,
                 accepted: true,
                 has_preview: false,
@@ -4626,7 +4707,11 @@ mod tests {
             // от «куска нет» обязан **вид ответа**, а не содержимое.
             Response::FileChunk { index: 3, bytes: vec![0u8; 16] },
             Response::Hello { wire: WIRE_VERSION },
-            Response::FileOffer { file_id: [4u8; 16], chunk_total: 3 },
+            Response::FileOffer {
+                file_id: [4u8; 16],
+                chunk_total: 3,
+                chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
+            },
             Response::FilePreview { bytes: Some(vec![0x89, b'P', b'N', b'G', 13]) },
             // Превью нулевой длины — законное значение, и отличать его
             // от «превью нет» обязано **поле**, а не длина.
@@ -4729,6 +4814,7 @@ mod tests {
                 name: "кот.jpg".into(),
                 size_bytes: 3_000_000,
                 chunk_total: 3,
+                chunk_bytes: crate::files::AIR_CHUNK_BYTES as u64,
                 have_chunks: 2,
                 accepted: true,
                 has_preview: true,
@@ -5197,7 +5283,7 @@ mod tests {
         );
         assert_eq!(kinds(&Response::Hello { wire: 1 }), RESPONSE_HELLO);
         assert_eq!(
-            kinds(&Response::FileOffer { file_id: [1u8; 16], chunk_total: 1 }),
+            kinds(&Response::FileOffer { file_id: [1u8; 16], chunk_total: 1, chunk_bytes: 1 }),
             RESPONSE_FILE_OFFER
         );
         assert_eq!(kinds(&Response::FilePreview { bytes: None }), RESPONSE_FILE_PREVIEW);

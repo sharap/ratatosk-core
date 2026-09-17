@@ -127,6 +127,16 @@ pub struct FfiCompanionAttachment {
     /// Сколько всего кусков — столько же понадобится
     /// [`RatatoskCompanion::save_file`].
     pub chunk_total: u64,
+    /// Нарезка этого вложения — сколько байт в куске (§10.2).
+    ///
+    /// **Отдавать её обратно в [`RatatoskCompanion::save_file`]
+    /// обязательно.** Нарезка у файла своя: у приехавшего эфиром кусок
+    /// четыре килобайта, у приехавшего по сети — мебибайт. Без неё куски
+    /// не сложить, и складывались они врастопырку — файл на диске
+    /// выходил битым и во много раз больше исходного.
+    ///
+    /// Показывать человеку её не надо: это число для вызова, а не для глаз.
+    pub chunk_bytes: u64,
     /// Сколько кусков уже у телефона.
     pub have_chunks: u64,
     /// Согласен ли телефон качать его сейчас.
@@ -1202,9 +1212,10 @@ impl RatatoskCompanion {
 
     /// Забирает вложение с телефона в файл по этому пути.
     ///
-    /// Байты пишет ядро: путь, а не поток. `chunk_total` берётся
-    /// из [`FfiCompanionAttachment::chunk_total`] — своей разбивки у десктопа
-    /// нет и быть не должно, она обязана совпадать с §10.2.
+    /// Байты пишет ядро: путь, а не поток. `chunk_total` и `chunk_bytes`
+    /// берутся из [`FfiCompanionAttachment`] — **из той же записи, оба**.
+    /// Своей разбивки у десктопа нет и быть не должно: она обязана
+    /// совпадать с §10.2, а у каждого файла она своя.
     ///
     /// Забирать имеет смысл то, что телефон уже собрал целиком
     /// (`have_chunks == chunk_total`); начатое раньше остановится на первой
@@ -1220,11 +1231,13 @@ impl RatatoskCompanion {
         &self,
         file_id: Vec<u8>,
         chunk_total: u64,
+        chunk_bytes: u64,
         path: String,
     ) -> Result<(), RatatoskError> {
         self.ask(CompanionCommand::SaveFile {
             file_id: to_file_id(&file_id)?,
             chunk_total,
+            chunk_bytes,
             path: PathBuf::from(path),
         })
     }
@@ -1593,6 +1606,7 @@ fn attachment_of(file: &Attachment) -> FfiCompanionAttachment {
         name: file.name.clone(),
         size_bytes: file.size_bytes,
         chunk_total: file.chunk_total,
+        chunk_bytes: file.chunk_bytes,
         have_chunks: file.have_chunks,
         accepted: file.accepted,
         has_preview: file.has_preview,
@@ -1655,6 +1669,7 @@ mod tests {
                 name: "кот.jpg".to_owned(),
                 size_bytes: 9_000_000,
                 chunk_total: 9,
+                chunk_bytes: ratatosk_proto::files::AIR_CHUNK_BYTES as u64,
                 have_chunks: 4,
                 accepted: true,
                 has_preview: true,

@@ -4694,7 +4694,13 @@ impl<S: Store> Engine<S> {
             preview,
             have: BTreeSet::new(),
         });
-        Ok(companion::Response::FileOffer { file_id, chunk_total })
+        // Нарезка едет вслух: её же телефон потом и спросит с каждого
+        // куска, а вывести её из размера десктоп не может.
+        Ok(companion::Response::FileOffer {
+            file_id,
+            chunk_total,
+            chunk_bytes: u64::from(chunk_bytes),
+        })
     }
 
     /// Приехал кусок выгружаемого файла.
@@ -11579,6 +11585,9 @@ impl<S: Store> Engine<S> {
                 name: file.name,
                 size_bytes: file.size_bytes,
                 chunk_total: file.chunk_total,
+                // Нарезка **этого** файла (миграция 0026), а не умолчание:
+                // по ней десктоп считает смещение, когда складывает куски.
+                chunk_bytes: u64::from(file.chunk_bytes),
                 have_chunks,
                 accepted: file.accepted,
                 // Признак, а не байты: сама картинка приедет отдельной

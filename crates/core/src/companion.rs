@@ -787,8 +787,17 @@ pub enum ClientEvent {
     FileBytes {
         /// Какого вложения.
         file_id: [u8; 16],
-        /// Какой кусок. Смещение — `index * files::CHUNK_BYTES`.
+        /// Какой кусок — для показа движения, не для записи.
         index: u64,
+        /// **Куда писать — в байтах от начала файла.**
+        ///
+        /// Смещение приезжает готовым нарочно. Считать его самому значит
+        /// знать нарезку, а нарезка у каждого файла своя с миграции 0026:
+        /// в эфире кусок четыре килобайта, на прочих ступенях мебибайт.
+        /// Терминал раньше умножал номер на своё умолчание — и файл,
+        /// приехавший на телефон эфиром, ложился на диск врастопырку:
+        /// одиннадцать килобайт превращались в три мебибайта дыр.
+        offset: u64,
         /// Открытые байты.
         bytes: Vec<u8>,
     },
@@ -831,8 +840,16 @@ pub enum ClientEvent {
         /// нескольких файлов означала бы, что путь ищут по имени, а имена
         /// в одном сообщении вправе совпадать.
         which: u32,
-        /// Какой кусок. Смещение — `index * files::CHUNK_BYTES`.
+        /// Какой кусок — им же он поедет обратно в [`ClientInput::PutChunk`].
         index: u64,
+        /// Откуда читать исходник — в байтах от начала.
+        offset: u64,
+        /// И сколько байт. **Нарезку назначает телефон**, он же сверяет
+        /// длину каждого присланного куска: прочитай терминал своим
+        /// умолчанием — телефон отверг бы кусок за куском, и выгрузка
+        /// не поехала бы вовсе. Хвост короче — это не ошибка, столько
+        /// в файле и осталось.
+        len: u64,
     },
     /// Файлы выгружены на телефон, и телефон отправил сообщение с ними.
     ///
@@ -1087,6 +1104,12 @@ pub enum ClientInput {
         file_id: [u8; 16],
         /// Сколько в нём кусков — из [`ratatosk_proto::companion::Attachment`].
         chunk_total: u64,
+        /// И какая у него нарезка — оттуда же.
+        ///
+        /// Оба числа из одной записи, и второе не выводится из первого:
+        /// деление размера на число кусков с округлением вверх обратимо
+        /// не всегда.
+        chunk_bytes: u64,
     },
     /// Отправить файл в чат: байты возьмёт терминал, спрашивая по куску.
     ///
@@ -1314,6 +1337,8 @@ struct Upload {
     next: u64,
     /// Сколько кусков у текущего файла.
     total: u64,
+    /// И какой длины каждый — так, как назначил телефон.
+    chunk_bytes: u64,
     /// Подпись к сообщению. Ждёт здесь третьего шага: с версии провода 8
     /// она едет с `FileSend`, а не с предложением, — потому что принадлежит
     /// **сообщению**, а сообщение рождается на третьем шаге.
@@ -1327,6 +1352,20 @@ impl Upload {
     /// Идентификатор файла, который выгружается сейчас.
     fn current(&self) -> Option<[u8; 16]> {
         self.ids.get(self.at).copied()
+    }
+
+    /// Откуда читать кусок и сколько байт — по нарезке, которую назначил
+    /// телефон.
+    ///
+    /// Считается **здесь**, а не у терминала, и это то же правило, что
+    /// на приёме: нарезку назвал телефон, и знать её обязан тот, кому
+    /// он её назвал. Хвост выходит короче сам собой — вычитанием
+    /// смещения из размера, — и телефон ждёт именно такой длины.
+    fn piece(&self, index: u64) -> (u64, u64) {
+        let offset = index.saturating_mul(self.chunk_bytes);
+        let size = self.items.get(self.at).map_or(0, |item| item.size_bytes);
+        let len = size.saturating_sub(offset).min(self.chunk_bytes);
+        (offset, len)
     }
 }
 
@@ -1354,6 +1393,8 @@ struct Download {
     next: u64,
     /// Сколько всего.
     total: u64,
+    /// Нарезка **этого** файла: по ней и считается смещение.
+    chunk_bytes: u64,
     /// Связь оборвалась, и выгрузка ждёт: просьбы в пути больше нет,
     /// а записанное на диске остаётся и переписываться не будет.
     stalled: bool,
@@ -1705,7 +1746,9 @@ impl CompanionClient {
                 Vec::new()
             }
             ClientInput::Ask(request) => self.on_ask(&request),
-            ClientInput::Fetch { file_id, chunk_total } => self.on_fetch(file_id, chunk_total),
+            ClientInput::Fetch { file_id, chunk_total, chunk_bytes } => {
+                self.on_fetch(file_id, chunk_total, chunk_bytes)
+            }
             ClientInput::CancelFetch => self.on_cancel_fetch(),
             ClientInput::Send { chat, items, text } => self.on_send(chat, items, text),
             ClientInput::PutChunk { index, bytes } => self.on_put_chunk(index, bytes),
@@ -1771,6 +1814,9 @@ impl CompanionClient {
             ids: Vec::new(),
             next: 0,
             total: 0,
+            // Настоящую назовёт телефон ответом `FileOffer`; до того
+            // куски всё равно не просятся.
+            chunk_bytes: 0,
             text,
             stalled: false,
         });
@@ -1865,7 +1911,12 @@ impl CompanionClient {
     }
 
     /// Начинает выгрузку вложения.
-    fn on_fetch(&mut self, file_id: [u8; 16], chunk_total: u64) -> Vec<ClientEffect> {
+    fn on_fetch(
+        &mut self,
+        file_id: [u8; 16],
+        chunk_total: u64,
+        chunk_bytes: u64,
+    ) -> Vec<ClientEffect> {
         if self.download.is_some() {
             return vec![ClientEffect::Show(ClientEvent::Refused(
                 "одно вложение за раз — дождитесь конца или отключитесь".to_owned(),
@@ -1878,7 +1929,8 @@ impl CompanionClient {
                 "в этом вложении нечего забирать".to_owned(),
             ))];
         }
-        self.download = Some(Download { file_id, next: 0, total: chunk_total, stalled: false });
+        self.download =
+            Some(Download { file_id, next: 0, total: chunk_total, chunk_bytes, stalled: false });
         let effects = self.on_ask(&Request::FileChunk { file_id, index: 0 });
         // Просьба могла не уехать — связи нет, кадр не собрался. Оставить
         // при этом выгрузку «идущей» значило бы запереть её навсегда: второй
@@ -2445,7 +2497,14 @@ impl CompanionClient {
                 upload.total = total;
                 let file_id = upload.ids[at];
                 let which = u32::try_from(at).unwrap_or(u32::MAX);
-                effects.push(ClientEffect::Show(ClientEvent::NeedChunk { file_id, which, index }));
+                let (offset, len) = upload.piece(index);
+                effects.push(ClientEffect::Show(ClientEvent::NeedChunk {
+                    file_id,
+                    which,
+                    index,
+                    offset,
+                    len,
+                }));
             }
             // Место под файл заводится заново. Хвост списка идентификаторов
             // при этом обрезается: всё, что за этой позицией, телефон завести
@@ -2528,7 +2587,7 @@ impl CompanionClient {
                 self.cache.remember_page(chat, page.clone(), before.is_none());
                 ClientEvent::History { chat, page, fresh: true }
             }
-            Response::FileOffer { file_id, chunk_total } => {
+            Response::FileOffer { file_id, chunk_total, chunk_bytes } => {
                 let Some(upload) = self.upload.as_mut() else {
                     return vec![ClientEffect::Show(ClientEvent::Ignored(
                         "место под файл, которого не просили",
@@ -2536,6 +2595,7 @@ impl CompanionClient {
                 };
                 upload.ids.push(file_id);
                 upload.total = chunk_total;
+                upload.chunk_bytes = chunk_bytes;
                 upload.next = 0;
                 let which = u32::try_from(upload.at).unwrap_or(u32::MAX);
                 // Пустой файл — законный файл, и просить у окна кусок,
@@ -2544,7 +2604,8 @@ impl CompanionClient {
                     earlier.extend(self.advance_upload());
                     return earlier;
                 }
-                ClientEvent::NeedChunk { file_id, which, index: 0 }
+                let (offset, len) = upload.piece(0);
+                ClientEvent::NeedChunk { file_id, which, index: 0, offset, len }
             }
             Response::Done => match &asked {
                 // Кусок лёг — просим у окна следующий. Движет отправку
@@ -2559,8 +2620,9 @@ impl CompanionClient {
                     upload.next += 1;
                     let (next, total, file_id) = (upload.next, upload.total, *file_id);
                     let which = u32::try_from(upload.at).unwrap_or(u32::MAX);
+                    let (offset, len) = upload.piece(next);
                     if next < total {
-                        ClientEvent::NeedChunk { file_id, which, index: next }
+                        ClientEvent::NeedChunk { file_id, which, index: next, offset, len }
                     } else {
                         earlier.extend(self.advance_upload());
                         return earlier;
@@ -2683,6 +2745,9 @@ impl CompanionClient {
         let mut effects = vec![ClientEffect::Show(ClientEvent::FileBytes {
             file_id: download.file_id,
             index,
+            // Считается **здесь**, а не у терминала: нарезка приехала
+            // вместе с вложением, и знать её обязан тот, кто её получил.
+            offset: index.saturating_mul(download.chunk_bytes),
             bytes,
         })];
         let next = index + 1;

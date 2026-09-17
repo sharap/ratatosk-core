@@ -294,6 +294,12 @@ pub enum CompanionCommand {
         file_id: FileId,
         /// Сколько в нём кусков — из [`Attachment::chunk_total`].
         chunk_total: u64,
+        /// И какая у него нарезка — из [`Attachment::chunk_bytes`].
+        ///
+        /// **Оба числа из одной записи.** Нарезка у файла своя с миграции
+        /// 0026, и без неё куски не сложить: своим умолчанием драйвер
+        /// раскладывал приехавшее эфиром врастопырку.
+        chunk_bytes: u64,
         /// Куда положить.
         path: PathBuf,
     },
@@ -951,8 +957,8 @@ impl<R: Runner> CompanionDriver<R> {
             CompanionCommand::Avatar { chat } => Request::Avatar { chat },
             CompanionCommand::SetAvatar { bytes } => Request::SetMyAvatar { bytes },
 
-            CompanionCommand::SaveFile { file_id, chunk_total, path } => {
-                self.start_save(file_id, chunk_total, path).await;
+            CompanionCommand::SaveFile { file_id, chunk_total, chunk_bytes, path } => {
+                self.start_save(file_id, chunk_total, chunk_bytes, path).await;
                 return;
             }
             CompanionCommand::CancelSave => {
@@ -978,7 +984,13 @@ impl<R: Runner> CompanionDriver<R> {
     }
 
     /// Готовит запись вложения и просит телефон отдавать куски.
-    async fn start_save(&mut self, file_id: FileId, chunk_total: u64, path: PathBuf) {
+    async fn start_save(
+        &mut self,
+        file_id: FileId,
+        chunk_total: u64,
+        chunk_bytes: u64,
+        path: PathBuf,
+    ) {
         if self.saving.is_some() {
             self.tell(CompanionEvent::Refused(
                 "одно вложение за раз — дождитесь конца или отмените".to_owned(),
@@ -994,7 +1006,7 @@ impl<R: Runner> CompanionDriver<R> {
                 return;
             }
         }
-        self.feed(ClientInput::Fetch { file_id, chunk_total }).await;
+        self.feed(ClientInput::Fetch { file_id, chunk_total, chunk_bytes }).await;
     }
 
     /// Разбирает список файлов и просит телефон отвести место под первый.
@@ -1237,7 +1249,7 @@ impl<R: Runner> CompanionDriver<R> {
     /// драйвер занимается сам.
     async fn show(&mut self, event: ClientEvent) -> Option<ClientInput> {
         match event {
-            ClientEvent::FileBytes { index, bytes, .. } => {
+            ClientEvent::FileBytes { offset, bytes, .. } => {
                 let Some(saving) = self.saving.as_mut() else {
                     tracing::debug!("кусок приехал, а писать некуда");
                     return None;
@@ -1245,10 +1257,15 @@ impl<R: Runner> CompanionDriver<R> {
                 // Запись **по смещению**, а не в конец: дописывание работало
                 // бы ровно до первого повтора куска и молча собрало бы файл
                 // длиннее исходного.
+                //
+                // Смещение — **готовое, из события**. Считать его здесь
+                // значило бы знать нарезку файла, а знает её терминал:
+                // она приехала вместе с вложением. Своим умолчанием драйвер
+                // когда-то и разложил приехавшее эфиром врастопырку.
                 use std::io::{Seek, SeekFrom, Write};
                 let written = saving
                     .file
-                    .seek(SeekFrom::Start(index * CHUNK_BYTES as u64))
+                    .seek(SeekFrom::Start(offset))
                     .and_then(|_| saving.file.write_all(&bytes));
                 if let Err(error) = written {
                     self.abandon_save();
@@ -1286,7 +1303,7 @@ impl<R: Runner> CompanionDriver<R> {
                 }
                 None
             }
-            ClientEvent::NeedChunk { which, index, .. } => {
+            ClientEvent::NeedChunk { which, index, offset, len, .. } => {
                 let Some(sending) = self.sending.as_mut() else {
                     tracing::debug!("телефон просит кусок, а читать нечего");
                     return None;
@@ -1318,10 +1335,14 @@ impl<R: Runner> CompanionDriver<R> {
                 }
                 let Some(sending) = self.sending.as_mut() else { return None };
                 use std::io::{Seek, SeekFrom};
-                let mut buffer = vec![0u8; CHUNK_BYTES];
+                // **Смещение и длина — от терминала, а не свои.** Нарезку
+                // назначает телефон и он же сверяет длину каждого куска:
+                // прочитай драйвер своим умолчанием — телефон отвергал бы
+                // кусок за куском, и выгрузка не ехала бы вовсе.
+                let mut buffer = vec![0u8; usize::try_from(len).unwrap_or(CHUNK_BYTES)];
                 let read = sending
                     .file
-                    .seek(SeekFrom::Start(index * CHUNK_BYTES as u64))
+                    .seek(SeekFrom::Start(offset))
                     .and_then(|_| read_full(&mut sending.file, &mut buffer));
                 match read {
                     Ok(got) => {

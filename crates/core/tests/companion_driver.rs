@@ -535,6 +535,7 @@ async fn a_saved_attachment_really_lands_on_disk() {
                 .send(CompanionCommand::SaveFile {
                     file_id: file.file_id,
                     chunk_total: file.chunk_total,
+                    chunk_bytes: u64::from(file.chunk_bytes),
                     path: target.clone(),
                 })
                 .await
@@ -549,6 +550,97 @@ async fn a_saved_attachment_really_lands_on_disk() {
 
             let written = std::fs::read(&target).expect("файл обязан лежать на диске");
             assert_eq!(written.len() as u64, file.size_bytes, "длина совпала");
+        } => {}
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_saved_attachment_keeps_its_bytes_when_the_narezka_is_not_the_default() {
+    // **Разбор жалобы «файлы через компаньона приходят битыми».**
+    //
+    // Нарезка у файла своя с миграции 0026: в эфире чанк четыре килобайта,
+    // на прочих ступенях мебибайт. Провод компаньона её **не везёт** —
+    // `Response::FileOffer` называет только число кусков, — а десктоп
+    // пишет кусок по смещению `index * CHUNK_BYTES`, то есть по своему
+    // умолчанию. Совпадают они ровно тогда, когда файл ехал не эфиром.
+    //
+    // Проверка выше этого не видит по двум причинам сразу: файл в ней
+    // однокусковый (смещение нулевое при любой нарезке) и сверяется у него
+    // **длина**, а не содержимое. Здесь наоборот: несколько кусков
+    // и побайтовое сравнение.
+    let dir = temp_dir("narezka");
+    let target = dir.join("kot.jpg");
+
+    let (mut driver, mut pair) = paired(1_000);
+    let peer_ik = with_contact(&mut pair.phone, 1_050);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    // **Эфир включён** — и этого довольно: нарезку телефон выбирает
+    // по включённым ступеням (`chunk_bytes_now`), а не по той, которой
+    // файл поедет. У Никиты на телефоне он включён всегда.
+    pair.phone
+        .step(
+            1_060,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается");
+
+    // Несколько кусков эфирной нарезки — и байты не нулевые, иначе
+    // перепутанные смещения не отличить от правильных.
+    let air = ratatosk_proto::files::AIR_CHUNK_BYTES;
+    let bytes: Vec<u8> = (0..air as u32 * 3 + 17).map(|n| (n % 251) as u8).collect();
+    pair.blobs.lock().unwrap().seed("/tmp/kot.jpg", bytes.clone());
+    pair.phone
+        .step(
+            1_100,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![ratatosk_core::OutgoingFile {
+                    path: "/tmp/kot.jpg".into(),
+                    preview: None,
+                }],
+                text: "вот кот".into(),
+            }),
+        )
+        .expect("отправка файла");
+    let msg_id = pair.phone.store().messages(&chat, 1, None).expect("история")[0].msg_id;
+    let file = pair.phone.store().files_of(&msg_id).expect("вложения")[0].clone();
+    assert!(
+        file.chunk_total > 1,
+        "проверка бессмысленна на одном куске: смещение нулевое при любой нарезке"
+    );
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_200).await;
+            pair.handle
+                .send(CompanionCommand::SaveFile {
+                    file_id: file.file_id,
+                    chunk_total: file.chunk_total,
+                    chunk_bytes: u64::from(file.chunk_bytes),
+                    path: target.clone(),
+                })
+                .await
+                .expect("команда принята");
+            pair.settle(1_300).await;
+
+            pair.wait_for(|event| match event {
+                CompanionEvent::FileSaved { path, .. } => Some(path.clone()),
+                _ => None,
+            }).await;
+
+            let written = std::fs::read(&target).expect("файл обязан лежать на диске");
+            assert_eq!(
+                written.len(),
+                bytes.len(),
+                "длина обязана совпасть: по чужой нарезке куски ложатся врастопырку"
+            );
+            assert!(written == bytes, "и содержимое — до байта, иначе файл битый");
         } => {}
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -592,6 +684,7 @@ async fn cancelling_a_save_removes_the_half_written_file() {
                 .send(CompanionCommand::SaveFile {
                     file_id: file.file_id,
                     chunk_total: file.chunk_total,
+                    chunk_bytes: u64::from(file.chunk_bytes),
                     path: target.clone(),
                 })
                 .await
@@ -661,6 +754,60 @@ async fn sending_two_files_reads_both_from_disk_in_order() {
     }
     let _ = std::fs::remove_dir_all(&first_dir);
     let _ = std::fs::remove_dir_all(&second_dir);
+}
+
+#[tokio::test]
+async fn a_file_going_up_is_cut_the_way_the_phone_agreed_to_take_it() {
+    // **Та же беда, что и на приёме, только с другой стороны провода.**
+    // Телефон нарезает выгрузку своим числом (`chunk_bytes_now`) и сам же
+    // сверяет длину каждого куска; десктоп читает исходник по своему
+    // умолчанию. Разойдись они — телефон отвергает кусок за куском,
+    // и выгрузка не едет вовсе.
+    let dir = temp_dir("send-narezka");
+    let path = dir.join("bolshoy.bin");
+    let air = ratatosk_proto::files::AIR_CHUNK_BYTES;
+    let bytes: Vec<u8> = (0..air as u32 * 2 + 9).map(|n| (n % 241) as u8).collect();
+    std::fs::write(&path, &bytes).expect("исходник");
+
+    let (mut driver, mut pair) = paired(1_000);
+    let peer_ik = with_contact(&mut pair.phone, 1_050);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    pair.phone
+        .step(
+            1_060,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается");
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_100).await;
+            pair.handle
+                .send(CompanionCommand::SendFiles {
+                    chat,
+                    files: vec![(path.clone(), None)],
+                    text: "большой".into(),
+                })
+                .await
+                .expect("команда принята");
+            pair.settle(1_200).await;
+
+            let sent = pair.wait_for(|event| match event {
+                CompanionEvent::FilesSent { file_ids } => Some(file_ids.clone()),
+                _ => None,
+            }).await;
+            assert_eq!(sent.len(), 1, "файл обязан уехать, а не застрять на первом куске");
+
+            let history = pair.phone.store().messages(&chat, 10, None).expect("история");
+            let stored = pair.phone.store().files_of(&history[0].msg_id).expect("вложения");
+            assert_eq!(stored[0].size_bytes, bytes.len() as u64, "и доехать целиком");
+        } => {}
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -744,6 +891,7 @@ async fn a_broken_link_leaves_the_part_file_and_finishes_it_later() {
                 .send(CompanionCommand::SaveFile {
                     file_id: file.file_id,
                     chunk_total: file.chunk_total,
+                    chunk_bytes: u64::from(file.chunk_bytes),
                     path: target.clone(),
                 })
                 .await

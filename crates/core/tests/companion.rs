@@ -702,7 +702,7 @@ fn stage<S: Store>(
             preview: None,
         },
     );
-    let Response::FileOffer { file_id, chunk_total } = answer else {
+    let Response::FileOffer { file_id, chunk_total, .. } = answer else {
         panic!("телефон обязан отвести место, а не {answer:?}");
     };
     for index in 0..chunk_total {
@@ -847,7 +847,7 @@ fn the_staged_answer_names_the_holes_and_not_the_count() {
         1_200,
         &Request::FileOffer { chat, name: "big.bin".into(), size_bytes: size, preview: None },
     );
-    let Response::FileOffer { file_id, chunk_total } = answer else {
+    let Response::FileOffer { file_id, chunk_total, .. } = answer else {
         panic!("место отведено");
     };
     assert_eq!(chunk_total, 3);

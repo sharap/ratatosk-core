@@ -1269,6 +1269,8 @@ impl Console {
             return Some(CompanionCommand::SaveFile {
                 file_id: file.file_id,
                 chunk_total: file.chunk_total,
+                // Нарезка — из той же записи: у каждого файла она своя.
+                chunk_bytes: file.chunk_bytes,
                 path: PathBuf::from(path),
             });
         }

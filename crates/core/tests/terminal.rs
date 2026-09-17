@@ -803,7 +803,11 @@ fn the_desktop_takes_an_attachment_chunk_by_chunk_and_gets_all_of_it() {
 
     let started = desktop.step(
         1_200,
-        ClientInput::Fetch { file_id: attachment.file_id, chunk_total: attachment.chunk_total },
+        ClientInput::Fetch {
+            file_id: attachment.file_id,
+            chunk_total: attachment.chunk_total,
+            chunk_bytes: attachment.chunk_bytes,
+        },
     );
     let shown = pump(&mut phone, &mut desktop, 1_200, started);
 
@@ -849,10 +853,24 @@ fn a_second_fetch_while_one_is_running_is_refused_in_words() {
     let file_id = phone.store().files_of(&msg_id).expect("вложения")[0].file_id;
 
     // Первая просьба уходит и **не** прокачивается: выгрузка остаётся идущей.
-    let started = desktop.step(1_200, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let started = desktop.step(
+        1_200,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     assert!(started.iter().any(|effect| matches!(effect, ClientEffect::Send(_))));
 
-    let second = desktop.step(1_300, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let second = desktop.step(
+        1_300,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     let refused =
         second.iter().any(|effect| matches!(effect, ClientEffect::Show(ClientEvent::Refused(_))));
     assert!(refused, "вторая выгрузка обязана быть отвергнута словами");
@@ -896,7 +914,14 @@ fn a_download_that_lost_the_link_waits_instead_of_hanging_or_dying() {
     // разрыв **посреди**. Просьба о следующем куске при этом никуда
     // не уезжает — её эффект здесь просто не подхватывается, и выглядит это
     // для терминала ровно как потерянный кадр.
-    let started = desktop.step(1_200, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let started = desktop.step(
+        1_200,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     let mut shown = Vec::new();
     for effect in started {
         let ClientEffect::Send(frame) = effect else { continue };
@@ -917,7 +942,14 @@ fn a_download_that_lost_the_link_waits_instead_of_hanging_or_dying() {
 
     // Место при этом **занято**, и это обратное прежнему правилу: приём
     // не закрыт, он ждёт. Освобождает его отмена человеком, а не разрыв.
-    let again = desktop.step(1_400, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let again = desktop.step(
+        1_400,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     assert!(
         again.iter().any(|effect| matches!(
             effect,
@@ -1905,7 +1937,14 @@ fn stopping_a_fetch_needs_no_word_with_the_phone() {
     let msg_id = phone.store().messages(&chat, 1, None).expect("история")[0].msg_id;
     let file_id = phone.store().files_of(&msg_id).expect("вложения")[0].file_id;
 
-    let started = desktop.step(1_200, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let started = desktop.step(
+        1_200,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     assert!(started.iter().any(|effect| matches!(effect, ClientEffect::Send(_))));
 
     let stopped = desktop.step(1_300, ClientInput::CancelFetch);
@@ -1919,7 +1958,14 @@ fn stopping_a_fetch_needs_no_word_with_the_phone() {
 
     // И место освобождено: следующая выгрузка принимается, а не отвергается
     // «одно вложение за раз».
-    let again = desktop.step(1_400, ClientInput::Fetch { file_id, chunk_total: 3 });
+    let again = desktop.step(
+        1_400,
+        ClientInput::Fetch {
+            file_id,
+            chunk_total: 3,
+            chunk_bytes: ratatosk_proto::files::CHUNK_BYTES as u64,
+        },
+    );
     assert!(again.iter().any(|effect| matches!(effect, ClientEffect::Send(_))));
 }
 

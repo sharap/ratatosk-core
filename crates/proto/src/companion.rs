@@ -159,7 +159,19 @@ pub const MAX_GONE_IDS: usize = 256;
 /// а отдача не ехала вовсе — телефон отвергал кусок за куском как
 /// «не той длины». Снаружи и то и другое выглядело как «файлы через
 /// компаньона приходят битыми».
-pub const WIRE_VERSION: u32 = 21;
+///
+/// Двадцать два — **пачка кусков за просьбу**: поле `count`
+/// у [`Request::FileChunk`]. Появилось, а не сменило форму; телефон
+/// постарше его не прочтёт и ответит одним куском, как отвечал всегда,
+/// а десктоп постарше не пришлёт — и получит то же самое.
+///
+/// Причина — та же нарезка эфира. Просьба о куске стоит круга по сети,
+/// и пока кусок был мебибайтом, один кусок за круг ничего не стоил:
+/// сто мегабайт — сотня кругов. С куском в четыре килобайта те же сто
+/// мегабайт стали двадцатью восемью тысячами кругов, и вложения через
+/// компаньона поползли даже по локальной сети. Кадр ответа при этом
+/// рассчитан на мебибайт и вёз четыре килобайта.
+pub const WIRE_VERSION: u32 = 22;
 
 /// Наибольшее число сообщений в одной просьбе десктопа.
 ///
@@ -323,6 +335,8 @@ const KEY_WHO: u64 = 41;
 /// в одиннадцать килобайт ложился на диск тремя килобайтами в трёх
 /// мебибайтах пустоты. Снаружи — «файлы приходят битыми».
 const KEY_CHUNK_BYTES: u64 = 42;
+/// Сколько кусков подряд просит десктоп одной просьбой.
+const KEY_COUNT: u64 = 43;
 
 // Виды запроса, ответа и новости нумеруются **каждый в своей области**,
 // и имена это называют вслух. Сперва все три набора звались `KIND_*`,
@@ -777,8 +791,29 @@ pub enum Request {
     FileChunk {
         /// Какого вложения.
         file_id: crate::files::FileId,
-        /// Какой кусок, от нуля до `chunk_total - 1`.
+        /// С какого куска, от нуля до `chunk_total - 1`.
         index: u64,
+        /// И сколько подряд — **не меньше одного**.
+        ///
+        /// **Ради чего это поле.** Просьба здесь стоит целого круга
+        /// по сети, и до него провод возил ровно один кусок за круг.
+        /// Пока кусок был мебибайтом, это ничего не стоило: сто мегабайт
+        /// — сотня кругов. С нарезкой эфира (четыре килобайта) те же сто
+        /// мегабайт превратились в двадцать восемь тысяч кругов, и файлы
+        /// через компаньона поползли **даже по локальной сети**.
+        ///
+        /// Кадр же у ответа рассчитан на целый мебибайт — это проверено
+        /// числом (`a_whole_chunk_still_fits_the_frame_it_has_to_ride_in`).
+        /// Значит везти в нём один кусок в четыре килобайта незачем:
+        /// [`chunks_per_ask`] говорит, сколько их туда войдёт.
+        ///
+        /// Телефон вправе отдать **меньше**, чем просят: за концом файла
+        /// или на первой же дырке в приёме. Сколько отдал — видно
+        /// по длине ответа, и десктоп продолжает с этого места.
+        ///
+        /// Отсутствие поля читается как единица: сборка десктопа постарше
+        /// просила по куску, и телефон обязан ей отвечать по-прежнему.
+        count: u64,
     },
     /// Принять входящее вложение к загрузке (§10.2).
     ///
@@ -1378,6 +1413,35 @@ pub struct StagedFile {
 /// константа не заводится — здесь как раз тот случай, когда второе число
 /// было бы вторым правилом.
 pub const MAX_ATTACHMENTS: usize = crate::files::MAX_FILES_PER_MESSAGE;
+
+/// Сколько байт вложения провод везёт одним ответом.
+///
+/// Ровно кусок §10.2 — число не выдумано, а взято у того, подо что кадр
+/// ответа и подогнан: [`crate::files::CHUNK_BYTES`] помещается в класс L
+/// вместе с конвертом компаньона, и это проверено числом, а не оценкой
+/// (`a_whole_chunk_still_fits_the_frame_it_has_to_ride_in`). Второе число
+/// здесь означало бы второе правило, которое разъедется с первым.
+pub const ASK_BYTES: u64 = crate::files::CHUNK_BYTES as u64;
+
+/// Сколько кусков такой нарезки просить одной просьбой.
+///
+/// **Просьба стоит круга по сети, кусок — нет.** При нарезке в мебибайт
+/// ответ и так везёт один кусок; при эфирной (четыре килобайта) в тот же
+/// кадр их входит под три сотни, и круги сокращаются во столько же раз.
+/// Меньше одного не бывает: кусок крупнее кадра сюда не попадёт —
+/// §10.2 подбирает нарезку под класс L.
+#[must_use]
+pub const fn chunks_per_ask(chunk_bytes: u64) -> u64 {
+    if chunk_bytes == 0 {
+        return 1;
+    }
+    let fits = ASK_BYTES / chunk_bytes;
+    if fits == 0 {
+        1
+    } else {
+        fits
+    }
+}
 
 /// Карточка человека, которой поделились в чате, — глазами десктопа.
 ///
@@ -1997,11 +2061,12 @@ pub fn request_payload(id: u64, request: &Request) -> Value {
                 .push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_CLEAR_CHAT.into())));
             fields.push((Value::Integer(KEY_CHAT.into()), Value::Bytes(chat.to_vec())));
         }
-        Request::FileChunk { file_id, index } => {
+        Request::FileChunk { file_id, index, count } => {
             fields
                 .push((Value::Integer(KEY_KIND.into()), Value::Integer(REQUEST_FILE_CHUNK.into())));
             fields.push((Value::Integer(KEY_FILE_ID.into()), Value::Bytes(file_id.to_vec())));
             fields.push((Value::Integer(KEY_INDEX.into()), Value::Integer((*index).into())));
+            fields.push((Value::Integer(KEY_COUNT.into()), Value::Integer((*count).into())));
         }
         Request::AcceptFile { file_id } => {
             fields.push((
@@ -2272,6 +2337,13 @@ pub fn request_from_payload(value: &Value) -> Result<(u64, Request), CodecError>
         REQUEST_FILE_CHUNK => Request::FileChunk {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
             index: canonical::as_u64(canonical::require(map, KEY_INDEX)?)?,
+            // Ноль читается как единица заодно с отсутствием: просьба
+            // «отдай нисколько» — это не просьба, а телефон, отвечающий
+            // на неё пустотой, выглядел бы как оборванная передача.
+            count: match canonical::get(map, KEY_COUNT) {
+                Some(value) => canonical::as_u64(value)?.max(1),
+                None => 1,
+            },
         },
         REQUEST_ACCEPT_FILE => Request::AcceptFile {
             file_id: canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?,
@@ -3298,7 +3370,7 @@ mod tests {
     /// они ради истории и ради того, чтобы правка последней строки на месте
     /// бросалась в глаза. Проверяется последняя: она обязана назвать
     /// [`WIRE_VERSION`] и сойтись с тем, что кодировщики строят сейчас.
-    const WIRE_SHAPES: [(u32, u64); 10] = [
+    const WIRE_SHAPES: [(u32, u64); 11] = [
         (12, 0x1ef3_4b21_4945_d1f1),
         (13, 0x9bba_1505_7b0f_b8ed),
         (14, 0x6558_a89b_8e4a_6268),
@@ -3309,6 +3381,7 @@ mod tests {
         (19, 0x7de1_f453_44f8_5b34),
         (20, 0xc637_afae_ca20_a717),
         (21, 0xf010_778b_812f_db68),
+        (22, 0x1ec9_73aa_de96_1ad2),
     ];
 
     /// **Подсказка сторожа верна до поднятия версии, а не после.**
@@ -3526,7 +3599,7 @@ mod tests {
             Request::RetractMessages { chat, msg_ids: vec![msg_id] },
             Request::ForwardMessages { chat, msg_ids: vec![msg_id] },
             Request::ClearChat { chat },
-            Request::FileChunk { file_id, index: 7 },
+            Request::FileChunk { file_id, index: 7, count: 1 },
             Request::AcceptFile { file_id },
             Request::DeclineFile { file_id },
             Request::PauseFile { file_id },
@@ -4032,8 +4105,8 @@ mod tests {
             Request::RetractMessages { chat: [6u8; 16], msg_ids: vec![[7u8; 16]] },
             Request::ForwardMessages { chat: [6u8; 16], msg_ids: vec![[7u8; 16]] },
             Request::ClearChat { chat: [6u8; 16] },
-            Request::FileChunk { file_id: [9u8; 16], index: 0 },
-            Request::FileChunk { file_id: [9u8; 16], index: 4_095 },
+            Request::FileChunk { file_id: [9u8; 16], index: 0, count: 1 },
+            Request::FileChunk { file_id: [9u8; 16], index: 4_095, count: 1 },
             Request::AcceptFile { file_id: [9u8; 16] },
             Request::DeclineFile { file_id: [9u8; 16] },
             Request::Hello,
@@ -4127,7 +4200,10 @@ mod tests {
             (kind(&Request::RetractMessages { chat, msg_ids: Vec::new() }), REQUEST_RETRACT),
             (kind(&Request::ForwardMessages { chat, msg_ids: Vec::new() }), REQUEST_FORWARD),
             (kind(&Request::ClearChat { chat }), REQUEST_CLEAR_CHAT),
-            (kind(&Request::FileChunk { file_id: [3u8; 16], index: 0 }), REQUEST_FILE_CHUNK),
+            (
+                kind(&Request::FileChunk { file_id: [3u8; 16], index: 0, count: 1 }),
+                REQUEST_FILE_CHUNK,
+            ),
             (kind(&Request::AcceptFile { file_id: [3u8; 16] }), REQUEST_ACCEPT_FILE),
             (kind(&Request::DeclineFile { file_id: [3u8; 16] }), REQUEST_DECLINE_FILE),
             (kind(&Request::Hello), REQUEST_HELLO),
@@ -4212,8 +4288,17 @@ mod tests {
         //
         // Тот же приём, что у почты (`a_letter_with_a_chunk_fits_the_limit`):
         // сверяем с настоящим собранным значением, а не с прикидкой.
-        let full =
-            Response::FileChunk { index: u64::MAX, bytes: vec![0xa5; crate::files::CHUNK_BYTES] };
+        // Мерится **`ASK_BYTES`**, а не `CHUNK_BYTES`, хотя числа равны:
+        // столько провод везёт одним ответом, и именно от этого числа
+        // считает пачку `chunks_per_ask`. Разойдись они однажды — падать
+        // обязана эта проверка, а не файлы у человека.
+        let full = Response::FileChunk {
+            index: u64::MAX,
+            bytes: vec![
+                0xa5;
+                usize::try_from(ASK_BYTES).expect("пачка мерится байтами")
+            ],
+        };
         let encoded = canonical::encode(&response_payload(u64::MAX, &full))
             .expect("ответ обязан кодироваться");
         assert!(

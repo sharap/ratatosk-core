@@ -8662,13 +8662,32 @@ impl<S: Store> Engine<S> {
             // за просьбу. Между кусками ядро успевает всё остальное,
             // и «телефон замер на время выгрузки» превращается в «телефон
             // отвечает медленнее, пока идёт выгрузка».
-            companion::Request::FileChunk { file_id, index } => {
+            companion::Request::FileChunk { file_id, index, count } => {
                 let Some(reader) = self.open_file(&file_id)? else {
                     return Ok(companion::Response::Refused(
                         "этого вложения у телефона нет".to_owned(),
                     ));
                 };
-                match reader.chunk(index)? {
+                // **Пачкой, а не по куску.** Кадр ответа рассчитан на целый
+                // мебибайт, и везти в нём четыре килобайта значило бы
+                // платить кругом по сети за каждую трёхсотую долю того,
+                // что и так влезает. Работы на просьбу при этом ровно
+                // столько же, сколько её было до нарезки эфира: мебибайт
+                // прочитать и расшифровать.
+                //
+                // Отдаём **сколько получится**: за концом файла и на первой
+                // же дырке в приёме пачка кончается. Сколько отдали, видно
+                // по длине — десктоп продолжит с этого места.
+                let mut bytes = Vec::new();
+                let want = count.min(companion::chunks_per_ask(u64::from(reader.chunk_bytes())));
+                for step in 0..want {
+                    let Some(piece) = reader.chunk(index.saturating_add(step))? else { break };
+                    bytes.extend_from_slice(&piece);
+                    if bytes.len() as u64 >= companion::ASK_BYTES {
+                        break;
+                    }
+                }
+                match (!bytes.is_empty()).then_some(bytes) {
                     Some(bytes) => Ok(companion::Response::FileChunk { index, bytes }),
                     // Три случая на один ответ, и различать их телефон
                     // не может сам (`FileReader::chunk`): кусок ещё не

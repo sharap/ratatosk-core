@@ -1053,7 +1053,7 @@ fn an_attachment_is_named_in_the_page_and_handed_over_chunk_by_chunk() {
             &mut phone,
             &mut desktop,
             1_400 + index,
-            &Request::FileChunk { file_id: attachment.file_id, index },
+            &Request::FileChunk { file_id: attachment.file_id, index, count: 1 },
         );
         let Response::FileChunk { index: got, bytes } = answer else {
             panic!("кусок вложения, а не {answer:?}");
@@ -1070,7 +1070,11 @@ fn an_attachment_is_named_in_the_page_and_handed_over_chunk_by_chunk() {
         &mut phone,
         &mut desktop,
         1_500,
-        &Request::FileChunk { file_id: attachment.file_id, index: attachment.chunk_total },
+        &Request::FileChunk {
+            file_id: attachment.file_id,
+            index: attachment.chunk_total,
+            count: 1,
+        },
     );
     assert!(matches!(past, Response::Refused(_)), "за концом файла — отказ, а не пустота");
 }

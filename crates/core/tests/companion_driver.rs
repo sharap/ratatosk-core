@@ -101,6 +101,12 @@ struct Pair {
     commands: Arc<Mutex<Vec<TransportCommand>>>,
     /// Ссылка сопряжения целиком — из неё тест собирает снимок на диск.
     invite: PairingInvite,
+    /// Сколько кадров доехало до телефона — то есть кругов по сети.
+    ///
+    /// Считается ради одной проверки: круг здесь стоит столько же,
+    /// сколько в жизни, и «медленно по локальной сети» — это про их число,
+    /// а не про байты.
+    turns: u64,
 }
 
 impl Pair {
@@ -110,6 +116,7 @@ impl Pair {
     /// сошёлся и ждать больше нечего.
     async fn turn(&mut self, now_ms: u64) -> bool {
         let Ok(frame) = self.from_desktop.try_recv() else { return false };
+        self.turns += 1;
         let effects = self
             .phone
             .step(now_ms, Input::Received { via: Transport::Lan, frame })
@@ -341,6 +348,7 @@ fn paired_with(
             addressed,
             commands,
             invite,
+            turns: 0,
         },
     )
 }
@@ -641,6 +649,97 @@ async fn a_saved_attachment_keeps_its_bytes_when_the_narezka_is_not_the_default(
                 "длина обязана совпасть: по чужой нарезке куски ложатся врастопырку"
             );
             assert!(written == bytes, "и содержимое — до байта, иначе файл битый");
+        } => {}
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_finely_cut_attachment_does_not_cost_a_round_trip_per_piece() {
+    // **Жалоба со стенда: «через компаньона файлы ползут даже по LAN».**
+    //
+    // Провод забирал вложение по куску за просьбу, а просьба — это круг
+    // по сети. Пока кусок был мебибайтом, это ничего не стоило: сто
+    // мегабайт — сотня кругов. С нарезкой эфира (четыре килобайта) те же
+    // сто мегабайт стали двадцатью восемью тысячами кругов. Байты те же,
+    // время — другое.
+    //
+    // Кадр ответа при этом рассчитан на целый мебибайт и вёз четыре
+    // килобайта. Проверка про то, что теперь он везёт столько, сколько
+    // влезает.
+    let dir = temp_dir("packs");
+    let target = dir.join("bolshoy.bin");
+
+    let (mut driver, mut pair) = paired(1_000);
+    let peer_ik = with_contact(&mut pair.phone, 1_050);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+    pair.phone
+        .step(
+            1_060,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Bt,
+                enabled: true,
+            }),
+        )
+        .expect("эфир включается");
+
+    let air = ratatosk_proto::files::AIR_CHUNK_BYTES as u64;
+    let pieces = 600u64;
+    let bytes: Vec<u8> = (0..(air * pieces) as u32).map(|n| (n % 251) as u8).collect();
+    pair.blobs.lock().unwrap().seed("/tmp/bolshoy.bin", bytes.clone());
+    pair.phone
+        .step(
+            1_100,
+            Input::Command(Command::SendFiles {
+                chat,
+                files: vec![ratatosk_core::OutgoingFile {
+                    path: "/tmp/bolshoy.bin".into(),
+                    preview: None,
+                }],
+                text: String::new(),
+            }),
+        )
+        .expect("отправка файла");
+    let msg_id = pair.phone.store().messages(&chat, 1, None).expect("история")[0].msg_id;
+    let file = pair.phone.store().files_of(&msg_id).expect("вложения")[0].clone();
+    assert_eq!(file.chunk_total, pieces, "нарезка обязана быть эфирной, иначе мерить нечего");
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            pair.settle(1_200).await;
+            // Считаем **только выгрузку**: рукопожатие и список чатов
+            // к делу не относятся.
+            pair.turns = 0;
+            pair.handle
+                .send(CompanionCommand::SaveFile {
+                    file_id: file.file_id,
+                    chunk_total: file.chunk_total,
+                    chunk_bytes: u64::from(file.chunk_bytes),
+                    path: target.clone(),
+                })
+                .await
+                .expect("команда принята");
+            pair.settle(1_300).await;
+
+            pair.wait_for(|event| match event {
+                CompanionEvent::FileSaved { path, .. } => Some(path.clone()),
+                _ => None,
+            }).await;
+
+            let written = std::fs::read(&target).expect("файл обязан лежать на диске");
+            assert!(written == bytes, "быстрее — не значит кое-как: байты до одного");
+
+            // **Число считается от правила, а не выписано.** Кусков шесть
+            // сотен; кругов обязано быть примерно столько, сколько пачек,
+            // — и уж точно не по кругу на кусок.
+            let per_ask = ratatosk_proto::companion::chunks_per_ask(air);
+            let packs = pieces.div_ceil(per_ask);
+            assert!(
+                pair.turns <= packs * 2 + 4,
+                "кругов {} при {packs} пачках ({per_ask} кусков в каждой) — провод снова возит по куску",
+                pair.turns
+            );
         } => {}
     }
     let _ = std::fs::remove_dir_all(&dir);

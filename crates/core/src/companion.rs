@@ -24,7 +24,8 @@ use ratatosk_crdt::{Hlc, MsgId};
 use ratatosk_crypto::handshake::{Initiator, PendingHandshake};
 use ratatosk_crypto::{Identity, Session};
 use ratatosk_proto::companion::{
-    self, ChatSummary, DeviceId, Member, Message, Notice, PairingInvite, Request, Response,
+    self, chunks_per_ask, ChatSummary, DeviceId, Member, Message, Notice, PairingInvite, Request,
+    Response,
 };
 use ratatosk_wire::FrameType;
 
@@ -1931,7 +1932,11 @@ impl CompanionClient {
         }
         self.download =
             Some(Download { file_id, next: 0, total: chunk_total, chunk_bytes, stalled: false });
-        let effects = self.on_ask(&Request::FileChunk { file_id, index: 0 });
+        let effects = self.on_ask(&Request::FileChunk {
+            file_id,
+            index: 0,
+            count: chunks_per_ask(chunk_bytes),
+        });
         // Просьба могла не уехать — связи нет, кадр не собрался. Оставить
         // при этом выгрузку «идущей» значило бы запереть её навсегда: второй
         // `Fetch` отвечался бы «одно вложение за раз», а первого нет.
@@ -2390,8 +2395,11 @@ impl CompanionClient {
             done: download.next,
             total: download.total,
         })];
-        let asked =
-            self.on_ask(&Request::FileChunk { file_id: download.file_id, index: download.next });
+        let asked = self.on_ask(&Request::FileChunk {
+            file_id: download.file_id,
+            index: download.next,
+            count: chunks_per_ask(download.chunk_bytes),
+        });
         // Не уехала — значит связь опять пропала между рукопожатием и этой
         // просьбой. Оставляем ждущей: следующий круг попробует снова.
         if !asked.iter().any(|effect| matches!(effect, ClientEffect::Send(_))) {
@@ -2722,7 +2730,7 @@ impl CompanionClient {
     /// который мы ждём, обязаны совпасть: кусок, приехавший не на своё место,
     /// собрал бы файл, который выглядит целым и не является им.
     fn on_chunk(&mut self, asked: &Request, index: u64, bytes: Vec<u8>) -> Vec<ClientEffect> {
-        let Request::FileChunk { file_id, index: wanted } = asked else {
+        let Request::FileChunk { file_id, index: wanted, .. } = asked else {
             return vec![ClientEffect::Show(ClientEvent::Ignored(
                 "кусок в ответ на другую просьбу",
             ))];
@@ -2742,6 +2750,17 @@ impl CompanionClient {
             ))];
         }
 
+        // **Сколько кусков приехало, видно по длине.** Телефон вправе
+        // отдать меньше, чем просили, — за концом файла или на дырке
+        // в приёме, — и считать съеденное по просьбе значило бы
+        // перепрыгнуть через непривезённое и собрать файл с дырой.
+        let eaten = {
+            let chunk = download.chunk_bytes.max(1);
+            let whole = bytes.len() as u64;
+            // Округление вверх: хвост файла короче куска, но кусок это
+            // целый — иначе последняя пачка не досчиталась бы одного.
+            whole.div_ceil(chunk).max(1)
+        };
         let mut effects = vec![ClientEffect::Show(ClientEvent::FileBytes {
             file_id: download.file_id,
             index,
@@ -2750,7 +2769,7 @@ impl CompanionClient {
             offset: index.saturating_mul(download.chunk_bytes),
             bytes,
         })];
-        let next = index + 1;
+        let next = index + eaten;
         if next >= download.total {
             self.download = None;
             effects.push(ClientEffect::Show(ClientEvent::FileDone { file_id: download.file_id }));
@@ -2758,8 +2777,11 @@ impl CompanionClient {
         }
 
         self.download = Some(Download { next, ..download });
-        let asked_next =
-            self.on_ask(&Request::FileChunk { file_id: download.file_id, index: next });
+        let asked_next = self.on_ask(&Request::FileChunk {
+            file_id: download.file_id,
+            index: next,
+            count: chunks_per_ask(download.chunk_bytes),
+        });
         // Просьба не уехала — связь пропала между куском и следующей просьбой.
         // Раньше выгрузка здесь закрывалась; теперь она **ждёт**: записанное
         // на диске никуда не делось, и продолжить его дешевле, чем качать

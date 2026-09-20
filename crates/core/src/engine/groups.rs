@@ -799,6 +799,39 @@ impl<S: Store> Engine<S> {
         if state.group.owner != me {
             return Err(group::GroupError::NotOwner.into());
         }
+        // **У канала имя живёт в подписанном представлении (§6.1), а не
+        // в действии переименования.** Иначе у названия два хозяина:
+        // строка чата у владельца меняется действием, а читателю приезжает
+        // документ со **старым** именем и молча возвращает его обратно.
+        // Ровно так это и выглядело бы после починки пустого имени
+        // у читателя: один переименовал, у всех осталось прежнее.
+        //
+        // Предел в байтах здесь свой: документ подписывается и едет
+        // ссылкой, и §6.1 меряет название байтами, а не знаками.
+        if !state.profile.everyone_writes() {
+            if title.len() > channel::MAX_TITLE_BYTES {
+                return Err(EngineError::GroupTitleTooLong);
+            }
+            // **Право, потом доставка, и порядок тут тот же, что у слова.**
+            // `publish_representation` пускает одного владельца и отказывает
+            // всем словами «нет права» — а у держателя `EDIT` право как раз
+            // есть, мешает ему доставка: состав канала знает владелец
+            // (§3.2), и развозить веером делегату некому. Сказать ему
+            // «нет права» значило бы посоветовать просить то, что у него
+            // уже есть (`even_with_the_edit_right_a_delegate_does_not_publish_in_a_star`).
+            self.check_may_put(now_ms, chat, channel::Rights::EDIT)?;
+            self.check_may_publish(chat)?;
+            let named = title.to_owned();
+            let mut effects =
+                self.publish_representation(now_ms, chat, move |next| next.title = named)?;
+            // Своя строка чата — тем же шагом: `publish_representation`
+            // трогает документ, а список чатов живёт в `chats`.
+            let at = self.clock.now(now_ms)?;
+            if self.apply_rename(chat, title, at)? {
+                effects.push(Effect::Notify(Event::GroupRenamed { chat, title: title.to_owned() }));
+            }
+            return Ok(effects);
+        }
         // Состоим ли — не спрашиваем: спросит сборка кадра, и её отказ
         // (`NotInGroup`) точнее. Вышедший создатель попадёт именно сюда.
         let action = ratatosk_proto::group_action::Action::Rename { title: title.to_owned() };

@@ -682,6 +682,20 @@ pub enum FfiEvent {
         /// Название из новой версии.
         title: String,
     },
+    /// Кто-то просится в канал (фаза 2, §10.4).
+    ///
+    /// Приходит **владельцу**. Ответ на заявку один — впуск
+    /// ([`RatatoskClient::admit_to_channel`]); отказа как сообщения
+    /// не бывает, и молчание и есть отказ. Показывать это надо так же:
+    /// список просящих и кнопка «впустить», а не «принять/отклонить».
+    ///
+    /// Карточка просящего уже приехала: заявка везёт только канал.
+    ChannelRequested {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Кто просится.
+        who: Vec<u8>,
+    },
     /// Отписались от канала (фаза 2, §10.6).
     ///
     /// Чата больше нет: ни истории, ни ключей чтения, ни представления.
@@ -1375,6 +1389,25 @@ pub struct FfiChannelGrant {
     /// выражается отсутствием строки, а не надгробием, — и показывать её
     /// действующей нельзя.
     pub live: bool,
+}
+
+/// Заявка на подписку — то, что видит владелец (фаза 2, §10.4).
+///
+/// Ответ на неё один — впуск ([`RatatoskClient::admit_to_channel`]).
+/// Отказа как сообщения не бывает: §10.4 знает только впуск, а молчание
+/// владельца и есть отказ. Рисовать поэтому надо список и кнопку
+/// «впустить», а не пару «принять/отклонить»: вторая обещала бы
+/// просящему ответ, которого он не получит.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannelRequest {
+    /// Кто просится.
+    pub who: Vec<u8>,
+    /// Как его назвать. Карточка приехала рукопожатием (§8.2), и он
+    /// **непроверенный контакт**, как всякий, кто написал первым.
+    pub name: String,
+    /// Когда попросил впервые, мс. Повтор заявки время не двигает:
+    /// §10.5 меряет ожидание от первой просьбы.
+    pub received_ms: u64,
 }
 
 /// Запись о впуске — учёт владельца (фаза 2, §6.5).
@@ -3284,6 +3317,15 @@ impl RatatoskClient {
     ///
     /// У канала по приглашению событие придёт с `awaiting = true`:
     /// впустить должен владелец, и до впуска читать будет нечего.
+    ///
+    /// **Заявка едет обычной очередью §5.4 и вправе ждать.** Ссылка везёт
+    /// onion, почту, меш, ключ nostr и реле (§10.2), но не адрес
+    /// в локальной сети —
+    /// он меняется при каждом подключении. Если в ссылке адресов нет
+    /// вовсе, до владельца дотянутся только через эфир, и заявка полежит
+    /// в очереди, пока его не станет слышно. Клиенту стоит сказать это
+    /// словами: «ждём впуска» без объяснения выглядит обещанием, которого
+    /// никто не давал (§14).
     pub fn subscribe_to_channel(&self, uri: String) -> Result<(), RatatoskError> {
         self.command(Command::SubscribeToChannel { uri })
     }
@@ -3410,6 +3452,32 @@ impl RatatoskClient {
                 rights: rights_of(grant.rights),
                 until_ms: grant.until_ms,
                 live: grant.live,
+            })
+            .collect())
+    }
+
+    /// Кто просится в канал (фаза 2, §10.4).
+    ///
+    /// Приходит владельцу и только ему. Заявка ложится на диск и ждёт:
+    /// §10.4 прямо говорит «владелец офлайн — заявка ждёт», и ждать она
+    /// может сутками.
+    ///
+    /// Отвеченная заявка исчезает сама: впуск и есть ответ.
+    pub fn channel_requests(
+        &self,
+        chat_id: Vec<u8>,
+    ) -> Result<Vec<FfiChannelRequest>, RatatoskError> {
+        let found = self
+            .opened
+            .handle
+            .channel_requests_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found
+            .into_iter()
+            .map(|request| FfiChannelRequest {
+                who: request.who.to_vec(),
+                name: request.name,
+                received_ms: request.received_ms,
             })
             .collect())
     }
@@ -4672,6 +4740,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         }
         Event::ChannelUnsubscribed { chat } => {
             FfiEvent::ChannelUnsubscribed { chat_id: chat.to_vec() }
+        }
+        Event::ChannelRequested { chat, who } => {
+            FfiEvent::ChannelRequested { chat_id: chat.to_vec(), who: who.to_vec() }
         }
         Event::ChannelKeyRotated { chat, generation } => {
             FfiEvent::ChannelKeyRotated { chat_id: chat.to_vec(), generation }

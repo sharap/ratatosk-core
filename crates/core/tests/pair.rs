@@ -7944,6 +7944,229 @@ fn readers_of_a_channel_do_not_learn_about_each_other() {
 }
 
 #[test]
+fn a_request_reaches_the_owner_without_making_him_a_contact() {
+    // **То, ради чего §8.3 и делался.** §10.4: «заявка владельцу — блок
+    // с нашей карточкой», и там же: «контакт не заводится».
+    //
+    // Раньше это было невозможно дважды: адреса из ссылки выбрасывались,
+    // а лестница §5.4 отвечала `UnknownPeer` всякому, кто не контакт.
+    // Теперь владелец лежит **пиром** — только адреса и ничего больше, —
+    // и заявка уезжает по обычной лестнице.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+
+    // **Знакомства между ними нет** — в этом весь смысл: Боб знает
+    // о владельце ровно то, что написано в ссылке.
+    assert!(!bob.contacts().contains_key(&alice.own_card().ik));
+
+    let effects = bob
+        .step(5_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    assert!(
+        !bob.contacts().contains_key(&alice.own_card().ik),
+        "§10.4: подписка контакта не заводит"
+    );
+    assert!(bob.peers().contains_key(&alice.own_card().ik), "а пиром владелец становится");
+
+    let events = pump(&mut bob, &mut alice, 5_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ChannelRequested { chat: c, who } if *c == chat && *who == bob.own_card().ik
+        )),
+        "заявка обязана доехать до владельца и стать событием"
+    );
+    let requests = alice.store().channel_requests(&chat).expect("заявки");
+    assert_eq!(requests.len(), 1, "и лечь на диск: владелец мог быть офлайн (§10.4)");
+    assert_eq!(requests[0].0, bob.own_card().ik);
+
+    // Впуск — единственный ответ на заявку (§10.4), и он её снимает.
+    let effects = alice
+        .step(6_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("владелец впускает");
+    pump(&mut alice, &mut bob, 6_000, effects);
+    assert!(
+        alice.store().channel_requests(&chat).expect("заявки").is_empty(),
+        "отвеченная заявка не остаётся висеть у владельца"
+    );
+    assert!(
+        !bob.channel_facts(&chat, 7_000).expect("факты").awaiting,
+        "а подписчик перестаёт ждать"
+    );
+}
+
+#[test]
+fn an_open_channel_does_not_get_requests_at_all() {
+    // §10.4 про открытый канал: «владелец не участвует и не узнаёт».
+    // Заявка туда — способ узнать, жив ли владелец, и отвечать на неё
+    // нечем. Проверяется с обеих сторон: подписчик её не шлёт,
+    // а владелец не принял бы.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", true);
+    let link = alice.channel_link(chat).expect("ссылка");
+
+    let effects = bob
+        .step(5_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    // **Отправляющая сторона проверяется по очереди, а не по последствию.**
+    // Смотри мы только на владельца, проверка прошла бы и при уехавшей
+    // заявке: он её всё равно отвергнет. А заявка в открытый канал — это
+    // рассказать владельцу то, чего он знать не должен (§10.4).
+    assert!(
+        bob.store().outbox().expect("очередь").is_empty(),
+        "подписка на открытый канал не ставит в очередь ни одного кадра"
+    );
+    pump(&mut bob, &mut alice, 5_000, effects);
+    assert!(
+        alice.store().channel_requests(&chat).expect("заявки").is_empty(),
+        "у открытого канала заявок не бывает"
+    );
+
+    // **И присланная всё-таки — не принимается.** Ссылку собирает тот,
+    // кто делится (§10.2), и собрать её **без ключа** на открытый канал
+    // может кто угодно — по ошибке или нарочно. Подписчик по такой ссылке
+    // считает канал закрытым и шлёт заявку; владелец судит по своему
+    // подписанному документу и молчит.
+    let mut carol = node(3, "carol");
+    let lying_link = ratatosk_proto::channel::Invitation {
+        group: chat,
+        owner: alice.own_card().ik,
+        min_version: 1,
+        key: None,
+        endpoints: Vec::new(),
+    }
+    .to_uri()
+    .expect("ссылка собирается");
+    introduce(&mut alice, &mut carol);
+    let effects = carol
+        .step(7_000, Input::Command(Command::SubscribeToChannel { uri: lying_link }))
+        .expect("подписка по ссылке без ключа");
+    let events = pump(&mut carol, &mut alice, 7_000, effects);
+
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::ChannelRequested { .. })),
+        "у открытого канала заявок не бывает — и события о них тоже"
+    );
+    assert!(alice.store().channel_requests(&chat).expect("заявки").is_empty());
+}
+
+#[test]
+fn a_request_for_a_channel_we_do_not_own_is_ignored() {
+    // Ссылку собирает тот, кто делится (§10.2), и назвать в ней владельцем
+    // можно кого угодно — например читателя. Тогда заявка приедет **ему**,
+    // а он в этом канале никто: состава не ведёт, впустить не может.
+    //
+    // Принять такую заявку значило бы завести у читателя список просящих,
+    // с которым он ничего не сделает, и показать ему чужих подписчиков.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let mut carol = node(3, "carol");
+    let chat = shared_channel(&mut alice, &mut bob, 1_000, false);
+    introduce(&mut bob, &mut carol);
+    let effects = send_text(&mut bob, &mut carol, 2_000, "привет");
+    pump(&mut bob, &mut carol, 2_000, effects);
+
+    // Ссылка врёт про владельца: там стоит Боб, который всего лишь читатель.
+    let forged = ratatosk_proto::channel::Invitation {
+        group: chat,
+        owner: bob.own_card().ik,
+        min_version: 1,
+        key: None,
+        endpoints: Vec::new(),
+    }
+    .to_uri()
+    .expect("ссылка собирается");
+
+    let effects = carol
+        .step(3_000, Input::Command(Command::SubscribeToChannel { uri: forged }))
+        .expect("подписка");
+    let events = pump(&mut carol, &mut bob, 3_000, effects);
+
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::ChannelRequested { .. })),
+        "читатель не владелец: заявку ему принимать нечем"
+    );
+    assert!(bob.store().channel_requests(&chat).expect("заявки").is_empty());
+}
+
+#[test]
+fn a_reader_learns_the_channel_name_from_the_signed_document() {
+    // **Поломка со стенда: канал у читателя оставался чатом без имени.**
+    // Строка чата заводится при подписке пустой — названия в ссылке нет
+    // (§10.1), его привозит представление (§6.1). Записывали мы имя
+    // только в `channel_representations`, и список чатов у читателя
+    // навсегда показывал «332b07081e64 «»», хотя событие о новой версии
+    // имя называло. Владельцу это было не видно: у него чат заведён
+    // своими руками и с именем.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "вестник", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    assert_eq!(
+        bob.groups().get(&chat).map(|state| state.title.as_str()),
+        Some(""),
+        "до впуска имени ещё нет — иначе проверка ниже пуста"
+    );
+
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("владелец впускает");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    assert_eq!(
+        bob.groups().get(&chat).map(|state| state.title.as_str()),
+        Some("вестник"),
+        "имя приезжает подписанным представлением и обязано лечь в строку чата"
+    );
+    // И переживает перезапуск: список чатов рисуется с диска.
+    bob.restore().expect("подъём");
+    assert_eq!(bob.groups().get(&chat).map(|state| state.title.as_str()), Some("вестник"));
+}
+
+#[test]
+fn renaming_a_channel_travels_in_the_signed_document() {
+    // Вторая половина того же: у названия канала **один** хозяин —
+    // подписанный документ (§6.1). Уйди переименование действием
+    // `Rename`, как у группы, — читателю приехал бы документ со старым
+    // именем и молча вернул бы его назад. То есть починка выше завела бы
+    // поломку: «переименовал, а у всех осталось прежнее».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "вестник", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("владелец впускает");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    let before = alice.store().channel(&chat).expect("документ").expect("есть").version;
+    let effects = alice
+        .step(4_000, Input::Command(Command::RenameGroup { chat, title: "глашатай".into() }))
+        .expect("владелец переименовывает канал");
+    pump(&mut alice, &mut bob, 4_000, effects);
+
+    let after = alice.store().channel(&chat).expect("документ").expect("есть");
+    assert_eq!(after.version, before + 1, "переименование обязано поднять версию документа");
+    assert_eq!(after.title, "глашатай");
+    assert_eq!(
+        bob.groups().get(&chat).map(|state| state.title.as_str()),
+        Some("глашатай"),
+        "и доехать до читателя"
+    );
+    assert_eq!(
+        bob.store().channel(&chat).expect("документ").expect("есть").title,
+        "глашатай",
+        "в его документе — то же имя, а не два разных хозяина у названия"
+    );
+}
+
+#[test]
 fn a_link_subscriber_hears_nothing_until_the_owner_admits_him() {
     // **Это не поломка, а следствие спеки, и записано оно проверкой,
     // чтобы не считалось поломкой каждый раз заново.**

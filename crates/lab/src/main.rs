@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2048,6 +2048,27 @@ async fn console(
                     // и ядро откажет словами, а источник правды один.
                     if let Ok(invitation) = ratatosk_proto::channel::Invitation::from_uri(&uri) {
                         println!("< {}", subscription_notice(invitation.claims_open()));
+                        // **Ссылка без адресов — честное предупреждение.**
+                        // §10.2 везёт в ссылке onion, почту, меш, ключ nostr
+                        // и реле, но
+                        // **не** адрес в локальной сети: он меняется при
+                        // каждом подключении. Если адресов нет вовсе,
+                        // заявка (§10.4) ляжет в очередь и будет ждать,
+                        // пока владельца не станет слышно в эфире, — а
+                        // на loopback маяка не бывает.
+                        //
+                        // Сказать это надо здесь: человек нажал «подписаться»
+                        // и вправе знать, что пути пока нет. Иначе «ждём
+                        // впуска» выглядит обещанием, которого никто
+                        // не давал (§14).
+                        if !invitation.claims_open() && invitation.endpoints.is_empty() {
+                            println!(
+                                "< в ссылке нет адресов: заявка полежит в очереди, пока \
+                                 владельца не станет слышно. Не слышно — назовите адрес: \
+                                 /peeraddr {} <ip:порт>",
+                                data_encoding::HEXLOWER.encode(&invitation.owner)
+                            );
+                        }
                     }
                     handle.send(Command::SubscribeToChannel { uri }).await.ok();
                     continue;
@@ -2145,6 +2166,13 @@ async fn console(
                     let (chat, _) = split_group(rest, "/grants <id канала>");
                     if let Some(chat) = chat {
                         show_grants(&handle, chat).await;
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/requests ") {
+                    let (chat, _) = split_group(rest, "/requests <id канала>");
+                    if let Some(chat) = chat {
+                        show_requests(&handle, chat).await;
                     }
                     continue;
                 }
@@ -2309,6 +2337,35 @@ async fn console(
                         .send(Command::CreateGroup { title: title.trim().to_owned() })
                         .await
                         .ok();
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/peeraddr ") {
+                    // **Адрес владельца канала руками.** По ссылке (§10.2)
+                    // едут onion, почта, меш, ключ nostr и реле — но **не** адрес
+                    // в локальной сети: он меняется при каждом подключении,
+                    // и в карточке его тоже нет. В LAN адрес даёт маяк
+                    // (§5.1), а мультикаст режут и корпоративные сети,
+                    // и гостевой Wi-Fi, и loopback на одной машине.
+                    //
+                    // Тогда адрес называет человек — как `/devaddr` для
+                    // терминала. Справочник у них один; команды две,
+                    // потому что человек думает не «в какой справочник»,
+                    // а «кому я называю адрес».
+                    //
+                    // Ключ владельца печатает `/groups` в строке канала.
+                    let mut parts = rest.split_whitespace();
+                    let key = parts.next().unwrap_or_default();
+                    let addr = parts.next().unwrap_or_default();
+                    match (decode_ik(key), addr.parse::<std::net::SocketAddr>()) {
+                        (Some(ik), Ok(addr)) => {
+                            directory.note(ik, addr);
+                            println!("< {} по адресу {addr} — заявка поедет туда", short(&ik));
+                        }
+                        _ => println!(
+                            "< нужно: /peeraddr <64 знака hex> <ip:порт> — ключ владельца \
+                             печатает /groups"
+                        ),
+                    }
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix("/devaddr ") {
@@ -2945,6 +3002,7 @@ async fn console(
                     | Event::ChannelCreated { .. }
                     | Event::ChannelChanged { .. }
                     | Event::ChannelSubscribed { .. }
+                    | Event::ChannelRequested { .. }
                     | Event::ChannelUnsubscribed { .. }
                     | Event::ChannelKeyRotated { .. }
                     | Event::ChannelAdmitted { .. }
@@ -3077,6 +3135,10 @@ fn channel_usage(line: &str) -> Option<&'static str> {
         "/rotate" => "/rotate <id канала>",
         "/grants" => "/grants <id канала>",
         "/admits" => "/admits <id канала>",
+        "/requests" => "/requests <id канала> — кто просится (§10.4)",
+        "/peeraddr" => {
+            "/peeraddr <ключ владельца> <ip:порт> — когда маяка нет; ключ печатает /groups"
+        }
         // `/channels` не существует: каналы показывает `/groups` — они
         // и есть группы со вторым профилем (§3.2).
         "/channels" => "/groups — каналы показываются там же, где группы",
@@ -3195,6 +3257,29 @@ async fn show_grants(handle: &DriverHandle, chat: [u8; 16]) {
     }
 }
 
+/// Заявки на подписку (§10.4).
+async fn show_requests(handle: &DriverHandle, chat: [u8; 16]) {
+    let Some(requests) = handle.channel_requests(chat).await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if requests.is_empty() {
+        println!("< заявок нет");
+        return;
+    }
+    for request in requests {
+        // Ключ целиком: им и впускают.
+        println!(
+            "< {} {} просится с {}\n    впустить: /admit {} {}",
+            data_encoding::HEXLOWER.encode(&request.who),
+            request.name,
+            request.received_ms,
+            data_encoding::HEXLOWER.encode(&chat),
+            data_encoding::HEXLOWER.encode(&request.who),
+        );
+    }
+}
+
 /// Учёт впусков (§6.5).
 async fn show_admits(handle: &DriverHandle, chat: [u8; 16]) {
     let Some(admits) = handle.channel_admits(chat).await else {
@@ -3264,6 +3349,11 @@ async fn show_groups(handle: &DriverHandle) {
         // Канальное — отдельной строкой и только у канала: у группы
         // этих вопросов нет вовсе (§3.2).
         if let Some(channel) = &group.channel {
+            // **Ключ владельца — целиком.** Им адресуется `/peeraddr`,
+            // когда маяка нет, и по нему человек отличает свой канал
+            // от чужого. У читателя владельца в составе не будет вовсе
+            // (§3.2), так что взять его больше неоткуда.
+            println!("    владелец: {}", data_encoding::HEXLOWER.encode(&channel.owner_ik));
             println!(
                 "    канал {}, версия {}, права [{}], цена {} бит, поколение {}{}{}{}",
                 match channel.open {
@@ -4709,9 +4799,27 @@ fn report(event: &Event) {
                 println!("    встало: {reason}");
             }
         }
-        Event::ContactAdded { fingerprint, verified, .. } => {
+        Event::ContactAdded { peer_ik, fingerprint, verified, .. } => {
             let mark = if *verified { "сверен" } else { "НЕ сверен (§4.2)" };
-            println!("< контакт добавлен, отпечаток {fingerprint}, {mark} — можно писать");
+            println!("< контакт добавлен, отпечаток {fingerprint}, {mark}");
+            // **Ключ целиком и слово про адрес — здесь, а не «можно
+            // писать».** Так приезжает незнакомец, пожавший руку: заявка
+            // в канал (§10.4) приходит именно этим путём. Ответить ему
+            // мы обязаны **своим** соединением (соединения односторонние,
+            // `ARCHITECTURE.md` 5ц), а адреса его у нас может не быть
+            // вовсе: в общей сети его даёт маяк §5.1, на одной машине
+            // и в сети с зарезанным мультикастом — никто.
+            //
+            // Пойман на прогоне: у владельца появлялась эта строка,
+            // и на том всё кончалось — заявка не приходила, потому что
+            // рукопожатию нечем было ответить. Снаружи выглядело
+            // как «дошло наполовину».
+            println!("    ключ: {}", data_encoding::HEXLOWER.encode(peer_ik));
+            println!(
+                "    ответить можно, лишь зная его адрес: в общей сети его даёт маяк, \
+                 иначе назовите сами — /peeraddr {} <ip:порт>",
+                data_encoding::HEXLOWER.encode(peer_ik)
+            );
         }
         Event::MessagesDeleted { msg_ids, .. } => {
             println!("< удалено сообщений: {}", msg_ids.len());
@@ -4743,6 +4851,8 @@ fn report(event: &Event) {
         }
         Event::GroupCreated { chat, title } => {
             println!("< группа {} заведена: {title}", short(chat));
+            // Полный идентификатор — по той же причине, что у канала ниже.
+            println!("    пригласить: /invite {}", data_encoding::HEXLOWER.encode(chat));
         }
         Event::ChannelAdmitted { chat, who, admitted_by } => {
             println!(
@@ -4765,6 +4875,17 @@ fn report(event: &Event) {
             let what = if *awaiting { "ждём впуска" } else { "открытый" };
             println!("< подписались на канал {} ({what})", short(chat));
         }
+        Event::ChannelRequested { chat, who } => {
+            // Ключ целиком: им же и впускают (`/admit`), а обрезанный
+            // пришлось бы искать глазами по журналу.
+            println!(
+                "< в канал {} просится {}\n    впустить: /admit {} {}",
+                short(chat),
+                short(who),
+                data_encoding::HEXLOWER.encode(chat),
+                data_encoding::HEXLOWER.encode(who),
+            );
+        }
         Event::ChannelUnsubscribed { chat } => {
             println!("< отписались от канала {}: ключи чтения стёрты", short(chat));
         }
@@ -4784,6 +4905,15 @@ fn report(event: &Event) {
                     println!("< канал {} заведён (по приглашению): {title}", short(chat));
                 }
                 None => println!("< канал {} появился: {title}", short(chat)),
+            }
+            // **Идентификатор целиком, готовой командой.** В первой строке
+            // он обрезан — так его читают глазами, — а команды стенда
+            // требуют все тридцать два знака и на обрезанный отвечают
+            // «нужно: … — id печатает /groups». Пойман на собственном
+            // прогоне: напечатанное только что нельзя скопировать
+            // в следующую же команду.
+            if open.is_some() {
+                println!("    ссылка: /clink {}", data_encoding::HEXLOWER.encode(chat));
             }
         }
         Event::GroupMembershipChanged { chat } => {

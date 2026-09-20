@@ -158,6 +158,25 @@ impl<S: Store> Engine<S> {
         let mine = self.presence_timer.take();
         let mut changed: Vec<[u8; 32]> = Vec::new();
         let mut anyone_near = false;
+        // **Пиры гаснут тем же сроком, что и контакты** (§8.3), только
+        // молча: события о них клиенту не идут — пира нет ни в списке
+        // чатов, ни в списке знакомых. Не гаси мы их здесь, владелец
+        // канала, услышанный однажды, числился бы слышимым вечно,
+        // и §5.4 выбирал бы LAN до скончания века.
+        for (peer_ik, peer) in &mut self.peers {
+            let heard = self.heard.get(peer_ik).copied().unwrap_or_default();
+            for via in ratatosk_proto::transport_policy::presence_rungs() {
+                let fresh = heard.fresh(via, now_ms, PRESENCE_TTL_MS);
+                anyone_near |= fresh;
+                let flag = match via {
+                    Transport::Lan => &mut peer.availability.seen_on_lan,
+                    _ => &mut peer.availability.seen_on_bt,
+                };
+                if *flag && !fresh {
+                    *flag = false;
+                }
+            }
+        }
         for (peer_ik, contact) in &mut self.contacts {
             let heard = self.heard.get(peer_ik).copied().unwrap_or_default();
             let mut gone = false;
@@ -246,6 +265,39 @@ impl<S: Store> Engine<S> {
     /// нельзя: устройство бывает слышно в Bluetooth и невидимо в локальной
     /// сети — разные сети Wi-Fi, гостевая сеть с изоляцией клиентов, —
     /// и наоборот. Слитое поле отдало бы §5.4 ступень, которой нет.
+    /// Доступность этого ключа **на правку** — контакта или пира (§8.3).
+    ///
+    /// Одним местом на оба списка, и это не экономия строк: соседство
+    /// правится в трёх местах (услышали, не дозвонились, срок вышел),
+    /// и пара «если контакт… если пир…» в каждом из них однажды
+    /// разошлась бы. Разойдясь, она дала бы пира, которого слышно
+    /// навсегда, — то есть заявку, уезжающую в мёртвый адрес до
+    /// скончания века.
+    pub(super) fn availability_mut(&mut self, peer_ik: &[u8; 32]) -> Option<&mut PeerAvailability> {
+        if let Some(contact) = self.contacts.get_mut(peer_ik) {
+            return Some(&mut contact.availability);
+        }
+        self.peers.get_mut(peer_ik).map(|peer| &mut peer.availability)
+    }
+
+    /// Доступность **всех**, кого ядро умеет достигать, — на правку.
+    ///
+    /// Разрешения человека (§5.4) и готовность ступеней одинаковы для
+    /// всех: это состояние **нашего** устройства, а не свойство
+    /// собеседника. Раньше их разносили по `contacts` в пяти местах,
+    /// и пир-не-контакт (§8.3) не получал ни одного — то есть застывал
+    /// с тем, что было в миг его появления: включённая через минуту сеть
+    /// до него не доходила, и заявка §10.4 ждала бы вечно.
+    ///
+    /// Одним обходом вместо пяти: новое место, забывшее про пиров,
+    /// теперь просто не с чем написать.
+    pub(super) fn availabilities_mut(&mut self) -> impl Iterator<Item = &mut PeerAvailability> {
+        self.contacts
+            .values_mut()
+            .map(|contact| &mut contact.availability)
+            .chain(self.peers.values_mut().map(|peer| &mut peer.availability))
+    }
+
     pub(super) fn note_heard(
         &mut self,
         now_ms: u64,
@@ -253,26 +305,27 @@ impl<S: Store> Engine<S> {
         via: Transport,
     ) -> Result<Vec<Effect>, EngineError> {
         let bt = via == Transport::Bt;
-        let appeared = match self.contacts.get(&peer_ik) {
-            Some(contact) if bt => !contact.availability.seen_on_bt,
-            Some(contact) => !contact.availability.seen_on_lan,
-            None => false,
-        };
-        match self.contacts.get_mut(&peer_ik) {
-            Some(contact) if bt => contact.availability.seen_on_bt = true,
-            Some(contact) => contact.availability.seen_on_lan = true,
-            // Контакт и его слышимость приходят разными путями — командой
-            // от UI и событием транспорта, — и порядок между ними
+        // **Контакт или пир** (§8.3): маяк владельца канала слышен ровно
+        // так же, как маяк знакомого, и не отметь мы его — §5.4 считал бы,
+        // что в эфире его нет, а заявка ждала бы почты при живом соседе
+        // за стенкой.
+        let Some(availability) = self.availability_mut(&peer_ik) else {
+            // Собеседник и его слышимость приходят разными путями —
+            // командой от UI и событием транспорта, — и порядок между ними
             // не гарантирован. Потерять отметку значило бы отправить почтой
-            // сообщение собеседнику за стенкой, и разбираться потом, почему.
-            None => {
-                if bt {
-                    self.seen_on_bt.insert(peer_ik);
-                } else {
-                    self.seen_on_lan.insert(peer_ik);
-                }
-                return Ok(Vec::new());
+            // сообщение тому, кто сидит напротив.
+            if bt {
+                self.seen_on_bt.insert(peer_ik);
+            } else {
+                self.seen_on_lan.insert(peer_ik);
             }
+            return Ok(Vec::new());
+        };
+        let appeared = if bt { !availability.seen_on_bt } else { !availability.seen_on_lan };
+        if bt {
+            availability.seen_on_bt = true;
+        } else {
+            availability.seen_on_lan = true;
         }
         // **Отметка времени — на каждое объявление, а не на переход.**
         // Соседство живёт сроком (`PRESENCE_TTL_MS`), и обновлять его надо

@@ -358,6 +358,30 @@ impl<S: Store> Engine<S> {
             .collect()
     }
 
+    /// Заявки на подписку — то, что видит владелец (фаза 2, §10.4).
+    ///
+    /// Пустой список означает «никто не просится», и у открытого канала
+    /// он пуст всегда: там владелец не участвует и не узнаёт.
+    ///
+    /// Ответ на заявку один — впуск ([`Command::AdmitToChannel`]);
+    /// отказа как сообщения не бывает, и показывать надо так же: список
+    /// просящих и кнопка «впустить», а не «принять/отклонить».
+    ///
+    /// [`Command::AdmitToChannel`]: crate::io::Command::AdmitToChannel
+    #[must_use]
+    pub fn channel_requests(&self, chat: &ChatId) -> Vec<ChannelRequestView> {
+        self.store
+            .channel_requests(chat)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(who, received_ms)| ChannelRequestView {
+                who,
+                name: self.name_of(&who),
+                received_ms,
+            })
+            .collect()
+    }
+
     /// Записи о впусках — учёт владельца (§6.5).
     ///
     /// Показываются **все**, включая впуски делегатами: в этом весь смысл

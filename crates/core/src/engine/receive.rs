@@ -805,6 +805,10 @@ impl<S: Store> Engine<S> {
             PayloadType::FileChunk => self.on_file_chunk(now_ms, via, peer_ik, &envelope),
             PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
             PayloadType::ContactShare => self.on_contact_share(now_ms, via, peer_ik, &envelope),
+            // Заявка на подписку (фаза 2, §10.4). Один на один, потому что
+            // в канале заявитель ещё никто: ни состава, ни цепочки у него
+            // там нет.
+            PayloadType::ChannelRequest => self.on_channel_request(now_ms, via, peer_ik, &envelope),
             // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
             // оно не ездит. Тип остаётся в перечислении, потому что он есть
             // в спецификации, а молча принимать то, чего мы не отправляем,

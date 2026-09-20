@@ -2210,6 +2210,98 @@ fn asking_for_every_message_of_a_chat_does_not_bring_the_store_down() {
     assert_eq!(store.search(Some(&[7u8; 16]), "привет", usize::MAX).unwrap().len(), 0);
 }
 
+// --- Пир, который не контакт (§8.3) ----------------------------------------
+
+fn peer(byte: u8) -> ratatosk_store::StoredPeer {
+    ratatosk_store::StoredPeer {
+        ik: [byte; 32],
+        onion: "abcdefghij.onion".to_owned(),
+        chatmail: "owner@nine.example".to_owned(),
+        ygg: vec![7u8; 32],
+        relays: vec!["wss://one.example".to_owned(), "wss://two.example".to_owned()],
+        // Ключ рядом с реле, и в проверке он **обязателен**: доступность
+        // ступени nostr считается по нему (миграция 0033). Потеряйся
+        // столбец — `a_peer_survives_reopening_with_every_address`
+        // краснеет, потому что сравнивает запись целиком.
+        nostr: vec![5u8; 32],
+        known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+        added_ms: 1_000,
+    }
+}
+
+#[test]
+fn a_peer_survives_reopening_with_every_address() {
+    // Пир держит **адреса**, а не карточку: у владельца канала, узнанного
+    // из ссылки (§10.1), карточки нет вовсе. Потеряйся здесь хоть один
+    // адрес — лестница §5.4 после перезапуска спустилась бы ступенью ниже
+    // и молча: «почты нет» она от «почта не отвечает» не отличает.
+    let db = TempDb::new("peer");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_peer(&peer(9)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.peers().unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0], peer(9), "пир доезжает до следующего запуска целиком");
+}
+
+#[test]
+fn both_backends_answer_the_same_about_a_peer() {
+    // Трейт с одной честной реализацией не бывает абстракцией, а симуляция
+    // §16 гоняет память.
+    let db = TempDb::new("peer-both");
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        store.put_peer(&peer(9)).unwrap();
+        store.put_peer(&peer(3)).unwrap();
+    }
+    assert_eq!(sqlite.peers().unwrap(), memory.peers().unwrap());
+    // Порядок — по ключу, и он одинаков у обоих: иначе симуляция §16
+    // перестала бы быть воспроизводимой по сиду.
+    assert_eq!(sqlite.peers().unwrap()[0].ik, [3u8; 32]);
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        store.delete_peer(&[3u8; 32]).unwrap();
+    }
+    assert_eq!(sqlite.peers().unwrap().len(), 1);
+    assert_eq!(memory.peers().unwrap().len(), 1);
+}
+
+#[test]
+fn a_session_with_someone_who_is_not_a_contact_lies_down_on_disk() {
+    // **То, ради чего снимался внешний ключ** (миграция 0031). Пока
+    // `sessions.peer_ik` ссылался на `contacts(ik)`, сессия с пиром
+    // физически не ложилась: вставка падала на ограничении, то есть
+    // §8.3 был невозможен не по замыслу, а по схеме.
+    let db = TempDb::new("session-peer");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_peer(&peer(9)).unwrap();
+        store
+            .put_session(&ratatosk_store::StoredSession {
+                session_id: 42,
+                peer_ik: [9u8; 32],
+                binding: 0,
+                snapshot: vec![1, 2, 3],
+                established_ms: 1_000,
+            })
+            .unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let sessions = store.sessions().unwrap();
+    assert_eq!(sessions.len(), 1, "сессия с не-контактом обязана пережить перезапуск");
+    assert_eq!(sessions[0].peer_ik, [9u8; 32]);
+}
+
 // --- Подписка и поколения ключа (фаза 2, §10.4, §6.4) ----------------------
 
 fn subscription(min_version: u64, kind_claimed: u32, state: u32) -> StoredSubscription {

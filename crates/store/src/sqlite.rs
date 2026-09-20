@@ -20,8 +20,8 @@ use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
     StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGrant, StoredGroup,
     StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox,
-    StoredPairedDevice, StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession,
-    StoredSubscription,
+    StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSenderChain,
+    StoredSession, StoredSubscription,
 };
 
 /// Хранилище на SQLite.
@@ -2112,6 +2112,110 @@ impl Store for SqliteStore {
             })
     }
 
+    fn put_channel_request(
+        &mut self,
+        chat_id: &[u8; 16],
+        who: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<()> {
+        // `OR IGNORE`, а не `OR REPLACE`: время в строке — момент **первой**
+        // просьбы, и повтор его не двигает (§10.5 меряет ожидание от него).
+        self.conn.execute(
+            "INSERT OR IGNORE INTO channel_requests (chat_id, who, received_ms)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![&chat_id[..], &who[..], sql_types::to_sql(now_ms)],
+        )?;
+        Ok(())
+    }
+
+    fn channel_requests(&self, chat_id: &[u8; 16]) -> Result<Vec<([u8; 32], u64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT who, received_ms FROM channel_requests WHERE chat_id = ?1 ORDER BY who",
+        )?;
+        let rows = statement.query_map([&chat_id[..]], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (who, received_ms) = row?;
+            let Ok(who) = <[u8; 32]>::try_from(who.as_slice()) else { continue };
+            found.push((who, sql_types::from_sql(received_ms)));
+        }
+        Ok(found)
+    }
+
+    fn delete_channel_request(&mut self, chat_id: &[u8; 16], who: &[u8; 32]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM channel_requests WHERE chat_id = ?1 AND who = ?2",
+            rusqlite::params![&chat_id[..], &who[..]],
+        )?;
+        Ok(())
+    }
+
+    fn put_peer(&mut self, peer: &StoredPeer) -> Result<()> {
+        // Реле склеиваются переводом строки: в адресе реле его быть
+        // не может (это URL), а отдельная таблица ради списка из трёх
+        // строк стоила бы больше, чем экономит.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO peers
+                 (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                &peer.ik[..],
+                peer.onion,
+                peer.chatmail,
+                peer.ygg,
+                peer.relays.join("\n"),
+                sql_types::to_sql(u64::from(peer.known_as)),
+                sql_types::to_sql(peer.added_ms),
+                peer.nostr,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn peers(&self) -> Result<Vec<StoredPeer>> {
+        let mut statement = self.conn.prepare(
+            "SELECT ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr
+             FROM peers ORDER BY ik",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+            ))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr) = row?;
+            // Длина не та — строка испорчена. Пропускаем: недосчитаться
+            // адреса хуже, чем уронить подъём на чужой строке.
+            let Ok(ik) = <[u8; 32]>::try_from(ik.as_slice()) else { continue };
+            found.push(StoredPeer {
+                ik,
+                onion,
+                chatmail,
+                ygg,
+                relays: relays.lines().map(str::to_owned).collect(),
+                nostr,
+                known_as: u32::try_from(sql_types::from_sql(known_as)).unwrap_or(0),
+                added_ms: sql_types::from_sql(added_ms),
+            });
+        }
+        Ok(found)
+    }
+
+    fn delete_peer(&mut self, ik: &[u8; 32]) -> Result<()> {
+        self.conn.execute("DELETE FROM peers WHERE ik = ?1", [&ik[..]])?;
+        Ok(())
+    }
+
     fn last_heard_in_chat(&self, chat_id: &[u8; 16], sender_ik: &[u8; 32]) -> Result<Option<u64>> {
         // `MAX`, а не «последняя строка по порядку показа»: порядок
         // в истории задаёт метка HLC отправителя, а спрашивают здесь
@@ -2789,10 +2893,23 @@ impl Store for SqliteStore {
     }
 
     fn delete_contact(&mut self, ik: &[u8; 32]) -> Result<()> {
-        // Сессии уйдут каскадом: внешний ключ объявлен ON DELETE CASCADE,
-        // а прагма `foreign_keys = ON` выставляется при каждом открытии.
-        self.conn.execute("DELETE FROM contacts WHERE ik = ?1", [&ik[..]])?;
-        self.conn.execute("DELETE FROM avatars WHERE owner_ik = ?1", [&ik[..]])?;
+        // **Сессии сносятся руками, и это не регресс.** Раньше их уносил
+        // внешний ключ `sessions.peer_ik REFERENCES contacts(ik)`, но
+        // он же означал, что сессии с **не-контактом** на диске быть
+        // не может (§8.3), — и в 0031 ключ снят. Каскад при этом обязан
+        // остаться: ключевой материал не должен переживать контакт.
+        //
+        // Порядок: сессии раньше контакта. Обратный порядок ничего бы
+        // не сломал сегодня, но читается он как «сперва забыли, кого
+        // удаляем».
+        //
+        // Пропущенные ключи уходят своим каскадом: `skipped_keys`
+        // ссылается на `sessions`, и этот ключ на месте.
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE peer_ik = ?1", [&ik[..]])?;
+        tx.execute("DELETE FROM contacts WHERE ik = ?1", [&ik[..]])?;
+        tx.execute("DELETE FROM avatars WHERE owner_ik = ?1", [&ik[..]])?;
+        tx.commit()?;
         Ok(())
     }
 

@@ -21,7 +21,9 @@ use ratatosk_transport::{Runner, TransportCommand, TransportError, TransportEven
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::ExportScope;
-use crate::engine::{ChannelAdmitView, ChannelFacts, ChannelGrantView, Engine, EngineError};
+use crate::engine::{
+    ChannelAdmitView, ChannelFacts, ChannelGrantView, ChannelRequestView, Engine, EngineError,
+};
 use crate::io::{ArchiveKey, ChatId, Command, Effect, Event, Exported, Input, Merged, Swept};
 use crate::reader::FileReader;
 use ratatosk_transport::runner::PeerAddress;
@@ -311,6 +313,8 @@ enum Query {
     /// не обрезается (§6.5), то есть он длиннее состава и никогда
     /// не короче.
     ChannelAdmits { chat: ChatId, reply: oneshot::Sender<Vec<ChannelAdmitView>> },
+    /// Заявки на подписку (фаза 2, §10.4).
+    ChannelRequests { chat: ChatId, reply: oneshot::Sender<Vec<ChannelRequestView>> },
 }
 
 /// Своя карточка в том виде, в каком её показывают человеку.
@@ -782,6 +786,14 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Читает заявки на подписку (фаза 2, §10.4). `None` — драйвер
+    /// остановлен.
+    pub async fn channel_requests(&self, chat: ChatId) -> Option<Vec<ChannelRequestView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::ChannelRequests { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
     /// Читает учёт впусков канала (фаза 2, §6.5). `None` — драйвер
     /// остановлен.
     pub async fn channel_admits(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
@@ -1153,6 +1165,13 @@ impl DriverHandle {
     pub fn channel_grants_blocking(&self, chat: ChatId) -> Option<Vec<ChannelGrantView>> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::ChannelGrants { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает заявки на подписку, блокируя вызывающий поток.
+    pub fn channel_requests_blocking(&self, chat: ChatId) -> Option<Vec<ChannelRequestView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChannelRequests { chat, reply })).ok()?;
         answer.blocking_recv().ok()
     }
 
@@ -1763,6 +1782,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Query::ChannelAdmits { chat, reply } => {
                 let _ = reply.send(self.engine.channel_admits(&chat));
             }
+            Query::ChannelRequests { chat, reply } => {
+                let _ = reply.send(self.engine.channel_requests(&chat));
+            }
         }
     }
 
@@ -2067,6 +2089,29 @@ impl<S: Store, R: Runner> Driver<S, R> {
     fn address_of(&self, peer_ik: [u8; 32]) -> PeerAddress {
         if let Some(contact) = self.engine.contacts().get(&peer_ik) {
             return peer_address_of(&contact.card);
+        }
+        // **Третий источник — пир-не-контакт** (§8.3). Владелец канала,
+        // узнанный из ссылки (§10.1), не контакт и не десктоп; адреса
+        // его лежат разобранными, потому что карточки у него нет вовсе:
+        // в ссылку их положил делившийся, и доверия им ровно столько же,
+        // сколько всякому адресу (§10.2) — не дозвонимся, спустимся
+        // по лестнице ниже.
+        if let Some(peer) = self.engine.peers().get(&peer_ik) {
+            return PeerAddress {
+                ik: peer_ik,
+                onion: non_empty(&peer.onion),
+                chatmail: non_empty(&peer.chatmail),
+                ygg: ygg_key(&peer.ygg),
+                // **Ключ nostr едет ссылкой рядом с реле** (§10.1, вид 5).
+                // Здесь стояло `None` с объяснением «в ссылке едут только
+                // реле» — и это было правдой ровно до той поломки, ради
+                // которой вид и заведён: доступность считалась по реле,
+                // §5.4 выбирал nostr, а раннер отвечал `NoAddress`. Пусто
+                // теперь значит «в ссылке ключа не было», и ступень
+                // неадресуема честно, с той же стороны.
+                nostr: ratatosk_proto::nostr::NostrKey::from_slice(&peer.nostr),
+                nostr_relays: peer.relays.clone(),
+            };
         }
         PeerAddress {
             ik: peer_ik,

@@ -18,7 +18,8 @@ use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
     StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar,
     StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice,
-    StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession, StoredSubscription,
+    StoredPeer, StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession,
+    StoredSubscription,
 };
 
 /// Хранилище в оперативной памяти.
@@ -54,6 +55,13 @@ pub struct MemoryStore {
     /// в файловой базе группа и чат — одна строка, а тут чат ничем, кроме
     /// сообщений, не представлен.
     groups: BTreeMap<[u8; 16], StoredGroup>,
+    /// Заявки на подписку (фаза 2, §10.4): чат, затем проситель.
+    /// Порядок обхода задан ключом и совпадает с `ORDER BY` файловой базы.
+    requests: BTreeMap<([u8; 16], [u8; 32]), u64>,
+    /// Пиры-не-контакты (§8.3): владелец канала, до которого надо
+    /// дотянуться заявкой. `BTreeMap` — по той же причине, что у контактов:
+    /// порядок обхода обязан быть одинаков от запуска к запуску.
+    peers: BTreeMap<[u8; 32], StoredPeer>,
     /// Представления каналов (фаза 2, §6.1). Выдачи лежат **внутри**
     /// `StoredChannel`, а не отдельной картой: в файловой базе они кладутся
     /// одной транзакцией с документом, и разъехаться им негде. Отдельная
@@ -263,6 +271,7 @@ impl Store for MemoryStore {
         self.subscriptions.remove(chat_id);
         self.archive_keys.retain(|(chat, _), _| chat != chat_id);
         self.admits.retain(|(chat, _), _| chat != chat_id);
+        self.requests.retain(|(chat, _), _| chat != chat_id);
         Ok(())
     }
 
@@ -792,6 +801,46 @@ impl Store for MemoryStore {
 
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
         self.avatars.remove(owner_ik);
+        Ok(())
+    }
+
+    fn put_channel_request(
+        &mut self,
+        chat_id: &[u8; 16],
+        who: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<()> {
+        // `or_insert`, а не `insert`: время — момент первой просьбы,
+        // и повтор его не двигает. То же правило, что в файловой базе.
+        self.requests.entry((*chat_id, *who)).or_insert(now_ms);
+        Ok(())
+    }
+
+    fn channel_requests(&self, chat_id: &[u8; 16]) -> Result<Vec<([u8; 32], u64)>> {
+        Ok(self
+            .requests
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|((_, who), at)| (*who, *at))
+            .collect())
+    }
+
+    fn delete_channel_request(&mut self, chat_id: &[u8; 16], who: &[u8; 32]) -> Result<()> {
+        self.requests.remove(&(*chat_id, *who));
+        Ok(())
+    }
+
+    fn put_peer(&mut self, peer: &StoredPeer) -> Result<()> {
+        self.peers.insert(peer.ik, peer.clone());
+        Ok(())
+    }
+
+    fn peers(&self) -> Result<Vec<StoredPeer>> {
+        Ok(self.peers.values().cloned().collect())
+    }
+
+    fn delete_peer(&mut self, ik: &[u8; 32]) -> Result<()> {
+        self.peers.remove(ik);
         Ok(())
     }
 

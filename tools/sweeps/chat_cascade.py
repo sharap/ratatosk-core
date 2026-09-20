@@ -52,6 +52,7 @@ FIELDS = {
     "channel_subscriptions": "subscriptions",
     "channel_archive_keys": "archive_keys",
     "channel_admits": "admits",
+    "channel_requests": "requests",
 }
 
 # Исключения — поимённо и с причиной.

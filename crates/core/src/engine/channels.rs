@@ -59,13 +59,7 @@ impl<S: Store> Engine<S> {
             channel::Kind::ByInvite => None,
         };
 
-        let mut endpoints = Vec::new();
-        if !self.addresses.onion.is_empty() {
-            endpoints.push(channel::Endpoint::Onion(self.addresses.onion.clone()));
-        }
-        if !self.addresses.chatmail.is_empty() {
-            endpoints.push(channel::Endpoint::Chatmail(self.addresses.chatmail.clone()));
-        }
+        let endpoints = self.own_endpoints();
 
         channel::Invitation {
             group: chat,
@@ -76,6 +70,55 @@ impl<S: Store> Engine<S> {
         }
         .to_uri()
         .map_err(|_| EngineError::NotAChannel)
+    }
+
+    /// Свои адреса для ссылки — **все, какие есть** (§10.1).
+    ///
+    /// # Почему список, а не два поля
+    ///
+    /// §10.1 говорит прямо: «`addrs[]` — адреса всех доступных видов,
+    /// **как в карточке контакта**», и §10.2 добавляет, зачем это нужно:
+    /// «ссылка провисит год… откроется она через почту и nostr».
+    ///
+    /// Здесь стояли onion и почта, и только они. Узел, у которого путь
+    /// один — меш или реле, — раздавал ссылку **без единого адреса**:
+    /// заявка (§10.4) ложилась в очередь и ждала, пока владельца станет
+    /// слышно в эфире, а в другой сети этого не случается никогда. Нашлось
+    /// на стенде, где у владельца был поднят один nostr.
+    ///
+    /// # Ключ nostr и реле — два разных адреса, и оба обязательны
+    ///
+    /// Реле говорит, куда положить событие, ключ — кому оно. Порознь
+    /// ни то ни другое не адрес; отсюда два вида в ссылке и правило
+    /// `Peer::nostr`, по которому доступность считается по ключу.
+    ///
+    /// # Предел
+    ///
+    /// Адресов в ссылке не больше [`channel::MAX_ENDPOINTS`], иначе она
+    /// не соберётся вовсе. Реле — последние в списке и первые под нож:
+    /// без реле собеседник возьмёт наши из карточки, когда она до него
+    /// доедет, а без onion или ключа меша ступени нет совсем.
+    fn own_endpoints(&self) -> Vec<channel::Endpoint> {
+        let mut endpoints = Vec::new();
+        if !self.addresses.onion.is_empty() {
+            endpoints.push(channel::Endpoint::Onion(self.addresses.onion.clone()));
+        }
+        if !self.addresses.chatmail.is_empty() {
+            endpoints.push(channel::Endpoint::Chatmail(self.addresses.chatmail.clone()));
+        }
+        if let Ok(key) = <[u8; 32]>::try_from(self.ygg.as_slice()) {
+            endpoints.push(channel::Endpoint::Ygg(key));
+        }
+        if let Ok(key) = <[u8; 32]>::try_from(self.nostr.as_slice()) {
+            endpoints.push(channel::Endpoint::Nostr(key));
+            for relay in self.nostr_card_relays() {
+                if endpoints.len() == channel::MAX_ENDPOINTS {
+                    break;
+                }
+                endpoints.push(channel::Endpoint::NostrRelay(relay));
+            }
+        }
+        endpoints
     }
 
     /// Заводит канал (фаза 2, §6.1).
@@ -327,6 +370,25 @@ impl<S: Store> Engine<S> {
             )?;
         }
 
+        // **Владелец запоминается пиром, а не контактом** (§8.3, §10.4).
+        //
+        // Раньше адреса из ссылки выбрасывались, и записано это было так:
+        // «они недоверенные, одноразовые и живут неделями, а строка
+        // проживёт год; хранить их значило бы завести кэш, устаревающий
+        // молча». Довод верен ровно до тех пор, пока до владельца нечем
+        // дотянуться: заявка (§10.4) без адреса не уедет никуда.
+        //
+        // Поэтому они кладутся — но **пиром**, а не контактом, и §10.4
+        // говорит про подписку прямо: «контакт не заводится». Пир — это
+        // «куда слать этому ключу», и ничего больше: ни чата, ни сверки,
+        // ни строки в списке знакомых.
+        //
+        // Устаревание названо, а не забыто: адрес из ссылки ничем
+        // не подтверждён (§10.2), и не дозвонившись, лестница §5.4
+        // спустится ниже сама. Приедет настоящая карточка — адреса
+        // обновятся из неё.
+        self.remember_peer(now_ms, invitation.owner, &invitation.endpoints)?;
+
         // Своя цепочка отправителя — как у всякого участника: без неё
         // нам нечем будет сказать ни слова, даже получив право.
         let mut chain = [0u8; 32];
@@ -359,7 +421,192 @@ impl<S: Store> Engine<S> {
             },
         );
 
-        Ok(vec![Effect::Notify(Event::ChannelSubscribed { chat, awaiting: !open })])
+        // **Заявка владельцу** (§10.4) — и только у канала по приглашению:
+        // у открытого владелец «не участвует и не узнаёт», и стучаться
+        // к нему значило бы сказать ему то, чего он знать не должен.
+        //
+        // Едет она один на один, а не в канал: в канале заявитель ещё
+        // никто — ни состава, ни цепочки у него там нет, и групповой кадр
+        // от него владелец не открыл бы. Дотянуться до владельца стало
+        // чем ровно сейчас: он лежит пиром, с адресами из ссылки (§8.3).
+        //
+        // Ответа у заявки нет и не предусмотрено: §10.4 говорит «впустил
+        // — присылает ключ», и впуск и есть ответ. Пока его нет, подписка
+        // числится заявкой, и человек видит ожидание (§10.5).
+        let mut effects = vec![Effect::Notify(Event::ChannelSubscribed { chat, awaiting: !open })];
+        if !open {
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                invitation.owner,
+                PayloadType::ChannelRequest,
+                channel::request_value(&chat),
+            )?;
+            effects.extend(sent);
+        }
+        Ok(effects)
+    }
+
+    /// Принимает заявку на подписку (фаза 2, §10.4).
+    ///
+    /// # Что здесь проверяется и чего не проверяется
+    ///
+    /// Канал обязан быть нашим и быть каналом: заявка в чужой чат —
+    /// это кадр не по адресу, и молчать на него нечего. А вот право
+    /// или порода заявителя не спрашиваются вовсе: просить вправе кто
+    /// угодно, на то она и просьба. Решает владелец, и решает руками.
+    ///
+    /// # Открытый канал заявок не принимает
+    ///
+    /// §10.4: у открытого владелец «не участвует и не узнаёт». Заявка
+    /// туда — либо чужая ошибка, либо попытка узнать, жив ли владелец;
+    /// ни на что из этого отвечать не надо.
+    ///
+    /// # Повтор не двигает время
+    ///
+    /// Заявка, посланная второй раз, — это та же просьба, на которую
+    /// ещё не ответили. Время в строке остаётся временем первой:
+    /// §10.5 меряет ожидание от неё, и обновляй мы его, ожидание
+    /// начиналось бы заново при каждом повторе.
+    pub(super) fn on_channel_request(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // **Квитанция — до разбора, и она про кадр, а не про решение.**
+        // Заявка едет обычной очередью §5.4, и у неё есть срок: не ответь
+        // мы, отправитель объявит неудачу, а §5.4 отправит сессию на покой
+        // — и следующие кадры начнут пропадать. Молчаливым этот кадр
+        // не назван (`silent_frame`), так что молчать на него нельзя.
+        //
+        // Что заявка не принята (чужой канал, открытый канал), квитанция
+        // не говорит и говорить не должна: она про доставку, а не про
+        // согласие. Ответ на саму заявку один — впуск (§10.4).
+        let mut effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+
+        let Ok(chat) = channel::request_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        let me = self.identity.public().ik;
+        let Some(state) = self.groups.get(&chat) else { return Ok(effects) };
+        if state.profile.everyone_writes() || state.group.owner != me {
+            return Ok(effects);
+        }
+        // Порода — из подписанного документа: у открытого канала заявок
+        // не бывает (§10.4).
+        let open = self
+            .store
+            .channel(&chat)?
+            .and_then(|it| channel::Kind::from_code(u64::from(it.kind)))
+            .is_some_and(|kind| kind == channel::Kind::Open);
+        if open {
+            return Ok(effects);
+        }
+        // Уже впущенному просить нечего: он в составе, ключ у него есть.
+        // Молчим, а не отмечаем аномалию: так выглядит повтор заявки,
+        // разминувшийся со впуском по дороге.
+        if state.group.contains(&peer_ik) {
+            return Ok(effects);
+        }
+
+        self.store.put_channel_request(&chat, &peer_ik, now_ms)?;
+        effects.push(Effect::Notify(Event::ChannelRequested { chat, who: peer_ik }));
+        Ok(effects)
+    }
+
+    /// Запоминает пира-не-контакта по адресам из ссылки (§8.3, §10.2).
+    ///
+    /// Адреса разбираются в те же поля, что у контакта, потому что
+    /// решение §5.4 принимается по одной структуре: у пира и у контакта
+    /// лестница обязана быть одна, иначе один и тот же собеседник
+    /// получал бы разные ответы в зависимости от того, как мы о нём
+    /// узнали.
+    ///
+    /// Пустой список адресов — законный случай: ссылку вправе собрать
+    /// тот, у кого своих адресов нет вовсе (§10.2). Пир тогда заводится
+    /// без единого адреса, и §5.4 честно скажет «отправлять некуда»,
+    /// а не промолчит.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn remember_peer(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        endpoints: &[channel::Endpoint],
+    ) -> Result<(), EngineError> {
+        // Контакта пиром не переписываем: у него есть карточка, подпись
+        // и сверка, и адрес из чужой ссылки её не улучшает.
+        if self.contacts.contains_key(&peer_ik) {
+            return Ok(());
+        }
+
+        let mut stored = ratatosk_store::StoredPeer {
+            ik: peer_ik,
+            onion: String::new(),
+            chatmail: String::new(),
+            ygg: Vec::new(),
+            relays: Vec::new(),
+            nostr: Vec::new(),
+            known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+            added_ms: now_ms,
+        };
+        for endpoint in endpoints {
+            match endpoint {
+                // Первый адрес каждого вида, а не последний: ссылку
+                // собирает тот, кто делится (§10.2), и порядок в ней
+                // его — а «последний побеждает» означало бы, что
+                // выбирает его хвост списка.
+                channel::Endpoint::Onion(address) if stored.onion.is_empty() => {
+                    stored.onion.clone_from(address);
+                }
+                channel::Endpoint::Chatmail(address) if stored.chatmail.is_empty() => {
+                    stored.chatmail.clone_from(address);
+                }
+                channel::Endpoint::Ygg(key) if stored.ygg.is_empty() => {
+                    stored.ygg = key.to_vec();
+                }
+                channel::Endpoint::NostrRelay(relay) => stored.relays.push(relay.clone()),
+                channel::Endpoint::Nostr(key) if stored.nostr.is_empty() => {
+                    stored.nostr = key.to_vec();
+                }
+                _ => {}
+            }
+        }
+        self.store.put_peer(&stored)?;
+
+        let availability = PeerAvailability {
+            has_ygg: !stored.ygg.is_empty(),
+            has_onion: !stored.onion.is_empty(),
+            // По ключу, а не по реле (см. `Peer::nostr`): реле без ключа —
+            // не адрес, и лестница, поверившая им, уводила заявку
+            // на ступень, где раннеру некого называть получателем.
+            has_nostr: !stored.nostr.is_empty(),
+            has_chatmail: !stored.chatmail.is_empty(),
+            enabled: self.announcing(),
+            ready: self.ready,
+            // Видимость в эфире с диска не поднимается и здесь не
+            // выдумывается: её говорит только эфир (§5.1).
+            seen_on_lan: false,
+            seen_on_bt: false,
+        };
+        self.peers.insert(
+            peer_ik,
+            Peer {
+                onion: stored.onion,
+                chatmail: stored.chatmail,
+                ygg: stored.ygg,
+                relays: stored.relays,
+                nostr: stored.nostr,
+                availability,
+                known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+            },
+        );
+        Ok(())
     }
 
     /// Отписывается от канала (фаза 2, §10.6).
@@ -458,6 +705,20 @@ impl<S: Store> Engine<S> {
             self.store.delete_outbox_all(msg_id)?;
         }
         self.read_upto.remove(&chat);
+        // **Пира забываем вместе с причиной, по которой он был нужен**
+        // (§8.3): владельца этого канала мы знали ради заявки и доставки,
+        // а канала больше нет. Если он владеет ещё каким-то нашим каналом
+        // — остаётся: причина никуда не делась.
+        //
+        // Сессия с ним при этом не трогается. Она живёт своей жизнью
+        // (§8.5) и исчезнет сама; рвать её здесь значило бы гасить связь,
+        // по которой, может быть, прямо сейчас едет наш же блок ухода.
+        let owner_elsewhere =
+            self.groups.iter().any(|(other, state)| *other != chat && state.group.owner == owner);
+        if !owner_elsewhere {
+            self.store.delete_peer(&owner)?;
+            self.peers.remove(&owner);
+        }
         self.pending_group.retain(|frame| frame.chat != chat);
         self.persist_pending_group();
         self.groups.remove(&chat);
@@ -605,6 +866,11 @@ impl<S: Store> Engine<S> {
         if owner != me {
             effects.extend(self.send_group_copy(now_ms, msg_id, owner, &bytes)?);
         }
+
+        // Заявка отвечена — строка уходит: §10.4 называет впуск ответом
+        // на неё, и держать её дальше значило бы показывать владельцу
+        // просьбу, которую он уже выполнил.
+        self.store.delete_channel_request(&chat, &peer_ik)?;
 
         effects.push(Effect::Notify(Event::ChannelAdmitted {
             chat,
@@ -1371,6 +1637,22 @@ impl<S: Store> Engine<S> {
                 })
                 .collect(),
         })?;
+
+        // **Название чата берётся отсюда, и это правка поломки со стенда.**
+        // У канала имя живёт в подписанном представлении (§6.1), а строка
+        // чата у читателя заводится пустой: при переходе по ссылке названия
+        // ещё нет, его привозит документ. Записывали мы его только
+        // в `channel_representations` — и канал у читателя навсегда
+        // оставался чатом без имени, хотя событие о новой версии имя
+        // называло. Снаружи: «332b07081e64 «»» в списке чатов.
+        //
+        // Метка берётся у часов **сейчас**, а не сравнивается с прежней:
+        // порядок представлений задаёт версия (её стережёт `accepts`
+        // выше), а не HLC. Строка чата у читателя родилась с его
+        // собственной меткой в миг подписки, и метка владельца — из более
+        // раннего документа — проиграла бы ей молча.
+        let at = self.clock.now(now_ms)?;
+        self.apply_rename(chat, &next.title, at)?;
 
         Ok(vec![Effect::Notify(Event::ChannelChanged {
             chat,

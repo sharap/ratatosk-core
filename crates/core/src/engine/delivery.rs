@@ -151,7 +151,19 @@ impl<S: Store> Engine<S> {
         // сопряжения — по тому же правилу §5.1, что и контакт от `IK`, —
         // и без этой строки телефон принял бы рукопожатие и не смог бы
         // ответить.
-        Effect::WatchPeers(self.contacts.keys().chain(self.devices.keys()).copied().collect())
+        // Пиры-не-контакты — наравне: до владельца канала, узнанного
+        // из ссылки, дотягиваются теми же ступенями, и в локальной сети
+        // он может оказаться за стенкой (§5.1). Не назови мы его здесь,
+        // §5.4 считал бы, что в эфире его нет, — и заявка уехала бы
+        // почтой при живом соседе.
+        Effect::WatchPeers(
+            self.contacts
+                .keys()
+                .chain(self.devices.keys())
+                .chain(self.peers.keys())
+                .copied()
+                .collect(),
+        )
     }
 
     /// Ставит в очередь §5.4 служебную просьбу: отзыв, правку, реакцию.
@@ -304,8 +316,8 @@ impl<S: Store> Engine<S> {
     /// и поэтому одно сообщение физически не может уйти двумя каналами
     /// одновременно.
     pub(super) fn advance(&mut self, delivery: &mut Delivery) -> Result<Vec<Effect>, EngineError> {
-        let contact = self.contacts.get(&delivery.peer_ik).ok_or(EngineError::UnknownPeer)?;
-        let availability = contact.availability;
+        // Доступность — одним вопросом на контакта и на пира (§8.3).
+        let availability = self.availability_of(&delivery.peer_ik)?;
 
         // Обнаружение ещё не отвечало — подождём его, прежде чем расходовать
         // транспорты. Иначе §5.4 получает на вход «в LAN не видно» там, где
@@ -800,7 +812,15 @@ impl<S: Store> Engine<S> {
         &self,
         peer_ik: &[u8; 32],
     ) -> Result<PeerAvailability, EngineError> {
-        Ok(self.contacts.get(peer_ik).ok_or(EngineError::UnknownPeer)?.availability)
+        // **Контакт, а если не он — пир** (§8.3). Второй источник заведён
+        // ради того, до кого дотягиваются, не заводя знакомства: владельца
+        // канала, узнанного из ссылки (§10.4). Правило §5.4 при этом одно
+        // на обоих — иначе один и тот же собеседник получал бы разные
+        // решения в зависимости от того, как мы о нём узнали.
+        if let Some(contact) = self.contacts.get(peer_ik) {
+            return Ok(contact.availability);
+        }
+        Ok(self.peers.get(peer_ik).ok_or(EngineError::UnknownPeer)?.availability)
     }
 
     pub(super) fn handshake_frame(
@@ -920,8 +940,15 @@ impl<S: Store> Engine<S> {
         // Ждать имеет смысл только если что-то может измениться. Условий два,
         // и оба необходимы.
         //
-        // Контакт должен существовать: удалённому отправлять некому.
-        let Some(contact) = self.contacts.get(&delivery.peer_ik) else {
+        // Получатель должен существовать: удалённому отправлять некому.
+        //
+        // **Спрашиваются оба списка** (§8.3). Пока здесь стоял один
+        // `contacts`, заявка владельцу канала (§10.4) не откладывалась
+        // вовсе: не найдя ступени в миг отправки — а у свежего узла
+        // их и не бывает, — она **выбрасывалась**, и включённая через
+        // минуту сеть уже ничего не меняла. Поймано на стенде: «ждём
+        // впуска» стояло у подписчика вечно, а владелец не видел заявки.
+        let Ok(availability) = self.availability_of(&delivery.peer_ik) else {
             return Ok((false, Vec::new()));
         };
         // И должен быть хоть один путь, который когда-нибудь может открыться.
@@ -942,7 +969,7 @@ impl<S: Store> Engine<S> {
         //
         // На стенде это не воспроизводилось никогда: там четыре ступени
         // и почта у всех. На живых устройствах с одним мешем — всегда.
-        if !Reachability::of(contact.availability).may_open() {
+        if !Reachability::of(availability).may_open() {
             return Ok((false, Vec::new()));
         }
         // По паре, а не по номеру: копии одного сообщения разным участникам
@@ -1012,7 +1039,11 @@ impl<S: Store> Engine<S> {
             // здесь, мы вернули бы ровно ту поломку, ради которой копии
             // и откладываются (`park_for_card`), — первый же посторонний
             // повод к пересылке убивал бы их до приезда карточки.
-            if !self.contacts.contains_key(&delivery.peer_ik) {
+            // Пир-не-контакт (§8.3) — законный получатель: заявка владельцу
+            // канала (§10.4) стоит в этой же очереди.
+            if !self.contacts.contains_key(&delivery.peer_ik)
+                && !self.peers.contains_key(&delivery.peer_ik)
+            {
                 if self.groups.values().any(|state| state.group.contains(&delivery.peer_ik)) {
                     self.deferred.push(delivery);
                     continue;
@@ -1092,8 +1123,10 @@ impl<S: Store> Engine<S> {
         // бы следующую попытку с LAN на транспорты, которых может и не быть,
         // — и вместо переустановки сессии получили бы «не доставлено».
         if why == Failure::Unreachable && via == Transport::Lan {
-            if let Some(contact) = self.contacts.get_mut(&peer_ik) {
-                contact.availability.seen_on_lan = false;
+            // Контакт или пир (§8.3): не достучавшись, считать слышимым
+            // нельзя никого, кем бы он нам ни приходился.
+            if let Some(availability) = self.availability_mut(&peer_ik) {
+                availability.seen_on_lan = false;
             }
             // Вместе с признаком — и отметка времени: иначе срок соседства
             // «воскресил» бы её при ближайшем проходе, и мы снова считали

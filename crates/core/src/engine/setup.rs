@@ -66,8 +66,10 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         let announcing = self.announcing();
         let enabled = announcing.contains(transport);
-        for contact in self.contacts.values_mut() {
-            contact.availability.enabled = announcing;
+        // Всем, кого умеем достигать: контактам и пирам (§8.3). Разрешение
+        // — состояние нашего устройства, а не свойство собеседника.
+        for availability in self.availabilities_mut() {
+            availability.enabled = announcing;
         }
 
         // Готовность идёт следом за разрешением, но не совпадает с ним.
@@ -75,8 +77,9 @@ impl<S: Store> Engine<S> {
         // работает не сразу, и у Tor это десятки секунд. Кто ждать
         // не заставляет, тот готов вместе с включением.
         self.ready.set(transport, enabled && IMMEDIATE_TRANSPORTS.contains(transport));
-        for contact in self.contacts.values_mut() {
-            contact.availability.ready = self.ready;
+        let ready = self.ready;
+        for availability in self.availabilities_mut() {
+            availability.ready = ready;
         }
 
         // Ключ nostr заводится ровно здесь — при первом включении ступени,
@@ -204,8 +207,9 @@ impl<S: Store> Engine<S> {
         if address.is_empty() {
             // Ящика больше нет: почта перестала работать в тот же миг.
             self.ready.set(Transport::Mail, false);
-            for contact in self.contacts.values_mut() {
-                contact.availability.ready = self.ready;
+            let ready = self.ready;
+            for availability in self.availabilities_mut() {
+                availability.ready = ready;
             }
             effects.extend(self.release_from(Transport::Mail)?);
         }
@@ -774,8 +778,9 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         self.ready.set(transport, true);
-        for contact in self.contacts.values_mut() {
-            contact.availability.ready = self.ready;
+        let ready = self.ready;
+        for availability in self.availabilities_mut() {
+            availability.ready = ready;
         }
         let mut effects = self.retry_deferred(None)?;
         // И недокачанные файлы. Для почты это единственный повод спросить
@@ -828,8 +833,9 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         self.ready.set(transport, false);
-        for contact in self.contacts.values_mut() {
-            contact.availability.ready = self.ready;
+        let ready = self.ready;
+        for availability in self.availabilities_mut() {
+            availability.ready = ready;
         }
         tracing::info!(?transport, "ступень перестала работать — §5.4 её больше не выбирает");
         self.release_from(transport)

@@ -226,6 +226,18 @@ pub enum PayloadType {
     /// отбросит — то есть не покажет ничего, вместо того чтобы показать
     /// мусор.
     Fragment,
+    /// Заявка на подписку к каналу по приглашению (фаза 2, §10.4).
+    ///
+    /// Едет **один на один**, а не в канал, и иначе не может: заявитель
+    /// в канале ещё никто — ни состава, ни цепочки отправителя у него
+    /// там нет, и групповой кадр от него владелец не открыл бы.
+    ///
+    /// Карточки внутри нет нарочно, хотя §10.4 говорит «блок с нашей
+    /// карточкой»: она уже приехала — рукопожатием (§8.2), первым же
+    /// кадром этой самой сессии. Второй её экземпляр внутри заявки
+    /// означал бы два источника одного и того же, и однажды они
+    /// разошлись бы.
+    ChannelRequest,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -262,6 +274,7 @@ impl PayloadType {
             PayloadType::GroupMessage => 22,
             PayloadType::GroupAction => 23,
             PayloadType::Fragment => 24,
+            PayloadType::ChannelRequest => 25,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -294,6 +307,7 @@ impl PayloadType {
             22 => PayloadType::GroupMessage,
             23 => PayloadType::GroupAction,
             24 => PayloadType::Fragment,
+            25 => PayloadType::ChannelRequest,
             other => PayloadType::Unknown(other),
         }
     }
@@ -503,7 +517,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 24;
+        const HIGHEST: u64 = 25;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

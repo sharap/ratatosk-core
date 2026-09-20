@@ -2087,3 +2087,332 @@ fn our_own_grant_is_shown_with_its_deadline() {
     assert_eq!(facts.rights, 0, "истекло — значит нет");
     assert_eq!(facts.rights_until_ms, 0, "и срока показывать больше нечего");
 }
+
+// --- Пир, который не контакт (§8.3; фаза 2, §10.4) -------------------------
+
+/// Ссылка с адресами: по ней и узнаётся пир.
+fn link_with_addresses() -> (String, [u8; 32]) {
+    let owner = Identity::from_seed([200u8; 32]).public().ik;
+    let uri = channel::Invitation {
+        group: [88u8; 16],
+        owner,
+        min_version: 1,
+        key: None,
+        endpoints: vec![
+            channel::Endpoint::Onion(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ),
+            channel::Endpoint::Chatmail("owner@nine.example".into()),
+        ],
+    }
+    .to_uri()
+    .expect("ссылка собирается");
+    (uri, owner)
+}
+
+#[test]
+fn a_channel_link_carries_every_kind_of_address_we_have() {
+    // **§10.1 дословно: «`addrs[]` — адреса всех доступных видов, как
+    // в карточке контакта».** Ядро клало туда два вида из пяти — onion
+    // и почту, — и это нашлось на стенде: у владельца был поднят один
+    // nostr, ссылка уехала **без единого адреса**, а подписчику стенд
+    // честно сказал «адреса нет». §10.2 обещает ровно обратное: «ссылка
+    // провисит год… откроется она через почту и nostr».
+    //
+    // Числа здесь свои, а не из крейта: проверка стережёт обещание §10.1
+    // («все виды»), и возьми она список видов у того же кода, что его
+    // собирает, — забытый вид она бы и не заметила.
+    let identity = Identity::from_seed([42u8; 32]);
+    let mut store = MemoryStore::new();
+    store.migrate().expect("миграция");
+    let mut me = Engine::new(
+        identity,
+        store,
+        Box::new(MemoryBlobs::new()),
+        Box::new(SeededEntropy::new(42)),
+        SelfAddresses {
+            onion: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            chatmail: "owner@nine.example".to_owned(),
+            display_name: "я".to_owned(),
+        },
+    );
+    me.restore().expect("подъём");
+    me.step(10, Input::Command(Command::SetYggMode(ratatosk_proto::ygg::YggMode::External)))
+        .expect("меш внешним демоном");
+    me.step(20, Input::Command(Command::SetYggKey(vec![4u8; 32]))).expect("ключ меша назван");
+    me.step(
+        30,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Nostr,
+            enabled: true,
+        }),
+    )
+    .expect("ступень nostr включена");
+    me.step(
+        40,
+        Input::Command(Command::SetNostrRelays(vec!["wss://relay.nine.example".to_owned()])),
+    )
+    .expect("реле названы");
+
+    let chat = create_channel(&mut me, 100, "вестник", false);
+    let link = me.channel_link(chat).expect("ссылка");
+    let parsed = channel::Invitation::from_uri(&link).expect("ссылка разбирается");
+
+    let kinds: Vec<&str> = parsed
+        .endpoints
+        .iter()
+        .map(|endpoint| match endpoint {
+            channel::Endpoint::Onion(_) => "onion",
+            channel::Endpoint::Chatmail(_) => "почта",
+            channel::Endpoint::Ygg(_) => "меш",
+            channel::Endpoint::Nostr(_) => "ключ nostr",
+            channel::Endpoint::NostrRelay(_) => "реле",
+        })
+        .collect();
+    for kind in ["onion", "почта", "меш", "ключ nostr", "реле"] {
+        assert!(kinds.contains(&kind), "в ссылке нет вида «{kind}»: {kinds:?}");
+    }
+    // И ключ — именно наш, а не чужой: перепутанный ключ увёл бы заявку
+    // к постороннему, и обнаружилось бы это одной тишиной.
+    assert!(
+        parsed
+            .endpoints
+            .iter()
+            .any(|e| matches!(e, channel::Endpoint::Nostr(key) if key == me.nostr_key())),
+        "ключ nostr в ссылке обязан быть нашим"
+    );
+}
+
+/// Ссылка, в которой из адресов — одни реле nostr.
+///
+/// Ровно то, что ядро собирало до починки: реле есть, ключа нет.
+fn link_with_relays_only() -> (String, [u8; 32]) {
+    let owner = Identity::from_seed([201u8; 32]).public().ik;
+    let uri = channel::Invitation {
+        group: [89u8; 16],
+        owner,
+        min_version: 1,
+        key: None,
+        endpoints: vec![channel::Endpoint::NostrRelay("wss://relay.nine.example".into())],
+    }
+    .to_uri()
+    .expect("ссылка собирается");
+    (uri, owner)
+}
+
+#[test]
+fn relays_without_a_key_do_not_make_the_owner_reachable_by_nostr() {
+    // **Поломка, найденная на стенде у владельца с одним только nostr.**
+    // Доступность пира считалась по списку реле, а раннеру получателем
+    // называть нечего: событие на реле адресуется открытым ключом.
+    // §5.4 выбирал ступень, раннер отвечал `NoAddress`, лестница
+    // кончалась — и заявка (§10.4) не уезжала никуда.
+    //
+    // У контакта то же самое всегда считалось по ключу (`card.nostr`);
+    // это проверка того, что пир решается **тем же** правилом.
+    let (mut me, (uri, owner)) = (node(1), link_with_relays_only());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+
+    let peer = me.peers().get(&owner).expect("владелец лёг пиром");
+    assert_eq!(peer.relays.len(), 1, "реле из ссылки запоминаются — они пригодятся с ключом");
+    assert!(peer.nostr.is_empty(), "а ключа в этой ссылке не было");
+    assert!(
+        !me.availability_for(&owner).expect("доступность").has_nostr,
+        "реле без ключа — не адрес: §5.4 не должен выбирать эту ступень"
+    );
+}
+
+#[test]
+fn a_nostr_key_in_the_link_is_what_opens_that_rung() {
+    // Вторая половина: с ключом ступень обязана стать годной — иначе
+    // проверка выше зелена оттого, что nostr не бывает годен никогда.
+    let owner = Identity::from_seed([202u8; 32]).public().ik;
+    let uri = channel::Invitation {
+        group: [90u8; 16],
+        owner,
+        min_version: 1,
+        key: None,
+        endpoints: vec![
+            channel::Endpoint::Nostr([3u8; 32]),
+            channel::Endpoint::NostrRelay("wss://relay.nine.example".into()),
+        ],
+    }
+    .to_uri()
+    .expect("ссылка собирается");
+
+    let mut me = node(1);
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+    assert_eq!(me.peers().get(&owner).expect("пир").nostr, vec![3u8; 32]);
+    assert!(
+        me.availability_for(&owner).expect("доступность").has_nostr,
+        "ключ приехал — ступень адресуема"
+    );
+
+    // И переживает перезапуск: заявка ждёт впуска сутками (§10.4), а
+    // процесс на телефоне убивают постоянно.
+    me.restore().expect("подъём");
+    assert_eq!(me.peers().get(&owner).expect("пир").nostr, vec![3u8; 32]);
+    assert!(me.availability_for(&owner).expect("доступность").has_nostr);
+}
+
+#[test]
+fn a_link_leaves_the_owner_as_a_peer_and_not_as_a_contact() {
+    // **§10.4 дословно: «контакт не заводится».** До владельца надо
+    // дотянуться заявкой, а заводить его в знакомые — значит показать
+    // человеку в списке чатов того, с кем он не разговаривал.
+    //
+    // Раньше адреса из ссылки выбрасывались вовсе, и дотянуться было
+    // нечем. Теперь они ложатся пиром (§8.3) — отдельным списком,
+    // который наружу не едет.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+
+    assert!(!me.contacts().contains_key(&owner), "владелец не становится контактом (§10.4)");
+    let peer = me.peers().get(&owner).expect("а пиром — становится");
+    assert_eq!(peer.chatmail, "owner@nine.example", "адреса взяты из ссылки");
+    assert!(peer.availability.has_onion && peer.availability.has_chatmail);
+    assert!(!peer.availability.has_ygg, "чего в ссылке не было, то и не выдумано");
+}
+
+#[test]
+fn a_peer_survives_a_restart_with_its_addresses() {
+    // Пир лежит на диске (миграция 0031): заявка может ждать владельца
+    // сутками, а процесс на телефоне убивают постоянно. Забудь мы пира
+    // при подъёме — очередь осталась бы с получателем, которого некуда
+    // слать, и её бы вычистили как мусор.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+
+    // Сперва — что он **на диске**: карта в памяти о перезапуске ничего
+    // не говорит.
+    let stored = me.store().peers().expect("пиры с диска");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].chatmail, "owner@nine.example");
+
+    me.restore().expect("подъём");
+    let peer = me.peers().get(&owner).expect("пир поднялся с диска");
+    assert_eq!(peer.chatmail, "owner@nine.example");
+    assert!(peer.availability.has_onion, "и доступность посчитана заново из адресов");
+}
+
+#[test]
+fn the_ladder_takes_a_peer_just_like_a_contact() {
+    // **Главная проверка §8.3.** До пира-не-контакта лестница §5.4 обязана
+    // доходить: раньше `advance` требовал контакта и отвечал `UnknownPeer`
+    // ещё до первой ступени — то есть заявка не уехала бы никуда.
+    //
+    // Проверяется тем, что видно снаружи: отправка **не отказывает**,
+    // и в эфире мы начинаем искать в том числе пира.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+
+    // **Список ищемых спрашивается у подъёма**, а не у случайной команды:
+    // `startup_effects` объявляет его всегда, и проверка не может пройти
+    // оттого, что искать никого не звали.
+    let watched = me
+        .startup_effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::WatchPeers(list) => Some(list.clone()),
+            _ => None,
+        })
+        .expect("подъём обязан сказать транспорту, кого искать");
+    assert!(
+        watched.contains(&owner),
+        "пира ищут в эфире наравне с контактами: он может быть за стенкой"
+    );
+
+    // Доступность у него есть, и она посчитана из адресов ссылки.
+    let availability = me.availability_for(&owner).expect("доступность пира");
+    assert!(availability.has_chatmail, "почта из ссылки — путь до владельца");
+}
+
+#[test]
+fn unsubscribing_forgets_the_peer_it_was_needed_for() {
+    // Пир держится причиной, по которой заведён (§10.6): канала нет —
+    // и звонить владельцу больше незачем. Оставь мы его, список пиров
+    // рос бы с каждой попробованной ссылкой и не убывал никогда.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+    let chat = *me.groups().keys().next().expect("канал завёлся");
+
+    me.step(200, Input::Command(Command::UnsubscribeFromChannel { chat })).expect("отписка");
+    assert!(me.peers().get(&owner).is_none(), "пир забыт вместе с каналом");
+
+    me.restore().expect("подъём");
+    assert!(me.peers().get(&owner).is_none(), "и не возвращается с диска");
+}
+
+#[test]
+fn a_request_that_had_nowhere_to_go_waits_instead_of_vanishing() {
+    // **Поломка, найденная на стенде, и найденная по симптому «ничего
+    // не произошло».** Человек подписался по ссылке в тот миг, когда
+    // ни одной ступени не было: локальная сеть выключена, onion не поднят,
+    // почты нет. Заявка (§10.4) собралась, лестница §5.4 честно сказала
+    // «отправлять некуда» — и её **выбросили**: очередь ожидания
+    // соглашалась ждать только ради контакта, а владелец канала контактом
+    // не становится (§10.4) и не станет.
+    //
+    // Снаружи это выглядело так: у подписчика вечное «ждём впуска»,
+    // у владельца — ни одной заявки, и включённая через минуту сеть
+    // ничего не меняла. Ждать было уже нечему.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+
+    // Ни одна ступень не годится: адреса из ссылки есть, а транспорты
+    // у свежего узла выключены — ровно как на стенде.
+    let waiting = me.store().outbox().expect("очередь");
+    assert_eq!(waiting.len(), 1, "заявка обязана лечь в очередь, а не пропасть");
+    assert_eq!(waiting[0].recipient_ik, owner, "и ждать именно владельца");
+
+    // И пережить перезапуск: подписка ждёт впуска сутками (§10.4), а
+    // процесс на телефоне убивают постоянно.
+    me.restore().expect("подъём");
+    assert_eq!(
+        me.store().outbox().expect("очередь").len(),
+        1,
+        "подъём не должен вычищать заявку как мусор: пир на месте"
+    );
+}
+
+#[test]
+fn hearing_the_owner_in_the_air_gets_the_waiting_request_moving() {
+    // Вторая половина той же поломки: отметку «слышно в эфире» ядро
+    // применяло только к контактам. Пир оставался неслышимым навсегда,
+    // и даже долежавшая заявка не трогалась с места.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    // **Порядок как на стенде, и он и есть проверка.** Сперва подписка,
+    // когда ни одной ступени нет (§5.1 держит локальную сеть выключенной
+    // по умолчанию), и только потом человек её включает. Разрешения —
+    // состояние нашего устройства, и разнести их надо **всем**, кого мы
+    // умеем достигать; пока они разносились одним контактам, пир застывал
+    // с тем, что было в миг его появления, и включённая через минуту сеть
+    // до него не доходила.
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+    me.step(
+        150,
+        Input::Command(Command::SetTransportEnabled {
+            transport: ratatosk_proto::Transport::Lan,
+            enabled: true,
+        }),
+    )
+    .expect("локальная сеть включена");
+    assert!(
+        !me.availability_for(&owner).expect("доступность").seen_on_lan,
+        "до маяка его не слышно — иначе проверка ниже пуста"
+    );
+
+    // Маяк владельца: транспорт услышал его и назвал ядру.
+    let effects = me.step(200, Input::SeenOnLan { peer_ik: owner }).expect("маяк");
+    assert!(
+        me.availability_for(&owner).expect("доступность").seen_on_lan,
+        "пира слышно так же, как контакта (§8.3)"
+    );
+    // И отложенное трогается с места: §5.4 больше не говорит «адреса нет».
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Send { peer_ik, .. } if *peer_ik == owner)),
+        "услышали владельца — заявка обязана поехать, не досиживая срока"
+    );
+}

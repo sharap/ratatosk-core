@@ -146,7 +146,7 @@ impl NostrKey {
     /// # Errors
     ///
     /// Подпись не построилась восемь раз подряд. Практически недостижимо —
-    /// см. [`SIGN_ATTEMPTS`].
+    /// см. `SIGN_ATTEMPTS`.
     pub fn sign(&self, event_id: &[u8; 32]) -> Result<[u8; NOSTR_SIG_LEN]> {
         for _ in 0..SIGN_ATTEMPTS {
             let mut aux = [0u8; 32];

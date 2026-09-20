@@ -35,7 +35,20 @@ import pathlib
 ROOT_DIR = __import__("pathlib").Path(__file__).resolve().parents[2]
 
 
-ENGINE = ROOT_DIR / "crates/core/src/engine.rs"
+def engine_source():
+    """Ядро целиком: `engine.rs` плюс его подмодули.
+
+    После разделения (0.5) ядро — не один файл, а каталог. Метелка,
+    читающая только `engine.rs`, нашла бы пустоту и отчиталась
+    «чисто» — то есть соврала бы ровно в тот день, когда её стоило
+    послушать. Читается всё разом: метелке безразлично, в каком
+    модуле лежит проводка, ей важно, что проводка есть.
+    """
+    root = ROOT_DIR / "crates/core/src"
+    parts = [(root / "engine.rs").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((root / "engine").glob("*.rs"))]
+    return "\n".join(parts)
+
 
 # Молчаливые по построению: копия каждому участнику группы (§11.3).
 # Квитанции у них нет и быть не может — один значок на тридцать двух
@@ -45,15 +58,15 @@ SILENT = {"GroupMessage", "GroupAction"}
 
 def body_of(src, name):
     """Тело функции `name` — от заголовка до следующего объявления."""
-    m = re.search(r"\n    (?:pub )?(?:const )?fn " + re.escape(name) + r"\b", src)
+    m = re.search(r"\n    (?:pub )?(?:pub\(super\) )?(?:pub\(crate\) )?(?:const )?fn " + re.escape(name) + r"\b", src)
     if m is None:
         return None
     rest = src[m.end():]
-    nxt = re.search(r"\n    (?:pub )?(?:const )?fn \w+", rest)
+    nxt = re.search(r"\n    (?:pub )?(?:pub\(super\) )?(?:pub\(crate\) )?(?:const )?fn \w+", rest)
     return rest[: nxt.start()] if nxt else rest
 
 
-src = ENGINE.read_text(encoding="utf-8")
+src = engine_source()
 
 # 1. Типы, которые ставятся в очередь.
 queued = set()

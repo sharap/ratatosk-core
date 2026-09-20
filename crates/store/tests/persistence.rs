@@ -8,8 +8,9 @@ use std::path::PathBuf;
 
 use ratatosk_crdt::Hlc;
 use ratatosk_store::{
-    MemoryStore, SqliteStore, Store, StoredContact, StoredGroup, StoredGroupAvatar,
-    StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredSenderChain,
+    MemoryStore, SqliteStore, Store, StoredArchiveKey, StoredChannel, StoredContact, StoredGrant,
+    StoredGroup, StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage,
+    StoredSenderChain, StoredSubscription,
 };
 use zeroize::Zeroizing;
 
@@ -1896,6 +1897,9 @@ fn group(byte: u8, title: &str, created_ms: u64) -> StoredGroup {
         title_wall: 0,
         title_logical: 0,
         created_ms,
+        // Профиль `closed` — заготовка про хранение группы; про канал
+        // спрашивают отдельные проверки ниже.
+        profile: 0,
     }
 }
 
@@ -1976,6 +1980,390 @@ fn a_repeated_put_renames_the_group_but_keeps_its_owner() {
     assert_eq!(found.title, "у большого костра", "название обязано обновиться");
     assert_eq!(found.owner_ik, [107u8; 32], "владелец обязан остаться прежним");
     assert_eq!(found.created_ms, 1_000, "время заведения обязано остаться прежним");
+}
+
+// --- Представление канала (фаза 2, §6.1–§6.3) ------------------------------
+
+fn channel(version: u64, grants: Vec<StoredGrant>) -> StoredChannel {
+    StoredChannel {
+        chat_id: [7u8; 16],
+        version,
+        owner_ik: [107u8; 32],
+        kind: 1,
+        title: "лента".to_owned(),
+        pow_bits: 20,
+        seed_days: 30,
+        seed_bytes: 1 << 20,
+        // Байты и подпись здесь не настоящие: проверка про хранение,
+        // а не про криптографию. Важно, что они доезжают **побайтово**.
+        block_bytes: vec![version as u8; 64],
+        signature: [9u8; 64],
+        received_ms: 1_000,
+        grants,
+    }
+}
+
+fn grant(who: u8, rights: u32, until_ms: u64) -> StoredGrant {
+    StoredGrant { who: [who; 32], rights, until_ms }
+}
+
+/// Чат заводится до представления: у `channel_representations` внешний
+/// ключ на `chats`, и в файловой базе без строки чата вставка не пройдёт.
+fn with_a_channel_chat(store: &mut dyn Store) {
+    let mut row = group(7, "лента", 1_000);
+    row.profile = 1;
+    store.put_group(&row).unwrap();
+}
+
+#[test]
+fn a_representation_survives_reopening_byte_for_byte() {
+    let db = TempDb::new("channel");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        with_a_channel_chat(&mut store);
+        store.put_channel(&channel(3, vec![grant(2, 1, 5_000), grant(1, 3, 9_000)])).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.channel(&[7u8; 16]).unwrap().expect("представление на месте");
+    assert_eq!(found.version, 3);
+    assert_eq!(found.title, "лента");
+    assert_eq!(found.kind, 1);
+    assert_eq!(found.pow_bits, 20);
+    assert_eq!(found.seed_bytes, 1 << 20);
+    // **Главное в этой проверке.** Подпись проверяется над принятыми
+    // байтами (§6); измени их хранение на один байт — и документ,
+    // проверившийся при приёме, перестал бы проверяться после перезапуска.
+    assert_eq!(found.block_bytes, vec![3u8; 64], "байты под подписью обязаны дожить целыми");
+    assert_eq!(found.signature, [9u8; 64]);
+    assert_eq!(
+        found.grants,
+        vec![grant(1, 3, 9_000), grant(2, 1, 5_000)],
+        "выдачи отдаются в порядке адресата, а не вставки"
+    );
+}
+
+#[test]
+fn the_channel_title_is_not_in_the_file() {
+    // Как владелец назвал канал — сведение того же рода, что название
+    // группы и текст сообщения (§12).
+    let db = TempDb::new("channel-plain");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        with_a_channel_chat(&mut store);
+        let mut it = channel(1, Vec::new());
+        it.title = "капибары вещают".to_owned();
+        store.put_channel(&it).unwrap();
+    }
+
+    let mut bytes = std::fs::read(&db.0).unwrap_or_default();
+    bytes.extend(std::fs::read(db.0.with_extension("db-wal")).unwrap_or_default());
+    let haystack = String::from_utf8_lossy(&bytes);
+    assert!(!haystack.contains("капибары"), "название канала лежит в файле открытым текстом");
+}
+
+#[test]
+fn a_new_version_replaces_the_grants_and_does_not_merge_them() {
+    // **Снятие права выражается тем, что строки больше нет** (§6.2):
+    // список в новой версии — это всё, что действует. Слейся он
+    // с прежним, снятое право воскресло бы, и заметить это было бы
+    // некому: документ подписан, а лишняя строка подписи не портит.
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("channel-grants-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+        with_a_channel_chat(store);
+
+        store.put_channel(&channel(1, vec![grant(1, 1, 5_000), grant(2, 1, 5_000)])).unwrap();
+        store.put_channel(&channel(2, vec![grant(1, 1, 9_000)])).unwrap();
+
+        let found = store.channel(&[7u8; 16]).unwrap().unwrap();
+        assert_eq!(found.version, 2);
+        assert_eq!(found.grants, vec![grant(1, 1, 9_000)], "снятая выдача не должна воскреснуть");
+    }
+}
+
+#[test]
+fn unknown_rights_bits_reach_the_disk_and_come_back() {
+    // Биты прав заведены ровно ради этого: сборка постарше обязана
+    // **сохранить** право, которого не знает. Потеряй она бит при записи —
+    // и отдала бы соседу документ, где прав меньше, чем подписал владелец.
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("channel-bits-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+        with_a_channel_chat(store);
+
+        let odd = 1 | (1 << 17);
+        store.put_channel(&channel(1, vec![grant(1, odd, 5_000)])).unwrap();
+        assert_eq!(store.channel(&[7u8; 16]).unwrap().unwrap().grants[0].rights, odd);
+    }
+}
+
+#[test]
+fn both_backends_answer_the_same_about_a_channel() {
+    // Трейт с одной честной реализацией не бывает абстракцией, а симуляция
+    // §16 гоняет память. Разойдись они — стенд проверял бы не то, что
+    // работает на устройстве.
+    let db = TempDb::new("channel-both");
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    let it = channel(4, vec![grant(3, 8, 1_000), grant(1, 2, 7_000), grant(2, 4, 3_000)]);
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        with_a_channel_chat(store);
+        store.put_channel(&it).unwrap();
+    }
+    assert_eq!(sqlite.channel(&[7u8; 16]).unwrap(), memory.channel(&[7u8; 16]).unwrap());
+    assert_eq!(sqlite.channel(&[8u8; 16]).unwrap(), None, "чужой чат — пусто у обоих");
+    assert_eq!(memory.channel(&[8u8; 16]).unwrap(), None);
+}
+
+// --- Подписка и поколения ключа (фаза 2, §10.4, §6.4) ----------------------
+
+fn subscription(min_version: u64, kind_claimed: u32, state: u32) -> StoredSubscription {
+    StoredSubscription {
+        chat_id: [7u8; 16],
+        owner_ik: [107u8; 32],
+        min_version,
+        kind_claimed,
+        state,
+        joined_ms: 1_000,
+    }
+}
+
+#[test]
+fn a_subscription_survives_reopening() {
+    // Порог версии обязан пережить перезапуск: без него §10.3 шаг 4
+    // и §10.7 перестают действовать, и старая ссылка снова пускает.
+    let db = TempDb::new("subscription");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        with_a_channel_chat(&mut store);
+        store.put_subscription(&subscription(7, 2, 1)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.subscription(&[7u8; 16]).unwrap().expect("подписка на месте");
+    assert_eq!(found.min_version, 7);
+    assert_eq!(found.kind_claimed, 2);
+    assert_eq!(found.state, 1);
+    assert_eq!(found.owner_ik, [107u8; 32]);
+    assert_eq!(store.subscription(&[8u8; 16]).unwrap(), None, "чужой чат — пусто");
+}
+
+#[test]
+fn a_subscription_changes_state_but_a_key_generation_does_not_change_its_key() {
+    // Два разных правила на соседних таблицах, и различие намеренное.
+    // Подписка **меняется**: заявка становится участием. Поколение ключа
+    // — нет: два разных ключа под одним номером это расхождение,
+    // а не обновление, и затерев прежний, мы потеряли бы архив, который
+    // он разворачивает (§6.4).
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("subscription-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+        with_a_channel_chat(store);
+
+        store.put_subscription(&subscription(7, 2, 1)).unwrap();
+        store.put_subscription(&subscription(7, 2, 2)).unwrap();
+        assert_eq!(store.subscription(&[7u8; 16]).unwrap().unwrap().state, 2, "впустили");
+
+        store
+            .put_archive_key(
+                &[7u8; 16],
+                &StoredArchiveKey { generation: 0, key: [1u8; 32], created_ms: 1_000 },
+            )
+            .unwrap();
+        store
+            .put_archive_key(
+                &[7u8; 16],
+                &StoredArchiveKey { generation: 0, key: [2u8; 32], created_ms: 2_000 },
+            )
+            .unwrap();
+        let keys = store.archive_keys(&[7u8; 16]).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, [1u8; 32], "прежний ключ поколения затирать нельзя");
+    }
+}
+
+#[test]
+fn key_generations_live_side_by_side_and_come_back_in_order() {
+    // §6.4: архив не теряется при повороте — читатель держит прежние
+    // поколения для истории и получает новое для будущего.
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("generations-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+        with_a_channel_chat(store);
+
+        // Кладём вразнобой: порядок обязан задаваться номером, а не
+        // порядком вставки (§16).
+        for generation in [2u64, 0, 1] {
+            store
+                .put_archive_key(
+                    &[7u8; 16],
+                    &StoredArchiveKey {
+                        generation,
+                        key: [u8::try_from(generation).unwrap(); 32],
+                        created_ms: 1_000 + generation,
+                    },
+                )
+                .unwrap();
+        }
+        let keys = store.archive_keys(&[7u8; 16]).unwrap();
+        assert_eq!(keys.iter().map(|k| k.generation).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(keys[1].key, [1u8; 32]);
+    }
+}
+
+#[test]
+fn the_read_key_is_not_in_the_file() {
+    // Ключ чтения канала — это доступ ко всему архиву (§5.4). На диске
+    // открытым он лежать не должен, как и ключи сессий.
+    let db = TempDb::new("generations-plain");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        with_a_channel_chat(&mut store);
+        store
+            .put_archive_key(
+                &[7u8; 16],
+                &StoredArchiveKey { generation: 0, key: [0xab; 32], created_ms: 1_000 },
+            )
+            .unwrap();
+    }
+
+    let mut bytes = std::fs::read(&db.0).unwrap_or_default();
+    bytes.extend(std::fs::read(db.0.with_extension("db-wal")).unwrap_or_default());
+    assert!(
+        !bytes.windows(32).any(|w| w == [0xab; 32]),
+        "ключ чтения канала лежит в файле открытым"
+    );
+}
+
+// --- Профиль (фаза 2, §3.2) ------------------------------------------------
+
+#[test]
+fn a_profile_survives_reopening() {
+    let db = TempDb::new("group-profile");
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        let mut channel = group(7, "лента", 1_000);
+        channel.profile = 1;
+        store.put_group(&channel).unwrap();
+        store.put_group(&group(8, "у костра", 1_000)).unwrap();
+    }
+
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert_eq!(
+        store.group(&[7u8; 16]).unwrap().unwrap().profile,
+        1,
+        "канал обязан остаться каналом"
+    );
+    assert_eq!(store.group(&[8u8; 16]).unwrap().unwrap().profile, 0, "группа — группой");
+}
+
+#[test]
+fn a_group_written_before_the_column_existed_reads_as_closed() {
+    // **Проверяется задним числом, а не на новых записях.** §14 обещает:
+    // группы фазы 1 остаются `closed` навсегда. Живая база к моменту 0027
+    // держит строки, написанные без этого столбца, и умолчание миграции —
+    // единственное, что назначает им профиль.
+    //
+    // Проверка идёт **через настоящее чтение**, а не через `SELECT profile`:
+    // столбец с умолчанием проверял бы SQLite, а нам надо знать, что
+    // `group()` отдаёт такую строку и отдаёт её закрытой группой. Название
+    // берётся зашифрованным из базы, накатанной до конца: ключ тот же
+    // и чат тот же, значит и откроется оно тем же.
+    let sealed = {
+        let donor = TempDb::new("group-profile-donor");
+        let mut store = SqliteStore::open(&donor.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(9, "у костра", 1_000)).unwrap();
+        rusqlite::Connection::open(&donor.0)
+            .unwrap()
+            .query_row("SELECT title_enc FROM chats WHERE chat_id = ?1", [&[9u8; 16][..]], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .unwrap()
+    };
+
+    let up_to = ratatosk_store::schema::MIGRATIONS
+        .iter()
+        .position(|m| *m == ratatosk_store::schema::MIGRATION_0027)
+        .expect("0027 в списке");
+    let db = TempDb::new("group-profile-old");
+    {
+        let conn = rusqlite::Connection::open(&db.0).unwrap();
+        for migration in &ratatosk_store::schema::MIGRATIONS[..up_to] {
+            conn.execute_batch(migration).unwrap();
+        }
+        // Версия схемы ставится руками: без неё `migrate()` начал бы
+        // с первой миграции и упал бы на «table contacts already exists».
+        // Это и есть состояние живой базы накануне 0027.
+        conn.pragma_update(None, "user_version", up_to as u32).unwrap();
+        conn.execute(
+            "INSERT INTO chats (chat_id, kind, owner_ik, title_enc, created_ms,
+                                title_wall, title_logical)
+             VALUES (?1, 1, ?2, ?3, 1000, 0, 0)",
+            rusqlite::params![&[9u8; 16][..], &[109u8; 32][..], sealed],
+        )
+        .unwrap();
+    }
+
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    let found = store.group(&[9u8; 16]).unwrap().expect("строка на месте");
+    assert_eq!(found.title, "у костра", "строка обязана дожить до нас целой");
+    assert_eq!(found.profile, 0, "группа фазы 1 обязана остаться closed (§14)");
+}
+
+#[test]
+fn a_profile_does_not_walk_back() {
+    // Порода задаётся при заведении и не меняется (§6.1, §14).
+    // `put_group` переписывает строку целиком — при переименовании тоже, —
+    // и вызывающий, забывший привезти профиль, понизил бы канал до группы.
+    // Здесь стоит `max`, чтобы забывчивость не была тихой порчей.
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("group-profile-back-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+
+        let mut channel = group(7, "лента", 1_000);
+        channel.profile = 1;
+        store.put_group(&channel).unwrap();
+
+        // Переименование, привёзшее умолчание вместо настоящего профиля.
+        let mut renamed = group(7, "другая лента", 1_000);
+        renamed.title_wall = 5_000;
+        store.put_group(&renamed).unwrap();
+
+        let found = store.group(&[7u8; 16]).unwrap().unwrap();
+        assert_eq!(found.title, "другая лента", "название обязано обновиться");
+        assert_eq!(found.profile, 1, "а канал — остаться каналом");
+    }
 }
 
 #[test]

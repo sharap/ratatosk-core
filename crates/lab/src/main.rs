@@ -2765,6 +2765,11 @@ async fn console(
                     | Event::AvatarChanged { .. }
                     | Event::OwnAvatarChanged
                     | Event::GroupCreated { .. }
+                    | Event::ChannelCreated { .. }
+                    | Event::ChannelChanged { .. }
+                    | Event::ChannelSubscribed { .. }
+                    | Event::ChannelKeyRotated { .. }
+                    | Event::ChannelAdmitted { .. }
                     | Event::GroupMembershipChanged { .. }
                     | Event::GroupRenamed { .. }
                     | Event::GroupAvatarChanged { .. }
@@ -4337,6 +4342,32 @@ fn report(event: &Event) {
         }
         Event::GroupCreated { chat, title } => {
             println!("< группа {} заведена: {title}", short(chat));
+        }
+        Event::ChannelAdmitted { chat, who, admitted_by } => {
+            println!(
+                "< в канал {} впущен {}; впустил {}",
+                short(chat),
+                short(who),
+                short(admitted_by)
+            );
+        }
+        Event::ChannelKeyRotated { chat, generation } => {
+            println!("< ключ чтения канала {} повернулся: поколение {generation}", short(chat));
+        }
+        Event::ChannelSubscribed { chat, awaiting } => {
+            // Названия здесь нет: оно внутри представления, а его ещё
+            // не привезли (§10.5).
+            let what = if *awaiting { "ждём впуска" } else { "открытый" };
+            println!("< подписались на канал {} ({what})", short(chat));
+        }
+        Event::ChannelChanged { chat, version, title } => {
+            println!("< канал {} обновился до версии {version}: {title}", short(chat));
+        }
+        Event::ChannelCreated { chat, title, open } => {
+            // Порода называется словом, а не флагом: §6.1 требует, чтобы
+            // одно слово означало одну гарантию, и «open=true» ею не является.
+            let kind = if *open { "открытый" } else { "по приглашению" };
+            println!("< канал {} заведён ({kind}): {title}", short(chat));
         }
         Event::GroupMembershipChanged { chat } => {
             println!("< состав группы {} изменился", short(chat));

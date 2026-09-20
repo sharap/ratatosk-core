@@ -63,7 +63,7 @@ impl<T> Raw<T> {
 
 /// Кодирует значение в детерминированный CBOR.
 ///
-/// Отвергает карты с повторяющимися ключами — см. [`canonicalize`].
+/// Отвергает карты с повторяющимися ключами — см. `canonicalize`.
 pub fn encode(value: &Value) -> Result<Vec<u8>> {
     let sorted = canonicalize(value.clone())?;
     let mut out = Vec::new();

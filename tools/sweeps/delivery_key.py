@@ -32,7 +32,20 @@ import pathlib
 ROOT_DIR = __import__("pathlib").Path(__file__).resolve().parents[2]
 
 
-ENGINE = ROOT_DIR / "crates/core/src/engine.rs"
+def engine_source():
+    """Ядро целиком: `engine.rs` плюс его подмодули.
+
+    После разделения (0.5) ядро — не один файл, а каталог. Метелка,
+    читающая только `engine.rs`, нашла бы пустоту и отчиталась
+    «чисто» — то есть соврала бы ровно в тот день, когда её стоило
+    послушать. Читается всё разом: метелке безразлично, в каком
+    модуле лежит проводка, ей важно, что проводка есть.
+    """
+    root = ROOT_DIR / "crates/core/src"
+    parts = [(root / "engine.rs").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((root / "engine").glob("*.rs"))]
+    return "\n".join(parts)
+
 
 # Функции, где «все копии» — и есть смысл: сообщение исчезает целиком.
 WHOLE_MESSAGE = {
@@ -48,12 +61,12 @@ QUEUES = ("self.deferred", "self.outbox")
 def enclosing(src, at):
     """Имя функции, внутри которой стоит позиция `at`."""
     name = None
-    for m in re.finditer(r"\n    (?:pub )?(?:const )?fn (\w+)", src[:at]):
+    for m in re.finditer(r"\n    (?:pub )?(?:pub\(super\) )?(?:pub\(crate\) )?(?:const )?fn (\w+)", src[:at]):
         name = m.group(1)
     return name
 
 
-src = ENGINE.read_text(encoding="utf-8")
+src = engine_source()
 
 bad = []
 checked = 0

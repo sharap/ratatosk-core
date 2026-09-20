@@ -1116,6 +1116,84 @@ pub fn request_from_payload(value: &Value) -> Result<(FileId, u64, bool), CodecE
 
 #[cfg(test)]
 mod tests {
+
+    /// Потолок живых сроков на одной передаче.
+    ///
+    /// Величина взята не с потолка: `окно_в_чанках × проходы ×
+    /// STALL_WINDOW_FACTOR` плюс запас на пол `MIN_STALL_MS`. Меняется
+    /// окно или множитель — меняется и она, и проверка ниже скажет
+    /// об этом словами.
+    const LIVE_STALLS_CEILING: f64 = 70.0;
+
+    /// Сколько сроков молчания живёт одновременно на одной передаче.
+    fn live_stalls(via: Transport) -> f64 {
+        let speed =
+            crate::transport_policy::floor_bytes_per_sec(via).unwrap_or(SLOW_BYTES_PER_SEC) as f64;
+        // За срок молчания успевает приехать столько чанков — столько
+        // сроков и стоит непогашенными.
+        (speed / CHUNK_BYTES as f64) * (stall_ms(via) as f64 / 1000.0)
+    }
+
+    #[test]
+    fn live_stall_timers_are_bounded_by_the_window_not_by_the_file() {
+        // **Это ответ на замер, который план назвал первым по важности:**
+        // «сколько живых таймеров держит нынешняя модель». Отменить срок
+        // драйверу нечем — метка забывается, сработавшая вхолостую ничего
+        // не делает, — и на каждый принятый чанк взводится новый. Файл
+        // предела (два гигабайта) — это 2048 чанков, и наивный счёт даёт
+        // 2048 непогашенных сроков.
+        //
+        // Счёт неверен, и вот почему. Срок молчания считается **из того
+        // же окна**, которое ограничивает число чанков в полёте:
+        // `срок ≈ окно / скорость`, а чанков за этот срок приедет
+        // `скорость × срок / чанк`. Скорость **сокращается**, и остаётся
+        // `окно_в_чанках × проходы × STALL_WINDOW_FACTOR` — величина,
+        // от размера файла и от быстроты ступени не зависящая вовсе.
+        //
+        // Значит модель сроков файлы переживает: десятки живых меток,
+        // а не тысячи. Развалится она там, где такого сокращения нет, —
+        // срок на каждое `IHAVE` в рое (§7.1) окном не ограничен ничем,
+        // и вот под него понадобится снимаемый срок.
+        for via in [
+            Transport::Lan,
+            Transport::Onion,
+            Transport::Bt,
+            Transport::Ygg,
+            Transport::Mail,
+            Transport::Nostr,
+        ] {
+            let live = live_stalls(via);
+            assert!(
+                live <= LIVE_STALLS_CEILING,
+                "{via:?}: живых сроков {live:.1}, потолок {LIVE_STALLS_CEILING} — \
+                 окно и срок разъехались, и модель сроков перестала быть ограниченной"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bigger_file_does_not_hold_more_stall_timers() {
+        // Пара к предыдущей: важна не сама величина, а то, что в ней
+        // **нет размера файла**. Проверяется тем, что она не зависит
+        // и от скорости, — а размер файла входил бы в неё только через
+        // время передачи, то есть через скорость.
+        for via in [Transport::Lan, Transport::Onion, Transport::Mail] {
+            let live = live_stalls(via);
+            let window_chunks = match via {
+                Transport::Mail | Transport::Nostr => mail_window_bytes(),
+                _ => window_bytes(via),
+            } as f64
+                / CHUNK_BYTES as f64;
+            let hops = if matches!(via, Transport::Mail | Transport::Nostr) { 2.0 } else { 1.0 };
+            let expected = window_chunks * hops * STALL_WINDOW_FACTOR as f64;
+            // Пол `MIN_STALL_MS` способен поднять срок выше расчётного —
+            // тогда живых сроков больше, но потолок всё равно про окно.
+            assert!(
+                live >= expected - 0.5,
+                "{via:?}: живых {live:.1}, а окно обещает {expected:.1}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

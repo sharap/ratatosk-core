@@ -63,6 +63,10 @@ const KEY_OFFER: u64 = 5;
 /// у `ContactShare`: оба — «непрозрачные байты этого действия», и второй
 /// ключ под то же самое значил бы два имени у одной вещи.
 const KEY_BYTES: u64 = 6;
+/// Номер поколения — только у ключа чтения (§6.4).
+const KEY_GENERATION: u64 = 7;
+/// Кому запечатано — только у ключа чтения (§5.3).
+const KEY_RECIPIENT: u64 = 8;
 
 const KIND_EDIT: u64 = 1;
 const KIND_RETRACT: u64 = 2;
@@ -77,6 +81,33 @@ const KIND_AVATAR: u64 = 7;
 const KIND_FORWARD: u64 = 8;
 /// Карточка контакта, которой поделились в группе.
 const KIND_CONTACT: u64 = 9;
+/// Новая версия представления канала (фаза 2, §6.1).
+///
+/// # Почему действием, а не своим типом нагрузки
+///
+/// Ему нужна **та же обвязка**, что и всему остальному: номер в цепочке
+/// отправителя, копия каждому, откладывание кадра, пришедшего раньше
+/// группы. Свой тип означал бы вторую копию всего этого ради одного
+/// отличия — того, что внутри лежит подписанный документ, а не текст.
+///
+/// # Байты везутся как есть, и это то же правило, что у карточки
+///
+/// Внутри — то, над чем считана подпись владельца (§6). Разбери мы его
+/// здесь и собери заново перед проверкой, расхождение канонизации
+/// на один байт превратило бы законный документ в испорченный.
+const KIND_REPRESENTATION: u64 = 10;
+/// Поколение ключа чтения канала, запечатанное одному читателю
+/// (фаза 2, §6.4, §5.3).
+///
+/// # По блоку на читателя, а не один на всех
+///
+/// §5.3 задаёт именно такую форму: блок называет получателя и едет
+/// **непрозрачным** — ретранслировать его может кто угодно, не читая.
+/// Один блок на всех означал бы, что каждый читатель тянет по восемьдесят
+/// байт за каждого другого; в канале без предела размера это квадрат.
+const KIND_ARCHIVE_KEY: u64 = 11;
+/// Подписанная запись о впуске в канал (фаза 2, §6.5).
+const KIND_ADMISSION: u64 = 12;
 
 /// Почему действие не разобралось.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -255,6 +286,146 @@ pub enum Action {
         /// — тем же кодеком, что и один на один.
         forwarded: bool,
     },
+    /// Поколение ключа чтения канала, запечатанное одному читателю
+    /// (фаза 2, §6.4).
+    ///
+    /// # Едет всем, а открывает один
+    ///
+    /// Блок непрозрачен и самопроверяем: получивший его, но не названный
+    /// адресатом, не может ни прочесть, ни подделать — и именно поэтому
+    /// вправе передать дальше (§4.3). Сегодня владелец шлёт каждому его
+    /// собственный; в рое тот же блок повезёт кто угодно.
+    ArchiveKey {
+        /// Номер поколения (§6.4). Поколения сосуществуют: прежние нужны
+        /// для архива, новое — для будущего.
+        generation: u64,
+        /// Чей это блок, 32 байта.
+        ///
+        /// **Открыто, и это не утечка**: §4.1 и так объявляет метаданные
+        /// конверта видимыми ретранслятору. Спрячь мы адресата, каждому
+        /// пришлось бы пробовать распечатать каждый блок.
+        recipient_ik: [u8; 32],
+        /// Ключ, запечатанный на `IK` адресата (`crypto::seal`).
+        sealed: Vec<u8>,
+    },
+    /// Подписанная запись о впуске в канал (фаза 2, §6.5).
+    ///
+    /// Едет **всем**, а не только впущенному: это учёт, и смотрит в него
+    /// владелец — он видит, кто воспользовался правом «впускать».
+    Admission {
+        /// Запись целиком, вместе с подписью впускающего, как приняли.
+        bytes: Vec<u8>,
+    },
+    /// Новая версия представления канала (фаза 2, §6.1).
+    Representation {
+        /// Документ целиком, вместе с подписью, ровно как приняли.
+        ///
+        /// Непрозрачные байты: разбирает и проверяет их
+        /// `channel::parse_representation`, а здесь они только едут.
+        bytes: Vec<u8>,
+    },
+}
+
+/// Чем судится действие в канале (фаза 2, §6.2).
+///
+/// Двумя разными вещами, и смешать их нельзя: почти всё судится
+/// **правом** из представления, а само представление — **подписью
+/// владельца**. Суди мы его правом, вышел бы круг: документ, который
+/// раздаёт права, не приняли бы, пока он не раздал права.
+///
+/// Обнаружилось это не рассуждением: проверка на приёме отбросила первую
+/// же выданную выдачу, и подписчик так и не узнал, что ему что-то дали.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Нужно это право в канале.
+    Right(crate::channel::Rights),
+    /// Нужно **хоть одно** из этих прав.
+    ///
+    /// Так у выдачи ключа чтения: её делает и тот, кто впускает, и тот,
+    /// кто поворачивает (§6.2). Требуй мы обоих, поворот стал бы
+    /// невозможен для того, кому дали только право «исключать».
+    AnyOf(crate::channel::Rights),
+    /// Судится подписью автора, а не правом.
+    ///
+    /// Так у представления канала: его авторитет — подпись владельца,
+    /// и проверяет её тот, кто документ принимает. Права, записанные
+    /// **в нём самом**, к вопросу «принимать ли его» отношения не имеют.
+    OwnSignature,
+}
+
+impl Action {
+    /// Чем это действие судится в канале (фаза 2, §6.2).
+    ///
+    /// # Список здесь **один**, и это главное в этом методе
+    ///
+    /// То же правило, что у `is_group_copy` в ядре: держи перечень в двух
+    /// местах — и новый вид действия завёлся бы в одном, а во втором
+    /// про него забыли. Забытым он оказался бы **разрешённым**, то есть
+    /// новая возможность молча обошла бы права.
+    ///
+    /// `match` здесь исчерпывающий и без `_`: новый вид обязан ронять
+    /// сборку, а не проваливаться в общую ветку.
+    ///
+    /// # Почему видов прав ровно два
+    ///
+    /// §6.2 раздаёт четыре права, но действия делятся надвое.
+    /// Правка, отзыв, реакция, ответ, файлы, пересылка и карточка —
+    /// это **сказанное в канале**, и требуют они «писать». Название
+    /// и картинка описывают **сам канал**, и требуют «менять
+    /// представление».
+    ///
+    /// «Впускать» и «исключать» не относятся ни к одному действию:
+    /// они про ключ чтения, а он не едет действием.
+    ///
+    /// # В группе это не спрашивается вовсе
+    ///
+    /// `closed` — буквально фаза 1 (§3.2): там пишут все, кто состоит,
+    /// и вопроса о праве не существует. Спрашивает только тот, у кого
+    /// профиль `channel`.
+    #[must_use]
+    pub const fn gate(&self) -> Gate {
+        match self {
+            Action::Edit { .. }
+            | Action::Retract { .. }
+            | Action::Reaction { .. }
+            | Action::Reply { .. }
+            | Action::Files { .. }
+            | Action::Forward { .. }
+            | Action::ContactShare { .. } => Gate::Right(crate::channel::Rights::WRITE),
+            Action::Rename { .. } | Action::Avatar { .. } => {
+                Gate::Right(crate::channel::Rights::EDIT)
+            }
+            // **Выдача ключа чтения, а не поворот.** Блок один и тот же
+            // в обоих случаях (§5.3), и право на него §6.2 называет
+            // дважды: «выдавать ключ чтения» — это «впускать», а
+            // «поворачивать ключ, отсекая невписанных» — «исключать».
+            // Значит годится любое из двух.
+            //
+            // Сперва здесь стояло одно «исключать», и впуск от делегата
+            // с правом «впускать» отказывал сам себе: команда проходила,
+            // а собрать блок с ключом не могла. Показал это тест про
+            // делегата, а не рассуждение.
+            //
+            // Что поворот делает **новое** поколение, а выдача отдаёт
+            // существующее, решает команда, а не этот ответ: она
+            // спрашивает «исключать» отдельно и своими словами.
+            Action::ArchiveKey { .. } => {
+                Gate::AnyOf(crate::channel::Rights::ADMIT.with(crate::channel::Rights::EVICT))
+            }
+            // Запись о впуске судится **правом впускать** (§6.2), а не
+            // подписью: подпись доказывает, кто её составил, но не то,
+            // что ему это было позволено. Оба вопроса разные, и второй
+            // без права не решается.
+            Action::Admission { .. } => Gate::Right(crate::channel::Rights::ADMIT),
+            // **Подписью, а не правом, и это не послабление.** Документ
+            // о правах, судимый правом, не приняли бы никогда: первая же
+            // выдача отбрасывалась бы, потому что у получателя ещё нет
+            // представления, где она записана. Подпись владельца строже:
+            // подделать её нельзя вовсе, тогда как право можно получить
+            // и потерять.
+            Action::Representation { .. } => Gate::OwnSignature,
+        }
+    }
 }
 
 /// Собирает открытый текст действия — то, что ляжет под sender key.
@@ -278,6 +449,20 @@ pub fn payload(action: &Action) -> Value {
         ]),
         Action::Avatar { bytes } => Value::Map(vec![
             (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_AVATAR.into())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
+        ]),
+        Action::ArchiveKey { generation, recipient_ik, sealed } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_ARCHIVE_KEY.into())),
+            (Value::Integer(KEY_GENERATION.into()), Value::Integer((*generation).into())),
+            (Value::Integer(KEY_RECIPIENT.into()), Value::Bytes(recipient_ik.to_vec())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(sealed.clone())),
+        ]),
+        Action::Admission { bytes } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_ADMISSION.into())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
+        ]),
+        Action::Representation { bytes } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_REPRESENTATION.into())),
             (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
         ]),
         Action::Forward { text } => Value::Map(vec![
@@ -337,6 +522,9 @@ pub fn from_payload(value: &Value) -> Result<Action, ActionError> {
         KIND_AVATAR => return avatar_from(map),
         KIND_FORWARD => return forward_from(map),
         KIND_CONTACT => return contact_from(map),
+        KIND_REPRESENTATION => return representation_from(map),
+        KIND_ARCHIVE_KEY => return archive_key_from(map),
+        KIND_ADMISSION => return admission_from(map),
         _ => return Err(ActionError::UnknownKind),
     }
 
@@ -386,6 +574,57 @@ fn avatar_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
     // чего нельзя человеку, причём молча.
     crate::avatar::check(bytes).map_err(|_| ActionError::Malformed)?;
     Ok(Action::Avatar { bytes: bytes.clone() })
+}
+
+fn admission_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let Ok(Value::Bytes(bytes)) = canonical::require(map, KEY_BYTES) else {
+        return Err(ActionError::Malformed);
+    };
+    // Разбор только на форму, без подписи: ключ впускающего знает ядро,
+    // а не разбор кадра. Форму проверить всё же надо — иначе в кадр
+    // клался бы мегабайт мусора, отказывающий только после расшифровки.
+    crate::channel::parse_admission(&canonical::decode(bytes).map_err(|_| ActionError::Malformed)?)
+        .map_err(|_| ActionError::Malformed)?;
+    Ok(Action::Admission { bytes: bytes.clone() })
+}
+
+fn archive_key_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let generation = canonical::require(map, KEY_GENERATION)
+        .and_then(canonical::as_u64)
+        .map_err(|_| ActionError::Malformed)?;
+    let recipient_ik = canonical::require(map, KEY_RECIPIENT)
+        .and_then(canonical::as_array::<32>)
+        .map_err(|_| ActionError::Malformed)?;
+    let Ok(Value::Bytes(sealed)) = canonical::require(map, KEY_BYTES) else {
+        return Err(ActionError::Malformed);
+    };
+    // Длина проверяется **до** распечатки: печать короче собственной
+    // накладной платы не может быть ничем, кроме мусора, и гонять
+    // на неё примитив незачем. Верхнего предела нет своего — его
+    // ставит размер кадра.
+    if sealed.len() < ratatosk_crypto::seal::SEAL_OVERHEAD {
+        return Err(ActionError::Malformed);
+    }
+    Ok(Action::ArchiveKey { generation, recipient_ik, sealed: sealed.clone() })
+}
+
+fn representation_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let Ok(Value::Bytes(bytes)) = canonical::require(map, KEY_BYTES) else {
+        return Err(ActionError::Malformed);
+    };
+    // **Разбор здесь только на форму, без проверки подписи.** Ключ
+    // владельца знает не разбор кадра, а ядро — оно же держит принятое
+    // представление и порог из ссылки. Проверь мы подпись здесь, пришлось
+    // бы протащить сюда ключ, и место, где решают «чей это канал»,
+    // оказалось бы в двух слоях.
+    //
+    // Проверка формы всё же нужна: без неё в кадр можно было бы положить
+    // мегабайт мусора, и отказал бы он только после расшифровки.
+    crate::channel::parse_representation(
+        &canonical::decode(bytes).map_err(|_| ActionError::Malformed)?,
+    )
+    .map_err(|_| ActionError::Malformed)?;
+    Ok(Action::Representation { bytes: bytes.clone() })
 }
 
 fn forward_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {

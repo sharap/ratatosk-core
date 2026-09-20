@@ -121,7 +121,7 @@ const SLOT_MARGIN: Duration = Duration::from_secs(2);
 /// Эфир этой машины: `bluer`, сокеты L2CAP, свои задачи.
 ///
 /// Реализация [`Air`] для Linux. Вся её жизнь — в поле: эфир есть,
-/// пока есть [`Radio`], и гаснет он не вызовом, а `drop`.
+/// пока есть `Radio`, и гаснет он не вызовом, а `drop`.
 #[derive(Default)]
 pub struct LocalAir {
     radio: Option<Radio>,

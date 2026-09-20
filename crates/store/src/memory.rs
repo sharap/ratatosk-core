@@ -15,10 +15,10 @@ use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
 use crate::{
-    FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
-    StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
-    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredPendingGroup,
-    StoredReaction, StoredSenderChain, StoredSession,
+    FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
+    StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar,
+    StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice,
+    StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession, StoredSubscription,
 };
 
 /// Хранилище в оперативной памяти.
@@ -54,10 +54,25 @@ pub struct MemoryStore {
     /// в файловой базе группа и чат — одна строка, а тут чат ничем, кроме
     /// сообщений, не представлен.
     groups: BTreeMap<[u8; 16], StoredGroup>,
+    /// Представления каналов (фаза 2, §6.1). Выдачи лежат **внутри**
+    /// `StoredChannel`, а не отдельной картой: в файловой базе они кладутся
+    /// одной транзакцией с документом, и разъехаться им негде. Отдельная
+    /// карта здесь завела бы такую возможность на ровном месте.
+    channels: BTreeMap<[u8; 16], StoredChannel>,
+    /// Подписки на каналы (фаза 2, §10.4) — наша сторона.
+    subscriptions: BTreeMap<[u8; 16], StoredSubscription>,
+    /// Поколения ключа чтения: чат, затем номер поколения. Порядок обхода
+    /// задан ключом и совпадает с `ORDER BY` файловой базы.
+    archive_keys: BTreeMap<([u8; 16], u64), StoredArchiveKey>,
+    /// Впуски в канал (фаза 2, §6.5): чат, затем впущенный. Порядок
+    /// обхода задан ключом и совпадает с `ORDER BY` файловой базы.
+    admits: BTreeMap<([u8; 16], [u8; 32]), StoredAdmit>,
     /// Операции состава. Ключ — метка целиком, ровно как первичный ключ
     /// `group_members`: повтор той же операции обязан лечь в ту же ячейку.
     /// Порядок обхода задан ключом и совпадает с `ORDER BY` файловой базы.
     membership: BTreeMap<([u8; 16], u64, u32, [u8; 32], [u8; 8], [u8; 32]), bool>,
+    /// Водяные знаки свёртки состава (§6.7) — зеркало `group_baseline`.
+    baselines: BTreeMap<[u8; 16], (u64, u32)>,
     /// Подписанные блоки состава (§11.5). Ключ — чат и идентификатор блока,
     /// ровно как первичный ключ `group_blocks`: тот же блок, пришедший
     /// вторым транспортом, обязан лечь в ту же ячейку.
@@ -479,6 +494,9 @@ impl Store for MemoryStore {
                     known.title_wall = group.title_wall;
                     known.title_logical = group.title_logical;
                 }
+                // Профиль — тем же `max`, что и в SQL: порода задаётся
+                // при заведении и обратно не ходит (§6.1, §14).
+                known.profile = known.profile.max(group.profile);
             }
             None => {
                 self.groups.insert(group.chat_id, group.clone());
@@ -500,6 +518,76 @@ impl Store for MemoryStore {
         Ok(found)
     }
 
+    fn put_channel(&mut self, channel: &StoredChannel) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // Замена целиком, не слияние: список выдач в новой версии — это
+        // всё, что действует (§6.2). Тот же смысл, что у `DELETE` перед
+        // вставкой в файловой базе.
+        let mut fresh = channel.clone();
+        // Порядок выдач тот же, что отдаёт `ORDER BY who`: обе реализации
+        // обязаны отвечать одинаково, иначе симуляция §16 проверяла бы
+        // не то, что работает на устройстве.
+        fresh.grants.sort_by_key(|grant| grant.who);
+        self.channels.insert(channel.chat_id, fresh);
+        Ok(())
+    }
+
+    fn channel(&self, chat_id: &[u8; 16]) -> Result<Option<StoredChannel>> {
+        Ok(self.channels.get(chat_id).cloned())
+    }
+
+    fn put_subscription(&mut self, subscription: &StoredSubscription) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.subscriptions.insert(subscription.chat_id, *subscription);
+        Ok(())
+    }
+
+    fn subscription(&self, chat_id: &[u8; 16]) -> Result<Option<StoredSubscription>> {
+        Ok(self.subscriptions.get(chat_id).copied())
+    }
+
+    fn put_archive_key(&mut self, chat_id: &[u8; 16], key: &StoredArchiveKey) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // Тем же правилом, что `OR IGNORE` в файловой базе: повтор того же
+        // поколения безвреден, а **замена** ключа потеряла бы архив,
+        // который прежний разворачивает.
+        self.archive_keys.entry((*chat_id, key.generation)).or_insert_with(|| key.clone());
+        Ok(())
+    }
+
+    fn archive_keys(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredArchiveKey>> {
+        Ok(self
+            .archive_keys
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|(_, key)| key.clone())
+            .collect())
+    }
+
+    fn put_admit(&mut self, chat_id: &[u8; 16], admit: &StoredAdmit) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        // Тем же правилом, что `OR IGNORE` в файловой базе.
+        self.admits.entry((*chat_id, admit.who)).or_insert_with(|| admit.clone());
+        Ok(())
+    }
+
+    fn admits(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredAdmit>> {
+        Ok(self
+            .admits
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|(_, admit)| admit.clone())
+            .collect())
+    }
+
     fn put_membership(&mut self, chat_id: &[u8; 16], ops: &[StoredMembershipOp]) -> Result<()> {
         if !self.migrated {
             return Err(StoreError::Backend("хранилище не проинициализировано".into()));
@@ -513,6 +601,31 @@ impl Store for MemoryStore {
             *known = *known || op.removed;
         }
         Ok(())
+    }
+
+    fn fold_membership(
+        &mut self,
+        chat_id: &[u8; 16],
+        baseline_wall: u64,
+        baseline_logical: u32,
+        folded: &[StoredMembershipOp],
+    ) -> Result<()> {
+        if !self.migrated {
+            return Err(StoreError::Backend("хранилище не проинициализировано".into()));
+        }
+        self.membership.retain(|(chat, ..), _| chat != chat_id);
+        for op in folded {
+            self.membership.insert(
+                (*chat_id, op.tag_wall, op.tag_logical, op.tag_actor, op.tag_uniq, op.member_ik),
+                false,
+            );
+        }
+        self.baselines.insert(*chat_id, (baseline_wall, baseline_logical));
+        Ok(())
+    }
+
+    fn group_baseline(&self, chat_id: &[u8; 16]) -> Result<Option<(u64, u32)>> {
+        Ok(self.baselines.get(chat_id).copied())
     }
 
     fn membership(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipOp>> {
@@ -1266,6 +1379,7 @@ mod tests {
             title_wall: 0,
             title_logical: 0,
             created_ms,
+            profile: 0,
         }
     }
 

@@ -17,10 +17,11 @@ use crate::schema;
 use crate::sql_types;
 use crate::tokens;
 use crate::{
-    FileId, Result, StagedUpload, Store, StoreError, StoredAvatar, StoredContact,
-    StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar, StoredMembershipBlock,
-    StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice, StoredPendingGroup,
-    StoredReaction, StoredSenderChain, StoredSession,
+    FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
+    StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGrant, StoredGroup,
+    StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox,
+    StoredPairedDevice, StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession,
+    StoredSubscription,
 };
 
 /// Хранилище на SQLite.
@@ -127,6 +128,7 @@ impl SqliteStore {
         created_ms: i64,
         title_wall: i64,
         title_logical: i64,
+        profile: i64,
     ) -> Result<StoredGroup> {
         let owner_ik: [u8; 32] = owner
             .try_into()
@@ -144,6 +146,11 @@ impl SqliteStore {
             // не кладётся.
             title_logical: u32::try_from(sql_types::from_sql(title_logical)).unwrap_or(u32::MAX),
             created_ms: sql_types::from_sql(created_ms),
+            // Незнакомый код сюда доезжает как есть: решать, что с ним
+            // делать, — дело ядра (`Profile::from_code`). Обрежь его
+            // здесь до `0`, и канал из будущей сборки открылся бы
+            // на старой как обычная группа, где писать вправе все.
+            profile: u32::try_from(sql_types::from_sql(profile)).unwrap_or(u32::MAX),
         })
     }
 
@@ -1126,11 +1133,18 @@ impl Store for SqliteStore {
             // порядке (§9.2), и без этого условия старое затёрло бы новое.
             // Сравнение стоит в SQL, а не в ядре, ровно затем, чтобы «читать
             // и писать» не разъезжались между чтением и записью.
+            //
+            // Профиль пишется и **не двигается обратно**: `max` вместо
+            // присвоения. Порода группы задаётся при заведении и не
+            // меняется (§6.1, §14), а строка `chats` может быть заведена
+            // раньше — приехавшим сообщением, с умолчанием `0`. Тогда
+            // `put_group` её и повышает; обратного хода нет.
             "INSERT INTO chats (chat_id, kind, owner_ik, title_enc, created_ms,
-                                title_wall, title_logical)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)
+                                title_wall, title_logical, profile)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(chat_id) DO UPDATE SET
                kind = 1,
+               profile = max(chats.profile, excluded.profile),
                owner_ik = coalesce(chats.owner_ik, excluded.owner_ik),
                title_enc = CASE
                  WHEN (excluded.title_wall, excluded.title_logical)
@@ -1148,7 +1162,8 @@ impl Store for SqliteStore {
                 sealed,
                 sql_types::to_sql(group.created_ms),
                 sql_types::to_sql(group.title_wall),
-                sql_types::to_sql(u64::from(group.title_logical))
+                sql_types::to_sql(u64::from(group.title_logical)),
+                sql_types::to_sql(u64::from(group.profile))
             ],
         )?;
         Ok(())
@@ -1158,7 +1173,8 @@ impl Store for SqliteStore {
         let found = self
             .conn
             .query_row(
-                "SELECT owner_ik, title_enc, created_ms, title_wall, title_logical FROM chats
+                "SELECT owner_ik, title_enc, created_ms, title_wall, title_logical, profile
+                   FROM chats
                   WHERE chat_id = ?1 AND kind = 1 AND owner_ik IS NOT NULL",
                 [&chat_id[..]],
                 |row| {
@@ -1168,6 +1184,7 @@ impl Store for SqliteStore {
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -1177,8 +1194,10 @@ impl Store for SqliteStore {
                 other => Err(StoreError::from(other)),
             })?;
 
-        let Some((owner, sealed, created_ms, wall, logical)) = found else { return Ok(None) };
-        Ok(Some(self.group_row(*chat_id, &owner, &sealed, created_ms, wall, logical)?))
+        let Some((owner, sealed, created_ms, wall, logical, profile)) = found else {
+            return Ok(None);
+        };
+        Ok(Some(self.group_row(*chat_id, &owner, &sealed, created_ms, wall, logical, profile)?))
     }
 
     fn groups(&self) -> Result<Vec<StoredGroup>> {
@@ -1186,7 +1205,7 @@ impl Store for SqliteStore {
             // Порядок — по времени заведения, затем по идентификатору:
             // §16 требует воспроизводимости, а она держится на том, что
             // порядок чтения задан целиком, без опоры на порядок вставки.
-            "SELECT chat_id, owner_ik, title_enc, created_ms, title_wall, title_logical
+            "SELECT chat_id, owner_ik, title_enc, created_ms, title_wall, title_logical, profile
                FROM chats
               WHERE kind = 1 AND owner_ik IS NOT NULL
               ORDER BY created_ms, chat_id",
@@ -1199,19 +1218,343 @@ impl Store for SqliteStore {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
 
         let mut groups = Vec::new();
         for row in rows {
-            let (id, owner, sealed, created_ms, wall, logical) = row?;
+            let (id, owner, sealed, created_ms, wall, logical, profile) = row?;
             let chat_id: [u8; 16] = id
                 .as_slice()
                 .try_into()
                 .map_err(|_| StoreError::Backend("идентификатор чата не 16 байт".into()))?;
-            groups.push(self.group_row(chat_id, &owner, &sealed, created_ms, wall, logical)?);
+            groups.push(
+                self.group_row(chat_id, &owner, &sealed, created_ms, wall, logical, profile)?,
+            );
         }
         Ok(groups)
+    }
+
+    fn put_channel(&mut self, channel: &StoredChannel) -> Result<()> {
+        let sealed = self.seal(
+            "channel_representations.title_enc",
+            &channel.chat_id,
+            channel.title.as_bytes(),
+        )?;
+        // Одной транзакцией: выдачи — производная от документа, и лягут
+        // они порознь, права одной версии будут судить записи при
+        // документе другой.
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO channel_representations
+               (chat_id, version, owner_ik, kind, title_enc, pow_bits,
+                seed_days, seed_bytes, block_bytes, signature, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               version = excluded.version,
+               owner_ik = excluded.owner_ik,
+               kind = excluded.kind,
+               title_enc = excluded.title_enc,
+               pow_bits = excluded.pow_bits,
+               seed_days = excluded.seed_days,
+               seed_bytes = excluded.seed_bytes,
+               block_bytes = excluded.block_bytes,
+               signature = excluded.signature,
+               received_ms = excluded.received_ms",
+            rusqlite::params![
+                &channel.chat_id[..],
+                sql_types::to_sql(channel.version),
+                &channel.owner_ik[..],
+                sql_types::to_sql(u64::from(channel.kind)),
+                sealed,
+                sql_types::to_sql(u64::from(channel.pow_bits)),
+                sql_types::to_sql(u64::from(channel.seed_days)),
+                sql_types::to_sql(channel.seed_bytes),
+                &channel.block_bytes[..],
+                &channel.signature[..],
+                sql_types::to_sql(channel.received_ms)
+            ],
+        )?;
+        // **Стирается целиком, а не дополняется.** Список в новой версии —
+        // это всё, что действует (§6.2); снятие права выражается тем, что
+        // строки в нём больше нет, и дополнение воскресило бы снятое.
+        tx.execute("DELETE FROM channel_grants WHERE chat_id = ?1", [&channel.chat_id[..]])?;
+        for grant in &channel.grants {
+            tx.execute(
+                "INSERT INTO channel_grants (chat_id, who, rights, until_ms, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    &channel.chat_id[..],
+                    &grant.who[..],
+                    sql_types::to_sql(u64::from(grant.rights)),
+                    sql_types::to_sql(grant.until_ms),
+                    sql_types::to_sql(channel.version)
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn channel(&self, chat_id: &[u8; 16]) -> Result<Option<StoredChannel>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT version, owner_ik, kind, title_enc, pow_bits, seed_days,
+                        seed_bytes, block_bytes, signature, received_ms
+                   FROM channel_representations WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        let Some((
+            version,
+            owner,
+            kind,
+            sealed,
+            pow_bits,
+            seed_days,
+            seed_bytes,
+            block_bytes,
+            signature,
+            received_ms,
+        )) = found
+        else {
+            return Ok(None);
+        };
+
+        let owner_ik: [u8; 32] = owner
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Backend("ключ владельца канала не 32 байта".into()))?;
+        let signature: [u8; 64] = signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| StoreError::Backend("подпись представления не 64 байта".into()))?;
+        let title = String::from_utf8(self.open_sealed(
+            "channel_representations.title_enc",
+            chat_id,
+            &sealed,
+        )?)
+        .map_err(|_| StoreError::Backend("название канала не UTF-8".into()))?;
+
+        // Порядок выдач задан целиком, без опоры на порядок вставки:
+        // §16 требует, чтобы прогон по сиду повторялся.
+        let mut stmt = self.conn.prepare(
+            "SELECT who, rights, until_ms FROM channel_grants
+              WHERE chat_id = ?1 ORDER BY who",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut grants = Vec::new();
+        for row in rows {
+            let (who, rights, until_ms) = row?;
+            grants.push(StoredGrant {
+                who: who
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("адресат выдачи не 32 байта".into()))?,
+                rights: u32::try_from(sql_types::from_sql(rights)).unwrap_or(u32::MAX),
+                until_ms: sql_types::from_sql(until_ms),
+            });
+        }
+
+        Ok(Some(StoredChannel {
+            chat_id: *chat_id,
+            version: sql_types::from_sql(version),
+            owner_ik,
+            kind: u32::try_from(sql_types::from_sql(kind)).unwrap_or(u32::MAX),
+            title,
+            pow_bits: u32::try_from(sql_types::from_sql(pow_bits)).unwrap_or(u32::MAX),
+            seed_days: u32::try_from(sql_types::from_sql(seed_days)).unwrap_or(u32::MAX),
+            seed_bytes: sql_types::from_sql(seed_bytes),
+            block_bytes,
+            signature,
+            received_ms: sql_types::from_sql(received_ms),
+            grants,
+        }))
+    }
+
+    fn put_subscription(&mut self, subscription: &StoredSubscription) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO channel_subscriptions
+               (chat_id, owner_ik, min_version, kind_claimed, state, joined_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               owner_ik = excluded.owner_ik,
+               min_version = excluded.min_version,
+               kind_claimed = excluded.kind_claimed,
+               state = excluded.state,
+               joined_ms = excluded.joined_ms",
+            rusqlite::params![
+                &subscription.chat_id[..],
+                &subscription.owner_ik[..],
+                sql_types::to_sql(subscription.min_version),
+                sql_types::to_sql(u64::from(subscription.kind_claimed)),
+                sql_types::to_sql(u64::from(subscription.state)),
+                sql_types::to_sql(subscription.joined_ms)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn subscription(&self, chat_id: &[u8; 16]) -> Result<Option<StoredSubscription>> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT owner_ik, min_version, kind_claimed, state, joined_ms
+                   FROM channel_subscriptions WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })?;
+        let Some((owner, min_version, kind_claimed, state, joined_ms)) = found else {
+            return Ok(None);
+        };
+        Ok(Some(StoredSubscription {
+            chat_id: *chat_id,
+            owner_ik: owner
+                .as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Backend("ключ владельца канала не 32 байта".into()))?,
+            min_version: sql_types::from_sql(min_version),
+            kind_claimed: u32::try_from(sql_types::from_sql(kind_claimed)).unwrap_or(u32::MAX),
+            state: u32::try_from(sql_types::from_sql(state)).unwrap_or(u32::MAX),
+            joined_ms: sql_types::from_sql(joined_ms),
+        }))
+    }
+
+    fn put_archive_key(&mut self, chat_id: &[u8; 16], key: &StoredArchiveKey) -> Result<()> {
+        let sealed = self.seal("channel_archive_keys.key_enc", chat_id, &key.key)?;
+        // `OR IGNORE`, а не `REPLACE`: два разных ключа под одним номером
+        // означают расхождение, а не обновление, и затерев прежний, мы
+        // потеряли бы архив, который он разворачивает.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO channel_archive_keys
+               (chat_id, generation, key_enc, created_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                &chat_id[..],
+                sql_types::to_sql(key.generation),
+                sealed,
+                sql_types::to_sql(key.created_ms)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn archive_keys(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredArchiveKey>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT generation, key_enc, created_ms FROM channel_archive_keys
+              WHERE chat_id = ?1 ORDER BY generation",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let (generation, sealed, created_ms) = row?;
+            let opened = self.open_sealed("channel_archive_keys.key_enc", chat_id, &sealed)?;
+            keys.push(StoredArchiveKey {
+                generation: sql_types::from_sql(generation),
+                key: opened
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("ключ чтения канала не 32 байта".into()))?,
+                created_ms: sql_types::from_sql(created_ms),
+            });
+        }
+        Ok(keys)
+    }
+
+    fn put_admit(&mut self, chat_id: &[u8; 16], admit: &StoredAdmit) -> Result<()> {
+        // `OR IGNORE`: одного человека впускают один раз, и второй впуск
+        // другим — спор о следе, а не новый факт.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO channel_admits
+               (chat_id, who, admitted_by, generation, block_bytes, signature, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                &chat_id[..],
+                &admit.who[..],
+                &admit.admitted_by[..],
+                sql_types::to_sql(admit.generation),
+                &admit.block_bytes[..],
+                &admit.signature[..],
+                sql_types::to_sql(admit.created_ms)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn admits(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredAdmit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT who, admitted_by, generation, block_bytes, signature, created_ms
+               FROM channel_admits WHERE chat_id = ?1 ORDER BY who",
+        )?;
+        let rows = stmt.query_map([&chat_id[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut admits = Vec::new();
+        for row in rows {
+            let (who, admitted_by, generation, block_bytes, signature, created_ms) = row?;
+            admits.push(StoredAdmit {
+                who: who
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("впущенный не 32 байта".into()))?,
+                admitted_by: admitted_by
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("впустивший не 32 байта".into()))?,
+                generation: sql_types::from_sql(generation),
+                block_bytes,
+                signature: signature
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Backend("подпись впуска не 64 байта".into()))?,
+                created_ms: sql_types::from_sql(created_ms),
+            });
+        }
+        Ok(admits)
     }
 
     fn put_membership(&mut self, chat_id: &[u8; 16], ops: &[StoredMembershipOp]) -> Result<()> {
@@ -1244,6 +1587,68 @@ impl Store for SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    fn fold_membership(
+        &mut self,
+        chat_id: &[u8; 16],
+        baseline_wall: u64,
+        baseline_logical: u32,
+        folded: &[StoredMembershipOp],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        // Порядок внутри транзакции безразличен — она атомарна, — но
+        // читается он как рассуждение: стираем прежнее, кладём свёрнутое,
+        // ставим знак.
+        tx.execute("DELETE FROM group_members WHERE chat_id = ?1", [&chat_id[..]])?;
+        for op in folded {
+            tx.execute(
+                "INSERT OR REPLACE INTO group_members
+                   (chat_id, member_ik, tag_wall, tag_logical, tag_actor, tag_uniq, removed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                rusqlite::params![
+                    &chat_id[..],
+                    &op.member_ik[..],
+                    sql_types::to_sql(op.tag_wall),
+                    i64::from(op.tag_logical),
+                    &op.tag_actor[..],
+                    &op.tag_uniq[..]
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO group_baseline (chat_id, baseline_wall, baseline_logical, messages_since)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               baseline_wall = excluded.baseline_wall,
+               baseline_logical = excluded.baseline_logical",
+            rusqlite::params![
+                &chat_id[..],
+                sql_types::to_sql(baseline_wall),
+                sql_types::to_sql(u64::from(baseline_logical))
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn group_baseline(&self, chat_id: &[u8; 16]) -> Result<Option<(u64, u32)>> {
+        self.conn
+            .query_row(
+                "SELECT baseline_wall, baseline_logical FROM group_baseline WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map(|(wall, logical)| {
+                Some((
+                    sql_types::from_sql(wall),
+                    u32::try_from(sql_types::from_sql(logical)).unwrap_or(u32::MAX),
+                ))
+            })
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::from(other)),
+            })
     }
 
     fn membership(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredMembershipOp>> {

@@ -12,8 +12,8 @@ use ratatosk_core::{
     Command, Effect, Engine, EngineError, Event, Input, SeededEntropy, MAX_GROUP_TITLE_CHARS,
 };
 use ratatosk_crypto::{Identity, PublicIdentity};
-use ratatosk_proto::group;
-use ratatosk_store::{MemoryBlobs, MemoryStore, Store};
+use ratatosk_proto::{channel, group};
+use ratatosk_store::{MemoryBlobs, MemoryStore, Store, StoredGroup, StoredMembershipOp};
 
 type Node = Engine<MemoryStore>;
 
@@ -297,10 +297,18 @@ fn an_invitation_adds_the_member_and_records_a_second_block() {
 }
 
 #[test]
-fn an_invitation_starts_a_new_sender_chain() {
-    // §11.5: «при вступлении каждый участник обязан начать новую
-    // sender-цепочку». Именно новую, а не продвинутую: продвижение
-    // выводится из прежнего состояния и знающему его ничего не закрывает.
+fn an_invitation_leaves_the_sender_chain_alone() {
+    // **Было наоборот, и менялось это зря.**
+    //
+    // §11.5 требует, чтобы новичок не вывел ключи прошлых сообщений, и
+    // до фазы 2 это делалось поворотом: каждое вступление заводило всем
+    // писателям новую цепочку. Цель верная, средство избыточное — новичку
+    // отдаётся состояние на **текущей** позиции, а ретчет назад
+    // не разворачивается. Прошлое закрывает он, а не политика.
+    //
+    // Цена поворота была не нулевой: он обнулял `counter` при каждом
+    // вступлении, и номер переставал быть непрерывным. Фазе 2 он нужен
+    // непрерывным.
     let mut me = node(1);
     let chat = create(&mut me, 100, "у костра");
     let mine = me.own_card().ik;
@@ -310,56 +318,38 @@ fn an_invitation_starts_a_new_sender_chain() {
     invite(&mut me, 200, chat, guest);
 
     let after = me.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
-    assert_ne!(after.chain, before.chain, "цепочка обязана смениться");
-    assert_eq!(after.counter, 0, "новая цепочка начинается с нуля");
-    assert_eq!(me.store().sender_chains(&chat).expect("хранилище").len(), 1, "не вторая строка");
+    assert_eq!(after.chain, before.chain, "вступление цепочку не трогает");
+    assert_eq!(after.counter, before.counter, "и номер не обнуляет");
+    assert_eq!(
+        (after.chain_wall, after.chain_logical),
+        (before.chain_wall, before.chain_logical),
+        "метка старшинства тоже на месте: цепочка не менялась, и говорить о смене нечего"
+    );
 }
 
 #[test]
-fn a_second_invitation_rotates_the_chain_again() {
+fn a_number_stays_continuous_across_invitations() {
+    // **Предусловие фазы 2, а не украшение.** На непрерывном номере автора
+    // стоят have-вектор (§7.2) и обнаружение пропуска (§7.3): узел, имеющий
+    // 46 и 48, обязан **знать**, что 47 существует. Обнулись номер на каждом
+    // вступлении — и знать было бы нечего.
     let mut me = node(1);
     let chat = create(&mut me, 100, "у костра");
     let mine = me.own_card().ik;
+    let chat_of =
+        |e: &Node| e.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
 
     let first = befriend(&mut me, &stranger(9));
     invite(&mut me, 200, chat, first);
-    let after_first = me.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
+    me.step(250, Input::Command(Command::SendText { chat, text: "слово".into() })).expect("текст");
+    let after_word = chat_of(&me).counter;
+    assert!(after_word > 0, "сказанное продвинуло номер");
 
     let second = befriend(&mut me, &stranger(8));
     invite(&mut me, 300, chat, second);
-    let after_second = me.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
 
-    assert_ne!(after_second.chain, after_first.chain, "каждое вступление — новая цепочка");
+    assert_eq!(chat_of(&me).counter, after_word, "второе вступление номер не сбрасывает");
     assert_eq!(me.groups()[&chat].group.len(), 3);
-
-    // Метка поворота обязана расти, и это не украшение. Оба объявления
-    // едут одновременно и с одинаковым (нулевым) номером; §9.2 разрешает
-    // их переставить, и отличить свежее от опоздавшего получателю больше
-    // нечем. Совпади метки — он взял бы пришедшее последним, то есть
-    // в половине случаев мёртвую цепочку.
-    assert!(
-        (after_second.chain_wall, after_second.chain_logical)
-            > (after_first.chain_wall, after_first.chain_logical),
-        "второй поворот обязан быть старше первого: {:?} против {:?}",
-        (after_second.chain_wall, after_second.chain_logical),
-        (after_first.chain_wall, after_first.chain_logical),
-    );
-}
-
-#[test]
-fn an_invitation_says_the_membership_changed() {
-    let mut me = node(1);
-    let chat = create(&mut me, 100, "у костра");
-    let guest = befriend(&mut me, &stranger(9));
-    let effects = invite(&mut me, 200, chat, guest);
-
-    assert!(
-        effects.iter().any(|e| matches!(
-            e,
-            Effect::Notify(Event::GroupMembershipChanged { chat: c }) if *c == chat
-        )),
-        "без события клиент не перерисует шапку"
-    );
 }
 
 #[test]
@@ -409,6 +399,39 @@ fn an_eviction_records_a_block_of_its_own() {
     assert_eq!(ops.len(), 2, "надгробие ложится на ту же метку, а не новой строкой");
     let tomb = ops.iter().find(|o| o.member_ik == guest).expect("строка гостя");
     assert!(tomb.removed, "метка добавления погашена");
+}
+
+#[test]
+fn an_eviction_starts_a_new_sender_chain() {
+    // **Ради чего исключение перестало быть социальным (§11.4, фаза 2).**
+    //
+    // Раньше здесь не поворачивалось ничего, и обоснование стояло в коде:
+    // «менять поздно, прошлое он уже прочёл». Про прошлое верно — забрать
+    // прочитанное нельзя. Про будущее было неверно: sender-цепочка идёт
+    // вперёд от состояния, которое у исключённого на руках, и всё, что
+    // группа напишет дальше, он прочёл бы, просто перехватывая кадры.
+    //
+    // Теперь состав уменьшился — цепочка новая, и перехваченное
+    // не открывается.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    let mine = me.own_card().ik;
+    let guest = befriend(&mut me, &stranger(9));
+    invite(&mut me, 200, chat, guest);
+    let before = me.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
+
+    me.step(300, Input::Command(Command::EvictFromGroup { chat, peer_ik: guest }))
+        .expect("исключение");
+
+    let after = me.store().sender_chain(&chat, &mine).expect("хранилище").expect("есть");
+    assert_ne!(after.chain, before.chain, "убыль состава обязана поворачивать цепочку");
+    assert_eq!(after.counter, 0, "новая цепочка начинается с нуля");
+    // Именно **новая**, а не продвинутая: продвижение выводится из прежнего
+    // состояния, которое у исключённого осталось.
+    assert!(
+        (after.chain_wall, after.chain_logical) > (before.chain_wall, before.chain_logical),
+        "метка поворота обязана расти — по ней получатель отличает свежую цепочку от опоздавшей"
+    );
 }
 
 #[test]
@@ -1264,4 +1287,539 @@ fn a_member_without_a_card_is_waited_for_not_dropped() {
     for member in &members[1..] {
         assert!(copies.contains(member), "участник {} обязан получить копию", who(member));
     }
+}
+
+// --- Профиль (фаза 2, §3.2) -----------------------------------------------
+
+/// Поднимает узел над хранилищем, в котором уже лежит группа с этим
+/// профилем. Так выглядит база, записанная другой сборкой.
+fn node_over_a_group_with_profile(seed: u8, profile: u32) -> Node {
+    let identity = Identity::from_seed([seed; 32]);
+    let mut store = MemoryStore::new();
+    store.migrate().expect("миграция");
+    store
+        .put_group(&StoredGroup {
+            chat_id: [9u8; 16],
+            // **Владелец — чужой, и это важно.** Себе владельцем правила
+            // канала не отказывают ни в чём (5вп), и заготовка с нами
+            // в роли владельца проверяла бы не то: «представления нет»
+            // перестало бы значить «прав нет».
+            owner_ik: [200u8; 32],
+            title: "лента".to_owned(),
+            title_wall: 0,
+            title_logical: 0,
+            created_ms: 100,
+            profile,
+        })
+        .expect("группа легла");
+    // Себя в состав — иначе это не «чат, в котором мы состоим», а чужой,
+    // и всякая проверка упиралась бы в состав раньше, чем во что-либо
+    // ещё. Метка своя: OR-Set разрешает порядок сам, а подъём читает
+    // именно операции.
+    store
+        .put_membership(
+            &[9u8; 16],
+            &[StoredMembershipOp {
+                member_ik: identity.public().ik,
+                tag_wall: 100,
+                tag_logical: 0,
+                tag_actor: identity.public().ik,
+                tag_uniq: [1u8; 8],
+                removed: false,
+            }],
+        )
+        .expect("состав лёг");
+    let mut engine = Engine::new(
+        identity,
+        store,
+        Box::new(MemoryBlobs::new()),
+        Box::new(SeededEntropy::new(u64::from(seed))),
+        SelfAddresses {
+            onion: String::new(),
+            chatmail: String::new(),
+            display_name: "я".to_owned(),
+        },
+    );
+    engine.restore().expect("подъём");
+    engine
+}
+
+#[test]
+fn a_group_created_here_is_closed_and_stays_closed_across_a_restart() {
+    // §14: группы фазы 1 остаются `closed` навсегда. Проверяется и после
+    // подъёма: профиль едет с диска, и потеряйся он там — канал после
+    // перезапуска стал бы группой, где писать вправе все.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    assert_eq!(me.groups().get(&chat).expect("группа").profile, group::Profile::Closed);
+
+    me.restore().expect("подъём");
+    assert_eq!(me.groups().get(&chat).expect("группа поднялась").profile, group::Profile::Closed);
+}
+
+#[test]
+fn a_channel_rises_as_a_channel() {
+    // Пара к следующей проверке: знакомый профиль обязан подниматься,
+    // иначе «не поднялся» ничего не значило бы.
+    let me = node_over_a_group_with_profile(1, group::Profile::Channel.code());
+    assert_eq!(
+        me.groups().get(&[9u8; 16]).expect("канал поднялся").profile,
+        group::Profile::Channel
+    );
+}
+
+#[test]
+fn a_chat_with_an_unknown_profile_does_not_rise() {
+    // **Главная проверка профиля.** Строку написала сборка новее нашей.
+    // Прочти мы её как `closed` — и получили бы чат, где, по нашему
+    // мнению, писать вправе все, хотя владелец этого не разрешал.
+    // Молчание здесь — то же поведение, что у сторожа версии провода
+    // (5вм): чужую версию встречают отказом, а не догадкой.
+    let me = node_over_a_group_with_profile(1, 7);
+    assert!(me.groups().get(&[9u8; 16]).is_none(), "незнакомую породу поднимать нельзя");
+    assert!(me.groups().is_empty(), "и ничего вместо неё тоже");
+}
+
+// --- Заведение канала (фаза 2, §6.1) --------------------------------------
+
+/// Заводит канал и отдаёт его идентификатор.
+fn create_channel(engine: &mut Node, now_ms: u64, title: &str, open: bool) -> [u8; 16] {
+    let effects = engine
+        .step(now_ms, Input::Command(Command::CreateChannel { title: title.to_owned(), open }))
+        .expect("канал заводится");
+    let mut found = None;
+    for effect in effects {
+        if let Effect::Notify(Event::ChannelCreated { chat, title: said, open: said_open }) = effect
+        {
+            assert_eq!(said, title, "название в событии — то же, что легло");
+            assert_eq!(said_open, open, "порода в событии — та же, что просили");
+            found = Some(chat);
+        }
+    }
+    found.expect("событие о заведении канала")
+}
+
+#[test]
+fn a_channel_is_a_group_with_a_channel_profile() {
+    // **Главное про канал в ядре.** Он лежит там же, где группы, — оттого
+    // сорок развилок «группа или 1:1» остались верными без единой новой
+    // ветки. Владелец в составе: он пишет, а пишущий обязан состоять.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+
+    let state = me.groups().get(&chat).expect("канал лежит среди групп");
+    assert_eq!(state.profile, group::Profile::Channel);
+    assert_eq!(state.title, "лента");
+    assert_eq!(state.group.owner, Identity::from_seed([1u8; 32]).public().ik, "владелец — мы");
+    assert!(
+        state.group.contains(&Identity::from_seed([1u8; 32]).public().ik),
+        "владелец состоит в своём канале"
+    );
+}
+
+#[test]
+fn a_fresh_channel_has_a_signed_representation_of_version_one() {
+    // Версия начинается с единицы, а не с нуля: ссылка называет
+    // **минимальную** версию (§10.1), и нулевая не отличалась бы
+    // от «версии не назвали».
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+
+    let stored = me.store().channel(&chat).expect("чтение").expect("представление легло");
+    assert_eq!(stored.version, 1);
+    assert_eq!(stored.owner_ik, Identity::from_seed([1u8; 32]).public().ik);
+    assert_eq!(stored.kind, u32::try_from(channel::Kind::Open.code()).unwrap());
+    assert_eq!(stored.title, "лента");
+    assert!(stored.grants.is_empty(), "владельца среди выдач нет: у него всё и всегда (5вп)");
+
+    // **Подпись проверяется над принятыми байтами, а не над пересобранными.**
+    // Разойдись канонизация на байт — документ, проверившийся при заведении,
+    // перестал бы проверяться после перезапуска, и наружу это вышло бы
+    // каналом, который вдруг перестал быть своим.
+    let value = ratatosk_codec::Value::Map(vec![
+        (
+            ratatosk_codec::Value::Integer(13.into()),
+            ratatosk_codec::Value::Bytes(stored.block_bytes.clone()),
+        ),
+        (
+            ratatosk_codec::Value::Integer(14.into()),
+            ratatosk_codec::Value::Bytes(stored.signature.to_vec()),
+        ),
+    ]);
+    let unchecked = channel::parse_representation(&value).expect("разбирается");
+    let checked = unchecked
+        .verify(&Identity::from_seed([1u8; 32]).public())
+        .expect("подпись владельца сходится");
+    assert_eq!(checked.version, 1);
+    assert_eq!(checked.kind, channel::Kind::Open);
+    assert_eq!(checked.pow_bits, channel::DEFAULT_POW_BITS);
+    assert_eq!(checked.seed_days, channel::DEFAULT_SEED_DAYS);
+    assert_eq!(checked.seed_bytes, channel::DEFAULT_SEED_BYTES);
+}
+
+#[test]
+fn the_kind_of_a_channel_is_what_the_command_said() {
+    // Порода задаётся при заведении и не меняется (§6.1): это разные
+    // обещания, и перехода между ними нет. Проверяется обе стороны —
+    // иначе `open` мог бы не доезжать вовсе и тест этого не заметил бы.
+    let mut me = node(1);
+    let open = create_channel(&mut me, 100, "открытый", true);
+    let closed = create_channel(&mut me, 200, "по приглашению", false);
+
+    let kind = |chat: &[u8; 16]| me.store().channel(chat).unwrap().unwrap().kind;
+    assert_eq!(kind(&open), u32::try_from(channel::Kind::Open.code()).unwrap());
+    assert_eq!(kind(&closed), u32::try_from(channel::Kind::ByInvite.code()).unwrap());
+}
+
+#[test]
+fn a_channel_comes_back_a_channel_after_a_restart() {
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    me.restore().expect("подъём");
+
+    let state = me.groups().get(&chat).expect("канал поднялся");
+    assert_eq!(state.profile, group::Profile::Channel, "профиль обязан пережить перезапуск");
+    assert_eq!(state.title, "лента");
+    assert_eq!(me.store().channel(&chat).unwrap().unwrap().version, 1);
+}
+
+#[test]
+fn a_channel_title_obeys_the_same_two_limits_as_a_group() {
+    // **Пределов два, и они обязаны сходиться.** В символах — тот же,
+    // что у группы: поле ввода одно, и два ответа на «почему не влезает»
+    // у него быть не должно. В байтах — предел представления.
+    //
+    // Проверка стоит здесь, а не в `proto`: предел в символах живёт
+    // в ядре, предел в байтах — в протоколе, и связать их можно только
+    // отсюда. Разведи их кто-нибудь — название из эмодзи, законное
+    // для группы, канал отверг бы, и объяснить это было бы нечем.
+    let mut me = node(1);
+
+    assert!(matches!(
+        me.step(100, Input::Command(Command::CreateChannel { title: "  ".to_owned(), open: true })),
+        Err(EngineError::GroupTitleEmpty)
+    ));
+    assert!(matches!(
+        me.step(
+            200,
+            Input::Command(Command::CreateChannel {
+                title: "я".repeat(MAX_GROUP_TITLE_CHARS + 1),
+                open: true,
+            })
+        ),
+        Err(EngineError::GroupTitleTooLong)
+    ));
+
+    // Самое дорогое законное название: предел в символах, по четыре байта
+    // на символ. Оно обязано пройти — иначе байтовый предел уже тесен.
+    let longest = "\u{1f600}".repeat(MAX_GROUP_TITLE_CHARS);
+    assert_eq!(longest.chars().count(), MAX_GROUP_TITLE_CHARS);
+    assert!(longest.len() <= channel::MAX_TITLE_BYTES, "байтовый предел уже символьного");
+    let chat = create_channel(&mut me, 300, &longest, true);
+    assert_eq!(me.store().channel(&chat).unwrap().unwrap().title, longest);
+}
+
+// --- Право писать (фаза 2, §6.2) -------------------------------------------
+
+/// Переписывает представление канала, выдав этому человеку эти права.
+///
+/// Мимо ядра, руками: команды выдачи прав ещё нет, а проверка нужна уже
+/// сейчас. Подпись здесь не настоящая — `check_may_put` читает
+/// разобранную таблицу выдач, а не проверяет документ заново.
+fn grant_in_channel(engine: &mut Node, chat: &[u8; 16], who: [u8; 32], rights: u32, until_ms: u64) {
+    let mut stored = engine.store().channel(chat).unwrap().expect("представление");
+    stored.version += 1;
+    stored.grants = vec![ratatosk_store::StoredGrant { who, rights, until_ms }];
+    engine.store_mut().put_channel(&stored).expect("новая версия легла");
+}
+
+#[test]
+fn the_owner_may_always_speak_in_his_own_channel() {
+    // Пара ко всему, что ниже: у владельца все права и отнять их нельзя
+    // (5вп). Не будь этой проверки, «отказано» ничего не значило бы —
+    // могло бы отказывать всем подряд.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+    me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() }))
+        .expect("владелец пишет в свой канал");
+}
+
+#[test]
+fn a_subscriber_without_the_write_right_is_refused_by_name() {
+    // **Первое место, где профили расходятся.** В группе пишут все, кто
+    // состоит; в канале — по праву. Отказ отдельный от `NotInGroup`:
+    // «вас тут нет» и «вы тут есть, но это вам не разрешено» требуют
+    // от человека разного.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+
+    // Владелец меняется на чужого: так выглядит канал, на который мы
+    // подписаны, а не наш.
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+
+    assert!(matches!(
+        me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() })),
+        Err(EngineError::NotAllowedInChannel)
+    ));
+}
+
+#[test]
+fn a_granted_right_lets_the_words_through_and_an_expired_one_does_not() {
+    // **Срок, а не отзыв** (§6.3). Не продлил — истекло само; молчание
+    // владельца отказывает вниз, а не вверх. Проверяется обеими
+    // сторонами одного мгновения, иначе «истекло» могло бы значить
+    // «не работало никогда».
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+    grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), 5_000);
+
+    me.step(4_999, Input::Command(Command::SendText { chat, text: "успел".to_owned() }))
+        .expect("пока срок не вышел — пишем");
+    assert!(
+        matches!(
+            me.step(5_000, Input::Command(Command::SendText { chat, text: "опоздал".to_owned() })),
+            Err(EngineError::NotAllowedInChannel)
+        ),
+        "ровно в назначенный миг право уже не действует"
+    );
+}
+
+#[test]
+fn the_write_right_does_not_let_you_rename_the_channel() {
+    // §6.2 раздаёт разные права разным действиям: слова — «писать»,
+    // название и картинка — «менять представление». Одно право,
+    // дающее оба, означало бы, что список прав короче, чем написано.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+    grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), u64::MAX);
+
+    me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() }))
+        .expect("писать — вправе");
+    // **Владельцем группы мы остались** — сменился владелец представления,
+    // и правило §11.2 «только создатель» сюда не вмешивается. Значит
+    // отказывает ровно то, ради чего проверка написана: у нас есть
+    // «писать» и нет «менять представление».
+    //
+    // Сперва здесь стояло `is_err()` с объяснением «упрётся в §11.2»,
+    // и объяснение было неверным. Показала это поломка: сделай
+    // `Rename` требующим `WRITE` — и переименование **проходит**,
+    // чего при упоре в §11.2 случиться бы не могло.
+    assert!(
+        matches!(
+            me.step(300, Input::Command(Command::RenameGroup { chat, title: "не я".to_owned() })),
+            Err(EngineError::NotAllowedInChannel)
+        ),
+        "право писать не даёт менять представление"
+    );
+}
+
+#[test]
+fn a_channel_without_a_representation_refuses_rather_than_guesses() {
+    // Документ не приехал — прав мы не знаем. «Не знаю» обязано
+    // отказывать вниз: пиши мы вслепую, кадры уезжали бы в канал,
+    // где нас, возможно, и не звали писать, — и вернуть их было бы
+    // нечем.
+    //
+    // Так выглядит канал сразу после перехода по ссылке: строка чата
+    // уже есть, представление ещё едет (§10.3).
+    let mut me = node_over_a_group_with_profile(1, group::Profile::Channel.code());
+    let chat = [9u8; 16];
+    assert!(me.store().channel(&chat).unwrap().is_none(), "представления ещё нет");
+
+    assert!(matches!(
+        me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() })),
+        Err(EngineError::NotAllowedInChannel)
+    ));
+}
+
+#[test]
+fn in_a_group_nobody_is_asked_about_rights() {
+    // §3.2: `closed` — буквально фаза 1. Проверка прав туда не должна
+    // добраться вовсе: там пишут все, кто состоит, и вопроса
+    // не существует.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() }))
+        .expect("в группе пишут все, кто состоит");
+    assert!(
+        me.store().channel(&chat).unwrap().is_none(),
+        "у группы представления нет — и спрашивать его незачем"
+    );
+}
+
+// --- Свёртка состава (фаза 2, §6.7, §12) ----------------------------------
+
+/// Горизонт свёртки: раньше него сворачивать нечего.
+const FOLD_AFTER: u64 = group::MEMBERSHIP_FOLD_AFTER_MS;
+
+#[test]
+fn nothing_is_folded_before_the_horizon() {
+    // Пара ко всему остальному: свёртка не должна срабатывать раньше
+    // времени, иначе она теряла бы операции, которые ещё в пути.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    let before = me.store().membership(&chat).unwrap().len();
+    assert!(before > 0, "своё добавление обязано лежать операцией");
+
+    assert_eq!(me.compact_if_due(1_000).unwrap(), 0, "уборке ещё не пора");
+    assert_eq!(me.store().membership(&chat).unwrap().len(), before);
+    assert_eq!(me.store().group_baseline(&chat).unwrap(), None, "знака ещё нет");
+}
+
+#[test]
+fn old_membership_is_folded_and_the_watermark_is_written() {
+    // **Ради чего свёртка существует**: история состава не растёт вечно.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    for (seed, at) in [(2u8, 200u64), (3, 300), (4, 400)] {
+        add_and_remove(&mut me, chat, seed, at);
+    }
+    let before = me.store().membership(&chat).unwrap().len();
+    // **Четыре строки, а не шесть.** Ключ строки — метка целиком,
+    // и удаление гасит **ту же** метку, которую поставило добавление:
+    // обе ложатся в одну ячейку, и остаётся строка с надгробием.
+    // То есть история состава и так вдвое короче, чем кажется по числу
+    // действий, — но всё равно растёт, и вот это свёртка и убирает.
+    assert_eq!(before, 4, "своё добавление и три погашенных");
+
+    let later = FOLD_AFTER + 10_000;
+    me.compact_if_due(later).expect("уборка");
+
+    let after = me.store().membership(&chat).unwrap();
+    assert!(after.len() < before, "свёрнутая история обязана стать короче: было {before}");
+    assert_eq!(after.len(), 1, "остался один участник — мы сами");
+    let (wall, _) = me.store().group_baseline(&chat).unwrap().expect("знак поставлен");
+    assert_eq!(wall, 10_000, "знак отстаёт от «сейчас» ровно на горизонт");
+
+    // Состав при этом не изменился — ни в памяти, ни после подъёма.
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+    assert_eq!(
+        me.groups().get(&chat).unwrap().group.members().copied().collect::<Vec<_>>(),
+        vec![mine]
+    );
+    me.restore().expect("подъём");
+    assert_eq!(
+        me.groups().get(&chat).unwrap().group.members().copied().collect::<Vec<_>>(),
+        vec![mine]
+    );
+}
+
+#[test]
+fn a_folded_add_does_not_come_back_after_a_restart() {
+    // **Главная проверка свёртки.** §6.7: операция старше знака
+    // отвергается — «иначе выброшенное добавление воскреснет, приехав
+    // от третьего участника». Работает это только если знак пережил
+    // подъём; не переживи он, воскрешение случилось бы при первом же
+    // перезапуске, и свёртка не значила бы ничего.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    let evicted = add_and_remove(&mut me, chat, 2, 200);
+
+    me.compact_if_due(FOLD_AFTER + 10_000).expect("уборка");
+    assert!(!me.groups().get(&chat).unwrap().group.contains(&evicted));
+
+    me.restore().expect("подъём");
+    assert_eq!(
+        me.store().group_baseline(&chat).unwrap().map(|(w, _)| w),
+        Some(10_000),
+        "знак обязан пережить подъём"
+    );
+    assert!(
+        !me.groups().get(&chat).unwrap().group.contains(&evicted),
+        "свёрнутое добавление не должно воскресать при подъёме"
+    );
+
+    // И то же самое, когда свёрнутое добавление приезжает заново.
+    let raised = me.groups().get(&chat).unwrap().group.clone();
+    let mut raised = raised;
+    raised.apply(ratatosk_crdt::OrSet::prepare_add(
+        evicted,
+        ratatosk_crdt::Tag::new(
+            ratatosk_crdt::Hlc::new(200, 0),
+            Identity::from_seed([1u8; 32]).public().ik,
+            [7u8; 8],
+        ),
+    ));
+    assert!(!raised.contains(&evicted), "и приехав от третьего — тоже не должно");
+}
+
+#[test]
+fn the_watermark_does_not_creep_forward_when_there_is_nothing_to_fold() {
+    // **Проверка сперва была слабой, и поломка это показала.** Она
+    // сверяла, что вторая свёртка «ничего не выбросила», — а выбросить
+    // там нечего в любом случае, и снятие сторожа её не роняло.
+    //
+    // Сторож стережёт другое, и это не про экономию диска. Горизонт
+    // сдвигается **всегда**, вместе с часами. Двинь мы знак вперёд,
+    // ничего при этом не свернув, — и операция, которая ещё в пути
+    // и старше нового знака, будет отвергнута, хотя прежний знак её
+    // принял бы. Свёртка сужает то, что мы готовы принять; сужать
+    // задаром нельзя.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    add_and_remove(&mut me, chat, 2, 200);
+
+    let first = me.compact_if_due(FOLD_AFTER + 10_000).expect("первая уборка");
+    assert!(first > 0, "первая свёртка обязана что-то выбросить");
+    let (wall, _) = me.store().group_baseline(&chat).unwrap().expect("знак");
+    assert_eq!(wall, 10_000);
+    let after = me.store().membership(&chat).unwrap();
+
+    // Уборка **сильно позже**: горизонт ушёл вперёд, а сворачивать
+    // по-прежнему нечего.
+    me.store_mut().put_meta(ratatosk_store::META_LAST_COMPACTION, &0u64.to_be_bytes()).unwrap();
+    let second = me.compact_if_due(FOLD_AFTER + 900_000).expect("вторая уборка");
+    assert_eq!(second, 0, "сворачивать нечего");
+    assert_eq!(
+        me.store().group_baseline(&chat).unwrap().map(|(w, _)| w),
+        Some(10_000),
+        "знак обязан остаться на месте: двигать его задаром — сужать приём"
+    );
+    assert_eq!(me.store().membership(&chat).unwrap(), after, "и состав не переписан");
+}
+
+#[test]
+fn the_blocks_are_not_touched_by_the_fold() {
+    // §6.7: знак «не утверждение о составе, а граница применимости»,
+    // и подписи у него нет. Блоки возят историю новичку (§11.5),
+    // и он проверяет их подписями — выброси мы блоки, отдать ему стало
+    // бы нечего, кроме нашего слова. Фаза 2 именно от веры пригласившему
+    // и уходит (§3.1).
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    add_and_remove(&mut me, chat, 2, 200);
+    let blocks = me.store().membership_blocks(&chat).unwrap().len();
+    assert!(blocks > 0, "блоки обязаны лежать");
+
+    me.compact_if_due(FOLD_AFTER + 10_000).expect("уборка");
+    assert_eq!(
+        me.store().membership_blocks(&chat).unwrap().len(),
+        blocks,
+        "свёртка блоки не трогает: новичку историю отдавать нечем будет"
+    );
+}
+
+/// Добавляет участника и тут же исключает — две операции в истории.
+fn add_and_remove(engine: &mut Node, chat: [u8; 16], seed: u8, at: u64) -> [u8; 32] {
+    let card = stranger(seed);
+    let who = befriend(engine, &card);
+    engine
+        .step(at, Input::Command(Command::InviteToGroup { chat, peer_ik: who }))
+        .expect("приглашение");
+    engine
+        .step(at + 1, Input::Command(Command::EvictFromGroup { chat, peer_ik: who }))
+        .expect("исключение");
+    who
 }

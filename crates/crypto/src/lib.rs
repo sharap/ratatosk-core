@@ -16,10 +16,11 @@
 //! | [`onion`] | §3 `onion_key`, §5.2 адрес сервиса |
 //! | [`mesh`] | ключ своего узла в меше Yggdrasil (0.2) |
 //! | [`aead`] | §7.2 запечатывание кадра |
-//! | [`file`] | §10.1 ключи и запечатывание чанков файла |
+//! | [`mod@file`] | §10.1 ключи и запечатывание чанков файла |
 //! | [`handshake`] | §8.2 Noise IK, §8.3 сессия, §8.5 перерукопожатие |
 //! | [`ratchet`] | §8.4 симметричный ретчет, §11.1 sender keys |
 //! | [`storage_key`] | §8.6 `db_key` из PIN |
+//! | [`seal`] | запечатывание на статический `IK` (фаза 2, §5.3) |
 //!
 //! Чего здесь нет и не будет в v1: DH-шага в ретчете (§8.5), пула
 //! одноразовых предключей (§8.2 — в `IK` он не нужен), PoW (§15 — в `IK`
@@ -41,7 +42,9 @@ pub mod labels;
 pub mod mesh;
 pub mod nostr;
 pub mod onion;
+pub mod pow;
 pub mod ratchet;
+pub mod seal;
 pub mod storage_key;
 
 pub use error::{CryptoError, Result};

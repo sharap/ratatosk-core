@@ -47,7 +47,7 @@ EXCUSE = re.compile(r"//.*групп\w* здесь не бывает", re.IGNORE
 def bodies(src: str) -> list[tuple[str, int, str]]:
     """Тела функций: имя, строка объявления, текст до закрывающей скобки."""
     found = []
-    for m in re.finditer(r"\n    (?:pub )?(?:const )?fn (\w+)\s*\(", src):
+    for m in re.finditer(r"\n    (?:pub )?(?:pub\(super\) )?(?:pub\(crate\) )?(?:const )?fn (\w+)\s*\(", src):
         name = m.group(1)
         # Тело — от `{` после списка доводов до скобки на том же отступе.
         open_at = src.find("{", m.end())

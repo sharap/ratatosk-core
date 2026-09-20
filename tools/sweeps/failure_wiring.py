@@ -23,13 +23,28 @@ def text(name):
         return f.read()
 
 
+def engine_source():
+    """Ядро целиком: `engine.rs` плюс его подмодули.
+
+    После разделения (0.5) ядро — не один файл, а каталог. Метелка,
+    читающая только `engine.rs`, нашла бы пустоту и отчиталась
+    «чисто» — то есть соврала бы ровно в тот день, когда её стоило
+    послушать. Читается всё разом: метелке безразлично, в каком
+    модуле лежит проводка, ей важно, что проводка есть.
+    """
+    root = ROOT_DIR / "crates/core/src"
+    parts = [(root / "engine.rs").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((root / "engine").glob("*.rs"))]
+    return "\n".join(parts)
+
+
 def strip_comments(s):
     return "\n".join(line.split("//")[0] for line in s.split("\n"))
 
 
 io = strip_comments(text("io.rs"))
 driver = strip_comments(text("driver.rs"))
-engine = strip_comments(text("engine.rs"))
+engine = strip_comments(engine_source())
 
 # 1. Оба входа существуют и различны.
 for want in ("ConnectionLost {", "ConnectFailed {"):

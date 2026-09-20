@@ -36,9 +36,9 @@
 //!
 //! # Байты вложений границу не пересекают
 //!
-//! Ни в одну сторону: [`RatatoskCompanion::save_file`] берёт путь,
-//! [`RatatoskCompanion::send_files`] берёт пути, читает и пишет
-//! [`CompanionDriver`]. Причина в заголовке `core::companion_driver`:
+//! Ни в одну сторону: [`crate::companion::RatatoskCompanion::save_file`] берёт путь,
+//! [`crate::companion::RatatoskCompanion::send_files`] берёт пути, читает и пишет
+//! [`ratatosk_core::companion_driver::CompanionDriver`]. Причина в заголовке `core::companion_driver`:
 //! UniFFI копирует каждый `Vec<u8>`, и мебибайт на кусок превратил бы
 //! гигабайтный файл в два гигабайта копирований.
 
@@ -114,7 +114,7 @@ pub struct FfiCompanionSharedContact {
 /// Вложение в сообщении, показанном на десктопе.
 ///
 /// Байтов здесь нет и быть не может: страница возит сотню сообщений.
-/// Содержимое забирается отдельно — [`RatatoskCompanion::save_file`].
+/// Содержимое забирается отдельно — [`crate::companion::RatatoskCompanion::save_file`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCompanionAttachment {
     /// Чем адресуются команды по этому вложению.
@@ -125,11 +125,11 @@ pub struct FfiCompanionAttachment {
     /// Размер открытого содержимого.
     pub size_bytes: u64,
     /// Сколько всего кусков — столько же понадобится
-    /// [`RatatoskCompanion::save_file`].
+    /// [`crate::companion::RatatoskCompanion::save_file`].
     pub chunk_total: u64,
     /// Нарезка этого вложения — сколько байт в куске (§10.2).
     ///
-    /// **Отдавать её обратно в [`RatatoskCompanion::save_file`]
+    /// **Отдавать её обратно в [`crate::companion::RatatoskCompanion::save_file`]
     /// обязательно.** Нарезка у файла своя: у приехавшего эфиром кусок
     /// четыре килобайта, у приехавшего по сети — мебибайт. Без неё куски
     /// не сложить, и складывались они врастопырку — файл на диске
@@ -976,7 +976,7 @@ impl RatatoskCompanion {
     ///
     /// Порядок обязателен и его надо объяснять человеку: сперва телефон
     /// забирает файл у собеседника, и только потом
-    /// [`RatatoskCompanion::save_file`] переносит его сюда. До `accept_file`
+    /// [`crate::companion::RatatoskCompanion::save_file`] переносит его сюда. До `accept_file`
     /// забирать нечего.
     ///
     /// # Errors

@@ -8,8 +8,10 @@
 //! * **Отрицаемости внутри группы нет.** Sender key одинаков у всех
 //!   получателей, поэтому групповое сообщение подписывается `SK` отправителя —
 //!   иначе любой участник подделал бы сообщение от имени любого другого (§11.1).
-//! * **Исключение социальное, а не криптографическое** (§11.4): исключённый
-//!   сохраняет доступ ко всей прошлой переписке.
+//! * **Исключение закрывает будущее, но не прошлое** (§11.4, фаза 2):
+//!   при убыли состава каждый писатель заводит новую sender-цепочку,
+//!   и старая, что осталась у ушедшего, с этой минуты ничего не
+//!   открывает. Прошлое он сохраняет — забрать прочитанное нельзя.
 //! * **Максимум 32 участника** (§11.3): групповое сообщение уходит отдельной
 //!   копией каждому по его 1:1-каналу, потому что отправка через `To:` со
 //!   списком раскрыла бы состав группы chatmail-серверу.
@@ -40,6 +42,15 @@ const KEY_SEALED: u64 = 17;
 const KEY_AVATAR: u64 = 18;
 const KEY_AVATAR_WALL: u64 = 19;
 const KEY_AVATAR_LOGICAL: u64 = 20;
+/// Номер сообщения внутри подписанного блока (фаза 2, §4.1).
+const KEY_MSG_ID: u64 = 21;
+/// Профиль чата во вводном блоке (фаза 2, §3.2). Отсутствие означает
+/// `closed`: так шлёт сборка фазы 1, и так же — любая группа.
+const KEY_PROFILE: u64 = 22;
+/// Нонс доказательства работы в групповом сообщении (фаза 2, §11).
+const KEY_POW: u64 = 23;
+const KEY_RECIPIENT: u64 = 24;
+const KEY_SEALED_CHAIN: u64 = 25;
 
 /// Код операции добавления в блоке состава. Едет по проводу — менять нельзя.
 const OP_ADD: u64 = 1;
@@ -53,11 +64,120 @@ const OP_REMOVE: u64 = 2;
 /// chatmail-серверов.
 pub const MAX_GROUP_MEMBERS: usize = 32;
 
-/// Раз во сколько сообщений фиксируется снапшот состава (§12).
-pub const MEMBERSHIP_SNAPSHOT_EVERY: u64 = 5_000;
+/// Насколько старой обязана быть операция состава, чтобы её свернуть
+/// (§6.7, §12).
+///
+/// # Считается **возрастом**, а не числом сообщений, и это исправление
+///
+/// Здесь стояло `MEMBERSHIP_SNAPSHOT_EVERY = 5_000` с объяснением:
+/// «триггер обязан быть одинаковым у всех участников, иначе узлы свернут
+/// разные истории и разойдутся». Объяснение описывало условие, которого
+/// **нельзя достичь**: каждый считает свои сообщения, а тот, кто был
+/// неделю офлайн, видел их меньше. Одинаковым такой счётчик не бывает
+/// ни при каком значении.
+///
+/// Настоящее условие безопасности — не «одинаковый триггер», а **«ниже
+/// знака ничего больше не приедет»**. Свёртка заставляет отвергать
+/// операции старше знака (§6.7), и законная операция, опоздавшая
+/// сильнее, будет потеряна. Значит знак обязан отставать от «сейчас»
+/// дольше самой длинной дороги, какая у нас есть.
+///
+/// Самая длинная — почта: `fragment::REASSEMBLY_TTL_MAIL_MS`, тридцать
+/// суток. Берётся вдвое: письмо может пролежать у сервера весь свой TTL
+/// и только потом собраться у нас, а часы двух устройств вдобавок
+/// расходятся. Шестьдесят суток — цена в виде неубранных строк
+/// невелика, а потеря законного исключения дорога.
+///
+/// Разные узлы свернут в разные моменты, и это **не** расхождение:
+/// пока ниже знака ничего не приезжает, обе стороны применили одни
+/// и те же операции и сошлись на одном составе.
+pub const MEMBERSHIP_FOLD_AFTER_MS: u64 = 2 * crate::fragment::REASSEMBLY_TTL_MAIL_MS;
 
 /// Идентификатор группы.
 pub type GroupId = [u8; 16];
+
+/// Профиль группового чата (фаза 2, §3.2).
+///
+/// Не третий вид чата, а вторая порода того же. Канал — это группа:
+/// у него есть владелец, название, состав и цепочки отправителей; вся
+/// развилка «группа или 1:1» в ядре остаётся верной без единой новой
+/// ветки. Меняется не **что это**, а **что с этим можно**: кто вправе
+/// писать (§6.2), откуда берётся состав (§6.1) и как раздаётся ключ
+/// чтения (§5.4).
+///
+/// # Профиль спрашивают явно или не спрашивают вовсе
+///
+/// Оборотная сторона того, что канал лежит там же, где группы: всякое
+/// место, где поведение профилей расходится, обязано спросить профиль
+/// **словами**. Молчаливое наследование группового поведения каналом —
+/// та же ошибка, от которой профиль и спасает, только наизнанку.
+/// Поэтому здесь нет ни `Default`, ни `is_channel()` без пары:
+/// решение «а как здесь у каналов» принимается на месте, а не берётся
+/// из умолчания.
+///
+/// # Обратного хода нет
+///
+/// Порода канала (`channel::Kind`) фиксируется при создании, и профиль
+/// тем более: §14 говорит, что группы фазы 1 остаются `Closed` навсегда.
+/// Их состав держится на неподписанных карточках (5вт), и подписать их
+/// задним числом некому — значит «повысить» группу до канала нельзя
+/// не из осторожности, а потому, что доверять в ней нечему.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// Буквально фаза 1: до 32 человек, пишут все, раздача копией каждому.
+    Closed,
+    /// Канал (§6): без предела размера, пишут по праву, ключ чтения
+    /// раздаётся ссылкой либо владельцем.
+    Channel,
+}
+
+impl Profile {
+    /// Код для хранения и провода. Менять нельзя: он лежит в чужих базах.
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Profile::Closed => 0,
+            Profile::Channel => 1,
+        }
+    }
+
+    /// Обратно из кода.
+    ///
+    /// `None` — незнакомый профиль. Читать его как `Closed` было бы
+    /// худшим из возможных: сборка постарше решила бы, что в канале
+    /// вправе писать все, и повела бы себя по правилам, которых там нет.
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Profile> {
+        match code {
+            0 => Some(Profile::Closed),
+            1 => Some(Profile::Channel),
+            _ => None,
+        }
+    }
+
+    /// Ограничен ли размер состава (§3.2).
+    #[must_use]
+    pub const fn member_limit(self) -> Option<usize> {
+        match self {
+            Profile::Closed => Some(MAX_GROUP_MEMBERS),
+            Profile::Channel => None,
+        }
+    }
+
+    /// Вправе ли писать всякий, кто состоит (§3.2).
+    ///
+    /// `false` у канала означает не «никто», а «спроси представление»
+    /// (`channel::Representation::may_write`). Отдельный вопрос затем,
+    /// чтобы место, забывшее спросить, читалось как ошибка, а не как
+    /// разрешение.
+    #[must_use]
+    pub const fn everyone_writes(self) -> bool {
+        match self {
+            Profile::Closed => true,
+            Profile::Channel => false,
+        }
+    }
+}
 
 /// Читает необязательную метку HLC из пары ключей.
 ///
@@ -108,7 +228,6 @@ pub struct Group {
     /// Создатель. В v1 только он может исключать (§11.2).
     pub owner: ActorId,
     members: OrSet<ActorId>,
-    messages_since_snapshot: u64,
 }
 
 impl Group {
@@ -117,7 +236,7 @@ impl Group {
     pub fn create(id: GroupId, owner: ActorId, at: Tag) -> Group {
         let mut members = OrSet::new();
         members.apply(OrSet::prepare_add(owner, at));
-        Group { id, owner, members, messages_since_snapshot: 0 }
+        Group { id, owner, members }
     }
 
     /// Поднимает группу, состав которой будет применён операциями.
@@ -137,7 +256,18 @@ impl Group {
     /// было до подъёма, здесь взять неоткуда.
     #[must_use]
     pub fn restore(id: GroupId, owner: ActorId) -> Group {
-        Group { id, owner, members: OrSet::new(), messages_since_snapshot: 0 }
+        Group { id, owner, members: OrSet::new() }
+    }
+
+    /// То же, но с **уже поставленным** водяным знаком (§6.7).
+    ///
+    /// Нужно при подъёме свёрнутой группы: без знака операции, которые
+    /// мы когда-то свернули, применились бы заново, приехав от соседа, —
+    /// и выброшенное добавление воскресло бы при первом же перезапуске.
+    /// Свёртка без этого не переживает подъём и не значит ничего.
+    #[must_use]
+    pub fn restore_folded(id: GroupId, owner: ActorId, baseline: Hlc) -> Group {
+        Group { id, owner, members: OrSet::restored_at(baseline) }
     }
 
     /// Текущий состав.
@@ -161,6 +291,22 @@ impl Group {
     #[must_use]
     pub fn contains(&self, who: &ActorId) -> bool {
         self.members.contains(who)
+    }
+
+    /// Сколько человек ещё поместится (§18.4).
+    ///
+    /// **Зеркало [`Group::invite`], и разъехаться им нельзя.** Число
+    /// отдаётся наружу затем, чтобы клиент гасил «добавить» заранее,
+    /// а не объяснялся после отказа; соври оно в большую сторону — и кнопка
+    /// осталась бы живой ради заведомо обречённой попытки, в меньшую —
+    /// человек не позвал бы того, кто влез бы.
+    ///
+    /// Повторное приглашение уже состоящего [`Group::invite`] пропускает
+    /// и у полной группы: места оно не занимает. Здесь это не учитывается
+    /// нарочно — число отвечает на вопрос «сколько **новых** влезет».
+    #[must_use]
+    pub fn free_slots(&self) -> u32 {
+        u32::try_from(MAX_GROUP_MEMBERS.saturating_sub(self.len())).unwrap_or(u32::MAX)
     }
 
     /// Готовит приглашение. Приглашать может любой участник (§11.2).
@@ -231,19 +377,36 @@ impl Group {
         self.members.merge(&other.members);
     }
 
-    /// Отмечает отправленное или принятое сообщение и говорит, пора ли снапшот.
+    /// Где сейчас стоит водяной знак свёртки (§6.7).
     ///
-    /// Триггер обязан быть одинаковым у всех участников (§12), иначе узлы
-    /// свернут разные истории и разойдутся.
-    pub fn note_message(&mut self) -> bool {
-        self.messages_since_snapshot += 1;
-        self.messages_since_snapshot >= MEMBERSHIP_SNAPSHOT_EVERY
+    /// Ниже него операции уже свёрнуты и новым не применяются.
+    #[must_use]
+    pub fn baseline(&self) -> Hlc {
+        self.members.baseline()
     }
 
-    /// Фиксирует снапшот состава, сворачивая историю OR-Set (§12).
+    /// Куда можно двинуть знак сейчас, если двигать есть куда (§6.7).
+    ///
+    /// `None` — сворачивать нечего: либо знак уже там, либо чат моложе
+    /// горизонта. Отдельный ответ вместо «сверни по этой метке» затем,
+    /// чтобы вызывающий не переписывал диск ради нулевой работы.
+    #[must_use]
+    pub fn fold_horizon(&self, now_ms: u64) -> Option<Hlc> {
+        let horizon = Hlc::new(now_ms.checked_sub(MEMBERSHIP_FOLD_AFTER_MS)?, 0);
+        (horizon > self.members.baseline()).then_some(horizon)
+    }
+
+    /// Сворачивает историю состава по этому знаку (§6.7, §12).
+    ///
+    /// После вызова состав описан синтетическими метками на знаке,
+    /// а операции старше него **отвергаются**: иначе выброшенное
+    /// добавление воскресло бы, приехав от третьего участника.
+    ///
+    /// Знак выбирает вызывающий, и выбирать его надо
+    /// [`Group::fold_horizon`]: свёртка по слишком свежему знаку теряет
+    /// законные операции, которые ещё в пути.
     pub fn snapshot(&mut self, baseline: Hlc) {
         self.members.compact(baseline, self.owner);
-        self.messages_since_snapshot = 0;
     }
 
     /// Кому рассылать групповое сообщение (§11.3).
@@ -268,6 +431,174 @@ pub const MAX_MEMBERSHIP_OPS: usize = MAX_GROUP_MEMBERS * 2;
 /// одного участника не бывает больше, чем раз его приглашали. Число
 /// щедрое: повторные приглашения законны, но их не тысячи.
 pub const MAX_OBSERVED_TAGS: usize = 256;
+
+/// Состояние цепочки в объявлении: открытое или запечатанное.
+///
+/// # Зачем два вида, а не один
+///
+/// Печать ([`crate::group::seal_chain`]) стоит прямой секретности:
+/// запечатано на долговременный `IK`, и утечка `IK` раскрывает всё, что
+/// ему когда-либо запечатывали. Живая 1:1-сессия этим свойством обладает —
+/// она ретчетится. Отсюда правило, которое держит отправитель: **есть
+/// живая сессия — отдавать по ней; печать только там, где сессии нет.**
+///
+/// Второй вид нужен не ради экономии, а потому что фазе 2 ключ обязан
+/// доезжать до того, с кем сессии нет и может не быть вовсе — через рой,
+/// третьими руками.
+///
+/// # Почему это перечисление, а не пара необязательных полей
+///
+/// Чтобы «забыл разобрать запечатанный» было ошибкой сборки, а не тихой
+/// веткой, в которой ключ молча не приезжает.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSecret {
+    /// Открытое состояние — так ехало в фазе 1 и так едет по живой сессии.
+    Open {
+        /// Состояние цепочки.
+        chain: [u8; 32],
+        /// Номер, которому это состояние соответствует.
+        counter: u64,
+    },
+    /// Запечатанное на один долговременный `IK` (§5.3).
+    Sealed {
+        /// Кому адресовано. Открыть сможет только он.
+        recipient_ik: [u8; 32],
+        /// Печать над состоянием, номером и **привязкой** к группе
+        /// с владельцем — см. [`seal_chain`].
+        sealed: Vec<u8>,
+    },
+}
+
+/// Длина запечатываемого куска: группа, владелец, состояние, номер.
+const SEAL_PAYLOAD_LEN: usize = 16 + 32 + 32 + 8;
+
+/// Складывает то, что уезжает под печать.
+///
+/// # Почему внутрь кладётся группа и владелец, хотя они есть снаружи
+///
+/// **Иначе печать не привязана ни к чему.** Снаружи `group` и `member`
+/// лежат открытым текстом, и переклеить их вправе любой, кто кадр везёт, —
+/// а везут его в фазе 2 третьи руки. Сама печать от этого не страдает:
+/// адресат её откроет. Но откроет он состояние цепочки **с чужой
+/// этикеткой** и положит ключ владельца A как ключ владельца B — или
+/// ключ из группы A в группу B.
+///
+/// Снаружи это выглядело бы как «сообщения владельца перестали
+/// открываться»: неудачный тег неотличим от порчи. Поэтому оба поля
+/// уезжают под печать, и [`open_chain`] сверяет их с наружными.
+fn seal_payload(group: &GroupId, member: &ActorId, chain: &[u8; 32], counter: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SEAL_PAYLOAD_LEN);
+    out.extend_from_slice(group);
+    out.extend_from_slice(member);
+    out.extend_from_slice(chain);
+    out.extend_from_slice(&counter.to_be_bytes());
+    out
+}
+
+/// Запечатывает состояние цепочки на долговременный `IK` получателя.
+///
+/// # Почему внутрь кладётся группа и владелец, хотя они есть снаружи
+///
+/// **Иначе печать не привязана ни к чему.** Снаружи они лежат открытым
+/// текстом, и переклеить их вправе любой, кто кадр везёт, — а в фазе 2
+/// везут третьи руки. Сама печать от подмены не страдает: адресат её
+/// откроет. Но откроет состояние **с чужой этикеткой** и положит ключ
+/// владельца A как ключ владельца B — или ключ из группы A в группу B.
+/// Снаружи это выглядит как «сообщения владельца перестали
+/// открываться»: неудачный тег неотличим от порчи.
+///
+/// # Errors
+///
+/// Печать не сложилась (разбор шаблона Noise, чужой ключ негодной формы).
+pub fn seal_chain(
+    group: &GroupId,
+    member: &ActorId,
+    chain: &[u8; 32],
+    counter: u64,
+    recipient_ik: &[u8; 32],
+) -> Result<ChainSecret, ratatosk_crypto::CryptoError> {
+    let payload = seal_payload(group, member, chain, counter);
+    let sealed = ratatosk_crypto::seal::seal_to_static(recipient_ik, &payload)?;
+    Ok(ChainSecret::Sealed { recipient_ik: *recipient_ik, sealed })
+}
+
+/// Решает за отправителя, печатать ли состояние этому адресату (§5.3).
+///
+/// **Правило одно: есть живая сессия — отдавать по ней, печать только
+/// там, где сессии нет.** Причина не в экономии. Печать ложится
+/// на долговременный `IK` и прямой секретности не имеет: утечка `IK`
+/// раскрывает всё, что ему когда-либо запечатывали. Сессия ретчетится.
+/// Печатать поверх живой сессии значило бы ухудшить свойство группы
+/// там, где ухудшать его не за чем, — а свойство формулируется
+/// по худшему случаю.
+///
+/// Функция живёт здесь, а не в движке, по одной причине: **правило должно
+/// быть проверяемым**. В движке до него не дотянуться ничем, кроме живого
+/// узла с сессиями, и проверка выродилась бы в проверку узла.
+///
+/// Уже запечатанный блок возвращается как есть: он привязан к своему
+/// адресату, и перерешать за него нельзя.
+///
+/// # Errors
+///
+/// Печать не сложилась.
+pub fn chain_secret_for(
+    block: &SenderKeyBlock,
+    recipient_ik: &[u8; 32],
+    has_live_session: bool,
+) -> Result<ChainSecret, ratatosk_crypto::CryptoError> {
+    let ChainSecret::Open { chain, counter } = &block.secret else {
+        return Ok(block.secret.clone());
+    };
+    if has_live_session {
+        return Ok(block.secret.clone());
+    }
+    seal_chain(&block.group, &block.member, chain, *counter, recipient_ik)
+}
+
+/// Достаёт состояние цепочки из объявления.
+///
+/// `None` означает одно и то же для всех причин: **этот блок нам
+/// не годится**. Причин три — адресовано не нам, печать не открылась,
+/// привязка не сошлась, — и разделять их наружу нечем: снаружи они
+/// неотличимы, а вызывающий на все три отвечает одинаково.
+///
+/// Открытое состояние отдаётся как есть: его привязывала живая сессия,
+/// по которой оно и приехало.
+#[must_use]
+pub fn open_chain(
+    block: &SenderKeyBlock,
+    own_ik_public: &[u8; 32],
+    own_ik_secret: &[u8; 32],
+) -> Option<([u8; 32], u64)> {
+    match &block.secret {
+        ChainSecret::Open { chain, counter } => Some((*chain, *counter)),
+        ChainSecret::Sealed { recipient_ik, sealed } => {
+            // **Это быстрый отказ, а не защита.** Снять его проверки
+            // не заметят — и правильно: печать чужому не открывается сама,
+            // а блок, запечатанный нам, но подписанный чужим адресатом,
+            // принять не вредно (запечатал его тот, кто имел на это право,
+            // и привязка ниже всё равно сверяется). Смысл строки в том,
+            // чтобы не звать Noise на заведомо чужой кадр.
+            if recipient_ik != own_ik_public {
+                return None;
+            }
+            let opened = ratatosk_crypto::seal::open_from_static(own_ik_secret, sealed).ok()?;
+            if opened.len() != SEAL_PAYLOAD_LEN {
+                return None;
+            }
+            // Привязка: под печатью лежат та же группа и тот же владелец,
+            // что и снаружи. Разошлись — блок переклеен по дороге.
+            if &opened[..16] != block.group.as_slice() || &opened[16..48] != block.member.as_slice()
+            {
+                return None;
+            }
+            let chain: [u8; 32] = opened[48..80].try_into().ok()?;
+            let counter = u64::from_be_bytes(opened[80..88].try_into().ok()?);
+            Some((chain, counter))
+        }
+    }
+}
 
 /// Ключ отправителя в том виде, в каком его отдают участнику (§11.1, §11.5).
 ///
@@ -302,10 +633,8 @@ pub struct SenderKeyBlock {
     pub group: GroupId,
     /// Чей это ключ. Не выводится из сессии: пригласивший отдаёт и чужие.
     pub member: ActorId,
-    /// Состояние цепочки.
-    pub chain: [u8; 32],
-    /// Номер, которому это состояние соответствует.
-    pub counter: u64,
+    /// Состояние цепочки — открытое или запечатанное на одного адресата.
+    pub secret: ChainSecret,
     /// Когда владелец эту цепочку завёл — метка его часов.
     ///
     /// Только для старшинства: получатель берёт цепочку, лишь если метка
@@ -315,16 +644,30 @@ pub struct SenderKeyBlock {
 }
 
 /// Кодирует ключ отправителя.
+///
+/// Открытый вид кодируется **теми же ключами, что и в фазе 1**, байт
+/// в байт: сборка, не знающая о печати, продолжает его читать. Новые ключи
+/// появляются только у запечатанного, и он ей не адресуется — печать
+/// выбирается лишь там, где живой сессии нет.
 #[must_use]
 pub fn sender_key_value(block: &SenderKeyBlock) -> Value {
-    Value::Map(vec![
+    let mut map = vec![
         (Value::Integer(KEY_GROUP.into()), Value::Bytes(block.group.to_vec())),
         (Value::Integer(KEY_ACTOR.into()), Value::Bytes(block.member.to_vec())),
-        (Value::Integer(KEY_CHAIN.into()), Value::Bytes(block.chain.to_vec())),
-        (Value::Integer(KEY_COUNTER.into()), Value::Integer(block.counter.into())),
-        (Value::Integer(KEY_WALL_MS.into()), Value::Integer(block.chain_hlc.wall_ms.into())),
-        (Value::Integer(KEY_LOGICAL.into()), Value::Integer(block.chain_hlc.logical.into())),
-    ])
+    ];
+    match &block.secret {
+        ChainSecret::Open { chain, counter } => {
+            map.push((Value::Integer(KEY_CHAIN.into()), Value::Bytes(chain.to_vec())));
+            map.push((Value::Integer(KEY_COUNTER.into()), Value::Integer((*counter).into())));
+        }
+        ChainSecret::Sealed { recipient_ik, sealed } => {
+            map.push((Value::Integer(KEY_RECIPIENT.into()), Value::Bytes(recipient_ik.to_vec())));
+            map.push((Value::Integer(KEY_SEALED_CHAIN.into()), Value::Bytes(sealed.clone())));
+        }
+    }
+    map.push((Value::Integer(KEY_WALL_MS.into()), Value::Integer(block.chain_hlc.wall_ms.into())));
+    map.push((Value::Integer(KEY_LOGICAL.into()), Value::Integer(block.chain_hlc.logical.into())));
+    Value::Map(map)
 }
 
 /// Разбирает ключ отправителя.
@@ -334,11 +677,24 @@ pub fn sender_key_value(block: &SenderKeyBlock) -> Value {
 /// Значение не той формы.
 pub fn sender_key_from_value(value: &Value) -> Result<SenderKeyBlock, CodecError> {
     let map = canonical::as_map(value)?;
+    // Запечатанный узнаётся по своему ключу, а не по отсутствию открытого:
+    // «нет поля» бывает и у порченого кадра, и тогда мы молча приняли бы
+    // его за блок другого вида.
+    let secret = match canonical::get(map, KEY_SEALED_CHAIN) {
+        Some(sealed) => ChainSecret::Sealed {
+            recipient_ik: canonical::as_array::<32>(canonical::require(map, KEY_RECIPIENT)?)?,
+            sealed: canonical::as_bytes(sealed)?.to_vec(),
+        },
+        // Ветка фазы 1, и она же ветка живой сессии.
+        None => ChainSecret::Open {
+            chain: canonical::as_array::<32>(canonical::require(map, KEY_CHAIN)?)?,
+            counter: canonical::as_u64(canonical::require(map, KEY_COUNTER)?)?,
+        },
+    };
     Ok(SenderKeyBlock {
         group: canonical::as_array::<16>(canonical::require(map, KEY_GROUP)?)?,
         member: canonical::as_array::<32>(canonical::require(map, KEY_ACTOR)?)?,
-        chain: canonical::as_array::<32>(canonical::require(map, KEY_CHAIN)?)?,
-        counter: canonical::as_u64(canonical::require(map, KEY_COUNTER)?)?,
+        secret,
         // Необязательное на чтении — по той же причине, что и метка
         // названия: сборка, не знавшая старшинства, её не шлёт.
         chain_hlc: optional_hlc(map, KEY_WALL_MS, KEY_LOGICAL)?,
@@ -765,6 +1121,18 @@ pub struct Intro {
     pub avatar: Vec<u8>,
     /// Метка аватарки (§9.1). Нулевая означает «картинки не ставили».
     pub avatar_hlc: Hlc,
+    /// Профиль чата (фаза 2, §3.2).
+    ///
+    /// **Едет здесь, потому что иначе канал становился бы группой
+    /// на той стороне — молча.** Впустив человека в канал, владелец
+    /// отдаёт ему вводный блок тем же путём, что и в группе; не скажи
+    /// блок породу, новичок завёл бы у себя обычную группу, где писать
+    /// вправе все, и первое же его слово уехало бы туда, куда его
+    /// не звали.
+    ///
+    /// Отсутствие поля означает [`Profile::Closed`]: так шлёт сборка
+    /// фазы 1, и это верный ответ — каналов у неё нет.
+    pub profile: Profile,
 }
 
 /// Влезает ли название в предел провода ([`MAX_GROUP_TITLE_BYTES`]).
@@ -820,6 +1188,7 @@ pub fn intro_value(intro: &Intro) -> Value {
             Value::Integer(KEY_AVATAR_LOGICAL.into()),
             Value::Integer(intro.avatar_hlc.logical.into()),
         ),
+        (Value::Integer(KEY_PROFILE.into()), Value::Integer(intro.profile.code().into())),
     ])
 }
 
@@ -851,6 +1220,20 @@ pub fn intro_from_value(value: &Value) -> Result<Intro, CodecError> {
             None => Vec::new(),
         },
         avatar_hlc: optional_hlc(map, KEY_AVATAR_WALL, KEY_AVATAR_LOGICAL)?,
+        // Необязательное на чтении: сборка фазы 1 профиля не шлёт,
+        // и `closed` для неё верный ответ — каналов у неё нет.
+        //
+        // **Незнакомый код — отказ вводному блоку целиком.** Прочти мы
+        // его как `closed`, и чат новой породы завёлся бы у нас обычной
+        // группой, где писать вправе все. Сорваться вступлению лучше,
+        // чем завестись не тем.
+        profile: match canonical::get(map, KEY_PROFILE) {
+            Some(value) => Profile::from_code(
+                u32::try_from(canonical::as_u64(value)?).map_err(|_| CodecError::TypeMismatch)?,
+            )
+            .ok_or(CodecError::TypeMismatch)?,
+            None => Profile::Closed,
+        },
     })
 }
 
@@ -887,6 +1270,49 @@ pub struct GroupMessage {
     pub counter: u64,
     /// Шифротекст вместе с тегом AEAD.
     pub sealed: Vec<u8>,
+    /// Номер и метка часов — **те же, что в конверте** (фаза 2, §4.1).
+    ///
+    /// `None` — блок от сборки, которая их не возила. Тогда сверять нечего
+    /// и верить приходится конверту, как верили всегда.
+    pub stamp: Option<MessageStamp>,
+    /// Нонс доказательства работы (фаза 2, §11).
+    ///
+    /// # Почему он **здесь**, а не внутри шифротекста
+    ///
+    /// §7.3 требует проверять дешёвое раньше дорогого: форма, состав,
+    /// PoW — и только потом вывод ключа. Внутри `sealed` нонс проверялся
+    /// бы **после** расшифровки, то есть не фильтровал бы ничего:
+    /// расшифровка и есть то дорогое, от чего он защищает.
+    ///
+    /// # И под подписью
+    ///
+    /// Иначе ретранслятор снимал бы его по дороге, и блок, за который
+    /// автор заплатил работой, отвергался бы как неоплаченный.
+    ///
+    /// `None` — сборка, которая работу не считала. В канале с ненулевой
+    /// сложностью такой блок отвергается; в группе и в канале
+    /// без сложности он законен, и таких блоков большинство.
+    pub pow_nonce: Option<u64>,
+}
+
+/// Номер сообщения и метка часов под подписью автора (фаза 2, §4.1).
+///
+/// # Зачем они здесь, если они и так в конверте
+///
+/// В конверте они **не подписаны**. Пока копию возит сам отправитель
+/// (§11.3), этого хватает: подменить их может только он сам. В рое копию
+/// везёт кто угодно, и переставленная метка HLC — это переставленный
+/// порядок показа у всех, кто принял кадр от ретранслятора, а подменённый
+/// `msg_id` — это чужая правка, попавшая не в то сообщение.
+///
+/// Обе половины лежат вместе и приходят вместе: блок, в котором есть одна
+/// и нет другой, — это блок, которому верить нельзя ни в чём.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageStamp {
+    /// Номер сообщения (§9.2), 16 байт.
+    pub msg_id: [u8; 16],
+    /// Метка часов — источник порядка показа (§9.1).
+    pub hlc: Hlc,
 }
 
 /// Разобранное, но **непроверенное** групповое сообщение.
@@ -925,6 +1351,27 @@ impl UncheckedMessage {
     #[must_use]
     pub const fn claims_counter(&self) -> u64 {
         self.message.counter
+    }
+
+    /// Нонс доказательства работы, на который претендует блок (§11).
+    ///
+    /// Отдаётся до проверки подписи нарочно: §7.3 требует проверять
+    /// дешёвое раньше дорогого, и работа — единственный фильтр, который
+    /// стоит **перед** подписью. Подменивший нонс не выиграет ничего:
+    /// он под подписью, и отказ придёт следующей же проверкой.
+    #[must_use]
+    pub const fn claims_pow_nonce(&self) -> Option<u64> {
+        self.message.pow_nonce
+    }
+
+    /// Тело блока, по которому считается работа (§11).
+    ///
+    /// Это **шифротекст**, а не открытый текст: считать работу
+    /// по открытому значило бы дать проверяющему повод его знать,
+    /// а весь смысл §7.3 в том, чтобы отсеять кадр до расшифровки.
+    #[must_use]
+    pub fn claims_sealed(&self) -> &[u8] {
+        &self.message.sealed
     }
 
     /// Проверяет подпись **известным** ключом и отдаёт сообщение.
@@ -977,12 +1424,28 @@ pub fn parse_message(value: &Value) -> Result<UncheckedMessage, MembershipError>
 }
 
 fn message_value(message: &GroupMessage) -> Value {
-    Value::Map(vec![
-        (Value::Integer(KEY_GROUP.into()), Value::Bytes(message.group.to_vec())),
-        (Value::Integer(KEY_ACTOR.into()), Value::Bytes(message.sender.to_vec())),
-        (Value::Integer(KEY_COUNTER.into()), Value::Integer(message.counter.into())),
-        (Value::Integer(KEY_SEALED.into()), Value::Bytes(message.sealed.clone())),
-    ])
+    Value::Map(
+        vec![
+            (Value::Integer(KEY_GROUP.into()), Value::Bytes(message.group.to_vec())),
+            (Value::Integer(KEY_ACTOR.into()), Value::Bytes(message.sender.to_vec())),
+            (Value::Integer(KEY_COUNTER.into()), Value::Integer(message.counter.into())),
+            (Value::Integer(KEY_SEALED.into()), Value::Bytes(message.sealed.clone())),
+        ]
+        .into_iter()
+        .chain(message.stamp.into_iter().flat_map(|stamp| {
+            [
+                (Value::Integer(KEY_MSG_ID.into()), Value::Bytes(stamp.msg_id.to_vec())),
+                (Value::Integer(KEY_WALL_MS.into()), Value::Integer(stamp.hlc.wall_ms.into())),
+                (Value::Integer(KEY_LOGICAL.into()), Value::Integer(stamp.hlc.logical.into())),
+            ]
+        }))
+        .chain(
+            message
+                .pow_nonce
+                .map(|nonce| (Value::Integer(KEY_POW.into()), Value::Integer(nonce.into()))),
+        )
+        .collect::<Vec<_>>(),
+    )
 }
 
 fn message_from_value(value: &Value) -> Result<GroupMessage, CodecError> {
@@ -990,11 +1453,33 @@ fn message_from_value(value: &Value) -> Result<GroupMessage, CodecError> {
     let Value::Bytes(sealed) = canonical::require(map, KEY_SEALED)? else {
         return Err(CodecError::TypeMismatch);
     };
+    // Номер и метка приходят **вместе или никак**: половина пары означает
+    // либо чужую поделку, либо сборку, которую мы не понимаем. И то и другое
+    // безопаснее прочесть как «не назвали», чем как «назвали половину».
+    let stamp = match canonical::get(map, KEY_MSG_ID) {
+        Some(value) => Some(MessageStamp {
+            msg_id: canonical::as_array::<16>(value)?,
+            hlc: Hlc {
+                wall_ms: canonical::as_u64(canonical::require(map, KEY_WALL_MS)?)?,
+                logical: u32::try_from(canonical::as_u64(canonical::require(map, KEY_LOGICAL)?)?)
+                    .map_err(|_| CodecError::TypeMismatch)?,
+            },
+        }),
+        None => None,
+    };
     Ok(GroupMessage {
         group: canonical::as_array::<16>(canonical::require(map, KEY_GROUP)?)?,
         sender: canonical::as_array::<32>(canonical::require(map, KEY_ACTOR)?)?,
         counter: canonical::as_u64(canonical::require(map, KEY_COUNTER)?)?,
         sealed: sealed.clone(),
+        stamp,
+        // Необязательное: сборка без PoW его не шлёт, и в группе
+        // и в канале без сложности это законно. Решает, довольно ли
+        // этого, не разбор, а тот, кто знает сложность канала.
+        pow_nonce: match canonical::get(map, KEY_POW) {
+            Some(value) => Some(canonical::as_u64(value)?),
+            None => None,
+        },
     })
 }
 
@@ -1012,13 +1497,30 @@ impl EvictionConsequences {
     /// Сохраняет ли доступ к прошлой переписке.
     pub const KEEPS_PAST_MESSAGES: bool = true;
     /// Может ли модифицированный клиент продолжать читать через пересылку.
+    ///
+    /// Остаётся истиной и после поворота: пересказать новое ушедшему может
+    /// любой, кто остался, и никакая криптография этого не запрещает.
     pub const MODIFIED_CLIENT_CAN_RELAY: bool = true;
+
+    /// Может ли ушедший **сам** читать будущее группы.
+    ///
+    /// **Было истиной, стало ложью, и это единственное, что изменилось.**
+    /// Sender-цепочка идёт вперёд от состояния, которое у ушедшего
+    /// на руках: не повернув её, группа отдавала ему всё, что напишет
+    /// дальше, — достаточно было перехватывать кадры. Теперь при убыли
+    /// состава каждый писатель заводит новую цепочку, и перехваченное
+    /// не открывается.
+    ///
+    /// Прошлое это не трогает: прочитанное у него останется навсегда.
+    pub const KEEPS_READING_FUTURE: bool = false;
 
     /// Точная формулировка для UI (§11.4).
     #[must_use]
     pub const fn ui_text() -> &'static str {
-        "Участник удалён. Он больше не получит новых сообщений, но сохранит \
-         доступ к прошлым. Для полной изоляции создайте новую группу."
+        "Участник удалён. Новых сообщений он не получит и прочесть их \
+         не сможет: остальные завели новые ключи. Прошлое у него \
+         сохранится — забрать прочитанное нельзя. И пересказать ему \
+         новое по-прежнему может любой, кто остался."
     }
 }
 
@@ -1186,6 +1688,7 @@ mod tests {
             title_hlc: Hlc::new(9, 2),
             avatar: Vec::new(),
             avatar_hlc: Hlc::default(),
+            profile: Profile::Closed,
         };
         let back = intro_from_value(&intro_value(&intro)).unwrap();
         assert_eq!(back.title_hlc, Hlc::new(9, 2));
@@ -1341,12 +1844,72 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_trigger_is_deterministic() {
+    fn the_fold_horizon_lags_behind_the_longest_road() {
+        // **Условие безопасности свёртки — не «одинаковый триггер»,
+        // а «ниже знака ничего больше не приедет».** Здесь стоял счётчик
+        // сообщений с объяснением про одинаковость; одинаковым он
+        // не бывает — каждый считает свои.
+        //
+        // Самая длинная дорога — почта, тридцать суток. Знак обязан
+        // отставать дольше: письмо может пролежать у сервера весь TTL
+        // и только потом собраться у нас.
+        let g = group();
+        let month = crate::fragment::REASSEMBLY_TTL_MAIL_MS;
+        assert!(
+            MEMBERSHIP_FOLD_AFTER_MS > month,
+            "знак обязан отставать дольше самой длинной дороги"
+        );
+
+        // Молодой чат не сворачивается вовсе: вычитать нечего.
+        assert_eq!(g.fold_horizon(0), None);
+        assert_eq!(g.fold_horizon(MEMBERSHIP_FOLD_AFTER_MS - 1), None);
+
+        let at = MEMBERSHIP_FOLD_AFTER_MS + 1_000;
+        assert_eq!(g.fold_horizon(at), Some(Hlc::new(1_000, 0)));
+    }
+
+    #[test]
+    fn the_horizon_does_not_walk_backwards() {
+        // Свёртка ставит знак; второй раз двигать его назад нельзя —
+        // это воскресило бы уже свёрнутое. Ответ «сворачивать нечего»
+        // здесь и есть защита от лишней перезаписи диска.
         let mut g = group();
-        for _ in 0..MEMBERSHIP_SNAPSHOT_EVERY - 1 {
-            assert!(!g.note_message());
+        let at = MEMBERSHIP_FOLD_AFTER_MS + 10_000;
+        let horizon = g.fold_horizon(at).expect("есть куда");
+        g.snapshot(horizon);
+        assert_eq!(g.baseline(), horizon);
+        assert_eq!(g.fold_horizon(at), None, "второй раз по тому же знаку — нечего");
+        assert_eq!(g.fold_horizon(at - 5_000), None, "и назад тоже нечего");
+        assert!(g.fold_horizon(at + 5_000).is_some(), "а вперёд — есть");
+    }
+
+    #[test]
+    fn a_folded_group_comes_back_with_its_watermark() {
+        // **Без этого свёртка не значит ничего.** Не поставь мы знак
+        // при подъёме, свёрнутое добавление применилось бы заново,
+        // приехав от соседа, — и выброшенный участник воскрес бы
+        // при первом же перезапуске.
+        let mut g = group();
+        g.apply(g.invite(OTHER, tag(2, OWNER, 1)).unwrap());
+        let left = g.members.prepare_remove(OTHER);
+        g.apply(left);
+        assert!(!g.contains(&OTHER));
+
+        let baseline = Hlc::new(100, 0);
+        g.snapshot(baseline);
+        let before: Vec<_> = g.members().copied().collect();
+
+        // Подъём: состав кладётся синтетическими метками на знаке,
+        // а знак ставится **до** первой операции.
+        let mut raised = Group::restore_folded(g.id, g.owner, baseline);
+        for member in &before {
+            raised.apply(OrSet::prepare_add(*member, Tag::new(baseline, g.owner, [0u8; 8])));
         }
-        assert!(g.note_message(), "снапшот раз в {MEMBERSHIP_SNAPSHOT_EVERY} сообщений");
+        assert_eq!(raised.members().copied().collect::<Vec<_>>(), before);
+
+        // А вот свёрнутое добавление, приехавшее от третьего участника.
+        raised.apply(OrSet::prepare_add(OTHER, tag(2, OWNER, 1)));
+        assert!(!raised.contains(&OTHER), "свёрнутое добавление воскресать не должно");
     }
 
     #[test]
@@ -1487,8 +2050,7 @@ mod tests {
         let block = SenderKeyBlock {
             group: [7u8; 16],
             member: OTHER,
-            chain: [3u8; 32],
-            counter: 1_234,
+            secret: ChainSecret::Open { chain: [3u8; 32], counter: 1_234 },
             chain_hlc: Hlc::new(9_000, 2),
         };
         let back = sender_key_from_value(&sender_key_value(&block)).expect("разбор");
@@ -1534,6 +2096,7 @@ mod tests {
             title_hlc: Hlc::new(7, 1),
             avatar: png(),
             avatar_hlc: Hlc::new(8, 3),
+            profile: Profile::Channel,
         };
         assert_eq!(intro_from_value(&intro_value(&intro)).unwrap(), intro);
     }
@@ -1571,6 +2134,7 @@ mod tests {
             title_hlc: Hlc::new(0, 0),
             avatar: Vec::new(),
             avatar_hlc: Hlc::default(),
+            profile: Profile::Closed,
         };
         assert_eq!(intro_from_value(&intro_value(&intro)).unwrap(), intro);
     }
@@ -1587,6 +2151,7 @@ mod tests {
             title_hlc: Hlc::new(9, 2),
             avatar: png(),
             avatar_hlc: Hlc::new(11, 5),
+            profile: Profile::Closed,
         };
         let back = intro_from_value(&intro_value(&intro)).unwrap();
         assert_eq!(back.avatar, png());
@@ -1649,6 +2214,7 @@ mod tests {
             title_hlc: Hlc::new(u64::MAX, u32::MAX),
             avatar: png_of(crate::avatar::MAX_AVATAR_BYTES),
             avatar_hlc: Hlc::new(u64::MAX, u32::MAX),
+            profile: Profile::Channel,
         };
         let bytes = canonical::encode(&intro_value(&intro)).expect("представление кодируется");
         let class = ratatosk_wire::SizeClass::smallest_for(bytes.len());
@@ -1741,7 +2307,17 @@ mod tests {
     }
 
     fn message(counter: u64) -> GroupMessage {
-        GroupMessage { group: [7u8; 16], sender: OWNER, counter, sealed: b"sealed bytes".to_vec() }
+        GroupMessage {
+            group: [7u8; 16],
+            sender: OWNER,
+            counter,
+            sealed: b"sealed bytes".to_vec(),
+            stamp: Some(MessageStamp {
+                msg_id: [9u8; 16],
+                hlc: Hlc { wall_ms: 1_700_000_000_000, logical: 3 },
+            }),
+            pow_nonce: Some(42),
+        }
     }
 
     #[test]
@@ -1816,6 +2392,117 @@ mod tests {
         assert!(matches!(unchecked.verify(&sender.public()), Err(MembershipError::BadSignature),));
     }
 
+    /// Подменяет блок, оставляя подпись от исходного.
+    fn forge(original: &GroupMessage, tampered: &GroupMessage, by: &Identity) -> Value {
+        let value = signed_message(by, original).unwrap();
+        let Value::Map(pairs) = &value else { panic!("нагрузка — карта") };
+        let signature = pairs
+            .iter()
+            .find(|(k, _)| *k == Value::Integer(KEY_SIGNATURE.into()))
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        Value::Map(vec![
+            (
+                Value::Integer(KEY_BLOCK.into()),
+                Value::Bytes(canonical::encode(&message_value(tampered)).unwrap()),
+            ),
+            (Value::Integer(KEY_SIGNATURE.into()), signature),
+        ])
+    }
+
+    #[test]
+    fn the_stamp_is_inside_the_signature() {
+        // **Ради чего метка переехала под подпись (фаза 2, §4.1).**
+        // В конверте она не подписана: пока копию возит сам отправитель,
+        // подменить её может только он. В рою копию везёт кто угодно —
+        // и переставленная метка HLC это переставленный порядок показа
+        // у всех, кто принял кадр из его рук.
+        let sender = Identity::from_seed([1u8; 32]);
+        let mut message = message(5);
+        message.sender = sender.public().ik;
+
+        let mut moved = message.clone();
+        moved.stamp = Some(MessageStamp {
+            msg_id: [9u8; 16],
+            hlc: Hlc { wall_ms: 1_700_000_000_000, logical: 4 },
+        });
+        let forged = forge(&message, &moved, &sender);
+        assert!(
+            matches!(parse_message(&forged).unwrap().verify(&sender.public()), Err(_)),
+            "сдвинутая метка обязана ломать подпись"
+        );
+
+        let mut renamed = message.clone();
+        renamed.stamp = Some(MessageStamp {
+            msg_id: [0xAAu8; 16],
+            hlc: Hlc { wall_ms: 1_700_000_000_000, logical: 3 },
+        });
+        let forged = forge(&message, &renamed, &sender);
+        assert!(
+            matches!(parse_message(&forged).unwrap().verify(&sender.public()), Err(_)),
+            "подменённый номер обязан ломать подпись"
+        );
+    }
+
+    #[test]
+    fn the_pow_nonce_is_inside_the_signature() {
+        // Не будь он под подписью, ретранслятор снимал бы его по дороге,
+        // и блок, за который автор заплатил работой, отвергался бы как
+        // неоплаченный. Подменить его тоже нельзя: чужой нонс работы
+        // не даёт, а подпись ломается раньше, чем его успеют проверить.
+        let sender = Identity::from_seed([1u8; 32]);
+        let mut message = message(5);
+        message.sender = sender.public().ik;
+
+        let mut other = message.clone();
+        other.pow_nonce = Some(43);
+        let forged = forge(&message, &other, &sender);
+        assert!(
+            parse_message(&forged).unwrap().verify(&sender.public()).is_err(),
+            "подменённый нонс обязан ломать подпись"
+        );
+
+        let mut stripped = message.clone();
+        stripped.pow_nonce = None;
+        let forged = forge(&message, &stripped, &sender);
+        assert!(
+            parse_message(&forged).unwrap().verify(&sender.public()).is_err(),
+            "снятый нонс обязан ломать подпись"
+        );
+    }
+
+    #[test]
+    fn a_block_without_a_nonce_still_parses() {
+        // Сборка без PoW его не шлёт, и в группе это большинство блоков.
+        // Разбор обязан их принимать; довольно ли этого, решает не он,
+        // а тот, кто знает сложность канала.
+        let sender = Identity::from_seed([1u8; 32]);
+        let mut message = message(5);
+        message.sender = sender.public().ik;
+        message.pow_nonce = None;
+
+        let signed = signed_message(&sender, &message).expect("подписалось");
+        let parsed = parse_message(&signed).expect("разбирается");
+        assert_eq!(parsed.claims_pow_nonce(), None);
+        assert_eq!(parsed.verify(&sender.public()).expect("подпись цела").pow_nonce, None);
+    }
+
+    #[test]
+    fn a_block_without_a_stamp_still_parses() {
+        // Так шлёт сборка фазы 1, и принять её надо: поле появилось,
+        // а не сменило форму. Сверять у такого блока нечего — верим
+        // конверту, как верили всегда.
+        let sender = Identity::from_seed([1u8; 32]);
+        let mut message = message(5);
+        message.sender = sender.public().ik;
+        message.stamp = None;
+
+        let value = signed_message(&sender, &message).unwrap();
+        let back = parse_message(&value).unwrap().verify(&sender.public()).expect("подпись цела");
+        assert_eq!(back.stamp, None, "метки нет — и выдумывать её нельзя");
+        assert_eq!(back.counter, 5, "всё остальное на месте");
+    }
+
     #[test]
     fn a_message_of_the_wrong_shape_is_refused() {
         assert!(matches!(
@@ -1834,7 +2521,14 @@ mod tests {
     fn ui_text_matches_the_actual_guarantees() {
         assert!(!EvictionConsequences::RECEIVES_NEW_MESSAGES);
         assert!(EvictionConsequences::KEEPS_PAST_MESSAGES);
-        assert!(EvictionConsequences::ui_text().contains("сохранит"));
+        // **Текст обязан называть обе половины.** Скажи он только про
+        // потерю доступа — человек решит, что ушедший отрезан начисто,
+        // а прошлое у того осталось и пересказать ему может любой.
+        // §14 существует ровно затем, чтобы обещание не обгоняло свойство.
+        assert!(!EvictionConsequences::KEEPS_READING_FUTURE);
+        assert!(EvictionConsequences::ui_text().contains("сохранится"));
+        assert!(EvictionConsequences::ui_text().contains("не сможет"));
+        assert!(EvictionConsequences::ui_text().contains("пересказать"));
     }
 
     #[test]
@@ -1860,5 +2554,308 @@ mod tests {
 
         let long = "я".repeat(MAX_GROUP_TITLE_BYTES);
         assert!(check_new_title(&long).is_err(), "предел провода один на оба правила");
+    }
+
+    // --- Профиль (фаза 2, §3.2) -------------------------------------------
+
+    #[test]
+    fn a_profile_survives_its_code() {
+        for profile in [Profile::Closed, Profile::Channel] {
+            assert_eq!(Profile::from_code(profile.code()), Some(profile));
+        }
+    }
+
+    #[test]
+    fn an_unknown_profile_is_not_read_as_closed() {
+        // **Главная проверка типа.** Прочитай сборка постарше незнакомый
+        // профиль как `Closed` — и она решила бы, что писать в этом чате
+        // вправе все, потому что в `closed` так и есть. Отказ здесь
+        // означает «не знаю, что это», а умолчание означало бы «знаю,
+        // и это разрешено».
+        assert_eq!(Profile::from_code(2), None);
+        assert_eq!(Profile::from_code(u32::MAX), None);
+    }
+
+    #[test]
+    fn the_codes_are_frozen() {
+        // Коды лежат в чужих базах: столбец `chats.profile` их и хранит.
+        // Поменяй их местами — и у всех живущих групп поменялся бы профиль
+        // на следующем запуске, молча.
+        assert_eq!(Profile::Closed.code(), 0, "умолчание миграции 0027");
+        assert_eq!(Profile::Channel.code(), 1);
+    }
+
+    #[test]
+    fn closed_is_phase_one_to_the_letter() {
+        // §3.2: «`closed` — буквально фаза 1, без единой правки провода».
+        // Значит предел состава тот же, и пишут все.
+        assert_eq!(Profile::Closed.member_limit(), Some(MAX_GROUP_MEMBERS));
+        assert!(Profile::Closed.everyone_writes());
+    }
+
+    #[test]
+    fn a_channel_has_no_size_limit_and_no_free_writing() {
+        // Две вещи, ради которых профиль и заведён (§3.2). Предела нет —
+        // значит `MAX_GROUP_MEMBERS` к каналу неприменим; писать по праву —
+        // значит спрашивать представление, а не состав.
+        assert_eq!(Profile::Channel.member_limit(), None);
+        assert!(!Profile::Channel.everyone_writes());
+    }
+
+    /// Печать открывается тем, кому адресована.
+    #[test]
+    fn a_sealed_chain_opens_for_the_one_it_was_addressed_to() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let chain = [3u8; 32];
+        let block = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: seal_chain(&[1u8; 16], &OWNER, &chain, 5, &bob.public().ik).expect("печать"),
+            chain_hlc: Hlc::new(9, 0),
+        };
+        let got = open_chain(&block, &bob.public().ik, &bob.ik_secret_bytes());
+        assert_eq!(got, Some((chain, 5)), "адресат обязан открыть и получить ровно то, что клали");
+    }
+
+    /// Чужим ключом не открывается — в этом весь смысл печати.
+    #[test]
+    fn a_sealed_chain_stays_shut_for_everyone_else() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let eve = Identity::from_seed([8u8; 32]);
+        let block = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: seal_chain(&[1u8; 16], &OWNER, &[3u8; 32], 5, &bob.public().ik)
+                .expect("печать"),
+            chain_hlc: Hlc::new(9, 0),
+        };
+        assert_eq!(
+            open_chain(&block, &eve.public().ik, &eve.ik_secret_bytes()),
+            None,
+            "ключ отправителя — секрет; открыть его вправе один адресат"
+        );
+    }
+
+    /// Переклеенный на другую группу не открывается.
+    ///
+    /// **Ради этого группа и владелец уезжают под печать.** Снаружи они
+    /// лежат открытым текстом, и переклеить их вправе любой, кто кадр
+    /// везёт, — а в фазе 2 везут третьи руки. Сама печать от подмены
+    /// не страдает: адресат её откроет. Но откроет с чужой этикеткой
+    /// и положит ключ не туда, а снаружи это выглядит как «сообщения
+    /// владельца перестали открываться».
+    #[test]
+    fn a_sealed_chain_relabelled_on_the_way_does_not_open() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let sealed =
+            seal_chain(&[1u8; 16], &OWNER, &[3u8; 32], 5, &bob.public().ik).expect("печать");
+
+        let other_group = SenderKeyBlock {
+            group: [2u8; 16],
+            member: OWNER,
+            secret: sealed.clone(),
+            chain_hlc: Hlc::new(9, 0),
+        };
+        assert_eq!(
+            open_chain(&other_group, &bob.public().ik, &bob.ik_secret_bytes()),
+            None,
+            "переклеенный на другую группу обязан не открыться"
+        );
+
+        let other_member = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OTHER,
+            secret: sealed,
+            chain_hlc: Hlc::new(9, 0),
+        };
+        assert_eq!(
+            open_chain(&other_member, &bob.public().ik, &bob.ik_secret_bytes()),
+            None,
+            "переклеенный на другого владельца обязан не открыться"
+        );
+    }
+
+    /// Блок старого вида читается и едет дальше как открытый.
+    ///
+    /// Сборка фазы 1 шлёт `chain` и `counter` открыто и новых ключей
+    /// не знает. Перестань мы её понимать — обновившееся устройство
+    /// перестало бы слышать все остальные.
+    #[test]
+    fn a_block_from_the_first_phase_is_still_understood() {
+        let old = Value::Map(vec![
+            (Value::Integer(KEY_GROUP.into()), Value::Bytes(vec![1u8; 16])),
+            (Value::Integer(KEY_ACTOR.into()), Value::Bytes(OWNER.to_vec())),
+            (Value::Integer(KEY_CHAIN.into()), Value::Bytes(vec![3u8; 32])),
+            (Value::Integer(KEY_COUNTER.into()), Value::Integer(5.into())),
+            (Value::Integer(KEY_WALL_MS.into()), Value::Integer(9.into())),
+            (Value::Integer(KEY_LOGICAL.into()), Value::Integer(0.into())),
+        ]);
+        let block = sender_key_from_value(&old).expect("блок фазы 1 обязан читаться");
+        assert_eq!(block.secret, ChainSecret::Open { chain: [3u8; 32], counter: 5 });
+        assert_eq!(block.chain_hlc, Hlc::new(9, 0), "старшинство читается и у старого вида");
+    }
+
+    /// Открытый вид кодируется теми же байтами, что и в фазе 1.
+    ///
+    /// Проверка на **отсутствие** изменения: стоит открытому виду обзавестись
+    /// лишним ключом, и сборка фазы 1 начнёт видеть незнакомое поле там,
+    /// где ей обещали прежнюю форму.
+    #[test]
+    fn the_open_shape_did_not_move_a_byte() {
+        let block = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: ChainSecret::Open { chain: [3u8; 32], counter: 5 },
+            chain_hlc: Hlc::new(9, 0),
+        };
+        let Value::Map(map) = sender_key_value(&block) else { panic!("карта") };
+        let keys: Vec<i128> = map
+            .iter()
+            .map(|(k, _)| {
+                let Value::Integer(i) = k else { panic!("ключ-целое") };
+                i128::from(*i)
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                i128::from(KEY_GROUP),
+                i128::from(KEY_ACTOR),
+                i128::from(KEY_CHAIN),
+                i128::from(KEY_COUNTER),
+                i128::from(KEY_WALL_MS),
+                i128::from(KEY_LOGICAL),
+            ],
+            "открытый вид обязан остаться прежним — по нему нас читает фаза 1"
+        );
+    }
+
+    /// Запечатанный проходит круг через провод.
+    #[test]
+    fn a_sealed_block_survives_the_wire() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let block = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: seal_chain(&[1u8; 16], &OWNER, &[3u8; 32], 5, &bob.public().ik)
+                .expect("печать"),
+            chain_hlc: Hlc::new(9, 0),
+        };
+        let back = sender_key_from_value(&sender_key_value(&block)).expect("разбор");
+        assert_eq!(back, block, "печать обязана пережить кодирование без потерь");
+        assert_eq!(
+            open_chain(&back, &bob.public().ik, &bob.ik_secret_bytes()),
+            Some(([3u8; 32], 5)),
+            "и открыться после круга"
+        );
+    }
+
+    /// Правило отправки: сессия есть — открытым, сессии нет — печать.
+    #[test]
+    fn the_seal_goes_only_where_no_session_carries_it() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let mine = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: ChainSecret::Open { chain: [3u8; 32], counter: 5 },
+            chain_hlc: Hlc::new(9, 0),
+        };
+
+        // Живая сессия ретчетится, печать — нет. Поверх сессии печатать
+        // значило бы ухудшить свойство группы задаром.
+        assert_eq!(
+            chain_secret_for(&mine, &bob.public().ik, true).expect("решение"),
+            mine.secret,
+            "по живой сессии состояние обязано ехать как прежде"
+        );
+
+        let sealed = chain_secret_for(&mine, &bob.public().ik, false).expect("решение");
+        let ChainSecret::Sealed { recipient_ik, .. } = &sealed else {
+            panic!("без сессии состояние обязано быть запечатано");
+        };
+        assert_eq!(recipient_ik, &bob.public().ik, "печать адресуется тому, кому шлём");
+
+        let block = SenderKeyBlock { secret: sealed, ..mine.clone() };
+        assert_eq!(
+            open_chain(&block, &bob.public().ik, &bob.ik_secret_bytes()),
+            Some(([3u8; 32], 5)),
+            "и он обязан её открыть"
+        );
+    }
+
+    /// Запечатанный не перепечатывается под другого.
+    #[test]
+    fn an_already_sealed_block_is_not_resealed() {
+        let bob = Identity::from_seed([7u8; 32]);
+        let eve = Identity::from_seed([8u8; 32]);
+        let block = SenderKeyBlock {
+            group: [1u8; 16],
+            member: OWNER,
+            secret: seal_chain(&[1u8; 16], &OWNER, &[3u8; 32], 5, &bob.public().ik)
+                .expect("печать"),
+            chain_hlc: Hlc::new(9, 0),
+        };
+        assert_eq!(
+            chain_secret_for(&block, &eve.public().ik, false).expect("решение"),
+            block.secret,
+            "чужая печать привязана к своему адресату — перерешать за неё нельзя"
+        );
+    }
+
+    /// Счётчик мест и само приглашение обязаны говорить одно.
+    ///
+    /// **Проверка на согласие двух мест, а не на число.** Счётчик нужен
+    /// затем, чтобы клиент гасил «добавить» заранее; соври он в большую
+    /// сторону — кнопка осталась бы живой ради обречённой попытки,
+    /// в меньшую — человек не позвал бы того, кто влез бы. Поэтому
+    /// проверяется не «ноль при тридцати двух», а то, что `free_slots`
+    /// и `invite` не расходятся **ни на одном** размере состава.
+    #[test]
+    fn the_free_seats_agree_with_what_an_invitation_actually_does() {
+        let mut g = group();
+        for i in 1..=MAX_GROUP_MEMBERS {
+            let free = g.free_slots() as usize;
+            assert_eq!(
+                free,
+                MAX_GROUP_MEMBERS - g.len(),
+                "при {} участниках свободных мест обязано быть {}",
+                g.len(),
+                MAX_GROUP_MEMBERS - g.len()
+            );
+
+            // Со сдвигом: [1u8; 32] — это сам OWNER, [2u8; 32] — OTHER,
+            // и без сдвига «новичок» оказался бы уже состоящим.
+            let newcomer = [u8::try_from(i + 100).unwrap_or(u8::MAX); 32];
+            let asked = g.invite(newcomer, tag(100 + i as u64, OWNER, i as u64));
+            assert_eq!(
+                asked.is_ok(),
+                free > 0,
+                "приглашение обязано удаваться ровно тогда, когда счётчик обещал место"
+            );
+            let Ok(op) = asked else { break };
+            g.apply(op);
+        }
+        assert_eq!(g.len(), MAX_GROUP_MEMBERS, "состав обязан набраться до предела");
+        assert_eq!(g.free_slots(), 0, "у полной группы мест нет");
+        assert!(
+            g.invite([200u8; 32], tag(999, OWNER, 999)).is_err(),
+            "тридцать третьему обязан быть отказ"
+        );
+    }
+
+    /// Повторное приглашение места не занимает и у полной группы.
+    #[test]
+    fn re_inviting_someone_already_in_does_not_need_a_free_seat() {
+        let mut g = group();
+        for i in 1..MAX_GROUP_MEMBERS {
+            let who = [u8::try_from(i + 100).unwrap_or(u8::MAX); 32];
+            let op = g.invite(who, tag(100 + i as u64, OWNER, i as u64)).expect("место есть");
+            g.apply(op);
+        }
+        assert_eq!(g.free_slots(), 0, "состав полон");
+        assert!(
+            g.invite(OWNER, tag(900, OWNER, 900)).is_ok(),
+            "уже состоящий места не занимает — отказывать ему не за что"
+        );
     }
 }

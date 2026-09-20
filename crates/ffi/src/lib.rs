@@ -32,10 +32,16 @@ use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 #[cfg(feature = "tor")]
 use ratatosk_transport::{onion::arti::OnionRunner, Switched};
-// `Disabled` остаётся нужен: без признаков `tor` и `mail` эти ступени
-// честно отказывают, и это правда о сборке, а не заглушка. Условие с него
-// снято потому, что сборка с обоими признаками всё равно бывает — а вот
-// меш теперь свой раннер имеет во всякой.
+// `Disabled` нужен там, где ступени в сборке нет: она честно отказывает,
+// и это правда о сборке, а не заглушка. Потребителей у него ровно два —
+// `MailSide` и `NostrSide`, — и оба живут под `not(feature)`.
+//
+// **Условие здесь обязано быть их отрицанием, а не отсутствовать.**
+// Стояло без условия, с объяснением «сборка с обоими признаками всё равно
+// бывает», — и в такой сборке импорт становился неиспользуемым. Поймалось
+// не сразу: `cargo build --workspace --all-features` в проверке не звался,
+// а без признаков предупреждения нет.
+#[cfg(not(all(feature = "mail", feature = "nostr")))]
 use ratatosk_transport::Disabled;
 use ratatosk_transport::{
     BridgedAir, BtConfig, BtRunner, LanConfig, LanRunner, Transports, YggConfig, YggRunner,
@@ -111,6 +117,12 @@ fn engine_err(error: ratatosk_core::EngineError) -> RatatoskError {
     match error {
         EngineError::Store(ratatosk_store::StoreError::Locked)
         | EngineError::Crypto(ratatosk_crypto::CryptoError::Decrypt) => RatatoskError::Locked,
+        // Группа полна — ответ, а не поломка (§18.4).
+        EngineError::Group(ratatosk_proto::GroupError::TooManyMembers) => {
+            RatatoskError::GroupFull {
+                limit: u32::try_from(ratatosk_proto::MAX_GROUP_MEMBERS).unwrap_or(u32::MAX),
+            }
+        }
         other => RatatoskError::internal(other),
     }
 }
@@ -125,6 +137,18 @@ pub enum RatatoskError {
     /// База заблокирована: нужен PIN (§8.6).
     #[error("база заблокирована")]
     Locked,
+    /// В группе больше нет мест (§18.4).
+    ///
+    /// **Отдельно от [`RatatoskError::Internal`] по той же причине, по какой
+    /// отдельно «не тот PIN»:** это не сбой, а обычный ответ, и человеку
+    /// есть что с ним сделать — завести вторую группу или кого-то убрать.
+    /// Показанный как внутренняя ошибка, он толкает переустанавливать
+    /// клиент ради того, что работает правильно.
+    #[error("в группе уже {limit} участников — больше не поместится")]
+    GroupFull {
+        /// Предел, в который упёрлись, — чтобы клиенту не хранить его у себя.
+        limit: u32,
+    },
     /// Внутренняя ошибка.
     #[error("внутренняя ошибка: {reason}")]
     Internal {
@@ -445,6 +469,69 @@ pub enum FfiEvent {
         chat_id: Vec<u8>,
         /// Название.
         title: String,
+    },
+    /// Кого-то впустили в канал (фаза 2, §6.5).
+    ///
+    /// Приходит и на свой впуск, и на чужой: учёт видит владелец, и он же
+    /// видит, кто именно воспользовался правом «впускать».
+    ChannelAdmitted {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Кого впустили.
+        who: Vec<u8>,
+        /// Кто впустил.
+        admitted_by: Vec<u8>,
+    },
+    /// Ключ чтения канала повернулся (фаза 2, §6.4).
+    ///
+    /// Приходит и на свой поворот, и на чужой: у клиента один путь
+    /// перерисовки. Архив при этом не теряется — прежние поколения
+    /// остаются, новое приходит для будущего.
+    ChannelKeyRotated {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Номер нового поколения.
+        generation: u64,
+    },
+    /// Подписались на канал по ссылке (фаза 2, §10.4).
+    ///
+    /// **Названия в событии нет**: оно внутри представления, а его ещё
+    /// не привезли. Класть название в ссылку для показа нельзя — оно
+    /// ничем не подписано (§10.5). Строку в списке чатов рисует клиент:
+    /// «канал, ссылку прислал X».
+    ChannelSubscribed {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Ждём ли впуска владельцем. `false` — открытый канал.
+        awaiting: bool,
+    },
+    /// У канала новая версия представления (фаза 2, §6.1).
+    ///
+    /// Отдельно от [`FfiEvent::GroupRenamed`]: у группы переименование —
+    /// это всё, что произошло, а здесь вместе с названием могли смениться
+    /// права, сложность PoW и окно сидирования.
+    ChannelChanged {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Номер принятой версии.
+        version: u64,
+        /// Название из новой версии.
+        title: String,
+    },
+    /// Канал заведён (фаза 2, §6.1).
+    ///
+    /// Отдельно от [`FfiEvent::GroupCreated`]: у канала нет списка
+    /// участников, зато есть ссылка и экран прав, и рисовать их
+    /// по одному событию значило бы решать породу догадкой.
+    ChannelCreated {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Название.
+        title: String,
+        /// Открытый ли канал (§6.1). Порода задана при заведении
+        /// и не меняется: «Открытый канал» и «Канал по приглашению» —
+        /// два разных обещания, и слово для каждого одно.
+        open: bool,
     },
     /// Группу переименовали.
     ///
@@ -968,7 +1055,7 @@ pub struct FfiContact {
 /// Участник группы в том виде, в каком его рисуют (§11).
 ///
 /// Три поля, и по отдельности ни одного не хватает: по ключу берётся лицо
-/// ([`RatatoskClient::avatar`]) и открывается карточка, имя считает ядро
+/// ([`RatatoskClient::avatar_of`]) и открывается карточка, имя считает ядро
 /// по §4.1, а «это я» из ключа выводится сравнением с собственным — то
 /// самое протокольное знание, которое §13.3 держит ниже границы.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1052,6 +1139,17 @@ pub struct FfiGroup {
     /// Участников же ядро заводит несверенными (§11.5), и правило §4.2
     /// означало бы «картинки почти никогда нет».
     pub avatar_ms: u64,
+    /// Сколько **новых** человек ещё поместится (§18.4).
+    ///
+    /// Отдаётся затем, чтобы отказ не понадобился: с этим числом клиент
+    /// гасит «добавить» заранее и говорит, сколько мест осталось, вместо
+    /// того чтобы объясняться после неудачной попытки. Упёршемуся всё
+    /// равно ответит [`RatatoskError::GroupFull`] — но это ответ на гонку,
+    /// а не обычный путь: состав меняется и у соседа.
+    ///
+    /// `0` у полной группы и у той, из которой мы вышли: звать оттуда
+    /// мы всё равно не вправе.
+    pub free_slots: u32,
 }
 
 /// Сообщение в том виде, в каком его показывает UI.
@@ -1084,7 +1182,7 @@ pub struct FfiMessage {
     /// Ключ автора — рядом с именем и по тому же правилу.
     ///
     /// Нужен не для подписи, а для всего, что к автору привязано:
-    /// лицо ([`RatatoskClient::avatar`] спрашивает по ключу), переход
+    /// лицо ([`RatatoskClient::avatar_of`] спрашивает по ключу), переход
     /// к карточке, склейка подряд идущих сообщений одного человека.
     /// Без него клиент умел бы только напечатать имя.
     ///
@@ -2216,7 +2314,7 @@ impl RatatoskClient {
     /// при каждом старте не только можно, но и нужно.
     ///
     /// **Версия карточки при этом растёт**, поэтому своя ссылка и QR
-    /// меняются: клиенту стоит перечитать [`RatatoskClient::contact_uri`],
+    /// меняются: клиенту стоит перечитать [`RatatoskClient::my_contact_uri`],
     /// если он показывает их на экране.
     pub fn announce_addresses(
         &self,
@@ -3274,6 +3372,7 @@ fn group_of(status: &ratatosk_core::driver::GroupStatus) -> FfiGroup {
         mine: status.mine,
         joined: status.joined,
         avatar_ms: status.avatar_ms,
+        free_slots: status.free_slots,
     }
 }
 
@@ -3939,6 +4038,23 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::MessageEdited { chat, msg_id } => {
             FfiEvent::MessageEdited { chat_id: chat.to_vec(), msg_id: msg_id.to_vec() }
         }
+        Event::ChannelCreated { chat, title, open } => {
+            FfiEvent::ChannelCreated { chat_id: chat.to_vec(), title, open }
+        }
+        Event::ChannelChanged { chat, version, title } => {
+            FfiEvent::ChannelChanged { chat_id: chat.to_vec(), version, title }
+        }
+        Event::ChannelSubscribed { chat, awaiting } => {
+            FfiEvent::ChannelSubscribed { chat_id: chat.to_vec(), awaiting }
+        }
+        Event::ChannelKeyRotated { chat, generation } => {
+            FfiEvent::ChannelKeyRotated { chat_id: chat.to_vec(), generation }
+        }
+        Event::ChannelAdmitted { chat, who, admitted_by } => FfiEvent::ChannelAdmitted {
+            chat_id: chat.to_vec(),
+            who: who.to_vec(),
+            admitted_by: admitted_by.to_vec(),
+        },
         Event::ReactionChanged { chat, msg_id, author_ik } => FfiEvent::ReactionChanged {
             chat_id: chat.to_vec(),
             msg_id: msg_id.to_vec(),
@@ -4730,6 +4846,7 @@ mod tests {
             mine,
             joined,
             avatar_ms,
+            free_slots: 30,
         }
     }
 
@@ -4749,6 +4866,7 @@ mod tests {
         assert!(it.mine);
         assert!(it.joined);
         assert_eq!(it.avatar_ms, 0, "картинки нет — и метка нулевая");
+        assert_eq!(it.free_slots, 30, "остаток мест едет наружу: по нему гасят «добавить»");
     }
 
     #[test]
@@ -4779,5 +4897,45 @@ mod tests {
         let it = group_of(&status(false, false));
         assert!(!it.mine);
         assert!(!it.joined);
+    }
+
+    /// Полная группа — ответ, а не сбой.
+    ///
+    /// **Различие содержательное, а не косметическое**, ровно как
+    /// у «не того PIN» выше: с полной группой человек что-то делает —
+    /// заводит вторую или кого-то убирает, — а с внутренней ошибкой
+    /// не делает ничего, кроме переустановки клиента. Показать первое
+    /// как второе значит посоветовать выбросить работающее.
+    #[test]
+    fn a_full_group_is_an_answer_and_not_a_fault() {
+        let refusal = engine_err(ratatosk_core::EngineError::Group(
+            ratatosk_proto::GroupError::TooManyMembers,
+        ));
+        let RatatoskError::GroupFull { limit } = refusal else {
+            panic!("полная группа обязана отличаться от внутренней ошибки");
+        };
+        assert_eq!(
+            usize::try_from(limit).unwrap_or(0),
+            ratatosk_proto::MAX_GROUP_MEMBERS,
+            "предел едет с отказом, чтобы клиенту не держать его у себя"
+        );
+    }
+
+    /// Остальные отказы группы остаются внутренней ошибкой.
+    ///
+    /// Пара к предыдущей: выведи мы наружу всё подряд — и клиенту пришлось бы
+    /// разбирать виды, о которых ему сказать человеку нечего.
+    #[test]
+    fn the_other_group_refusals_stay_internal() {
+        for other in [ratatosk_proto::GroupError::NotOwner, ratatosk_proto::GroupError::NotAMember]
+        {
+            assert!(
+                matches!(
+                    engine_err(ratatosk_core::EngineError::Group(other)),
+                    RatatoskError::Internal { .. }
+                ),
+                "наружу выведен ровно тот отказ, с которым человеку есть что делать"
+            );
+        }
     }
 }

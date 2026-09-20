@@ -46,7 +46,20 @@ ROOT_DIR = __import__("pathlib").Path(__file__).resolve().parents[2]
 
 
 ROOT = ROOT_DIR / "crates"
-ENGINE = ROOT / "core/src/engine.rs"
+def engine_source():
+    """Ядро целиком: `engine.rs` плюс его подмодули.
+
+    После разделения (0.5) ядро — не один файл, а каталог. Метелка,
+    читающая только `engine.rs`, нашла бы пустоту и отчиталась
+    «чисто» — то есть соврала бы ровно в тот день, когда её стоило
+    послушать. Читается всё разом: метелке безразлично, в каком
+    модуле лежит проводка, ей важно, что проводка есть.
+    """
+    root = ROOT_DIR / "crates/core/src"
+    parts = [(root / "engine.rs").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8") for p in sorted((root / "engine").glob("*.rs"))]
+    return "\n".join(parts)
+
 
 # Настройки, чьё имя не начинается с `Set`, но которые ими являются.
 # Имя сменилось в 0.4 (`WatchLanPeers` → `WatchPeers`: эфиров стало два,
@@ -79,7 +92,7 @@ def own_body_of(src, name):
     независимо от того, где его позвали, и проверка порядка на нём врёт.
     Первая редакция так и врала — ругалась на исправный подъём.
     """
-    m = re.search(r"\n    (?:pub )?fn " + re.escape(name) + r"\b", src)
+    m = re.search(r"\n    (?:pub )?(?:pub\(super\) )?(?:const )?fn " + re.escape(name) + r"\b", src)
     if not m:
         return None
     return braced(src, src.index("{", m.end()))
@@ -93,13 +106,13 @@ def body_of(src, name):
     (`apply_transport`, `apply_ygg`). Два уровня уже утащили бы половину
     ядра и превратили бы правило в «эффект встречается где-нибудь».
     """
-    m = re.search(r"\n    (?:pub )?fn " + re.escape(name) + r"\b", src)
+    m = re.search(r"\n    (?:pub )?(?:pub\(super\) )?(?:const )?fn " + re.escape(name) + r"\b", src)
     if not m:
         return None
     start = src.index("{", m.end())
     body = braced(src, start)
     for callee in set(re.findall(r"self\.(\w+)\(", body)):
-        m2 = re.search(r"\n    (?:pub )?fn " + re.escape(callee) + r"\b", src)
+        m2 = re.search(r"\n    (?:pub )?(?:pub\(super\) )?(?:const )?fn " + re.escape(callee) + r"\b", src)
         if m2:
             body += braced(src, src.index("{", m2.end()))
     return body
@@ -110,7 +123,7 @@ def settings_in(body):
     return {v for v in found if (v.startswith("Set") or v in EXTRA) and v not in NOT_A_SETTING}
 
 
-src = ENGINE.read_text(encoding="utf-8")
+src = engine_source()
 
 startup = body_of(src, "startup_effects")
 if startup is None:
@@ -118,7 +131,7 @@ if startup is None:
     sys.exit(2)
 pushed = settings_in(startup)
 
-handlers = sorted(set(re.findall(r"\n    fn (on_set_\w+)\b", src)))
+handlers = sorted(set(re.findall(r"\n    (?:pub )?(?:pub\(super\) )?fn (on_set_\w+)\b", src)))
 if not handlers:
     print("обработчиков настроек не найдено — метелка бесполезна")
     sys.exit(2)

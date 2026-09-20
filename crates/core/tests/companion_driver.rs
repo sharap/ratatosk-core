@@ -172,6 +172,19 @@ impl Pair {
         }
     }
 
+    /// Сколько кадров десктоп успел отправить — забирая их из очереди.
+    ///
+    /// Нужен там, где важен сам факт повторной отправки, а не её разбор:
+    /// телефон на эти кадры отвечать не обязан, потому что проверяется
+    /// именно упорство десктопа.
+    fn frames_from_desktop(&mut self) -> usize {
+        let mut seen = 0;
+        while self.from_desktop.try_recv().is_ok() {
+            seen += 1;
+        }
+        seen
+    }
+
     /// Ждёт событие, которое подходит под образец.
     ///
     /// С таймаутом, а не бесконечно: не пришедшее событие обязано выглядеть
@@ -255,11 +268,30 @@ fn paired_with_onion(now_ms: u64, phone_onion: String) -> (CompanionDriver<FakeR
 /// `stale_invite` отдаёт терминалу ссылку **без** пиров — такую, какую
 /// печатала сборка постарше, — оставляя полную в `Pair::invite`. Так
 /// проверяется второй путь: пиры не из QR, а с диска.
+/// То же, но с подменёнными часами драйвера.
+///
+/// `with_clock` стоит в дереве публичной и помечена «для тестов» с самого
+/// рождения, а звать её до сих пор было некому: повтор рукопожатия
+/// по времени не проверялся вовсе.
+fn paired_with_clock(now_ms: u64, clock: fn() -> u64) -> (CompanionDriver<FakeRunner>, Pair) {
+    paired_inner(now_ms, String::new(), Vec::new(), false, Some(clock))
+}
+
 fn paired_with(
     now_ms: u64,
     phone_onion: String,
     ygg_peers: Vec<String>,
     stale_invite: bool,
+) -> (CompanionDriver<FakeRunner>, Pair) {
+    paired_inner(now_ms, phone_onion, ygg_peers, stale_invite, None)
+}
+
+fn paired_inner(
+    now_ms: u64,
+    phone_onion: String,
+    ygg_peers: Vec<String>,
+    stale_invite: bool,
+    clock: Option<fn() -> u64>,
 ) -> (CompanionDriver<FakeRunner>, Pair) {
     let identity = Identity::from_seed([1u8; 32]);
     let mut store = MemoryStore::new();
@@ -333,7 +365,10 @@ fn paired_with(
         commands: Arc::clone(&commands),
     };
 
-    let (driver, handle, events) = CompanionDriver::new(client, runner);
+    let (driver, handle, events) = match clock {
+        Some(now) => CompanionDriver::with_clock(client, runner, now),
+        None => CompanionDriver::new(client, runner),
+    };
     (
         driver,
         Pair {
@@ -392,7 +427,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     path
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_driver_links_up_and_hands_the_chat_list_to_the_window() {
     // Самый первый круг: драйвер здоровается сам, телефон отвечает, и окно
     // получает список чатов, ничего не спросив. Без этого человек после
@@ -414,7 +449,7 @@ async fn the_driver_links_up_and_hands_the_chat_list_to_the_window() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_terminal_falls_back_to_onion_and_comes_back_to_the_shared_network() {
     // Вне общей сети терминал до этой поставки звонил в никуда: адрес
     // телефона лежал у него в приглашении с самого сопряжения, а в команду
@@ -478,7 +513,7 @@ async fn the_terminal_falls_back_to_onion_and_comes_back_to_the_shared_network()
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_terminal_without_the_phones_address_stays_where_it_is() {
     // Переключаться некуда: адреса нет. «Звоню туда, где никого нет»
     // честнее, чем «звоню в никуда», — и заодно это тот самый случай,
@@ -504,7 +539,7 @@ async fn a_terminal_without_the_phones_address_stays_where_it_is() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_saved_attachment_really_lands_on_disk() {
     // **Путь, который не исполнялся ни разу.** Запись по смещению, закрытие
     // файла, событие `FileSaved` с путём — всё это живёт только в драйвере,
@@ -563,7 +598,7 @@ async fn a_saved_attachment_really_lands_on_disk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_saved_attachment_keeps_its_bytes_when_the_narezka_is_not_the_default() {
     // **Разбор жалобы «файлы через компаньона приходят битыми».**
     //
@@ -654,7 +689,7 @@ async fn a_saved_attachment_keeps_its_bytes_when_the_narezka_is_not_the_default(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_finely_cut_attachment_does_not_cost_a_round_trip_per_piece() {
     // **Жалоба со стенда: «через компаньона файлы ползут даже по LAN».**
     //
@@ -745,7 +780,7 @@ async fn a_finely_cut_attachment_does_not_cost_a_round_trip_per_piece() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancelling_a_save_removes_the_half_written_file() {
     // Недокачанный файл выглядит на диске ровно как докачанный. Оставить
     // его — значит отдать человеку битую картинку без единого признака
@@ -807,7 +842,7 @@ async fn cancelling_a_save_removes_the_half_written_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sending_two_files_reads_both_from_disk_in_order() {
     // Очередь выгрузки целиком: драйвер открывает файлы по номеру из
     // `NeedChunk`, а не по имени. Имена здесь нарочно **одинаковые** — ровно
@@ -855,7 +890,7 @@ async fn sending_two_files_reads_both_from_disk_in_order() {
     let _ = std::fs::remove_dir_all(&second_dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_file_going_up_is_cut_the_way_the_phone_agreed_to_take_it() {
     // **Та же беда, что и на приёме, только с другой стороны провода.**
     // Телефон нарезает выгрузку своим числом (`chunk_bytes_now`) и сам же
@@ -909,7 +944,7 @@ async fn a_file_going_up_is_cut_the_way_the_phone_agreed_to_take_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_file_that_cannot_be_read_is_refused_before_anything_goes_up() {
     // Узнать, что второй файл не читается, после того как первый уже уехал,
     // — худший из порядков: на телефоне осталось бы занятое место, а человек
@@ -949,7 +984,7 @@ async fn a_file_that_cannot_be_read_is_refused_before_anything_goes_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_broken_link_leaves_the_part_file_and_finishes_it_later() {
     // Приём через разрыв — вторая половина того же решения. Раньше обрывок
     // стирался, и человек качал мебибайты заново из-за секундной потери сети.
@@ -1046,7 +1081,7 @@ async fn a_broken_link_leaves_the_part_file_and_finishes_it_later() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_broken_link_does_not_take_the_paths_with_it() {
     // Пути держит драйвер, и отпускать их на разрыве нельзя: продолжение
     // выгрузки просит кусок того же файла, а читать его будет неоткуда —
@@ -1140,7 +1175,7 @@ async fn a_broken_link_does_not_take_the_paths_with_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn turning_the_cache_off_wipes_the_file() {
     // §13.4: выключение **стирает**, а не перестаёт обновлять. Человек,
     // снявший галочку, имел в виду «здесь этого не должно быть».
@@ -1169,7 +1204,7 @@ async fn turning_the_cache_off_wipes_the_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_terminal_raises_its_own_mesh_node_from_the_invite() {
     // Поломка, ради которой это написано: встроенный узел терминала
     // не вставал **никогда** вне общей сети. Пиры приезжали только
@@ -1220,7 +1255,7 @@ async fn the_terminal_raises_its_own_mesh_node_from_the_invite() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_terminal_without_peers_asks_the_transport_for_no_mesh_at_all() {
     // Обратная половина: пиров нет — и ступень не поднимается вовсе.
     // Поднятая без пиров, она стоила бы `Unavailable` на каждый кадр,
@@ -1247,7 +1282,7 @@ async fn a_terminal_without_peers_asks_the_transport_for_no_mesh_at_all() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_same_peers_announced_again_do_not_restart_the_node() {
     // Объявление адреса приходит на **каждом** рукопожатии, а перезапуск
     // узла — это разрыв всего, что через него шло. Повтор с тем же списком
@@ -1270,7 +1305,7 @@ async fn the_same_peers_announced_again_do_not_restart_the_node() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn peers_kept_on_disk_raise_the_node_without_a_single_frame() {
     // Живой прогон сказал ровно это: «узел поднимается, только если есть
     // соединение по lan». Приглашение закрывает первый запуск, а дальше
@@ -1325,4 +1360,105 @@ async fn peers_kept_on_disk_raise_the_node_without_a_single_frame() {
         } => {}
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Подменные часы драйвера — для проверки повтора рукопожатия.
+///
+/// Обычные часы у драйвера настоящие, а сроки в тестах виртуальные,
+/// и повтор по времени из-за этого не проверялся **вовсе**: `with_clock`
+/// стоит в дереве публичной, помечена «для тестов», на неё ссылается
+/// шапка этого файла — и до сих пор её не звал никто. Проверка ниже
+/// обналичивает это обещание.
+static FAKE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Потолок отступления, какой обещает драйвер (`RETRY_MAX_MS`).
+///
+/// Число повторено здесь нарочно, а не взято из крейта: проверка стережёт
+/// **обещание**, а не переменную. Возьми она константу — поднятие потолка
+/// поднимало бы вместе с ним и проверку, и та молчала бы о том, что окно
+/// стало оживать вдесятеро дольше.
+const RETRY_CEILING_MS: u64 = 15_000;
+
+fn fake_now() -> u64 {
+    FAKE_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unlinked_terminal_keeps_reaching_out_and_backs_off() {
+    // **Повтор по времени, а не только по маяку** — исправление настоящей
+    // поломки со стенда: телефон не может ответить, пока не знает адреса
+    // десктопа, а маяк mDNS шлётся однократно. Полагаться было не на что.
+    //
+    // Проверяется то, ради чего повтор и заведён: пока связи нет, десктоп
+    // продолжает здороваться, и паузы между попытками растут — но
+    // не бесконечно, иначе человек перед окном решит, что оно мертво.
+    FAKE_CLOCK.store(1_000, std::sync::atomic::Ordering::SeqCst);
+    let (mut driver, mut pair) = paired_with_clock(1_000, fake_now);
+
+    tokio::select! {
+        () = driver.run() => panic!("драйвер вышел раньше теста"),
+        () = async {
+            // Первое «здравствуй» уходит сразу, без всякого срока.
+            pair.breathe().await;
+            let first = pair.frames_from_desktop();
+            assert!(first > 0, "десктоп обязан поздороваться сразу, не дожидаясь маяка");
+
+            // Связи нет — двигаем часы и ждём повторов. Очередь при каждом
+            // замере опустошается, поэтому проверяется не рост числа,
+            // а то, что **каждый** раз приходит новое «здравствуй».
+            //
+            // Шаг заведомо больше потолка отступления: с потолком
+            // на месте этого хватает всегда, а без потолка паузы
+            // перерастают шаг за пару кругов — на том проверка и стоит.
+            //
+            // **Двигаются обе стрелки сразу, и это не дублирование.**
+            // Драйвер считает свой срок по подменённым часам
+            // (`retry_at_ms`), а спит по часам tokio. Двинь одни — и он
+            // либо не проснётся, либо проснётся и решит, что ещё рано.
+            //
+            // Ожидание здесь настоящее, а не уступка планировщику:
+            // виртуальные часы идут только тогда, когда рантайму больше
+            // нечего делать, а `yield_now` оставляет задачу готовой
+            // к работе — и время стоит.
+            let step = RETRY_CEILING_MS + 1_000;
+            for round in 1..=6 {
+                FAKE_CLOCK.fetch_add(step, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+                assert!(
+                    pair.frames_from_desktop() > 0,
+                    "круг {round}: отступление обязано упираться в потолок, \
+                     иначе окно выглядит мёртвым — а человек перед ним сидит"
+                );
+            }
+
+            // **А теперь вторая половина обещания: не долбить.**
+            //
+            // Проверка сперва стерегла только упорство, и снятие отступления
+            // её не роняло — «здороваться снова» без отступления получается
+            // даже лучше. Имя теста при этом обещало `backs_off`, то есть
+            // половину того, что проверялось. Поломкой это и вскрылось.
+            //
+            // Минута мелкими шагами: с отступлением и потолком в пятнадцать
+            // секунд попыток выходит около четырёх, без отступления — под
+            // шестьдесят. Порог посередине и с запасом: проверка стережёт
+            // порядок величины, а не точное число.
+            let mut tries = 0;
+            for _ in 0..60 {
+                FAKE_CLOCK.fetch_add(1_000, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+                tries += pair.frames_from_desktop();
+            }
+            assert!(
+                tries <= 12,
+                "за минуту молчания попыток вышло {tries} — это долбёжка, \
+                 а не отступление: телефон может быть просто выключен"
+            );
+
+            // **Чего эта проверка не стережёт.** Сброс отступления при живой
+            // связи (`on_tick` под `linked()`) — здесь связь не встаёт ни разу,
+            // и снять этот сброс можно, ничего не уронив. Проверено поломкой,
+            // сказано словами: покрытие, о котором не сказано, назавтра
+            // считают имеющимся.
+        } => {}
+    }
 }

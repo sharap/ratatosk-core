@@ -31,6 +31,7 @@
 pub mod avatar;
 pub mod bluetooth;
 pub mod card_update;
+pub mod channel;
 pub mod companion;
 pub mod contact_share;
 pub mod edit;

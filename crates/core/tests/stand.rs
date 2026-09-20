@@ -406,7 +406,30 @@ impl Stand {
         Stand::build(seed, count, false)
     }
 
+    /// Стенд, где узлы друг другу **никто** (§8.3).
+    ///
+    /// `Stand::new` знакомит всех со всеми — `O(n²)` карточек «как при
+    /// встрече по QR». Для роя это не просто дорого: это **неверная
+    /// посылка**. В канале узлы друг другу не контакты, в этом весь §8.3,
+    /// и проверка, собранная на взаимных знакомствах, зеленела бы там,
+    /// где живой рой упёрся бы в `UnknownPeer`.
+    ///
+    /// Здесь знакомства нет ни у кого: каждый знает только себя. Путь
+    /// к чужому узлу открывает ссылка на канал (§10.1) — она заводит
+    /// **пира**, — либо `introduce`, если сценарию нужна ровно одна пара.
+    ///
+    /// Почта выключена по той же причине, по какой её выключает
+    /// `without_mail`: с ней всякое письмо доезжает спулом, и ожидание
+    /// §5.4 не проверяется вовсе.
+    fn strangers(seed: u64, count: u16) -> Stand {
+        Stand::assemble(seed, count, false, false)
+    }
+
     fn build(seed: u64, count: u16, mail: bool) -> Stand {
+        Stand::assemble(seed, count, mail, true)
+    }
+
+    fn assemble(seed: u64, count: u16, mail: bool, introduce_everyone: bool) -> Stand {
         let mut nodes: Vec<Peer> = (0..count)
             .map(|i| Peer::new(u8::try_from(i + 1).expect("узлов не больше 254"), seed, mail))
             .collect();
@@ -445,7 +468,8 @@ impl Stand {
         sim.start();
 
         // Знакомство — как при встрече по QR: карточка каждому от каждого.
-        for i in 0..count {
+        // Для роя его не бывает: см. `Stand::strangers`.
+        for i in (0..count).filter(|_| introduce_everyone) {
             for (_, ik, card) in &cards {
                 if *ik == sim.node(NodeId(i)).ik() {
                     continue;
@@ -569,6 +593,20 @@ impl Stand {
                 _ => None,
             })
             .expect("о заведении канала обязано прийти событие")
+    }
+
+    /// Ссылка на канал — та, которой владелец делится (§10.1).
+    fn channel_link(&self, owner: NodeId, chat: [u8; 16]) -> String {
+        self.sim.node(owner).engine().channel_link(chat).expect("ссылка собирается")
+    }
+
+    /// Переход по ссылке: подписка (§10.3, §10.4).
+    fn subscribe(&mut self, who: NodeId, uri: &str) {
+        let uri = uri.to_owned();
+        self.sim.act(who, |node, ctx| {
+            node.command(ctx, Command::SubscribeToChannel { uri });
+        });
+        self.settle();
     }
 
     /// Впускает читателя в канал (фаза 2, §6.5).
@@ -1074,6 +1112,65 @@ const C: NodeId = NodeId(2);
 const D: NodeId = NodeId(3);
 
 // --- разговор двоих ---------------------------------------------------------
+
+#[test]
+fn a_channel_lives_among_nodes_that_know_nobody() {
+    // **Стенд для роя, первый его сценарий.** `Stand::new` знакомит всех
+    // со всеми — «как при встрече по QR», — и на такой популяции канал
+    // проверяется не тот: в канале узлы друг другу не контакты, в этом
+    // весь §8.3. Здесь знакомства нет ни у кого, и единственный путь
+    // к владельцу — ссылка (§10.1).
+    //
+    // Проверка **не** стережёт рой: раздача по-прежнему звездой, и слово
+    // владельца развозит он сам (§7.5.2). Она стережёт посылку, на которой
+    // рой будет строиться, — что узлы доходят друг до друга, никого
+    // не заводя в знакомые.
+    let mut stand = Stand::strangers(0x5EED_D00D, 4);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    for reader in 1..4u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    // Заявки §10.4 доехали до владельца — по ссылке, без единого
+    // знакомства.
+    assert_eq!(
+        stand.sim.node(NodeId(0)).engine().store().channel_requests(&chat).expect("заявки").len(),
+        3,
+        "трое попросились, и все трое дошли; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    for reader in 1..4u16 {
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.say(NodeId(0), chat, "слово");
+    stand.settle();
+
+    for reader in 1..4u16 {
+        let node = stand.sim.node(NodeId(reader));
+        assert_eq!(
+            node.seen(chat),
+            vec!["слово".to_owned()],
+            "читатель {reader} не услышал владельца; сид {:#x}",
+            stand.sim.seed()
+        );
+        assert!(
+            node.engine().contacts().is_empty(),
+            "читатель {reader} завёл знакомых, хотя ни с кем не говорил (§8.3)"
+        );
+    }
+    assert!(
+        stand.sim.node(NodeId(0)).engine().contacts().is_empty(),
+        "и у владельца: канал на сотню читателей — не сотня знакомых"
+    );
+    assert_eq!(
+        stand.sim.node(NodeId(0)).engine().groups()[&chat].group.members().count(),
+        4,
+        "а состав у владельца полон — он его и ведёт (§3.2)"
+    );
+}
 
 #[test]
 fn files_cross_in_the_air_in_both_directions() {

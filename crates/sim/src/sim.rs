@@ -83,9 +83,30 @@ pub trait SimNode {
 
 #[derive(Debug, Clone)]
 enum Event {
-    Deliver { from: NodeId, to: NodeId, kind: TransportKind, bytes: Vec<u8> },
-    Timer { node: NodeId, token: u64 },
-    SendFailed { node: NodeId, to: NodeId, kind: TransportKind },
+    Deliver {
+        from: NodeId,
+        to: NodeId,
+        kind: TransportKind,
+        bytes: Vec<u8>,
+    },
+    Timer {
+        node: NodeId,
+        token: u64,
+    },
+    SendFailed {
+        node: NodeId,
+        to: NodeId,
+        kind: TransportKind,
+    },
+    /// Кончилось окно ухода: узел вернулся, и спул пора разобрать.
+    ///
+    /// Своим событием, а не проверкой на каждом шаге: часы в прогоне
+    /// двигаются очередью, и «момент возвращения» обязан быть в ней —
+    /// иначе вернувшийся узел ждал бы постороннего повода, а на пустой
+    /// очереди не дождался бы никогда.
+    Returned {
+        node: NodeId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +291,46 @@ impl<N: SimNode> Sim<N> {
         }
     }
 
+    /// Расписывает окно ухода: узел выключен с `from_ms` по `to_ms`.
+    ///
+    /// **Расписание, а не вызов посреди прогона.** Рой ломается
+    /// на совпадениях — волна ухода, наложившаяся на заживание дерева, —
+    /// и задавать их надо до прогона, чтобы падение воспроизводилось
+    /// по сиду. Спул при возвращении разбирается сам.
+    pub fn schedule_offline(&mut self, node: NodeId, from_ms: u64, to_ms: u64) {
+        self.net.set_offline_window(node, from_ms, to_ms);
+        self.push(to_ms, Event::Returned { node });
+    }
+
+    /// Волна ухода: `share_permille` узлов уходят вразнобой и возвращаются.
+    ///
+    /// Кто именно уйдёт — решает генератор прогона, то есть сид: сценарий
+    /// «ушла пятая часть» обязан воспроизводиться, а не зависеть
+    /// от порядка, в котором его написали. Моменты ухода разведены
+    /// по `stagger_ms`: одновременный уход — это отдельный сценарий,
+    /// и он задаётся нулём.
+    ///
+    /// Возвращает тех, кто ушёл, — по ним сценарий и проверяет итог.
+    pub fn churn_wave(
+        &mut self,
+        share_permille: u32,
+        start_ms: u64,
+        stagger_ms: u64,
+        duration_ms: u64,
+    ) -> Vec<NodeId> {
+        let mut gone = Vec::new();
+        for i in 0..self.nodes.len() {
+            if !self.net_rng.chance_permille(share_permille) {
+                continue;
+            }
+            let node = NodeId(u16::try_from(i).expect("узлов меньше 65536"));
+            let from = start_ms + stagger_ms * gone.len() as u64;
+            self.schedule_offline(node, from, from + duration_ms);
+            gone.push(node);
+        }
+        gone
+    }
+
     /// Помещает узел в сегмент сети.
     pub fn partition(&mut self, node: NodeId, segment: u8) {
         self.net.set_segment(node, segment);
@@ -330,8 +391,15 @@ impl<N: SimNode> Sim<N> {
 
     fn dispatch(&mut self, event: Event) {
         match event {
+            Event::Returned { node } => {
+                // Часы уже стоят на моменте возвращения: окно кончилось,
+                // и `is_online_at` отвечает «в сети».
+                if self.net.is_online_at(node, self.now_ms) {
+                    self.flush_spool(node);
+                }
+            }
             Event::Deliver { from, to, kind, bytes } => {
-                if !self.net.is_online(to) {
+                if !self.net.is_online_at(to, self.now_ms) {
                     // Узел успел уйти офлайн, пока кадр был в пути.
                     if kind.is_direct() {
                         self.stats.dropped += 1;

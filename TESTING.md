@@ -122,6 +122,36 @@ cargo test -p ratatosk-sim  --test scenarios   # на учебном узле
 не исследует перестановки и ничего не найдёт), а **итоговое состояние**
 обязано не зависеть (это и есть сходимость).
 
+#### 2а. Сеть по слоям: связь, узел, топология, расписание
+
+```sh
+cargo test -p ratatosk-sim --lib net
+cargo test -p ratatosk-sim --test scenarios churn
+cargo test -p ratatosk-sim --test scenarios the_same_seed
+cargo test -p ratatosk-core --test stand know_nobody
+```
+
+Заведено под рой (`phase2-plan.md`, §6а): на популяции, где все друг другу
+контакты, а задержка одна на всю сеть, рой проверяется не тот.
+
+| Тест | Что держит |
+|---|---|
+| `a_link_profile_beats_the_transport_profile` | профиль **связи** перекрывает профиль ступени, и в одну сторону |
+| `a_rung_missing_on_one_node_is_missing_for_the_pair` | ступень нужна **обоим**: смешанная популяция |
+| `three_hops_cost_more_than_one` | путь по графу складывается с задержкой ступени; вне графа — недостижим |
+| `a_shorter_path_wins_even_when_it_is_found_later` | это Дейкстра, а не «первый найденный путь» |
+| `an_offline_window_is_a_schedule_and_not_a_switch` | уход — расписание, а не вызов посреди прогона |
+| `a_churn_wave_is_scheduled_once_and_heals_by_itself` | вернувшийся разбирает спул **сам**, своим событием |
+| `the_same_seed_sends_the_same_nodes_away` | волна воспроизводима: иначе падение на ней не поймать |
+| `a_channel_lives_among_nodes_that_know_nobody` | стенд без знакомств: канал живёт, знакомых не появляется |
+
+**Чего эти проверки не стерегут.** Самого роя: раздача по-прежнему
+звездой (§7.5.2), и `a_channel_lives_among_nodes_that_know_nobody`
+стережёт **посылку**, на которой рой будет строиться, а не рой.
+Не стерегут они и пропускной способности: модель считает задержки,
+потери и дубли, но не байты в секунду, — это по-прежнему живёт
+в `floor_bytes_per_sec` у политики.
+
 ### 3. Всё остальное
 
 ```sh

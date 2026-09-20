@@ -726,6 +726,21 @@ impl<S: Store> Engine<S> {
         Ok(candidates)
     }
 
+    /// Какой ступенью блок поедет к этому пиру **сейчас** (§5.4).
+    ///
+    /// Первая годная по лестнице — та же, которую выберет доставка.
+    /// Ни одной годной нет — `None`: кадр ляжет в очередь и поедет,
+    /// когда путь появится, а форму дерева на «пока некуда» строить
+    /// нельзя.
+    fn rung_to(&self, peer_ik: &[u8; 32]) -> Option<Transport> {
+        let availability = self.availability_of(peer_ik).ok()?;
+        ratatosk_proto::transport_policy::Reachability::of(availability)
+            .rungs
+            .into_iter()
+            .find(|rung| rung.usable())
+            .map(|rung| rung.transport)
+    }
+
     /// Делит тех, кому можем слать, на eager и lazy (§7.1).
     ///
     /// # Почему по порядку ключа, а не случайно
@@ -818,6 +833,29 @@ impl<S: Store> Engine<S> {
                 tree.lazy.remove(&first);
                 tree.eager.insert(first);
             }
+        }
+        // **Ступень решает форму раздачи** (§8.4): почта и реле «всегда
+        // eager, никогда lazy», эфир — «только eager, только хвост».
+        // Ленивый на такой ступени получает зов, а завести по нему срок
+        // ему нечем (`graft_wait_ms` — `None`), и блока он попросит
+        // только анти-энтропией, часы спустя. Снаружи это не «позже»,
+        // а «не дошло».
+        //
+        // Считается **последним**: до этого дерево делится по §7.1,
+        // и вмешиваться в ту арифметику незачем — здесь только перенос
+        // тех, кому ленивым быть нечем.
+        let lazy_now: Vec<[u8; 32]> = tree.lazy.iter().copied().collect();
+        let mut forced = Vec::new();
+        for peer in lazy_now {
+            let lazy_works = self.rung_to(&peer).is_some_and(swarm::may_be_lazy);
+            if !lazy_works {
+                forced.push(peer);
+            }
+        }
+        let tree = self.tree.entry(chat).or_default();
+        for peer in forced {
+            tree.lazy.remove(&peer);
+            tree.eager.insert(peer);
         }
         Ok((tree.eager.iter().copied().collect(), tree.lazy.iter().copied().collect()))
     }
@@ -1210,6 +1248,13 @@ impl<S: Store> Engine<S> {
                 .is_some_and(|last| *first > last);
             (tail, *first)
         });
+        // **Просьба обязана знать, по какой ступени уедет** (§8.4) —
+        // и не просить архив там, где он не доедет. Эфир его не возит:
+        // 9–12 КБ/с, и мебибайт — полторы минуты. Живая лента при этом
+        // по нему ходит: §8.4 оставляет эфиру хвост, а не историю.
+        if !self.rung_to(&peer_ik).is_some_and(swarm::carries_archive) {
+            return Ok(Vec::new());
+        }
         let mut effects = Vec::new();
         for (author, from_seq, to_seq) in holes.into_iter().take(swarm::MAX_WANTS_PER_ROUND) {
             let ask = swarm::Control::Want { group: chat, author, from_seq, to_seq };
@@ -1256,6 +1301,15 @@ impl<S: Store> Engine<S> {
         // **Право на обслуживание** (§8.3): спрашивается наше участие
         // в раздаче, а не чужой состав — см. `may_serve`.
         if !self.may_serve(chat, &peer_ik)? {
+            return Ok(Vec::new());
+        }
+        // **Эфир не возит архив** (§8.4) — и спрашивается это на обоих
+        // концах. Просящий не просит того, что не доедет, отдающий
+        // не отдаёт того, что не увезёт: у двоих в комнате без сети
+        // ответ на просьбу об истории занял бы канал на минуты,
+        // а живая лента встала бы за ним в очередь.
+        if !self.rung_to(&peer_ik).is_some_and(swarm::carries_archive) {
+            tracing::debug!(peer = ?&peer_ik[..4], "архив не отдаётся эфиром (§8.4)");
             return Ok(Vec::new());
         }
         // **Предел на пира** (§7.7, «бесконечное вытягивание»). Считается

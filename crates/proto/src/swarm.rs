@@ -786,6 +786,44 @@ impl Control {
     }
 }
 
+/// Бывает ли пир на этой ступени **ленивым** (§8.4).
+///
+/// §8.4 расписывает роли ступеней прямо:
+///
+/// | Ступень | Роль в gossip |
+/// |---|---|
+/// | LAN | eager, приоритетный |
+/// | ygg / onion | eager и lazy — основная ткань дерева |
+/// | bluetooth | **только eager, только хвост**; архив не возит |
+/// | почта, nostr | **всегда eager, никогда lazy** |
+///
+/// Довод у почты и реле назван там же: «`IHAVE` с ответом через часы
+/// бессмыслен». У эфира он другой и не про скорость: 9–12 КБ/с и класс
+/// S — зов там дешевле блока, но разница съедается вторым кругом
+/// «зов → срок → `GRAFT`», а сроки в комнате без сети некому пережить.
+///
+/// **Цена ошибки здесь — молчание.** Ленивый на почте получает зов,
+/// заводить срок ему нечем (см. [`graft_wait_ms`]), и блок он попросит
+/// только анти-энтропией — часы спустя. Снаружи это «слово не дошло»,
+/// а не «дошло позже».
+#[must_use]
+pub const fn may_be_lazy(via: crate::transport_policy::Transport) -> bool {
+    use crate::transport_policy::Transport;
+    matches!(via, Transport::Lan | Transport::Ygg | Transport::Onion)
+}
+
+/// Возит ли ступень **архив** (§8.4): эфир — нет.
+///
+/// «Эфир не возит архив: 9–12 КБ/с, мебибайт — полторы минуты».
+/// Спрашивается на обоих концах: просящий не просит того, что
+/// не доедет, отдающий не отдаёт того, что не увезёт. Живая лента
+/// по эфиру при этом ходит — §8.4 оставляет ему хвост.
+#[must_use]
+pub const fn carries_archive(via: crate::transport_policy::Transport) -> bool {
+    use crate::transport_policy::Transport;
+    !matches!(via, Transport::Bt)
+}
+
 /// Сколько ждать блок после `IHAVE`, прежде чем звать `GRAFT` (§7.1, §7.7).
 ///
 /// # Число берётся у ступени, а не выдумывается здесь
@@ -807,6 +845,13 @@ pub fn graft_wait_ms(via: crate::transport_policy::Transport) -> Option<u64> {
         Transport, BT_RECEIPT_TIMEOUT_MS, LAN_RECEIPT_TIMEOUT_MS, ONION_REPLY_TIMEOUT_MS,
         YGG_RECEIPT_TIMEOUT_MS,
     };
+    // **Одно решение, а не два.** Кто бывает ленивым, сказано
+    // в [`may_be_lazy`]; срок заводится ровно тем, кто им бывает.
+    // Разойдись эти два места, зов приехал бы туда, где его некому
+    // превратить в просьбу, — то есть в молчание.
+    if !may_be_lazy(via) {
+        return None;
+    }
     match via {
         Transport::Lan => Some(LAN_RECEIPT_TIMEOUT_MS),
         Transport::Bt => Some(BT_RECEIPT_TIMEOUT_MS),
@@ -1077,6 +1122,31 @@ mod tests {
         assert!(text.contains("не сразу"), "гаснет по сроку, и об этом сказано до нажатия");
         assert!(text.contains("Тихая раздача"), "названа середина, которая адрес не раскрывает");
         assert!(!SeedingConsequences::STOPS_AT_ONCE);
+    }
+
+    #[test]
+    fn the_rungs_that_cannot_be_lazy_have_no_graft_deadline() {
+        // §8.4 таблицей: LAN, ygg и onion — ткань дерева; эфир «только
+        // eager»; почта и реле «всегда eager, никогда lazy».
+        //
+        // **Два места обязаны говорить одно.** Кто бывает ленивым —
+        // `may_be_lazy`; кто заводит срок на зов — `graft_wait_ms`.
+        // Разойдись они, зов приехал бы туда, где его некому превратить
+        // в просьбу, а снаружи это выглядело бы как «слово не дошло».
+        use crate::transport_policy::Transport;
+        for via in [Transport::Lan, Transport::Ygg, Transport::Onion] {
+            assert!(may_be_lazy(via), "{via:?} — ткань дерева");
+            assert!(graft_wait_ms(via).is_some(), "{via:?} обязан заводить срок");
+        }
+        for via in [Transport::Bt, Transport::Nostr, Transport::Mail] {
+            assert!(!may_be_lazy(via), "{via:?} ленивым не бывает");
+            assert_eq!(graft_wait_ms(via), None, "{via:?} срока не заводит");
+        }
+        // Эфир возит хвост, но не архив; остальные — возят.
+        assert!(!carries_archive(Transport::Bt), "9–12 КБ/с: мебибайт — полторы минуты");
+        for via in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+            assert!(carries_archive(via), "{via:?} архив возит");
+        }
     }
 
     #[test]

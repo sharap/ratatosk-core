@@ -434,6 +434,15 @@ impl Stand {
         Stand::assemble(seed, count, false, false)
     }
 
+    /// Незнакомцы, у каждого из которых есть почтовый адрес (§5.3).
+    ///
+    /// Нужно проверкам §8.4: асинхронная ступень меняет форму раздачи,
+    /// и увидеть это можно лишь там, где почта — настоящая дорога,
+    /// а не пустая строка в карточке.
+    fn strangers_with_mail(seed: u64, count: u16) -> Stand {
+        Stand::assemble(seed, count, true, false)
+    }
+
     fn build(seed: u64, count: u16, mail: bool) -> Stand {
         Stand::assemble(seed, count, mail, true)
     }
@@ -896,6 +905,28 @@ impl Stand {
                 node.beacons = true;
             });
         }
+        self.settle();
+    }
+
+    /// Оставляет узлу одну ступень — почту: onion выключается (§5.3).
+    ///
+    /// Нужно проверкам §8.4: асинхронная ступень меняет **форму**
+    /// раздачи, а не только её скорость, и увидеть это можно лишь там,
+    /// где другой дороги нет.
+    fn mail_only(&mut self, who: NodeId) {
+        self.sim.act(who, |node, ctx| {
+            let effects = node
+                .engine_mut()
+                .step(
+                    ctx.now_ms(),
+                    Input::Command(Command::SetTransportEnabled {
+                        transport: Transport::Onion,
+                        enabled: false,
+                    }),
+                )
+                .expect("ступень выключается");
+            node.apply(ctx, effects);
+        });
         self.settle();
     }
 
@@ -1808,6 +1839,58 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
         "анти-энтропия обязана вернуть потерянное деревом; сид {:#x}",
         stand.sim.seed()
     );
+}
+
+#[test]
+fn a_reader_reachable_only_by_mail_is_never_lazy() {
+    // §8.4 прямо: «почта, nostr — всегда eager, никогда lazy.
+    // Асинхронные ступени не бывают lazy: `IHAVE` с ответом через часы
+    // бессмыслен».
+    //
+    // Цена ошибки здесь — **молчание, а не задержка**. Ленивый на почте
+    // получает зов, а завести по нему срок ему нечем (`graft_wait_ms`
+    // у почты — `None`), и блок он попросит только анти-энтропией,
+    // часы спустя. Снаружи это «слово не дошло».
+    let mut stand = Stand::strangers_with_mail(0x0_0A17, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    // Сид нужен, чтобы дерево вообще делилось: без сидов канал — звезда
+    // (§7.5.2), и ленивых в нём не бывает ни на какой ступени.
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // **Почта остаётся единственной дорогой у всех**, а не у одного
+    // владельца. Оставь мы onion сиду — его копия дошла бы до ленивых
+    // и без просьбы, и проверка стерегла бы форму дерева, но не цену
+    // ошибки: слово доезжало бы в обоих случаях.
+    for node in 0..7u16 {
+        stand.mail_only(NodeId(node));
+    }
+    stand.say(NodeId(0), chat, "почтой");
+    stand.settle();
+
+    let (_, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert!(
+        lazy.is_empty(),
+        "на почте ленивых не бывает (§8.4), а их {}; сид {:#x}",
+        lazy.len(),
+        stand.sim.seed()
+    );
+    for reader in 1..7u16 {
+        assert!(
+            stand.sim.node(NodeId(reader)).seen(chat).contains(&"почтой".to_owned()),
+            "слово обязано дойти до читателя {reader} целиком; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // **Чего проверка не стережёт.** Пакета блоков «за окно
+    // с избыточностью», который §8.4 предлагает асинхронным ступеням:
+    // его нет, блоки едут по одному.
 }
 
 #[test]

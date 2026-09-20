@@ -1461,6 +1461,224 @@ fn a_duplicate_prunes_the_edge_it_came_by() {
 }
 
 #[test]
+fn an_honest_seed_is_not_cooled_by_a_busy_channel() {
+    // §7.7 стережёт **затопление** зовами, а не занятый канал. Сид,
+    // честно зовущий на каждый новый блок, обязан остаться рабочим:
+    // остыви мы его за живую ленту, рой ломался бы ровно там, где
+    // он нужнее всего.
+    //
+    // Числа здесь свои: предел §7.7 — шестьдесят четыре зова за минуту,
+    // и семьдесят слов подряд его перешагивают. Если проверка краснеет,
+    // значит предел считает не то.
+    let mut stand = Stand::strangers(0xB0_5EED, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    let owner = stand.ik(NodeId(0));
+    let seed = stand.ik(NodeId(1));
+    for i in 0..70 {
+        stand.say(NodeId(0), chat, &format!("слово {i}"));
+    }
+    stand.settle();
+
+    let now = stand.sim.now_ms();
+    for reader in 1..7u16 {
+        let node = stand.sim.node(NodeId(reader)).engine();
+        assert!(
+            !node.swarm_cooling(&owner, now),
+            "владельца не остужают никогда: он источник; сид {:#x}",
+            stand.sim.seed()
+        );
+        assert!(
+            !node.swarm_cooling(&seed, now),
+            "честный сид остался рабочим у читателя {reader}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // И лента дошла: проверка выше была бы пуста, если бы слова
+    // не ходили вовсе.
+    assert!(
+        stand.sim.node(NodeId(6)).seen(chat).contains(&"слово 69".to_owned()),
+        "последнее слово обязано дойти; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+/// Канал, в котором ленивым читателям раздаёт **только сид**.
+///
+/// Отдаёт стенд, канал, ключ сида и тех читателей, кого сид зовёт,
+/// а не шлёт целиком. Нужно это обеим проверкам про «ложное have»:
+/// ленивый у сида ленив и у владельца — зовут его оба, — а ждать блока
+/// он будет от того, чей зов приехал первым. Приди копия владельца
+/// вовремя, срок застал бы блок на месте, и «звал, а блока нет»
+/// проверить было бы нечем: зов сида оказался бы просто опоздавшим.
+/// Потеря здесь не годится — §10.5 повторяет, и копия доезжает
+/// всё равно; поэтому владельцу до читателей кладётся путь длиной
+/// в десять минут, а до сида он остаётся прежним.
+fn a_channel_where_only_the_seed_calls(seed: u64) -> (Stand, [u8; 16], [u8; 32], Vec<u16>) {
+    let mut stand = Stand::strangers(seed, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    let seed_ik = stand.ik(NodeId(1));
+    // Дерево у сида появляется, когда он впервые раздаёт: до первого
+    // слова делить нечего.
+    stand.say(NodeId(0), chat, "нулевое");
+    stand.settle();
+    // Кого из читателей сид зовёт, а не шлёт целиком, решает его дерево.
+    let (_, lazy) = stand.sim.node(NodeId(1)).engine().swarm_tree(chat);
+    let lazy_nodes: Vec<u16> = (2..7u16).filter(|i| lazy.contains(&stand.ik(NodeId(*i)))).collect();
+    assert!(!lazy_nodes.is_empty(), "у сида обязан быть ленивый читатель — иначе проверка пуста");
+
+    let slow =
+        LinkProfile { min_latency_ms: 600_000, max_latency_ms: 600_000, ..LinkProfile::INSTANT };
+    for reader in 2..7u16 {
+        for kind in [
+            TransportKind::Onion,
+            TransportKind::Mail,
+            TransportKind::Lan,
+            TransportKind::Bt,
+            TransportKind::Ygg,
+            TransportKind::Nostr,
+        ] {
+            stand.sim.net_mut().set_link_profile(NodeId(0), NodeId(reader), kind, slow);
+        }
+    }
+    (stand, chat, seed_ik, lazy_nodes)
+}
+
+/// Столько ждёт проверка, чтобы у зова вышли **оба** срока: ожидание
+/// блока и ожидание ответа на просьбу.
+///
+/// Число здесь своё, а не из крейта: стереги оно константу, поднятие
+/// срока подняло бы и проверку, и та смолчала бы о том, что остывание
+/// перестало наступать.
+const TWO_GRAFT_DEADLINES_MS: u64 = 400_000;
+
+#[test]
+fn a_seed_that_calls_and_disappears_cools_down() {
+    // §7.7, «ложное have»: «счёт неудач, остывание, предпочтение
+    // отвечавшим недавно». Звал, блока нет — звать этого пира снова
+    // значит тратить `T_graft` на заведомое молчание.
+    //
+    // Сценарий честный: сид зовёт ленивых читателей и уходит из сети
+    // между зовом и просьбой. Вторую половину имени — что **одного**
+    // молчания мало — стережёт `a_single_silence_does_not_cool_a_seed`.
+    let (mut stand, chat, seed, lazy_nodes) = a_channel_where_only_the_seed_calls(0xFA_15E0);
+
+    // Два зова — и сид пропадает, не ответив ни на один.
+    stand.say(NodeId(0), chat, "раз");
+    stand.sim.run_for(500);
+    stand.say(NodeId(0), chat, "два");
+    stand.sim.run_for(500);
+    stand.offline(NodeId(1));
+    stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
+
+    let now = stand.sim.now_ms();
+    for reader in lazy_nodes {
+        assert!(
+            stand.sim.node(NodeId(reader)).engine().swarm_cooling(&seed, now),
+            "два неответа подряд — остывание (§7.7), читатель {reader}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // **Чего проверка не стережёт.** Что остывание когда-нибудь кончится:
+    // это время (`COOLING_MS`), а не событие, и проверки на него нет.
+    // И что остывший перестаёт получать зовы — это видно по ветке
+    // `IHave`, но не по этому сценарию.
+}
+
+#[test]
+fn the_owner_is_never_cooled_however_long_he_is_silent() {
+    // §7.7 с оговоркой: владельца канала остужать нельзя. Остывание
+    // отрезает от живой ленты на четверть часа, а другого пути у канала
+    // может не быть вовсе (§7.5.2, «ноль сидов — это звезда»): остудив
+    // владельца, читатель остался бы без канала совсем. Защищаться
+    // от него бессмысленно и по второй причине — канал его, и «затопить»
+    // нас он может просто словами.
+    //
+    // Сценарий тот же, что у пропавшего сида, но пропадает владелец:
+    // зовёт дважды и уходит. Снимешь оговорку — читатели его остудят.
+    let mut stand = Stand::strangers(0x0_4DEAD, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    // Сид нужен, чтобы дерево вообще делилось: без сидов канал — звезда,
+    // и зовов в нём не бывает (§7.5.2). Сразу после объявления он уходит,
+    // и звать остаётся одному владельцу.
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.say(NodeId(0), chat, "нулевое");
+    stand.settle();
+    let owner = stand.ik(NodeId(0));
+    let (_, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    let lazy_nodes: Vec<u16> = (1..7u16).filter(|i| lazy.contains(&stand.ik(NodeId(*i)))).collect();
+    assert!(!lazy_nodes.is_empty(), "у владельца обязан быть ленивый читатель");
+    stand.offline(NodeId(1));
+
+    stand.say(NodeId(0), chat, "раз");
+    stand.sim.run_for(500);
+    stand.say(NodeId(0), chat, "два");
+    stand.sim.run_for(500);
+    stand.offline(NodeId(0));
+    stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
+
+    let now = stand.sim.now_ms();
+    for reader in lazy_nodes {
+        assert!(
+            !stand.sim.node(NodeId(reader)).engine().swarm_cooling(&owner, now),
+            "владельца не остужают никогда (§7.7), читатель {reader}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn a_single_silence_does_not_cool_a_seed() {
+    // Вторая половина §7.7: молчание **одного** зова виной не считается.
+    // Пир мог моргнуть — сеть пропала на минуту, телефон уснул, — и
+    // отрезать его от ленты на четверть часа за одно опоздание значит
+    // ломать рой там, где он цел.
+    //
+    // Сценарий тот же, что у `a_seed_that_calls_and_disappears_cools_down`,
+    // и отличается ровно одним словом вместо двух: разница между
+    // проверками и есть то, что стережётся.
+    let (mut stand, chat, seed, lazy_nodes) = a_channel_where_only_the_seed_calls(0x5117_0000);
+
+    stand.say(NodeId(0), chat, "раз");
+    stand.sim.run_for(500);
+    stand.offline(NodeId(1));
+    stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
+
+    let now = stand.sim.now_ms();
+    for reader in lazy_nodes {
+        assert!(
+            !stand.sim.node(NodeId(reader)).engine().swarm_cooling(&seed, now),
+            "одного молчания мало (§7.7), читатель {reader}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn a_deferred_copy_tries_again_on_its_own_schedule() {
     // **Находка живого меша, и самая дорогая за этот круг.** В локальной
     // сети отложенное будит маяк §5.1: собеседник появился — копия

@@ -1384,9 +1384,14 @@ pub struct Engine<S: Store> {
     /// давно нет, и ждал бы от него блоков.
     tree: BTreeMap<ChatId, swarm::Tree>,
     /// Блоки, о которых позвали `IHAVE`, и кто позвал.
-    awaited_blocks: BTreeMap<(ChatId, MsgId), [u8; 32]>,
+    awaited_blocks: BTreeMap<(ChatId, MsgId), swarm::Awaited>,
     /// Метки сроков `T_graft`: какая метка какой блок ждёт.
     graft_timers: BTreeMap<u64, (ChatId, MsgId)>,
+    /// Пределы и остывание роевых пиров (§7.7).
+    ///
+    /// В памяти: после перезапуска у всех чистый лист, и это честнее
+    /// диска — за время сна сеть всё равно поменялась.
+    swarm_budget: BTreeMap<[u8; 32], swarm::Budget>,
     /// Сроки повтора отложенного (§10.5): метка и номер шага расписания.
     ///
     /// **Один на собеседника, а не на доставку.** Ждут они одного и того
@@ -1935,6 +1940,7 @@ impl<S: Store> Engine<S> {
             tree: BTreeMap::new(),
             awaited_blocks: BTreeMap::new(),
             graft_timers: BTreeMap::new(),
+            swarm_budget: BTreeMap::new(),
             retry_timers: BTreeMap::new(),
             retry_step: BTreeMap::new(),
             sessions: SessionRegistry::new(),

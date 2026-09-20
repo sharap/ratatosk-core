@@ -370,6 +370,36 @@ impl<S: Store> Engine<S> {
                 effects.extend(self.publish_own_record(now_ms, chat)?);
             }
         }
+        // **Против эклипса — периодическое повышение** (§7.7): «лечится
+        // минимальной степенью и периодическим повышением случайного
+        // пира». Минимальная степень уже есть (`split_tree` поднимает
+        // при опустевшем eager); здесь вторая половина. Без неё
+        // запруненный со всех сторон узел так и остался бы ленивым
+        // у всех — то есть отрезанным от живой ленты, хотя связи
+        // у него есть.
+        let trees: Vec<ChatId> = self.tree.keys().copied().collect();
+        for chat in trees {
+            let lazy: Vec<[u8; 32]> = self
+                .tree
+                .get(&chat)
+                .map(|tree| tree.lazy.iter().copied().collect())
+                .unwrap_or_default();
+            if lazy.is_empty() {
+                continue;
+            }
+            // Случайный, а не первый: первый по ключу поднимался бы
+            // каждый обход, и «периодическое повышение случайного»
+            // выродилось бы в «вечный eager у одного и того же».
+            let mut raw = [0u8; 4];
+            self.entropy.fill(&mut raw);
+            let pick = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(0) % lazy.len();
+            let lucky = lazy[pick];
+            if let Some(tree) = self.tree.get_mut(&chat) {
+                tree.lazy.remove(&lucky);
+                tree.eager.insert(lucky);
+            }
+        }
+
         // **Привязка повторяется обходом, и это не расточительство.**
         // У сида она живёт только в памяти: соединение — не запись
         // на диске, и после его перезапуска читателя надо назвать заново.
@@ -420,13 +450,25 @@ impl<S: Store> Engine<S> {
         if self.channel_owner(chat).is_some_and(|owner| owner == me) {
             return Ok(Vec::new());
         }
-        let seeds: Vec<[u8; 32]> = self
+        // **Предпочтение отвечавшим недавно** (§7.7): сперва те, кто
+        // что-то нам отдавал, потом остальные; остывающие — в конец,
+        // а не вон: других может не быть вовсе, и тогда лучше попробовать
+        // остывшего, чем не пробовать никого.
+        let mut candidates: Vec<[u8; 32]> = self
             .seeds(chat, now_ms)?
             .into_iter()
             .map(|seed| seed.ik)
             .filter(|ik| *ik != me)
-            .take(MAX_ATTACHED_SEEDS)
             .collect();
+        candidates.sort_by_key(|ik| {
+            let budget = self.swarm_budget.get(ik);
+            let cooling = u8::from(self.cooling(now_ms, ik));
+            // По убыванию «недавности»: чем позже ответил, тем раньше
+            // в списке. Ключ добавлен третьим, чтобы порядок оставался
+            // воспроизводимым по сиду (§16).
+            (cooling, std::cmp::Reverse(budget.map_or(0, |b| b.answered_ms)), *ik)
+        });
+        let seeds: Vec<[u8; 32]> = candidates.into_iter().take(MAX_ATTACHED_SEEDS).collect();
         let mut effects = Vec::new();
         for seed in seeds {
             // Молчаливой доставкой: квитанции у привязки нет и не нужно.
@@ -637,6 +679,11 @@ impl<S: Store> Engine<S> {
         // §7.2 отвечает он, и ответить надо будет тому, кто сейчас
         // получит зов.
         self.archive_channel_frame(now_ms, chat, msg_id, bytes)?;
+        // Принёсший ответил делом: счёт неудач ему обнуляется, и он
+        // становится «отвечавшим недавно» (§7.7).
+        if let Some(from) = from {
+            self.note_swarm_answer(now_ms, from);
+        }
 
         let (eager, lazy) = self.split_tree(now_ms, chat)?;
         let mut effects = Vec::new();
@@ -786,26 +833,76 @@ impl<S: Store> Engine<S> {
 
         match control {
             swarm::Control::IHave { block, .. } => {
-                // Блок уже есть — зов опоздал, и это штатная работа дерева,
-                // а не ошибка: у нас он приехал целиком от eager-пира.
-                // Молчим: `PRUNE` подрезает ребро, по которому приходит
-                // **лишний блок**, а не лишний зов, — иначе мы отрезали бы
-                // ленивых за то, ради чего они и существуют.
-                if self.store.seen(&block)? {
+                // **Затопление зовами** (§7.7): счётчик на пира, перевод
+                // в lazy и остывание. Зов стоит метки времени и строки
+                // в памяти, а блоков в минуту в канале единицы — сотня
+                // зовов от одного пира это не лента, а попытка занять нас
+                // собой.
+                if self.cooling(now_ms, &peer_ik) {
                     return Ok(Vec::new());
                 }
+                // **Пустой зов** — о блоке, который у нас уже есть, либо
+                // о том, которого мы и так ждём. Честному сиду такое
+                // случается, а затопление из них и состоит.
+                // **Зов о том, что у нас уже есть, — не затопление.**
+                // Так выглядит обычная работа дерева: блок пришёл
+                // от владельца раньше, чем зов от сида. Лишнее ребро
+                // подрезает `PRUNE` — по лишнему **блоку**, а не по зову.
+                // Первая редакция считала и такие, и остужала честного
+                // сида за занятую ленту: проверка покраснела на семидесяти
+                // словах подряд.
+                let known = self.store.seen(&block)?;
+                // **Повтор — это его же зов о том же блоке.** Зов другого
+                // пира о блоке, которого мы уже ждём, — не затопление,
+                // а обычная работа дерева: у блока в рое два источника,
+                // владелец и сид, и второй зовёт просто потому, что первым
+                // не был. Считай мы и такие, честный сид остывал бы на
+                // ленте из семидесяти слов подряд — ровно на этом
+                // проверка про него и покраснела.
+                let repeat = self
+                    .awaited_blocks
+                    .get(&(chat, block))
+                    .is_some_and(|awaited| awaited.who == peer_ik);
+                let already = self.awaited_blocks.contains_key(&(chat, block));
+                let outstanding =
+                    self.awaited_blocks.values().filter(|awaited| awaited.who == peer_ik).count();
+                if known {
+                    return Ok(Vec::new());
+                }
+                // Сверх предела памяти зов просто не берётся: остывание
+                // за всплеск не ставится, потому что всплеск бывает
+                // и у честного (см. `OUTSTANDING_CALLS`).
+                if outstanding >= swarm::OUTSTANDING_CALLS {
+                    return Ok(Vec::new());
+                }
+                if already {
+                    if !repeat {
+                        return Ok(Vec::new());
+                    }
+                    let budget = self.budget_of(now_ms, peer_ik);
+                    budget.ihave = budget.ihave.saturating_add(1);
+                    if budget.ihave > swarm::EMPTY_CALLS_PER_WINDOW {
+                        // Сперва в ленивые — чтобы мы сами перестали слать
+                        // ему целиком, — и только потом остывание: §7.7
+                        // называет оба, и порядок здесь тот же.
+                        let tree = self.tree.entry(chat).or_default();
+                        tree.eager.remove(&peer_ik);
+                        tree.lazy.insert(peer_ik);
+                        self.cool_down(now_ms, peer_ik, "затопил пустыми зовами");
+                    }
+                    return Ok(Vec::new());
+                }
+                // Ни `PRUNE`, ни отметки: `PRUNE` подрезает ребро,
+                // по которому приходит **лишний блок**, а не лишний зов, —
+                // иначе мы отрезали бы ленивых за то, ради чего они
+                // и существуют.
                 // Срок берётся у ступени, которой приехал зов (§7.7).
                 // У почты и реле его нет вовсе — там `GRAFT` значил бы
                 // «попроси ещё раз то, что и так в пути».
                 let Some(wait) = swarm::graft_wait_ms(via) else { return Ok(Vec::new()) };
-                // Второй зов на тот же блок сроку не мешает: ждём мы
-                // **блок**, а не зовущего, и первый ответивший закроет
-                // ожидание всем.
-                if self.awaited_blocks.contains_key(&(chat, block)) {
-                    return Ok(Vec::new());
-                }
                 let token = self.allocate_timer();
-                self.awaited_blocks.insert((chat, block), peer_ik);
+                let awaited = Awaited { who: peer_ik, wait_ms: wait, asked: false };
+                self.awaited_blocks.insert((chat, block), awaited);
                 self.graft_timers.insert(token, (chat, block));
                 Ok(vec![Effect::SetTimer { after_ms: wait, token }])
             }
@@ -946,17 +1043,30 @@ impl<S: Store> Engine<S> {
         from_seq: u64,
         to_seq: u64,
     ) -> Result<Vec<Effect>, EngineError> {
+        // **Предел на пира** (§7.7, «бесконечное вытягивание»). Считается
+        // за окно, а не на просьбу: предел на просьбу обходится десятью
+        // просьбами подряд.
+        let budget = self.budget_of(now_ms, peer_ik);
+        let left = swarm::BLOCKS_PER_WINDOW.saturating_sub(budget.served);
+        if left == 0 {
+            tracing::debug!(peer = ?&peer_ik[..4], "предел отдачи за окно исчерпан (§7.7)");
+            return Ok(Vec::new());
+        }
         let width = usize::try_from(to_seq.saturating_sub(from_seq).saturating_add(1))
             .unwrap_or(swarm::MAX_WANT_BLOCKS);
-        let limit = width.min(swarm::MAX_WANT_BLOCKS);
+        let limit = width.min(swarm::MAX_WANT_BLOCKS).min(left as usize);
         let blocks = self.store.archived_range(&chat, author, from_seq, limit)?;
         let mut effects = Vec::new();
+        let mut given = 0u32;
         for block in blocks {
             if block.seq > to_seq {
                 break;
             }
             effects.extend(self.send_group_copy(now_ms, block.msg_id, peer_ik, &block.frame)?);
+            given = given.saturating_add(1);
         }
+        let budget = self.budget_of(now_ms, peer_ik);
+        budget.served = budget.served.saturating_add(given);
         Ok(effects)
     }
 
@@ -970,11 +1080,26 @@ impl<S: Store> Engine<S> {
         token: u64,
     ) -> Result<Option<Vec<Effect>>, EngineError> {
         let Some((chat, block)) = self.graft_timers.remove(&token) else { return Ok(None) };
-        let Some(who) = self.awaited_blocks.remove(&(chat, block)) else {
+        let Some(awaited) = self.awaited_blocks.remove(&(chat, block)) else {
             return Ok(Some(Vec::new()));
         };
-        // Приехал, пока ждали, — чинить нечего.
+        let who = awaited.who;
+        // Приехал, пока ждали, — чинить нечего. **Но и в заслугу
+        // звавшему это не идёт**: блок мог прийти любым путём, и чей
+        // он был на самом деле, мы не знаем. Заслуга считается там, где
+        // она видна, — по блоку, принятому из его рук (`push_block`).
         if self.store.seen(&block)? {
+            return Ok(Some(Vec::new()));
+        }
+        if awaited.asked {
+            // **Спросили и не получили** — счёт неудач растёт, и на втором
+            // подряд он остывает (§7.7, «ложное have»). Звать его снова
+            // значит тратить `T_graft` на заведомое молчание; блок придёт
+            // анти-энтропией §7.2, когда он вернётся.
+            self.note_swarm_miss(now_ms, who);
+            return Ok(Some(Vec::new()));
+        }
+        if self.cooling(now_ms, &who) {
             return Ok(Some(Vec::new()));
         }
         // Зовущий становится eager: мы просим у него блок и хотим, чтобы
@@ -982,8 +1107,15 @@ impl<S: Store> Engine<S> {
         let tree = self.tree.entry(chat).or_default();
         tree.lazy.remove(&who);
         tree.eager.insert(who);
+        // Второй срок — на ответ: по его исходу и считается вина.
+        let token = self.allocate_timer();
+        let wait = awaited.wait_ms;
+        self.awaited_blocks.insert((chat, block), Awaited { asked: true, ..awaited });
+        self.graft_timers.insert(token, (chat, block));
         let ask = swarm::Control::Graft { group: chat, block };
-        Ok(Some(self.send_swarm_control(now_ms, who, &ask)?))
+        let mut effects = self.send_swarm_control(now_ms, who, &ask)?;
+        effects.push(Effect::SetTimer { after_ms: wait, token });
+        Ok(Some(effects))
     }
 
     /// Блок приехал вторым путём: подрезать ребро (§7.1, шаг 3).
@@ -1029,6 +1161,53 @@ impl<S: Store> Engine<S> {
 /// обрыва: ленивому придётся дождаться срока и позвать `GRAFT`.
 pub(super) const K_EAGER: usize = 4;
 
+/// Что мы считаем за одним роевым пиром (§7.7).
+///
+/// **Пределы считаются на пира, а не на канал**, и так велит §7.7:
+/// затопить нас можно зовами по одному каналу, а вредит это всем.
+/// Окно скользит по времени; в памяти, а не на диске: после
+/// перезапуска у всех чистый лист, и это честнее — состояние сети
+/// за время сна всё равно поменялось.
+#[derive(Debug, Default, Clone)]
+pub(super) struct Budget {
+    /// Когда началось нынешнее окно.
+    pub(super) window_started_ms: u64,
+    /// Сколько зовов `IHAVE` он прислал за окно.
+    pub(super) ihave: u32,
+    /// Сколько блоков мы ему отдали за окно.
+    pub(super) served: u32,
+    /// Сколько раз подряд он не ответил на просьбу.
+    pub(super) misses: u32,
+    /// До какого момента он остывает, мс. Ноль — не остывает.
+    pub(super) cooled_until_ms: u64,
+    /// Когда он в последний раз что-то нам отдал, мс.
+    ///
+    /// §7.7 велит «предпочитать отвечавшим недавно», и это то самое
+    /// «недавно».
+    pub(super) answered_ms: u64,
+}
+
+/// Ожидание блока, о котором позвали `IHAVE` (§7.1, шаг 4).
+///
+/// Двухступенчатое нарочно. Первый срок — «не приехало ли другим
+/// путём»: в дереве блок обычно приходит от eager-родителя раньше,
+/// чем зов от ленивого, и зов оказывается просто опоздавшим. По его
+/// исходу мы **просим** (`GRAFT`), но вины ещё не считаем: звавшего
+/// никто не спрашивал. Второй срок — уже про вину: спросили и не
+/// получили, это и есть «ложное have» из §7.7.
+///
+/// Первая редакция считала вину на первом сроке и остужала честного
+/// сида за то, что владелец быстрее.
+#[derive(Debug, Clone)]
+pub(super) struct Awaited {
+    /// Кто позвал.
+    pub(super) who: [u8; 32],
+    /// Срок ступени, которой приехал зов, мс, — по нему заводится второй.
+    pub(super) wait_ms: u64,
+    /// Спросили ли уже: на первом сроке — нет, на втором — да.
+    pub(super) asked: bool,
+}
+
 /// Дерево раздачи одного канала (§7.1).
 #[derive(Debug, Default, Clone)]
 pub(super) struct Tree {
@@ -1058,6 +1237,79 @@ const SWARM_KEY_GROUP: u8 = 1;
 const SWARM_KEY_RECORD: u8 = 2;
 
 impl<S: Store> Engine<S> {
+    /// Открывает окно пределов, если прежнее вышло (§7.7).
+    fn budget_of(&mut self, now_ms: u64, peer_ik: [u8; 32]) -> &mut Budget {
+        let budget = self.swarm_budget.entry(peer_ik).or_default();
+        if now_ms.saturating_sub(budget.window_started_ms) >= swarm::BUDGET_WINDOW_MS {
+            budget.window_started_ms = now_ms;
+            budget.ihave = 0;
+            budget.served = 0;
+        }
+        budget
+    }
+
+    /// Остывает ли этот пир сейчас (§7.7).
+    ///
+    /// Остывание — не наказание, а правило приоритета: у нас есть другие
+    /// пиры, и звать того, кто дважды подряд не ответил, — значит
+    /// тратить `T_graft` на заведомое молчание.
+    pub(super) fn cooling(&self, now_ms: u64, peer_ik: &[u8; 32]) -> bool {
+        self.swarm_budget.get(peer_ik).is_some_and(|b| b.cooled_until_ms > now_ms)
+    }
+
+    /// Ставит пира на остывание (§7.7).
+    ///
+    /// **Владельца канала не остужают никогда**, и это не поблажка:
+    /// он источник. Остывший владелец означает читателя, отрезанного
+    /// от живой ленты на четверть часа — при том что другого пути
+    /// у канала может не быть вовсе (§7.5.2, «ноль сидов — это звезда»).
+    /// Защищаться от него бессмысленно и по второй причине: канал —
+    /// его, и «затопить» нас он может просто словами.
+    fn cool_down(&mut self, now_ms: u64, peer_ik: [u8; 32], why: &'static str) {
+        if self.groups.keys().copied().collect::<Vec<_>>().into_iter().any(|chat| {
+            !self.groups[&chat].profile.everyone_writes()
+                && self.channel_owner(chat) == Some(peer_ik)
+        }) {
+            return;
+        }
+        let budget = self.swarm_budget.entry(peer_ik).or_default();
+        budget.cooled_until_ms = now_ms.saturating_add(swarm::COOLING_MS);
+        budget.misses = 0;
+        tracing::debug!(peer = ?&peer_ik[..4], why, "роевой пир остывает (§7.7)");
+    }
+
+    /// Он ответил: счёт неудач обнуляется, «недавно» сдвигается (§7.7).
+    pub(super) fn note_swarm_answer(&mut self, now_ms: u64, peer_ik: [u8; 32]) {
+        let budget = self.swarm_budget.entry(peer_ik).or_default();
+        budget.misses = 0;
+        budget.answered_ms = now_ms;
+        // Ответивший перестаёт остывать досрочно: остывание говорит
+        // «он молчит», а он только что ответил.
+        budget.cooled_until_ms = 0;
+    }
+
+    /// Он не ответил на просьбу: счёт неудач растёт (§7.7, «ложное have»).
+    ///
+    /// **Послабления «он отвечал недавно» здесь нет, и это решение,
+    /// а не упущение.** Сперва оно стояло: пир, только что отдавший нам
+    /// блок, вины не получал. Но вина теперь считается на **втором**
+    /// сроке, а два срока `T_graft` длиннее окна `BUDGET_WINDOW_MS`
+    /// на всякой ступени, кроме локальной сети, — «ответил недавно»
+    /// и «промолчал дважды» вместе не встречаются, и снятие послабления
+    /// не роняло ни одной проверки. Оставлять правило, которого нечем
+    /// прогнать, значит завтра считать его работающим.
+    ///
+    /// «Предпочитать отвечавшим недавно» из §7.7 держится другим местом
+    /// и живо: ответ делом обнуляет счёт (`note_swarm_answer`), а порядок
+    /// привязки сортируется по `answered_ms`.
+    fn note_swarm_miss(&mut self, now_ms: u64, peer_ik: [u8; 32]) {
+        let budget = self.swarm_budget.entry(peer_ik).or_default();
+        budget.misses = budget.misses.saturating_add(1);
+        if budget.misses >= swarm::MISSES_BEFORE_COOLING {
+            self.cool_down(now_ms, peer_ik, "звал, а блока нет");
+        }
+    }
+
     /// Форма дерева раздачи: кому целиком, кому зовом (§7.1).
     ///
     /// Наружу — ради разбора. «Слово не дошло» в рое означает одно
@@ -1073,6 +1325,15 @@ impl<S: Store> Engine<S> {
             || (Vec::new(), Vec::new()),
             |tree| (tree.eager.iter().copied().collect(), tree.lazy.iter().copied().collect()),
         )
+    }
+
+    /// Остывает ли роевой пир сейчас (§7.7) — наружу, ради разбора.
+    ///
+    /// «Он молчит» и «мы его не спрашиваем» выглядят снаружи одинаково,
+    /// и различить их иначе нечем. Границу UniFFI не пересекает (§13.3).
+    #[must_use]
+    pub fn swarm_cooling(&self, peer_ik: &[u8; 32], now_ms: u64) -> bool {
+        self.cooling(now_ms, peer_ik)
     }
 }
 

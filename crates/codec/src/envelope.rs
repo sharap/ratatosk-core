@@ -238,6 +238,13 @@ pub enum PayloadType {
     /// означал бы два источника одного и того же, и однажды они
     /// разошлись бы.
     ChannelRequest,
+    /// Запись каталога роя, едущая владельцу (фаза 2, §7.5).
+    ///
+    /// Едет **один на один**, как и заявка §10.4, и по той же причине:
+    /// развозить каталог читателям некому, кроме владельца, — состав
+    /// знает он (§3.2). Дальше запись едет уже действием
+    /// (`Action::SeedRecord`), веером.
+    SwarmPeer,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -299,7 +306,10 @@ impl PayloadType {
             | PayloadType::GroupIntro
             | PayloadType::GroupMessage
             | PayloadType::GroupAction
-            | PayloadType::ChannelRequest => false,
+            | PayloadType::ChannelRequest
+            // Запись каталога — про раздачу, а не про разговор: сид
+            // сообщает владельцу адрес, а не пишет ему.
+            | PayloadType::SwarmPeer => false,
             // Служебное: ни строки в чате, ни повода знакомиться.
             // Обновление карточки (§4.3) правит запись, которая уже есть,
             // и заводить её оно не вправе: иначе адреса известного
@@ -346,6 +356,7 @@ impl PayloadType {
             PayloadType::GroupAction => 23,
             PayloadType::Fragment => 24,
             PayloadType::ChannelRequest => 25,
+            PayloadType::SwarmPeer => 26,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -379,6 +390,7 @@ impl PayloadType {
             23 => PayloadType::GroupAction,
             24 => PayloadType::Fragment,
             25 => PayloadType::ChannelRequest,
+            26 => PayloadType::SwarmPeer,
             other => PayloadType::Unknown(other),
         }
     }
@@ -588,7 +600,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 25;
+        const HIGHEST: u64 = 26;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

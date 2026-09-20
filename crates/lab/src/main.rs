@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off>   /seeds <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2170,6 +2170,35 @@ async fn console(
                     let (chat, _) = split_group(rest, "/grants <id канала>");
                     if let Some(chat) = chat {
                         show_grants(&handle, chat).await;
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/seed ") {
+                    // **Раздача — согласие, а не право** (§7.5.1), и три
+                    // состояния здесь не для полноты: тихая раздача
+                    // умолчанием и есть то, на чём рой держится, а
+                    // объявление адреса остаётся выбором с текстом §15.
+                    let (chat, tail) = split_group(rest, "/seed <id канала> <on|off>");
+                    if let Some(chat) = chat {
+                        let announced = matches!(tail.trim(), "on" | "да");
+                        if announced {
+                            // Текст — **до** команды: после неё адрес уже
+                            // уехал бы в каталог.
+                            println!("< {}", ratatosk_proto::swarm::SeedingConsequences::ui_text());
+                        }
+                        let mode = if announced {
+                            ratatosk_proto::swarm::Seeding::Announced
+                        } else {
+                            ratatosk_proto::swarm::Seeding::Quiet
+                        };
+                        handle.send(Command::SetSeeding { chat, mode }).await.ok();
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/seeds ") {
+                    let (chat, _) = split_group(rest, "/seeds <id канала>");
+                    if let Some(chat) = chat {
+                        show_seeds(&handle, chat).await;
                     }
                     continue;
                 }
@@ -2928,6 +2957,9 @@ async fn console(
                 let Some(event) = event else { return };
                 report(&event);
                 match &event {
+                    // Каталог роя строку разговора не заводит: его
+                    // печатает `report`, а здесь выбирают собеседника.
+                    Event::SeedingChanged { .. } | Event::SeedAnnounced { .. } => {}
                     // Контакт, приехавший рукопожатием: отвечать ему можно
                     // сразу, ничего не набирая.
                     Event::ContactAdded { peer_ik, .. } => {
@@ -3401,6 +3433,37 @@ async fn show_groups(handle: &DriverHandle) {
                 if member.mine { "  (вы)" } else { "" }
             );
         }
+    }
+}
+
+/// Печатает каталог раздающих канал (§7.5).
+///
+/// Пока дерева раздачи (§7.1) нет, каталог ничего не доставляет — он
+/// собирается. Показывать его всё равно надо: иначе «вызвался раздавать»
+/// не отличить от «ничего не произошло», а разбирать потом нечем.
+async fn show_seeds(handle: &DriverHandle, chat: [u8; 16]) {
+    let Some(seeds) = handle.channel_seeds(chat).await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if seeds.is_empty() {
+        println!("< канал никто не раздаёт: /seed <id> on — объявить себя");
+        return;
+    }
+    let now = wall_ms();
+    for seed in seeds {
+        let left = seed.valid_until_ms.saturating_sub(now) / (24 * 60 * 60 * 1000);
+        // Ключ целиком: им называют адрес (`/peeraddr`), если до сида
+        // не достучаться.
+        println!(
+            "< {} — раздаёт, годно ещё {left} сут{}",
+            data_encoding::HEXLOWER.encode(&seed.ik),
+            if seed.verified {
+                ""
+            } else {
+                ", подпись не проверена (карточки нет)"
+            }
+        );
     }
 }
 
@@ -4939,6 +5002,27 @@ fn report(event: &Event) {
                 short(who),
                 data_encoding::HEXLOWER.encode(chat),
                 data_encoding::HEXLOWER.encode(who),
+            );
+        }
+        Event::SeedingChanged { chat, announced } => {
+            if *announced {
+                println!("< раздаём канал {} и объявили адрес — нас будут набирать", short(chat));
+            } else {
+                println!(
+                    "< адрес в канале {} больше не объявляем; прежнее объявление \
+                     погаснет к концу срока (§7.5)",
+                    short(chat)
+                );
+            }
+        }
+        Event::SeedAnnounced { chat, who } => {
+            // Приходит владельцу: он и развозит каталог. Ключ целиком —
+            // им же называют адрес (`/peeraddr`), если до сида не достучаться.
+            println!(
+                "< в канале {} вызвался раздавать {}\n    кто раздаёт: /seeds {}",
+                short(chat),
+                short(who),
+                data_encoding::HEXLOWER.encode(chat),
             );
         }
         Event::ChannelUnsubscribed { chat } => {

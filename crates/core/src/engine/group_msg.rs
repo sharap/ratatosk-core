@@ -1254,6 +1254,35 @@ impl<S: Store> Engine<S> {
         }
 
         match action {
+            Action::SeedRecord { bytes } => {
+                // **Кто вписан в записи, тот её и подписал**, и берётся
+                // это из самой записи, а не из отправителя: развозит
+                // каталог владелец (§7.5.2), и запись в его кадре —
+                // чужая по построению.
+                let Ok(value) = ratatosk_codec::canonical::decode(bytes) else {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                };
+                let Ok(unchecked) = ratatosk_proto::swarm::record_from_wire(&value) else {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                };
+                let claimed = *unchecked.claims_ik();
+                // **Своя же запись, вернувшаяся веером, — не новость.**
+                // Владелец развозит её всем, включая нас; принять её
+                // обратно не вредно, но и класть поверх своей незачем.
+                if claimed == self.identity.public().ik {
+                    return Ok(Vec::new());
+                }
+                if !self.take_seed_record(now_ms, chat, claimed, bytes)? {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                // Наружу — ничего: каталог это не разговор, и строки
+                // в чате ему не полагается. Кто раздаёт, клиент спросит
+                // сам (`Engine::seeds`).
+                Ok(Vec::new())
+            }
             Action::Rename { title } => {
                 // **Только создатель** (§11.2, расширенное по смыслу).
                 // Проверка на приёме, а не только у отправителя: иначе

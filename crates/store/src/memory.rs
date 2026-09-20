@@ -18,7 +18,7 @@ use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
     StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar,
     StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice,
-    StoredPeer, StoredPendingGroup, StoredReaction, StoredSenderChain, StoredSession,
+    StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed, StoredSenderChain, StoredSession,
     StoredSubscription,
 };
 
@@ -58,6 +58,11 @@ pub struct MemoryStore {
     /// Заявки на подписку (фаза 2, §10.4): чат, затем проситель.
     /// Порядок обхода задан ключом и совпадает с `ORDER BY` файловой базы.
     requests: BTreeMap<([u8; 16], [u8; 32]), u64>,
+    /// Каталог роя (§7.5): чат, затем чей адрес. Порядок обхода задан
+    /// ключом и совпадает с `ORDER BY` файловой базы.
+    seeds: BTreeMap<([u8; 16], [u8; 32]), StoredSeed>,
+    /// Наше участие в раздаче (§7.5.1): код состояния и когда выбран.
+    seeding: BTreeMap<[u8; 16], (u32, u64)>,
     /// Пиры-не-контакты (§8.3): владелец канала, до которого надо
     /// дотянуться заявкой. `BTreeMap` — по той же причине, что у контактов:
     /// порядок обхода обязан быть одинаков от запуска к запуску.
@@ -272,6 +277,12 @@ impl Store for MemoryStore {
         self.archive_keys.retain(|(chat, _), _| chat != chat_id);
         self.admits.retain(|(chat, _), _| chat != chat_id);
         self.requests.retain(|(chat, _), _| chat != chat_id);
+        // Каталог роя и своё участие (§7.5): удалённый чат уносит и их.
+        // §12 говорит про удаление канала прямо: «сидирование
+        // прекращается», а сидировать чат, которого нет, — это держать
+        // адрес в чужих каталогах ради байтов, которых у нас уже нет.
+        self.seeds.retain(|(chat, _), _| chat != chat_id);
+        self.seeding.remove(chat_id);
         Ok(())
     }
 
@@ -801,6 +812,40 @@ impl Store for MemoryStore {
 
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
         self.avatars.remove(owner_ik);
+        Ok(())
+    }
+
+    fn put_seed(&mut self, chat_id: &[u8; 16], seed: &StoredSeed) -> Result<()> {
+        self.seeds.insert((*chat_id, seed.ik), seed.clone());
+        Ok(())
+    }
+
+    fn seeds(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredSeed>> {
+        Ok(self
+            .seeds
+            .iter()
+            .filter(|((chat, _), _)| chat == chat_id)
+            .map(|(_, seed)| seed.clone())
+            .collect())
+    }
+
+    fn delete_seed(&mut self, chat_id: &[u8; 16], ik: &[u8; 32]) -> Result<()> {
+        self.seeds.remove(&(*chat_id, *ik));
+        Ok(())
+    }
+
+    fn prune_seeds(&mut self, now_ms: u64) -> Result<usize> {
+        let before = self.seeds.len();
+        self.seeds.retain(|_, seed| seed.valid_until_ms > now_ms);
+        Ok(before - self.seeds.len())
+    }
+
+    fn seeding(&self, chat_id: &[u8; 16]) -> Result<Option<u32>> {
+        Ok(self.seeding.get(chat_id).map(|(mode, _)| *mode))
+    }
+
+    fn set_seeding(&mut self, chat_id: &[u8; 16], mode: u32, now_ms: u64) -> Result<()> {
+        self.seeding.insert(*chat_id, (mode, now_ms));
         Ok(())
     }
 

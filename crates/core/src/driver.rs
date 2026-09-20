@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::engine::ExportScope;
 use crate::engine::{
     ChannelAdmitView, ChannelFacts, ChannelGrantView, ChannelRequestView, Engine, EngineError,
+    SeedView,
 };
 use crate::io::{ArchiveKey, ChatId, Command, Effect, Event, Exported, Input, Merged, Swept};
 use crate::reader::FileReader;
@@ -275,6 +276,10 @@ enum Query {
     Devices { reply: oneshot::Sender<Vec<DeviceStatus>> },
     /// Пиры-не-контакты: третий вид записи за сессией (§8.3).
     Peers { reply: oneshot::Sender<Vec<PeerStatus>> },
+    /// Каталог раздающих этот канал (фаза 2, §7.5).
+    ChannelSeeds { chat: ChatId, reply: oneshot::Sender<Vec<SeedView>> },
+    /// Наше участие в раздаче этого канала (фаза 2, §7.5.1).
+    Seeding { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Seeding> },
     /// Группы и их состав (§11).
     Groups { reply: oneshot::Sender<Vec<GroupStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
@@ -1213,6 +1218,34 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает каталог раздающих (§7.5), блокируя вызывающий поток.
+    pub fn channel_seeds_blocking(&self, chat: ChatId) -> Option<Vec<SeedView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChannelSeeds { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// То же без блокировки.
+    pub async fn channel_seeds(&self, chat: ChatId) -> Option<Vec<SeedView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::ChannelSeeds { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает наше участие в раздаче (§7.5.1), блокируя вызывающий поток.
+    pub fn seeding_blocking(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Seeding> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Seeding { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// То же без блокировки.
+    pub async fn seeding(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Seeding> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Seeding { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
     /// Читает учёт впусков канала, блокируя вызывающий поток.
     pub fn channel_admits_blocking(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
         let (reply, answer) = oneshot::channel();
@@ -1839,6 +1872,16 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::ChannelRequests { chat, reply } => {
                 let _ = reply.send(self.engine.channel_requests(&chat));
+            }
+            Query::ChannelSeeds { chat, reply } => {
+                // Часы спрашиваются здесь, а не в ядре: протухшие записи
+                // отсекаются по времени, а времени у ядра своего нет.
+                let _ = reply.send(self.engine.seeds(chat, now_ms()).unwrap_or_default());
+            }
+            Query::Seeding { chat, reply } => {
+                let _ = reply.send(
+                    self.engine.seeding(chat).unwrap_or(ratatosk_proto::swarm::Seeding::Quiet),
+                );
             }
         }
     }

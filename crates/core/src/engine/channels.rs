@@ -98,7 +98,7 @@ impl<S: Store> Engine<S> {
     /// не соберётся вовсе. Реле — последние в списке и первые под нож:
     /// без реле собеседник возьмёт наши из карточки, когда она до него
     /// доедет, а без onion или ключа меша ступени нет совсем.
-    fn own_endpoints(&self) -> Vec<channel::Endpoint> {
+    pub(super) fn own_endpoints(&self) -> Vec<channel::Endpoint> {
         let mut endpoints = Vec::new();
         if !self.addresses.onion.is_empty() {
             endpoints.push(channel::Endpoint::Onion(self.addresses.onion.clone()));
@@ -1239,6 +1239,14 @@ impl<S: Store> Engine<S> {
         }
         self.last_rotation_scan_ms = now_ms;
 
+        // **Каталог роя освежается тем же обходом** (§7.5), и это не
+        // экономия строк: оба дела меряются сутками и месяцами, а часов
+        // у ядра нет — обход даёт им обоим единственный повод, который
+        // случается на спящем телефоне. Заведи каталог свой обход,
+        // он ходил бы по тому же признаку «прошло ли столько-то»,
+        // то есть был бы второй копией этого.
+        let mut effects = self.keep_catalogue_fresh(now_ms)?;
+
         let me = self.identity.public().ik;
         let mine: Vec<ChatId> = self
             .groups
@@ -1268,7 +1276,6 @@ impl<S: Store> Engine<S> {
             }
         }
 
-        let mut effects = Vec::new();
         for chat in due {
             // Через ту же команду, что и кнопка. Второй путь поворота
             // означал бы второе место, где живут нижний предел, порода

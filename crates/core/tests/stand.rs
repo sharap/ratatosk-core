@@ -609,6 +609,33 @@ impl Stand {
         self.settle();
     }
 
+    /// Объявляет узел раздающим этот канал (§7.5.1).
+    fn announce_seeding(&mut self, who: NodeId, chat: [u8; 16]) {
+        self.sim.act(who, |node, ctx| {
+            node.command(
+                ctx,
+                Command::SetSeeding { chat, mode: ratatosk_proto::swarm::Seeding::Announced },
+            );
+        });
+        self.settle();
+    }
+
+    /// Каталог раздающих, каким его видит этот узел (§7.5).
+    fn seeds(&self, who: NodeId, chat: [u8; 16]) -> Vec<[u8; 32]> {
+        let now = self.sim.now_ms();
+        let mut found: Vec<[u8; 32]> = self
+            .sim
+            .node(who)
+            .engine()
+            .seeds(chat, now)
+            .expect("каталог")
+            .into_iter()
+            .map(|s| s.ik)
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
     /// Впускает читателя в канал (фаза 2, §6.5).
     fn admit(&mut self, owner: NodeId, chat: [u8; 16], guest: NodeId) {
         let peer_ik = self.ik(guest);
@@ -1112,6 +1139,132 @@ const C: NodeId = NodeId(2);
 const D: NodeId = NodeId(3);
 
 // --- разговор двоих ---------------------------------------------------------
+
+#[test]
+fn a_seed_becomes_known_to_every_reader() {
+    // **§7.5 целиком, на трёх узлах.** Читатель вызвался раздавать —
+    // и об этом обязаны узнать остальные читатели, иначе спрашивать
+    // блоки будет не у кого, когда появится дерево (§7.1).
+    //
+    // Везёт это владелец: состав канала знает он (§3.2), и сам читатель
+    // развезти не может — других читателей он не знает. Здесь это
+    // и проверяется: Кэрол узнаёт про Боба, **не зная Боба**.
+    let mut stand = Stand::strangers(0x5EED_C0DE, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+
+    assert!(stand.seeds(NodeId(2), chat).is_empty(), "до объявления каталог пуст");
+
+    stand.announce_seeding(NodeId(1), chat);
+
+    let bob = stand.ik(NodeId(1));
+    assert_eq!(stand.seeds(NodeId(0), chat), vec![bob], "владелец принял запись");
+    assert_eq!(
+        stand.seeds(NodeId(2), chat),
+        vec![bob],
+        "и развёз её читателю, который сида не знает; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        !stand.sim.node(NodeId(2)).engine().contacts().contains_key(&bob),
+        "знакомым сид при этом не становится (§3.2, §8.3)"
+    );
+    // Подпись у Кэрол не сходится не потому, что запись плоха, а потому,
+    // что карточки Боба у неё нет вовсе. Сказать это надо вслух: иначе
+    // «не проверено» читается как «подделка».
+    let at_carol =
+        stand.sim.node(NodeId(2)).engine().seeds(chat, stand.sim.now_ms()).expect("каталог");
+    assert!(!at_carol[0].verified, "карточки сида у читателя нет — проверять нечем (§3.2)");
+    assert!(
+        stand.sim.node(NodeId(0)).engine().seeds(chat, stand.sim.now_ms()).unwrap()[0].verified,
+        "а у владельца карточка есть, и подпись сошлась"
+    );
+}
+
+#[test]
+fn a_catalogue_entry_dies_of_old_age() {
+    // §7.5: «срок годности убирает ушедших — перестал продлевать, выпал».
+    // Отзыва нет нарочно: ушедший чаще всего просто выключил телефон,
+    // и дождаться от него отзыва было бы нельзя.
+    //
+    // Число здесь своё, а не из крейта: проверка стережёт обещание
+    // «неделя», и возьми она константу, продление срока подняло бы и её.
+    let mut stand = Stand::strangers(0x0DD_5EED, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    assert_eq!(stand.seeds(NodeId(0), chat).len(), 1);
+
+    // **Читатель перестал раздавать.** Отказ по сети не едет вовсе
+    // (§7.5 отзыва не знает), и у владельца запись всё ещё лежит —
+    // именно это и должно кончиться сроком, а не сообщением.
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(
+            ctx,
+            Command::SetSeeding { chat, mode: ratatosk_proto::swarm::Seeding::Quiet },
+        );
+    });
+    stand.settle();
+    assert_eq!(
+        stand.seeds(NodeId(0), chat).len(),
+        1,
+        "отказ владельцу не уезжает: гасит объявление срок, а не кадр"
+    );
+    assert!(stand.seeds(NodeId(1), chat).is_empty(), "а у себя раздающий себя не держит");
+
+    // Шесть суток спустя запись ещё жива...
+    stand.sleep_for(6 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    assert_eq!(stand.seeds(NodeId(0), chat).len(), 1, "неделя ещё не вышла");
+
+    // ...а на восьмые её нет, и убрала её уборка, а не показ.
+    stand.sleep_for(2 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    assert!(
+        stand.seeds(NodeId(0), chat).is_empty(),
+        "запись обязана выпасть по сроку; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        stand.sim.node(NodeId(0)).engine().store().seeds(&chat).expect("диск").is_empty(),
+        "и с диска тоже: иначе она вернулась бы после перезапуска"
+    );
+}
+
+#[test]
+fn a_seed_keeps_its_place_by_renewing() {
+    // Вторая половина того же правила: **кто продлевает, тот остаётся**.
+    // Без неё проверка выше зелена оттого, что запись умирает всегда.
+    let mut stand = Stand::strangers(0xC0FFEE, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+
+    // Шесть суток — внутри окна продления (двое суток до конца срока):
+    // обслуживание обязано переподписать запись и разослать заново.
+    stand.sleep_for(6 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    stand.sleep_for(3 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    assert_eq!(
+        stand.seeds(NodeId(0), chat).len(),
+        1,
+        "продлённая запись пережила свой первый срок; сид {:#x}",
+        stand.sim.seed()
+    );
+}
 
 #[test]
 fn a_channel_lives_among_nodes_that_know_nobody() {

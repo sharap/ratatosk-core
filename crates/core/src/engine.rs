@@ -374,6 +374,14 @@ pub enum EngineError {
     /// и просить тут нечего.
     #[error("в этом канале публикует только владелец: доставить слово больше некому")]
     OnlyOwnerPublishesYet,
+    /// Объявляться сидом нечем: своих адресов нет (фаза 2, §7.5).
+    ///
+    /// Запись каталога без единого адреса обещает путь, которого нет:
+    /// читатель положит её к себе и будет считать, что сид есть.
+    /// Отказ вслух лучше молчаливой записи — человеку надо поднять Tor,
+    /// завести почту или назвать ключ меша.
+    #[error("объявлять нечего: своих адресов нет — поднимите Tor, заведите почту или назовите ключ меша")]
+    NothingToAnnounce,
     /// Владельцу канала прав не выдают (фаза 2, §6.2).
     ///
     /// **Отдельно от [`EngineError::NotAllowedInChannel`], и это не
@@ -1848,7 +1856,10 @@ mod pairing;
 mod presence;
 mod receive;
 mod setup;
+mod swarm;
 mod views;
+
+pub use swarm::SeedView;
 
 impl<S: Store> Engine<S> {
     /// Собирает ядро.
@@ -2306,6 +2317,7 @@ impl<S: Store> Engine<S> {
             Command::SetYggKey(key) => self.on_set_ygg_key(now_ms, key),
             Command::SetYggMode(mode) => self.on_set_ygg_mode(now_ms, mode),
             Command::SetYggPeers(peers) => self.on_set_ygg_peers(now_ms, peers),
+            Command::SetSeeding { chat, mode } => self.on_set_seeding(now_ms, chat, mode),
             Command::SetNostrRelays(relays) => self.on_set_nostr_relays(now_ms, relays),
             Command::SetNostrDirect(direct) => self.on_set_nostr_direct(now_ms, direct),
             Command::SetForeground(front) => self.on_set_foreground(now_ms, front),

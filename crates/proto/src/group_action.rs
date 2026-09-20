@@ -109,6 +109,9 @@ const KIND_ARCHIVE_KEY: u64 = 11;
 /// Подписанная запись о впуске в канал (фаза 2, §6.5).
 const KIND_ADMISSION: u64 = 12;
 
+/// Запись каталога роя (§7.5).
+const KIND_SEED_RECORD: u64 = 13;
+
 /// Почему действие не разобралось.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ActionError {
@@ -308,6 +311,20 @@ pub enum Action {
         /// Ключ, запечатанный на `IK` адресата (`crypto::seal`).
         sealed: Vec<u8>,
     },
+    /// Подписанная запись каталога роя (фаза 2, §7.5).
+    ///
+    /// Едет **всем**: каталог и есть то, из чего читатель узнаёт, у кого
+    /// спрашивать блоки. Внутри — подпись самого сида, а не развозящего:
+    /// развозит владелец (звезда, §7.5.2), и подделать чужой адрес он
+    /// не может.
+    ///
+    /// Что это раскрывает, сказано до нажатия
+    /// (`swarm::SeedingConsequences`): объявленный адрес узнаёт каждый
+    /// читатель канала.
+    SeedRecord {
+        /// Подписанная запись вместе с подписью — как приехала.
+        bytes: Vec<u8>,
+    },
     /// Подписанная запись о впуске в канал (фаза 2, §6.5).
     ///
     /// Едет **всем**, а не только впущенному: это учёт, и смотрит в него
@@ -399,6 +416,11 @@ impl Action {
             // адресно; новую версию рассылает владелец, и веер там его
             // собственный.
             Action::Representation { .. } => false,
+            // **Каталог едет веером, и в этом его смысл** (§7.5): читатель
+            // узнаёт, у кого спрашивать блоки, а состав знает владелец
+            // (§3.2) — значит развозит он. Сам сид шлёт свою запись ему
+            // одному, и это не веер, а адресный кадр.
+            Action::SeedRecord { .. } => true,
         }
     }
 
@@ -472,6 +494,11 @@ impl Action {
             // подделать её нельзя вовсе, тогда как право можно получить
             // и потерять.
             Action::Representation { .. } => Gate::OwnSignature,
+            // **Подписью, по той же причине, что у представления.** Судить
+            // запись каталога правом нельзя: раздача — не право §6.2,
+            // а согласие (§7.5.1), и никакого бита под неё нет. Подпись
+            // же говорит именно то, что нужно: адрес назвал тот, чей он.
+            Action::SeedRecord { .. } => Gate::OwnSignature,
         }
     }
 }
@@ -511,6 +538,10 @@ pub fn payload(action: &Action) -> Value {
         ]),
         Action::Representation { bytes } => Value::Map(vec![
             (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_REPRESENTATION.into())),
+            (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
+        ]),
+        Action::SeedRecord { bytes } => Value::Map(vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(KIND_SEED_RECORD.into())),
             (Value::Integer(KEY_BYTES.into()), Value::Bytes(bytes.clone())),
         ]),
         Action::Forward { text } => Value::Map(vec![
@@ -573,6 +604,7 @@ pub fn from_payload(value: &Value) -> Result<Action, ActionError> {
         KIND_REPRESENTATION => return representation_from(map),
         KIND_ARCHIVE_KEY => return archive_key_from(map),
         KIND_ADMISSION => return admission_from(map),
+        KIND_SEED_RECORD => return seed_record_from(map),
         _ => return Err(ActionError::UnknownKind),
     }
 
@@ -654,6 +686,19 @@ fn archive_key_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
         return Err(ActionError::Malformed);
     }
     Ok(Action::ArchiveKey { generation, recipient_ik, sealed: sealed.clone() })
+}
+
+fn seed_record_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {
+    let Ok(Value::Bytes(bytes)) = canonical::require(map, KEY_BYTES) else {
+        return Err(ActionError::Malformed);
+    };
+    // Разбор только на форму, как у представления и записи о впуске:
+    // подпись проверяет ядро — оно знает, чей это адрес и чьим ключом
+    // сверять. Форму проверить всё же надо, иначе в кадр клался бы
+    // мегабайт мусора, отказывающий только после расшифровки.
+    crate::swarm::record_from_wire(&canonical::decode(bytes).map_err(|_| ActionError::Malformed)?)
+        .map_err(|_| ActionError::Malformed)?;
+    Ok(Action::SeedRecord { bytes: bytes.clone() })
 }
 
 fn representation_from(map: &[(Value, Value)]) -> Result<Action, ActionError> {

@@ -20,8 +20,8 @@ use crate::{
     FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
     StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGrant, StoredGroup,
     StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox,
-    StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSenderChain,
-    StoredSession, StoredSubscription,
+    StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed,
+    StoredSenderChain, StoredSession, StoredSubscription,
 };
 
 /// Хранилище на SQLite.
@@ -2110,6 +2110,92 @@ impl Store for SqliteStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(StoreError::from(other)),
             })
+    }
+
+    fn put_seed(&mut self, chat_id: &[u8; 16], seed: &StoredSeed) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO swarm_peers
+                 (chat_id, ik, record_bytes, signature, valid_until_ms, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &chat_id[..],
+                &seed.ik[..],
+                seed.record_bytes,
+                &seed.signature[..],
+                sql_types::to_sql(seed.valid_until_ms),
+                sql_types::to_sql(seed.received_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seeds(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredSeed>> {
+        let mut statement = self.conn.prepare(
+            "SELECT ik, record_bytes, signature, valid_until_ms, received_ms
+             FROM swarm_peers WHERE chat_id = ?1 ORDER BY ik",
+        )?;
+        let rows = statement.query_map([&chat_id[..]], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (ik, record_bytes, signature, valid_until_ms, received_ms) = row?;
+            // Длина не та — строка испорчена. Пропускаем: недосчитаться
+            // сида хуже, чем уронить подъём на чужой строке.
+            let Ok(ik) = <[u8; 32]>::try_from(ik.as_slice()) else { continue };
+            let Ok(signature) = <[u8; 64]>::try_from(signature.as_slice()) else { continue };
+            found.push(StoredSeed {
+                ik,
+                record_bytes,
+                signature,
+                valid_until_ms: sql_types::from_sql(valid_until_ms),
+                received_ms: sql_types::from_sql(received_ms),
+            });
+        }
+        Ok(found)
+    }
+
+    fn delete_seed(&mut self, chat_id: &[u8; 16], ik: &[u8; 32]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM swarm_peers WHERE chat_id = ?1 AND ik = ?2",
+            rusqlite::params![&chat_id[..], &ik[..]],
+        )?;
+        Ok(())
+    }
+
+    fn prune_seeds(&mut self, now_ms: u64) -> Result<usize> {
+        let gone = self.conn.execute(
+            "DELETE FROM swarm_peers WHERE valid_until_ms <= ?1",
+            [sql_types::to_sql(now_ms)],
+        )?;
+        Ok(gone)
+    }
+
+    fn seeding(&self, chat_id: &[u8; 16]) -> Result<Option<u32>> {
+        let mut statement =
+            self.conn.prepare("SELECT mode FROM swarm_seeding WHERE chat_id = ?1")?;
+        let mut rows = statement.query([&chat_id[..]])?;
+        let Some(row) = rows.next()? else { return Ok(None) };
+        let mode: i64 = row.get(0)?;
+        Ok(Some(u32::try_from(sql_types::from_sql(mode)).unwrap_or(0)))
+    }
+
+    fn set_seeding(&mut self, chat_id: &[u8; 16], mode: u32, now_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO swarm_seeding (chat_id, mode, changed_ms) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                &chat_id[..],
+                sql_types::to_sql(u64::from(mode)),
+                sql_types::to_sql(now_ms),
+            ],
+        )?;
+        Ok(())
     }
 
     fn put_channel_request(

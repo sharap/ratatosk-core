@@ -234,6 +234,30 @@ fn introduce(a: &mut Node, b: &mut Node) {
         .unwrap();
 }
 
+/// Узел **без единого своего адреса**: ни onion, ни почты.
+///
+/// Так выглядит свежее устройство, на котором человек ещё ничего
+/// не поднял. Отдельным конструктором, потому что проверяются на нём
+/// отказы, а не доставка.
+fn node_without_addresses(seed: u8, name: &str) -> Node {
+    let identity = Identity::from_seed([seed; 32]);
+    let mut store = MemoryStore::new();
+    store.migrate().expect("миграция");
+    let mut engine = Engine::new(
+        identity,
+        store,
+        Box::new(MemoryBlobs::new()),
+        Box::new(SeededEntropy::new(u64::from(seed))),
+        SelfAddresses {
+            onion: String::new(),
+            chatmail: String::new(),
+            display_name: name.to_owned(),
+        },
+    );
+    engine.restore().expect("подъём");
+    engine
+}
+
 fn send_text(node: &mut Node, peer: &Node, now_ms: u64, text: &str) -> Vec<Effect> {
     let chat = Engine::<MemoryStore>::chat_id_for(&peer.own_card().ik);
     node.step(now_ms, Input::Command(Command::SendText { chat, text: text.into() }))
@@ -7941,6 +7965,155 @@ fn readers_of_a_channel_do_not_learn_about_each_other() {
         3,
         "владелец ведёт состав: на нём держится звезда"
     );
+}
+
+// --- Каталог пиров роя (фаза 2, §7.5, §7.5.1) -----------------------------
+
+#[test]
+fn the_default_is_quiet_seeding_and_it_announces_nothing() {
+    // §7.5.1: тихая раздача — умолчание, и в этом весь смысл трёх
+    // состояний. Рой не должен зависеть от того, нажмёт ли кто-нибудь
+    // кнопку, а раскрытие адреса обязано остаться выбором.
+    let mut alice = node(1, "alice");
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    assert_eq!(
+        alice.seeding(chat).expect("состояние"),
+        ratatosk_proto::swarm::Seeding::Quiet,
+        "никто ничего не выбирал — значит тихо"
+    );
+    assert!(
+        alice.seeds(chat, 1_000).expect("каталог").is_empty(),
+        "тихая раздача в каталог не попадает: адрес не объявлен"
+    );
+}
+
+#[test]
+fn announcing_puts_our_address_into_our_own_catalogue() {
+    // Объявление — это подписанная запись о себе (§7.5). Своя запись
+    // ложится к себе же: каталог у владельца и есть то, что он развозит.
+    let mut alice = node(1, "alice");
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    alice
+        .step(
+            2_000,
+            Input::Command(Command::SetSeeding {
+                chat,
+                mode: ratatosk_proto::swarm::Seeding::Announced,
+            }),
+        )
+        .expect("объявились");
+
+    let catalogue = alice.seeds(chat, 2_000).expect("каталог");
+    assert_eq!(catalogue.len(), 1);
+    assert_eq!(catalogue[0].ik, alice.own_card().ik);
+    assert!(catalogue[0].verified, "свою запись мы проверить можем всегда");
+    assert!(
+        !catalogue[0].endpoints.is_empty(),
+        "объявлять без адреса нечего — иначе запись обещает путь, которого нет"
+    );
+    // Срок — неделя (§7.5). Число здесь своё, не из крейта: возьми
+    // проверка константу, продление срока подняло бы и её, и она
+    // смолчала бы о том, что мёртвые адреса стали жить вдвое дольше.
+    let week = 7 * 24 * 60 * 60 * 1000;
+    assert_eq!(catalogue[0].valid_until_ms, 2_000 + week);
+}
+
+#[test]
+fn announcing_without_a_single_address_is_refused_in_words() {
+    // Запись без адреса — обещание пути, которого нет: читатель положит
+    // её в каталог и будет считать, что сид есть. Отказ вслух лучше:
+    // человеку надо поднять Tor, завести почту или назвать ключ меша.
+    let mut bare = node_without_addresses(3, "без адресов");
+    let chat = create_channel_for(&mut bare, 1_000, "лента", false);
+    assert!(matches!(
+        bare.step(
+            2_000,
+            Input::Command(Command::SetSeeding {
+                chat,
+                mode: ratatosk_proto::swarm::Seeding::Announced
+            })
+        ),
+        Err(EngineError::NothingToAnnounce)
+    ));
+    assert!(bare.seeds(chat, 2_000).expect("каталог").is_empty());
+}
+
+#[test]
+fn a_readers_announcement_reaches_the_owner() {
+    // §7.5: сид шлёт свою запись **владельцу** — состав знает он (§3.2),
+    // и развозить каталог больше некому. Здесь проверяется первая
+    // половина пути; вторая — до остальных читателей — на стенде,
+    // где узлов больше двух (`a_seed_becomes_known_to_every_reader`).
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    let effects = bob
+        .step(
+            4_000,
+            Input::Command(Command::SetSeeding {
+                chat,
+                mode: ratatosk_proto::swarm::Seeding::Announced,
+            }),
+        )
+        .expect("объявился");
+    let events = pump(&mut bob, &mut alice, 4_000, effects);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::SeedAnnounced { chat: c, who } if *c == chat && *who == bob.own_card().ik
+        )),
+        "владелец обязан узнать, что раздающих стало больше: {events:?}"
+    );
+    let at_owner = alice.seeds(chat, 4_000).expect("каталог владельца");
+    assert_eq!(at_owner.len(), 1, "и запись обязана лечь к нему");
+    assert_eq!(at_owner[0].ik, bob.own_card().ik);
+    assert!(at_owner[0].verified, "у владельца карточка читателя есть — подпись проверена");
+}
+
+#[test]
+fn an_announcement_from_someone_not_in_the_channel_is_ignored() {
+    // **Каталог — не про чтение.** §7.6 разрешает вытянуть шифротекст
+    // всякому, у кого есть идентификатор канала; но вписаться в каталог
+    // значит стать для читателей адресом, у которого те спрашивают
+    // блоки, — а это уже про доверие, и даётся оно составом.
+    //
+    // Так выглядит подписавшийся по ссылке, которого ещё не впустили:
+    // канал он знает, в составе его нет.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+
+    let effects = bob
+        .step(
+            3_000,
+            Input::Command(Command::SetSeeding {
+                chat,
+                mode: ratatosk_proto::swarm::Seeding::Announced,
+            }),
+        )
+        .expect("объявился, не будучи впущенным");
+    let events = pump(&mut bob, &mut alice, 3_000, effects);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::SeedAnnounced { .. })),
+        "невпущенного в каталог не берут — и владельцу об этом сообщать нечего"
+    );
+    assert!(alice.seeds(chat, 3_000).expect("каталог").is_empty());
+    // А у себя он свою запись держит: отказ владельца до него не едет
+    // (§7.5 отзыва не знает), и с впуском она уедет заново.
+    assert_eq!(bob.seeds(chat, 3_000).expect("свой каталог").len(), 1);
 }
 
 // --- Приёмная сторона §8.3: незнакомец ложится пиром ----------------------

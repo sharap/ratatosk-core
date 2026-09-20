@@ -188,6 +188,9 @@ RatatoskClient::open(db_path: String, pin: Option<String>, display_name: String)
 | `set_channel_right(chat_id, who, rights: FfiChannelRights, until_ms: u64)` | выдать или снять право (§6.2); срок обязателен (§6.3) |
 | `set_channel_pow(chat_id, bits: u32)` | назначить цену слова (§11); уезжает новой версией представления |
 | `rotate_channel_key(chat_id: Vec<u8>)` | повернуть ключ чтения (§6.4) — это и есть исключение читателя |
+| `set_seeding(chat_id, announced: bool)` | раздавать ли канал и объявлять ли адрес (§7.5.1); текст §15 — **до** объявления |
+| `seeding(chat_id) -> bool` | объявлен ли наш адрес в каталоге |
+| `channel_seeds(chat_id) -> Vec<FfiChannelSeed>` | кто раздаёт канал (§7.5); протухшие не показываются |
 | `set_transport_enabled(transport: FfiTransport, enabled: bool)` | включить или выключить транспорт (§5.4); выбор хранит ядро |
 | `transport_enabled(transport: FfiTransport) -> bool` | включён ли он сейчас |
 | `transport_ready(transport: FfiTransport) -> bool` | **работает** ли он сейчас — не то же самое, см. ниже |
@@ -1377,12 +1380,16 @@ fn rotate_channel_key(chat_id: Vec<u8>) -> Result<(), RatatoskError>
 fn channel_grants(chat_id: Vec<u8>) -> Result<Vec<FfiChannelGrant>, RatatoskError>
 fn channel_admits(chat_id: Vec<u8>) -> Result<Vec<FfiChannelAdmit>, RatatoskError>
 fn channel_requests(chat_id: Vec<u8>) -> Result<Vec<FfiChannelRequest>, RatatoskError>
+fn set_seeding(chat_id: Vec<u8>, announced: bool) -> Result<(), RatatoskError>
+fn seeding(chat_id: Vec<u8>) -> Result<bool, RatatoskError>
+fn channel_seeds(chat_id: Vec<u8>) -> Result<Vec<FfiChannelSeed>, RatatoskError>
 
 open_channel_notice() -> String     // **до** заведения открытого канала (§15)
 private_channel_notice() -> String  // **до** заведения канала по приглашению
 admitter_grant_notice() -> String   // **при выдаче** права «впускать» (§6.5)
 key_rotation_notice() -> String     // **до** кнопки «повернуть ключ» (§6.4)
 sharing_notice() -> String          // **до** показа ссылки (§10.2)
+seeding_notice() -> String          // **до** объявления себя раздающим (§7.5.1)
 channel_refusal_text(reason) -> String  // слова к отказу канала
 ```
 
@@ -2014,6 +2021,41 @@ FfiMerged { own_graph: bool, added: u64, known: u64, refused: u64 }
 
 Читаются реакции вместе с сообщением (`FfiMessage::reactions`), а событие
 `ReactionChanged` только говорит, что список пора перечитать.
+
+### Раздача — согласие, а не право (§7.5.1)
+
+Состояний **три**, и это не педантизм спеки:
+
+| Состояние | Адрес объявлен | Нас набирают | Отдаём |
+|---|---|---|---|
+| тихая раздача (**умолчание**) | нет | нет | тем, с кем соединились сами |
+| объявленный сид | да, запись в каталоге | да | всем по политике |
+| не раздаём | нет | нет | никому |
+
+Середина — та, ради которой всё это написано: рой не зависит
+от того, нажмёт ли кто-нибудь кнопку, а раскрытие адреса остаётся
+осознанным выбором. Наружу сегодня едут **два** состояния из трёх
+(`set_seeding(announced)`), и это честная неполнота: «тихо»
+и «не раздаём» различаются только тем, отдаём ли мы по своим исходящим
+соединениям, а отдавать пока нечего — дерева раздачи (§7.1) ещё нет.
+Третье состояние появится на границе вместе с ним.
+
+**`seeding_notice()` показывается до включения, и там сказано главное:**
+адрес узнаёт каждый читатель канала, набирать по нему будут незнакомые,
+а отказ гасит объявление **не сразу** — запись живёт неделю и просто
+перестаёт продлеваться (§7.5, отзыва не бывает).
+
+**Отказ «объявлять нечего»** означает, что своих адресов нет вовсе:
+ни onion, ни почты, ни ключа меша. Адрес в локальной сети в каталог
+не кладётся никогда — он меняется при каждом подключении, и в записи
+годности бы не имел. Клиенту это надо показать как «поднимите Tor
+или заведите почту», а не как внутреннюю ошибку.
+
+**`verified = false` в `FfiChannelSeed` — это «проверить нечем», а не
+«подделка».** Карточки сида у читателя может не быть вовсе: читатели
+канала друг друга не знают (§3.2). Подделанную запись отсеивает
+владелец, у которого карточки есть; читателю же адрес и так ничем
+не подтверждён (§10.2) — личность устанавливает рукопожатие.
 
 ### Очередь ожидающих: что обещано и что нет
 

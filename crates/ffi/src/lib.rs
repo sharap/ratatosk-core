@@ -696,6 +696,28 @@ pub enum FfiEvent {
         /// Кто просится.
         who: Vec<u8>,
     },
+    /// Наше участие в раздаче канала изменилось (фаза 2, §7.5.1).
+    ///
+    /// Признак «объявлено», а не всё состояние: человеку важно одно —
+    /// раскрыт ли его адрес. Тихая раздача и отказ снаружи отличаются
+    /// не событием, а экраном настроек.
+    SeedingChanged {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Объявлен ли наш адрес в каталоге.
+        announced: bool,
+    },
+    /// Кто-то вызвался раздавать наш канал (фаза 2, §7.5).
+    ///
+    /// Приходит **владельцу**: каталог развозит он. Клиенту это повод
+    /// перечитать список раздающих
+    /// ([`RatatoskClient::channel_seeds`]), а не строка в чате.
+    SeedAnnounced {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Кто вызвался.
+        who: Vec<u8>,
+    },
     /// Отписались от канала (фаза 2, §10.6).
     ///
     /// Чата больше нет: ни истории, ни ключей чтения, ни представления.
@@ -1389,6 +1411,27 @@ pub struct FfiChannelGrant {
     /// выражается отсутствием строки, а не надгробием, — и показывать её
     /// действующей нельзя.
     pub live: bool,
+}
+
+/// Кто раздаёт канал — строка каталога (фаза 2, §7.5).
+///
+/// Адреса наружу **не едут**: набирает ядро (§13.3), а на экране это
+/// строка «такой-то раздаёт».
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannelSeed {
+    /// Чей адрес объявлен.
+    pub who: Vec<u8>,
+    /// До какого момента запись годна, мс (§7.5).
+    ///
+    /// Показывать стоит: «раздаёт» с истекающим сроком означает
+    /// «раздавал», и разница видна только по нему.
+    pub valid_until_ms: u64,
+    /// Сошлась ли подпись записи.
+    ///
+    /// Ложь означает «проверить было нечем» — карточки сида у читателя
+    /// может не быть вовсе (§3.2), — а не «подделка». Поддельную отсеет
+    /// владелец, который карточки знает.
+    pub verified: bool,
 }
 
 /// Заявка на подписку — то, что видит владелец (фаза 2, §10.4).
@@ -3429,6 +3472,71 @@ impl RatatoskClient {
         self.command(Command::RotateChannelKey { chat: to_chat(&chat_id)? })
     }
 
+    /// Раздавать ли этот канал и объявлять ли адрес (фаза 2, §7.5.1).
+    ///
+    /// Три состояния, а не переключатель: «не раздаём», «тихо»
+    /// (умолчание) и «объявлено». Тихая раздача — середина, ради которой
+    /// §7.5.1 и написан: рой не зависит от того, нажмёт ли кто-нибудь
+    /// кнопку, а адрес при этом не раскрывается.
+    ///
+    /// **Перед `announced` клиент обязан показать [`seeding_notice`]**:
+    /// объявленный адрес узнаёт каждый читатель канала, и отказ гасит
+    /// объявление не сразу.
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Channel`] — это не канал, или объявлять нечего:
+    /// своих адресов нет вовсе.
+    pub fn set_seeding(&self, chat_id: Vec<u8>, announced: bool) -> Result<(), RatatoskError> {
+        // Наружу едут два состояния из трёх, и это не потеря: «тихо»
+        // и «не раздаём» различаются только тем, отдаём ли мы по своим
+        // исходящим, а отдавать сегодня нечего — дерева раздачи (§7.1)
+        // ещё нет. Третье состояние появится на границе вместе с ним.
+        let mode = if announced {
+            ratatosk_proto::swarm::Seeding::Announced
+        } else {
+            ratatosk_proto::swarm::Seeding::Quiet
+        };
+        self.command(Command::SetSeeding { chat: to_chat(&chat_id)?, mode })
+    }
+
+    /// Объявлен ли наш адрес в каталоге этого канала (фаза 2, §7.5.1).
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn seeding(&self, chat_id: Vec<u8>) -> Result<bool, RatatoskError> {
+        let mode = self
+            .opened
+            .handle
+            .seeding_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(mode.announces_address())
+    }
+
+    /// Кто раздаёт этот канал (фаза 2, §7.5).
+    ///
+    /// Протухшие записи не показываются: «перестал продлевать — выпал».
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn channel_seeds(&self, chat_id: Vec<u8>) -> Result<Vec<FfiChannelSeed>, RatatoskError> {
+        let found = self
+            .opened
+            .handle
+            .channel_seeds_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found
+            .into_iter()
+            .map(|seed| FfiChannelSeed {
+                who: seed.ik.to_vec(),
+                valid_until_ms: seed.valid_until_ms,
+                verified: seed.verified,
+            })
+            .collect())
+    }
+
     /// Кому что выдано в канале (фаза 2, §6.2).
     ///
     /// Отдельным чтением, а не полем в [`FfiGroup`]: до шестидесяти
@@ -4744,6 +4852,12 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::ChannelRequested { chat, who } => {
             FfiEvent::ChannelRequested { chat_id: chat.to_vec(), who: who.to_vec() }
         }
+        Event::SeedingChanged { chat, announced } => {
+            FfiEvent::SeedingChanged { chat_id: chat.to_vec(), announced }
+        }
+        Event::SeedAnnounced { chat, who } => {
+            FfiEvent::SeedAnnounced { chat_id: chat.to_vec(), who: who.to_vec() }
+        }
         Event::ChannelKeyRotated { chat, generation } => {
             FfiEvent::ChannelKeyRotated { chat_id: chat.to_vec(), generation }
         }
@@ -5058,6 +5172,17 @@ pub fn key_rotation_notice() -> String {
 #[must_use]
 pub fn sharing_notice() -> String {
     ratatosk_proto::channel::SharingConsequences::ui_text().to_owned()
+}
+
+/// Что означает «объявить себя раздающим» (фаза 2, §15, §7.5.1).
+///
+/// Показывается **до** включения: адрес узнаёт каждый читатель канала,
+/// набирать по нему будут незнакомые, а отказ гасит объявление не сразу —
+/// оно живёт сроком годности (§7.5).
+#[uniffi::export]
+#[must_use]
+pub fn seeding_notice() -> String {
+    ratatosk_proto::swarm::SeedingConsequences::ui_text().to_owned()
 }
 
 /// Наибольший размер аватарки в байтах.

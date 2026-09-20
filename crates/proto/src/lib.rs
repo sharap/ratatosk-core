@@ -47,6 +47,7 @@ pub mod receipts;
 pub mod reply;
 pub mod retract;
 pub mod session;
+pub mod swarm;
 pub mod transport_policy;
 pub mod ygg;
 

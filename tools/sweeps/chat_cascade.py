@@ -53,6 +53,8 @@ FIELDS = {
     "channel_archive_keys": "archive_keys",
     "channel_admits": "admits",
     "channel_requests": "requests",
+    "swarm_peers": "seeds",
+    "swarm_seeding": "seeding",
 }
 
 # Исключения — поимённо и с причиной.

@@ -10,7 +10,7 @@
 //! но места, которые они чистят, заданы уже здесь.
 
 /// Версия схемы. Увеличивается на каждую миграцию.
-pub const SCHEMA_VERSION: u32 = 34;
+pub const SCHEMA_VERSION: u32 = 35;
 
 /// Прагмы, выставляемые при каждом открытии соединения.
 pub const PRAGMAS: &str = "\
@@ -1373,6 +1373,44 @@ pub const MIGRATION_0034: &str = r#"
 ALTER TABLE peers ADD COLUMN card BLOB NOT NULL DEFAULT x'';
 "#;
 
+/// Каталог пиров роя и своё участие в раздаче (фаза 2, §7.5, §7.5.1).
+///
+/// # Две таблицы, потому что это две разные вещи
+///
+/// `swarm_peers` — **чужие** подписанные записи: кто вызвался раздавать
+/// этот канал и куда ему звонить. Байты хранятся как приехали (§6),
+/// потому что запись пересылаемая: владелец развозит её остальным,
+/// и подпись обязана сойтись у каждого.
+///
+/// `swarm_seeding` — **наше** состояние на этот канал: три значения
+/// из §7.5.1. Оно локальное, по сети не едет и в чужой записи ему делать
+/// нечего. Умолчание — тихая раздача, и отсутствие строки означает
+/// именно его.
+///
+/// # Срок годности лежит столбцом, хотя он же внутри байтов
+///
+/// Затем, что по нему чистят: «перестал продлевать — выпал» (§7.5).
+/// Разбирать каждую запись, чтобы узнать, не протухла ли она, значило бы
+/// читать весь каталог на каждую уборку.
+pub const MIGRATION_0035: &str = r#"
+CREATE TABLE swarm_peers (
+    chat_id         BLOB NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    ik              BLOB NOT NULL,               -- чей адрес, 32 байта
+    record_bytes    BLOB NOT NULL,               -- подписанные байты, как приехали
+    signature       BLOB NOT NULL,               -- 64 байта
+    valid_until_ms  INTEGER NOT NULL,            -- §7.5: срок годности вместо отзыва
+    received_ms     INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, ik)
+) STRICT;
+CREATE INDEX swarm_peers_by_life ON swarm_peers(valid_until_ms);
+
+CREATE TABLE swarm_seeding (
+    chat_id         BLOB PRIMARY KEY NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    mode            INTEGER NOT NULL,            -- 0 не раздаём, 1 тихо, 2 объявлено
+    changed_ms      INTEGER NOT NULL
+) STRICT;
+"#;
+
 /// Все таблицы базы — поимённо.
 ///
 /// Список нужен вывозу «социального графа» (§12): он оставляет
@@ -1382,7 +1420,7 @@ ALTER TABLE peers ADD COLUMN card BLOB NOT NULL DEFAULT x'';
 ///
 /// Сверяется тестом с тем, что на самом деле создают миграции, — чтобы
 /// «список отстал от схемы» было падением сборки, а не тихой утечкой.
-pub const ALL_TABLES: [&str; 35] = [
+pub const ALL_TABLES: [&str; 37] = [
     "avatars",
     "causal_refs",
     "channel_admits",
@@ -1390,6 +1428,8 @@ pub const ALL_TABLES: [&str; 35] = [
     "channel_grants",
     "channel_representations",
     "channel_requests",
+    "swarm_peers",
+    "swarm_seeding",
     "channel_subscriptions",
     "chats",
     "contact_shares",
@@ -1447,7 +1487,7 @@ pub const GRAPH_META_KEYS: [&str; 5] =
     ["identity_seed", "onion_key", "db_salt", "self_card", "mail_account"];
 
 /// Все миграции по порядку.
-pub const MIGRATIONS: [&str; 34] = [
+pub const MIGRATIONS: [&str; 35] = [
     MIGRATION_0001,
     MIGRATION_0002,
     MIGRATION_0003,
@@ -1482,6 +1522,7 @@ pub const MIGRATIONS: [&str; 34] = [
     MIGRATION_0032,
     MIGRATION_0033,
     MIGRATION_0034,
+    MIGRATION_0035,
 ];
 
 #[cfg(test)]
@@ -1562,7 +1603,7 @@ mod tests {
     /// **Что делать, если тест упал.** Почти наверняка вы правите выпущенную
     /// миграцию — верните её как было и заведите следующий номер. Число здесь
     /// меняют только вместе с добавлением новой миграции в конец списка.
-    const FROZEN: [u64; 34] = [
+    const FROZEN: [u64; 35] = [
         0xa3f5_d87f_eeaa_0e3c,
         0x7996_4d61_828d_b650,
         0x67d3_78d4_c2cc_c4f1,
@@ -1597,6 +1638,7 @@ mod tests {
         0x41a5_a005_e5c9_f25d,
         0xbb0b_8b0d_1fd9_00e2,
         0x168c_0f81_36d1_241c,
+        0xf79c_2798_5608_5547,
     ];
 
     #[test]

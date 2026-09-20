@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1976,6 +1976,183 @@ async fn console(
                 }
                 if line == "/groups" {
                     show_groups(&handle).await;
+                    continue;
+                }
+                // **Команда без аргументов — подсказка, а не сообщение.**
+                // Разборы ниже ищут приставку **с пробелом**, и `/clink`,
+                // набранный без идентификатора, проваливался сквозь них
+                // в общий путь «строка без команды» — то есть уезжал
+                // собеседнику текстом. Поймано на стенде: в чужом чате
+                // появились строки `/channels` и `/clink`.
+                if let Some(usage) = channel_usage(&line) {
+                    println!("< нужно: {usage}");
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/newchannel ") {
+                    // Порода называется **словом и всегда**: она задаётся
+                    // при заведении и не меняется никогда (§6.1), а умолчание
+                    // здесь означало бы выбрать за человека то, что потом
+                    // не исправить.
+                    let (kind, title) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+                    let open = match kind {
+                        "open" => Some(true),
+                        "invite" => Some(false),
+                        _ => {
+                            println!("< нужно: /newchannel <open|invite> <название>");
+                            None
+                        }
+                    };
+                    if let Some(open) = open {
+                        if title.trim().is_empty() {
+                            println!("< без названия: /newchannel <open|invite> <название>");
+                        } else {
+                            // Последствие — до заведения, а не после (§15),
+                            // и только то, которое сказано **заводящему**.
+                            if let Some(notice) = creation_notice(open) {
+                                println!("< {notice}");
+                            }
+                            handle
+                                .send(Command::CreateChannel {
+                                    title: title.trim().to_owned(),
+                                    open,
+                                })
+                                .await
+                                .ok();
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/clink ") {
+                    let (chat, _) = split_group(rest, "/clink <id канала>");
+                    if let Some(chat) = chat {
+                        match handle.channel_link(chat).await {
+                            None => println!("< драйвер остановлен"),
+                            Some(Err(error)) => println!("< ссылку не собрать: {error}"),
+                            Some(Ok(link)) => {
+                                // Последствие — вместе со ссылкой, а не вместо
+                                // неё (§15, §10.2): в ссылке едет наш адрес.
+                                println!("< {}", ratatosk_proto::channel::SharingConsequences::ui_text());
+                                println!("< {link}");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/sub ") {
+                    let uri = rest.trim().to_owned();
+                    // **Вот здесь §15 и говорит про породу** — тому, кто
+                    // подписывается, и до подписки. Порода читается
+                    // из самой ссылки: наличие ключа чтения и есть она
+                    // (§6.1). Разобрать её здесь — не вторая проверка:
+                    // не разберись строка, команда всё равно уедет
+                    // и ядро откажет словами, а источник правды один.
+                    if let Ok(invitation) = ratatosk_proto::channel::Invitation::from_uri(&uri) {
+                        println!("< {}", subscription_notice(invitation.claims_open()));
+                    }
+                    handle.send(Command::SubscribeToChannel { uri }).await.ok();
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/unsub ") {
+                    let (chat, _) = split_group(rest, "/unsub <id канала>");
+                    if let Some(chat) = chat {
+                        // Стирает ключи чтения, а с ними архив (§10.6).
+                        // Сказать это стенду надо ровно так же, как клиенту.
+                        println!(
+                            "< отписка сотрёт ключи чтения: прежние записи канала \
+                             больше не откроются никогда"
+                        );
+                        handle.send(Command::UnsubscribeFromChannel { chat }).await.ok();
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/admit ") {
+                    let (chat, who) = split_group(rest, "/admit <id канала> <ключ>");
+                    if let Some(chat) = chat {
+                        match decode_ik(who.trim()) {
+                            Some(peer_ik) => {
+                                handle.send(Command::AdmitToChannel { chat, peer_ik }).await.ok();
+                            }
+                            None => println!("< ключ — 64 знака hex; /who показывает его"),
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/right ") {
+                    // `/right <id> <ключ> <набор|-> <дней>`: набор буквами
+                    // (w a e d), прочерк снимает. Срок обязателен — §6.3
+                    // не знает прав без срока, и умолчание здесь завело бы
+                    // право, которое некому истечь.
+                    let (chat, tail) = split_group(rest, "/right <id канала> <ключ> <waed|-> <дней>");
+                    if let Some(chat) = chat {
+                        let mut parts = tail.split_whitespace();
+                        let who = parts.next().unwrap_or_default();
+                        let set = parts.next().unwrap_or_default();
+                        let days = parts.next().unwrap_or_default();
+                        match (decode_ik(who), decode_rights(set), days.parse::<u64>()) {
+                            (Some(who), Some(rights), Ok(days)) => {
+                                if rights != 0 && set.contains('a') {
+                                    // §6.5: сказать это надо при назначении,
+                                    // а не при снятии.
+                                    println!(
+                                        "< {}",
+                                        ratatosk_proto::channel::AdmitterGrantConsequences::ui_text()
+                                    );
+                                }
+                                let until_ms = wall_ms() + days * 24 * 60 * 60 * 1000;
+                                handle
+                                    .send(Command::SetChannelRight {
+                                        chat,
+                                        who,
+                                        rights,
+                                        until_ms: if rights == 0 { 0 } else { until_ms },
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            _ => println!(
+                                "< нужно: /right <id канала> <ключ> <waed|-> <дней> — \
+                                 w писать, a впускать, e исключать, d править"
+                            ),
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/pow ") {
+                    let (chat, bits) = split_group(rest, "/pow <id канала> <бит>");
+                    if let Some(chat) = chat {
+                        match bits.trim().parse::<u32>() {
+                            Ok(bits) => {
+                                handle.send(Command::SetChannelPow { chat, bits }).await.ok();
+                            }
+                            Err(_) => println!("< нужно: /pow <id канала> <бит>, ноль снимает цену"),
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/rotate ") {
+                    let (chat, _) = split_group(rest, "/rotate <id канала>");
+                    if let Some(chat) = chat {
+                        // Кнопка называется последствием (§6.4, §15).
+                        println!(
+                            "< {}",
+                            ratatosk_proto::channel::KeyRotationConsequences::ui_text()
+                        );
+                        handle.send(Command::RotateChannelKey { chat }).await.ok();
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/grants ") {
+                    let (chat, _) = split_group(rest, "/grants <id канала>");
+                    if let Some(chat) = chat {
+                        show_grants(&handle, chat).await;
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/admits ") {
+                    let (chat, _) = split_group(rest, "/admits <id канала>");
+                    if let Some(chat) = chat {
+                        show_admits(&handle, chat).await;
+                    }
                     continue;
                 }
                 if let Some(rest) = line.strip_prefix("/rename ") {
@@ -2768,6 +2945,7 @@ async fn console(
                     | Event::ChannelCreated { .. }
                     | Event::ChannelChanged { .. }
                     | Event::ChannelSubscribed { .. }
+                    | Event::ChannelUnsubscribed { .. }
                     | Event::ChannelKeyRotated { .. }
                     | Event::ChannelAdmitted { .. }
                     | Event::GroupMembershipChanged { .. }
@@ -2878,13 +3056,192 @@ async fn last_in_group(
         .map(|view| view.message.msg_id)
 }
 
+/// Подсказка по канальной команде, набранной без аргументов.
+///
+/// `None` — это не канальная команда без аргументов, и строку надо
+/// разбирать дальше: она может быть и командой с аргументами,
+/// и обычным сообщением.
+///
+/// Список здесь, а не по месту каждого разбора: забыть одну строку
+/// из десяти — значит вернуть ровно ту поломку, ради которой список
+/// и заведён.
+fn channel_usage(line: &str) -> Option<&'static str> {
+    Some(match line.trim() {
+        "/newchannel" => "/newchannel <open|invite> <название>",
+        "/clink" => "/clink <id канала> — id печатает /groups",
+        "/sub" => "/sub <ссылка ratatosk:v0:channel:…>",
+        "/unsub" => "/unsub <id канала> — стирает ключи чтения вместе с архивом",
+        "/admit" => "/admit <id канала> <ключ> — ключ печатает /who",
+        "/right" => "/right <id канала> <ключ> <waed|-> <дней>",
+        "/pow" => "/pow <id канала> <бит>, ноль снимает цену",
+        "/rotate" => "/rotate <id канала>",
+        "/grants" => "/grants <id канала>",
+        "/admits" => "/admits <id канала>",
+        // `/channels` не существует: каналы показывает `/groups` — они
+        // и есть группы со вторым профилем (§3.2).
+        "/channels" => "/groups — каналы показываются там же, где группы",
+        _ => return None,
+    })
+}
+
+/// Системное время в миллисекундах — для срока выдачи (§6.3).
+///
+/// Здесь, а не у ядра: срок в команде **абсолютный**, и считает его тот,
+/// кто её отдаёт, — ровно как это сделает клиент на телефоне. Часы ядра
+/// для этого не годятся: §9.1 держит их входом для HLC, а не источником
+/// значений для протокола.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Текст §15, который надо показать **заводящему** канал. `None` —
+/// показывать нечего.
+///
+/// # Почему у канала по приглашению текста нет
+///
+/// **Поломка, найденная на стенде.** Здесь печатался
+/// `channel_private_notice`, а он обращён к тому, кто **подписывается**:
+/// «Впустить вас должен владелец, и он должен быть для этого на связи».
+/// Владелец, заводящий свой канал, читал про то, что его самого должен
+/// кто-то впустить.
+///
+/// Текста для этого действия в §15 нет — и выдумывать его здесь нельзя:
+/// тексты живут в `proto` и связаны проверками со свойствами протокола
+/// (§14). Отдача `Option` — способ не соврать молча: «текста нет» здесь
+/// выражено типом, а не пустой строкой.
+///
+/// У открытого канала текст есть и заводящему он нужен: ключ чтения
+/// уедет в ссылку, и **закрыть доступ обратно нельзя никогда**.
+fn creation_notice(open: bool) -> Option<&'static str> {
+    open.then(ratatosk_proto::channel::OpenChannelConsequences::ui_text)
+}
+
+/// Текст §15 тому, кто **подписывается** по ссылке, — до подписки.
+///
+/// Оба здесь на месте: открытому каналу человек должен знать, что ключ
+/// лежит в ссылке и раздаётся дальше вместе с ней; каналу по приглашению
+/// — что его должен впустить владелец, и до тех пор канал не откроется.
+fn subscription_notice(open: bool) -> &'static str {
+    if open {
+        ratatosk_proto::channel::OpenChannelConsequences::ui_text()
+    } else {
+        ratatosk_proto::channel::PrivateChannelConsequences::ui_text()
+    }
+}
+
+/// Разбирает ключ участника из шестидесяти четырёх знаков hex.
+fn decode_ik(text: &str) -> Option<[u8; 32]> {
+    let raw = data_encoding::HEXLOWER.decode(text.trim().as_bytes()).ok()?;
+    let mut ik = [0u8; 32];
+    if raw.len() != 32 {
+        return None;
+    }
+    ik.copy_from_slice(&raw);
+    Some(ik)
+}
+
+/// Разбирает набор прав из букв: `w` писать, `a` впускать, `e` исключать,
+/// `d` править. Прочерк — снять всё.
+///
+/// Незнакомая буква — отказ, а не пропуск: набрав `/right ... wx 30`,
+/// человек имел в виду что-то, и молча выдать ему одно `w` значило бы
+/// выдать не то, о чём он просил.
+fn decode_rights(text: &str) -> Option<u32> {
+    use ratatosk_proto::channel::Rights;
+
+    if text == "-" {
+        return Some(0);
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let mut rights = Rights::none();
+    for letter in text.chars() {
+        rights = match letter {
+            'w' => rights.with(Rights::WRITE),
+            'a' => rights.with(Rights::ADMIT),
+            'e' => rights.with(Rights::EVICT),
+            'd' => rights.with(Rights::EDIT),
+            _ => return None,
+        };
+    }
+    Some(rights.bits())
+}
+
+/// Выдачи прав канала (§6.2, §6.3).
+async fn show_grants(handle: &DriverHandle, chat: [u8; 16]) {
+    let Some(grants) = handle.channel_grants(chat).await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if grants.is_empty() {
+        println!("< выдач нет — или представление канала ещё не приехало");
+        return;
+    }
+    for grant in grants {
+        // «Истекла» печатается словом: строка остаётся в документе
+        // до следующей версии (§6.2), и молчаливый пропуск истёкших
+        // спрятал бы от хозяина стенда ровно то, что §6.3 велит показать.
+        println!(
+            "< {} {} [{}] до {}{}",
+            data_encoding::HEXLOWER.encode(&grant.who),
+            grant.name,
+            rights_letters(grant.rights),
+            grant.until_ms,
+            if grant.live { "" } else { "  (истекла)" }
+        );
+    }
+}
+
+/// Учёт впусков (§6.5).
+async fn show_admits(handle: &DriverHandle, chat: [u8; 16]) {
+    let Some(admits) = handle.channel_admits(chat).await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if admits.is_empty() {
+        println!("< впусков нет");
+        return;
+    }
+    for admit in admits {
+        println!(
+            "< {} {} впущен {} на поколении {}",
+            data_encoding::HEXLOWER.encode(&admit.who),
+            admit.name,
+            admit.admitted_by_name,
+            admit.generation
+        );
+    }
+}
+
+/// Биты прав обратно в буквы — теми же, какими их набирают.
+fn rights_letters(bits: u32) -> String {
+    use ratatosk_proto::channel::Rights;
+
+    let rights = Rights::from_bits(bits);
+    let mut letters = String::new();
+    for (right, letter) in
+        [(Rights::WRITE, 'w'), (Rights::ADMIT, 'a'), (Rights::EVICT, 'e'), (Rights::EDIT, 'd')]
+    {
+        if rights.has(right) {
+            letters.push(letter);
+        }
+    }
+    if letters.is_empty() {
+        letters.push('-');
+    }
+    letters
+}
+
 async fn show_groups(handle: &DriverHandle) {
     let Some(groups) = handle.groups().await else {
         println!("< драйвер остановлен");
         return;
     };
     if groups.is_empty() {
-        println!("< групп нет: /newgroup <название>");
+        println!("< ни групп, ни каналов: /newgroup <название> либо /newchannel <open|invite> <название>");
         return;
     }
     for group in groups {
@@ -2903,6 +3260,40 @@ async fn show_groups(handle: &DriverHandle) {
         // доехала, — при одном и том же «есть» она обязана меняться.
         if group.avatar_ms != 0 {
             println!("    аватарка есть, метка {}", group.avatar_ms);
+        }
+        // Канальное — отдельной строкой и только у канала: у группы
+        // этих вопросов нет вовсе (§3.2).
+        if let Some(channel) = &group.channel {
+            println!(
+                "    канал {}, версия {}, права [{}], цена {} бит, поколение {}{}{}{}",
+                match channel.open {
+                    Some(true) => "открытый",
+                    Some(false) => "по приглашению",
+                    // Документа ещё нет: порода известна только
+                    // из ссылки, а ссылка ничем не подписана (§10.2).
+                    None => "породы пока не знаем",
+                },
+                channel.version,
+                rights_letters(channel.rights),
+                channel.pow_bits,
+                channel.generation,
+                if channel.readable { "" } else { ", читать нечем" },
+                if channel.awaiting { ", ждём впуска" } else { "" },
+                if channel.may_rotate { ", ключ можно повернуть" } else { "" },
+            );
+            // §6.3: факт, а не вывод. «От владельца ничего не приходило»
+            // — это про наш приём, а не про то, где владелец.
+            if channel.owner_unseen {
+                if let Some(quiet) = channel.owner_quiet_ms {
+                    println!("    от владельца ничего не приходило {} суток", quiet / 86_400_000);
+                }
+            }
+            if channel.grants_expiring != 0 {
+                println!(
+                    "    выдач истекает меньше чем через месяц: {} — продлите заранее",
+                    channel.grants_expiring
+                );
+            }
         }
         for member in &group.members {
             // Ключ целиком: им исключают (`/evict`), и обрезанный пришлось бы
@@ -2980,6 +3371,16 @@ async fn show_contacts(handle: &DriverHandle, directory: &LanDirectory) {
         // Отпечаток — то, что сверяют голосом (§4.2). Без него отметка
         // «не сверен» остаётся упрёком без способа его снять.
         println!("    отпечаток: {}", contact.fingerprint);
+        // **Ключ целиком**, а не только начало в первой строке. Им
+        // адресуются `/invite`, `/evict`, `/admit` и `/right`, и все
+        // четыре требуют шестидесяти четырёх знаков — то же правило,
+        // по которому `/groups` печатает ключи участников целиком.
+        //
+        // Пока его здесь не было, подсказки этих команд («ключ печатает
+        // /who») говорили неправду: в списке стояло начало из двенадцати
+        // знаков, и взять недостающее было негде. Поймано на стенде —
+        // «ничего из /who не подходит».
+        println!("    ключ: {}", data_encoding::HEXLOWER.encode(&contact.peer_ik));
 
         // **Рядом ли он прямо сейчас** — отдельной строкой и первой
         // из адресных, потому что это самый частый вопрос к списку.
@@ -4352,7 +4753,11 @@ fn report(event: &Event) {
             );
         }
         Event::ChannelKeyRotated { chat, generation } => {
-            println!("< ключ чтения канала {} повернулся: поколение {generation}", short(chat));
+            // **«Поколение», а не «повернулся».** Событие приходит и на
+            // поворот, и на первую выдачу ключа впущенному — а у того
+            // ничего не поворачивалось, он только что получил первое.
+            // Читать «повернулся: поколение 0» человеку неоткуда.
+            println!("< ключ чтения канала {}: поколение {generation}", short(chat));
         }
         Event::ChannelSubscribed { chat, awaiting } => {
             // Названия здесь нет: оно внутри представления, а его ещё
@@ -4360,26 +4765,42 @@ fn report(event: &Event) {
             let what = if *awaiting { "ждём впуска" } else { "открытый" };
             println!("< подписались на канал {} ({what})", short(chat));
         }
+        Event::ChannelUnsubscribed { chat } => {
+            println!("< отписались от канала {}: ключи чтения стёрты", short(chat));
+        }
         Event::ChannelChanged { chat, version, title } => {
             println!("< канал {} обновился до версии {version}: {title}", short(chat));
         }
         Event::ChannelCreated { chat, title, open } => {
             // Порода называется словом, а не флагом: §6.1 требует, чтобы
             // одно слово означало одну гарантию, и «open=true» ею не является.
-            let kind = if *open { "открытый" } else { "по приглашению" };
-            println!("< канал {} заведён ({kind}): {title}", short(chat));
+            //
+            // Породы может не быть вовсе: так приходит событие тому, кого
+            // впустили, — вводный блок говорит «это канал», а порода живёт
+            // в представлении и приедет следом.
+            match open {
+                Some(true) => println!("< канал {} заведён (открытый): {title}", short(chat)),
+                Some(false) => {
+                    println!("< канал {} заведён (по приглашению): {title}", short(chat));
+                }
+                None => println!("< канал {} появился: {title}", short(chat)),
+            }
         }
         Event::GroupMembershipChanged { chat } => {
-            println!("< состав группы {} изменился", short(chat));
+            // **«Чат», а не «группа».** Событие общее: состав меняется
+            // и у группы, и у канала (там — список читателей у владельца,
+            // §3.2). Звать канал группой — тот же промах, что был
+            // у «группа заведена» на вводном блоке.
+            println!("< состав чата {} изменился", short(chat));
         }
         Event::GroupRenamed { chat, title } => {
-            println!("< группа {} теперь называется: {title}", short(chat));
+            println!("< чат {} теперь называется: {title}", short(chat));
         }
         Event::GroupAvatarChanged { chat } => {
             // Байты в событии не едут — их спрашивают, когда рисуют.
             // Стенд не рисует ничего, поэтому печатает только факт;
             // «есть ли теперь картинка» видно по `/groups`.
-            println!("< у группы {} сменилась аватарка", short(chat));
+            println!("< у чата {} сменилась аватарка", short(chat));
         }
         Event::FileProgress { file_id, received, total } => {
             println!("< файл {}: {received}/{total}", short(file_id));
@@ -4593,6 +5014,94 @@ fn adorn(reactions: &[Reaction]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kind_notice_goes_to_the_person_it_is_written_for() {
+        // **Поломка, найденная на стенде.** Заведение канала печатало текст
+        // §15 по породе — и у канала по приглашению это был
+        // `channel_private_notice`, обращённый к тому, кто подписывается:
+        // «Впустить вас должен владелец». Владелец, заводящий свой канал,
+        // читал про то, что его самого должен кто-то впустить.
+        assert_eq!(
+            creation_notice(false),
+            None,
+            "заводящему канал по приглашению §15 не говорит ничего — и выдумывать нельзя"
+        );
+        assert_eq!(
+            creation_notice(true),
+            Some(ratatosk_proto::channel::OpenChannelConsequences::ui_text()),
+            "а про открытый заводящему сказать надо: доступ обратно не закрыть"
+        );
+
+        // Подписывающемуся — оба, и каждый свой.
+        assert_eq!(
+            subscription_notice(false),
+            ratatosk_proto::channel::PrivateChannelConsequences::ui_text()
+        );
+        assert_eq!(
+            subscription_notice(true),
+            ratatosk_proto::channel::OpenChannelConsequences::ui_text()
+        );
+        // И тексты эти **разные**: сойдись они, проверка выше зеленела бы
+        // на пустом месте.
+        assert_ne!(subscription_notice(false), subscription_notice(true));
+    }
+
+    #[test]
+    fn a_channel_command_without_arguments_says_what_it_wants() {
+        // Разборы ищут приставку **с пробелом**, и команда без аргументов
+        // проваливалась в общий путь «строка без команды» — то есть уезжала
+        // собеседнику текстом. Поймано на стенде: в чужом чате появились
+        // строки `/channels` и `/clink`.
+        for bare in [
+            "/newchannel",
+            "/clink",
+            "/sub",
+            "/unsub",
+            "/admit",
+            "/right",
+            "/pow",
+            "/rotate",
+            "/grants",
+            "/admits",
+        ] {
+            assert!(channel_usage(bare).is_some(), "{bare} без аргументов обязан подсказывать");
+        }
+        // `/channels` команды нет вовсе: каналы показывает `/groups`.
+        assert!(channel_usage("/channels").is_some());
+        // А команда **с** аргументами сюда не попадает: её разбирают ниже.
+        assert!(channel_usage("/clink 76ee0a3d").is_none());
+        assert!(channel_usage("обычное сообщение").is_none(), "текст человека — не команда");
+    }
+
+    #[test]
+    fn rights_letters_survive_the_round_trip() {
+        use ratatosk_proto::channel::Rights;
+
+        assert_eq!(decode_rights("-"), Some(0), "прочерк снимает всё");
+        assert_eq!(decode_rights("w"), Some(Rights::WRITE.bits()));
+        assert_eq!(
+            decode_rights("waed"),
+            Some(Rights::all().bits()),
+            "четыре буквы — четыре права §6.2"
+        );
+        // Незнакомая буква — отказ, а не пропуск: набрав `wx`, человек имел
+        // в виду что-то, и выдать ему одно `w` значило бы выдать не то,
+        // о чём он просил.
+        assert_eq!(decode_rights("wx"), None);
+        assert_eq!(decode_rights(""), None);
+
+        for set in ["w", "a", "e", "d", "waed", "we"] {
+            let bits = decode_rights(set).expect("набор разбирается");
+            let shown = rights_letters(bits);
+            assert_eq!(
+                decode_rights(&shown),
+                Some(bits),
+                "показанное обязано читаться обратно: {set} → {shown}"
+            );
+        }
+        assert_eq!(rights_letters(0), "-", "пустой набор печатается прочерком, а не пустотой");
+    }
 
     #[test]
     fn a_long_text_is_exactly_as_long_as_asked() {

@@ -362,15 +362,28 @@ fn to_sim(transport: Transport) -> TransportKind {
 /// `restart`, — чтобы сценарий читался как запись сеанса за консолью,
 /// а не как обход внутренностей ядра.
 struct Stand {
+    /// Сколько событий сети разобрано с начала сценария.
+    ///
+    /// Мера цены, а не отладочная мелочь: по ней видно, линейно ли растёт
+    /// работа с числом читателей. Именно она показала, что слово в канале
+    /// стоит двух шагов на читателя, а впуск — квадрата (§8ф).
+    steps: usize,
     sim: Sim<Peer>,
 }
 
-/// Предел шагов на одно «дать сети затихнуть».
+/// Предел шагов на одно «дать сети затихнуть» — **на узел**.
 ///
 /// Щедрый, и это не послабление: он ловит **кольцо** событий, а кольцо
 /// не сходится ни при каком пределе. Честный разговор троих с почтой
 /// в запасе стоит сотен шагов.
-const MAX_STEPS: usize = 20_000;
+///
+/// **Считается от числа узлов, а не плоским числом.** Плоские двадцать
+/// тысяч означали, что сценарий на двадцати шести узлах падает с криком
+/// «кольцо событий», хотя кольца там нет: впуск в канал стоит кадров
+/// по числу уже впущенных, и тридцать тысяч шагов на двадцать пять
+/// читателей — цена, а не поломка. Предел, срабатывающий от размера
+/// сценария, ловит не кольцо, а собственную тесноту.
+const MAX_STEPS_PER_NODE: usize = 20_000;
 
 impl Stand {
     /// Собирает стенд из `count` узлов и знакомит всех со всеми (§4.2).
@@ -465,7 +478,7 @@ impl Stand {
             }
         }
 
-        let mut stand = Stand { sim };
+        let mut stand = Stand { steps: 0, sim };
         stand.settle();
         stand
     }
@@ -478,8 +491,8 @@ impl Stand {
         // соседство погасшим — обычное дело. Круг объявлений здесь и есть
         // то, что в жизни происходит само.
         self.beacons();
-        match self.sim.run_to_idle(MAX_STEPS) {
-            Ok(_) => {}
+        match self.sim.run_to_idle(MAX_STEPS_PER_NODE * self.sim.len()) {
+            Ok(done) => self.steps += done,
             Err(done) => panic!(
                 "сеть не затихла за {done} шагов: кольцо событий или срок, взводящий сам себя \
                  (сид {:#x})",
@@ -499,6 +512,10 @@ impl Stand {
         let until_ms = self.sim.now_ms() + duration_ms;
         while self.sim.now_ms() < until_ms {
             self.beacons();
+            // Обслуживание — на каждом круге, как у драйвера: он
+            // спрашивает после каждого пробуждения, а не по таймеру
+            // (§6.4, §12).
+            self.maintenance();
             let step_ms = BEACON_EVERY_MS.min(until_ms - self.sim.now_ms());
             self.sim.run_for(step_ms);
         }
@@ -531,6 +548,103 @@ impl Stand {
                 _ => None,
             })
             .expect("о заведении группы обязано прийти событие")
+    }
+
+    /// Заводит канал (фаза 2, §6.1) и отдаёт его идентификатор.
+    ///
+    /// Порода называется словом и здесь: она задаётся при заведении
+    /// и не меняется никогда, а умолчание в заготовке стенда означало бы,
+    /// что половина сценариев проверяет не ту породу, о которой написана.
+    fn create_channel(&mut self, owner: NodeId, title: &str, open: bool) -> [u8; 16] {
+        let title = title.to_owned();
+        let events = self.sim.act(owner, |node, ctx| {
+            let before = node.events.len();
+            node.command(ctx, Command::CreateChannel { title, open });
+            node.events[before..].to_vec()
+        });
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::ChannelCreated { chat, .. } => Some(*chat),
+                _ => None,
+            })
+            .expect("о заведении канала обязано прийти событие")
+    }
+
+    /// Впускает читателя в канал (фаза 2, §6.5).
+    fn admit(&mut self, owner: NodeId, chat: [u8; 16], guest: NodeId) {
+        let peer_ik = self.ik(guest);
+        self.sim.act(owner, |node, ctx| {
+            node.command(ctx, Command::AdmitToChannel { chat, peer_ik });
+        });
+    }
+
+    /// Отписывается от канала (фаза 2, §10.6).
+    fn unsubscribe(&mut self, who: NodeId, chat: [u8; 16]) {
+        self.sim.act(who, |node, ctx| {
+            node.command(ctx, Command::UnsubscribeFromChannel { chat });
+        });
+    }
+
+    /// Гонит модельное время большими шагами, спрашивая обслуживание.
+    ///
+    /// Отдельно от `run_for` ровно из-за размера шага: тот идёт
+    /// получасовыми кругами эфира, и месяц в нём — это восемьдесят тысяч
+    /// кругов. Здесь шаг шестичасовой, а эфир молчит — как у телефона,
+    /// пролежавшего ночь в кармане.
+    ///
+    /// Сроки §6.3 и §6.4 меряются месяцами, и другого способа их проверить
+    /// нет: ждать квартал нельзя, а подделка часов превратила бы стенд
+    /// в симулятор, только хуже.
+    fn sleep_for(&mut self, duration_ms: u64) {
+        let until_ms = self.sim.now_ms() + duration_ms;
+        while self.sim.now_ms() < until_ms {
+            self.maintenance();
+            let step_ms = (6 * 60 * 60 * 1000).min(until_ms - self.sim.now_ms());
+            self.sim.run_for(step_ms);
+        }
+        self.maintenance();
+    }
+
+    /// Новейшее поколение ключа чтения, каким его знает этот узел (§6.4).
+    fn generation(&self, who: NodeId, chat: [u8; 16]) -> u64 {
+        self.sim
+            .node(who)
+            .engine()
+            .store()
+            .archive_keys(&chat)
+            .expect("поколения ключа чтения")
+            .iter()
+            .map(|key| key.generation)
+            .max()
+            .expect("хоть одно поколение у канала есть всегда")
+    }
+
+    /// Факты канала глазами этого узла (§6).
+    fn facts(&self, who: NodeId, chat: [u8; 16]) -> ratatosk_core::engine::ChannelFacts {
+        self.sim
+            .node(who)
+            .engine()
+            .channel_facts(&chat, self.sim.now_ms())
+            .expect("у канала обязаны быть факты канала")
+    }
+
+    /// Спрашивает у узла обслуживание по расписанию — то, что в жизни
+    /// спрашивает драйвер после каждого пробуждения (§6.4).
+    ///
+    /// Без этого круга поворот ключа раз в месяц на стенде не случился бы
+    /// вовсе: стенд гоняет `Engine` напрямую, а расписание живёт
+    /// не таймером, а вопросом «не пора ли» — ровно потому, что телефон
+    /// спит (§13.1).
+    fn maintenance(&mut self) {
+        let count = u16::try_from(self.sim.len()).expect("узлов не больше 65535");
+        for i in 0..count {
+            self.sim.act(NodeId(i), |node, ctx| {
+                let now = ctx.now_ms();
+                let effects = node.engine_mut().rotate_channels_if_due(now).expect("обход каналов");
+                node.apply(ctx, effects);
+            });
+        }
     }
 
     fn invite(&mut self, owner: NodeId, chat: [u8; 16], guest: NodeId) {
@@ -1850,4 +1964,382 @@ fn a_parked_group_frame_survives_a_restart_and_is_delivered_after() {
         stand.sim.node(C).engine().store().pending_group().expect("очередь").is_empty(),
         "и с диска тоже — иначе перезапуск разобрал бы его во второй раз"
     );
+}
+
+// --- Каналы (фаза 2, §6, §10) --------------------------------------------
+//
+// Здесь и только здесь канал проверяется **настоящим хранилищем**
+// и настоящим перезапуском. Проверки крейта (`groups.rs`, `pair.rs`) держат
+// правила по одному; стенд стережёт то, что живёт между ними: что стёртое
+// не возвращается с диска, что расписание срабатывает в модельном месяце
+// и что сказанное каналом доезжает до читателя на другом узле.
+
+/// Сутки в миллисекундах — чтобы сроки в сценариях читались.
+///
+/// Числа сроков ниже повторены **руками**, а не взяты из ядра: они
+/// стерегут обещания §6.3 и §6.4, и возьми проверка константу, поднятие
+/// месяца до квартала прошло бы молча (см. `CLAUDE.md`).
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[test]
+fn an_unsubscribed_channel_does_not_come_back_after_a_restart() {
+    // §10.6: «чат удаляется, ключи стираются». Проверяется именно
+    // с диском: карта в памяти забывает что угодно, а поломка такого рода
+    // выглядит как «отписался, перезапустил — канал снова здесь».
+    let mut stand = Stand::new(0x6801, 2);
+    let chat = stand.create_channel(A, "вестник", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.say(A, chat, "первое слово");
+    stand.settle();
+    stand.assert_seen(B, chat, &["первое слово"]);
+
+    // До отписки читать есть чем — иначе следующая половина проверки
+    // была бы истинной на пустом месте.
+    let before = stand.sim.node(B).engine().store().archive_keys(&chat).expect("ключи чтения");
+    assert!(!before.is_empty(), "до отписки поколение ключа чтения обязано быть");
+
+    stand.unsubscribe(B, chat);
+    stand.settle();
+
+    let gone = |stand: &Stand, when: &str| {
+        let node = stand.sim.node(B);
+        assert!(!node.engine().groups().contains_key(&chat), "{when}: чат остался в памяти");
+        let store = node.engine().store();
+        assert!(
+            store.archive_keys(&chat).expect("ключи чтения").is_empty(),
+            "{when}: ключи чтения не стёрты — архив остался бы открытым"
+        );
+        assert!(store.channel(&chat).expect("представление").is_none(), "{when}: документ остался");
+        assert!(
+            store.subscription(&chat).expect("подписка").is_none(),
+            "{when}: подписка осталась"
+        );
+        assert!(
+            store.sender_chains(&chat).expect("цепочки").is_empty(),
+            "{when}: цепочки отправителей остались"
+        );
+    };
+    gone(&stand, "сразу после отписки");
+
+    // Настоящий перезапуск: подъём идёт с диска, и ровно здесь жили
+    // поломки этого класса.
+    stand.restart(B);
+    stand.settle();
+    gone(&stand, "после перезапуска");
+
+    // Блок ухода доехал: у владельца в составе снова он один (§10.6 —
+    // «дешевле прислать блок ухода, чем ждать срока»).
+    stand.assert_members(A, chat, 1);
+
+    // И сказанное после ухода читателю больше не приходит.
+    stand.say(A, chat, "после ухода");
+    stand.settle();
+    assert!(
+        !stand.sim.node(B).engine().groups().contains_key(&chat),
+        "ушедший не заводит канал заново от первого же слова"
+    );
+}
+
+#[test]
+fn the_owner_learns_about_a_leaving_reader_even_after_the_chat_is_wiped() {
+    // Стык, который легко сломать уборкой: отписка **стирает чат**, а блок
+    // ухода к этому моменту уже собран. Уход обязан дойти до владельца,
+    // когда тот появится, — даже если у ушедшего этого чата больше нет
+    // и не будет, и даже если он успел перезапуститься.
+    //
+    // **Чего проверка не различает, сказано вслух.** Где кадр пролежал
+    // это время — в нашей очереди доставки или в спуле связи, — здесь
+    // не видно: узел «не в сети» у стенда означает спул, как и у соседней
+    // `a_message_waits_for_someone_who_is_away`. Проверено поломкой:
+    // вычистить очередь целиком (и в памяти, и на диске) — тест остаётся
+    // зелёным, потому что кадр к тому моменту уже ушёл в связь.
+    // Стережёт она другое и важное: что уборка отписки не отменяет
+    // **самого ухода**.
+    let mut stand = Stand::new(0x6806, 2);
+    let chat = stand.create_channel(A, "вестник", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+
+    stand.offline(A);
+    stand.unsubscribe(B, chat);
+    stand.settle();
+    assert!(stand.sim.node(B).engine().groups().get(&chat).is_none(), "у ушедшего чата нет сразу");
+
+    // И перезапуск ушедшего между уходом и доставкой: очередь поднимается
+    // с диска, а чата, к которому она относилась, уже не существует.
+    stand.restart(B);
+    stand.online(A);
+    stand.settle();
+
+    stand.assert_members(A, chat, 1);
+}
+
+#[test]
+fn the_read_key_turns_itself_after_a_month_and_not_before() {
+    // §6.4: «раз в месяц по умолчанию». Расписание, а не таймер: ядро
+    // спрашивают после каждого пробуждения, и месяц, проспанный
+    // устройством, наступает при первом вопросе после него.
+    //
+    // Число повторено руками: возьми проверка константу ядра, растяжение
+    // месяца до квартала прошло бы молча.
+    let mut stand = Stand::new(0x6802, 2);
+    let chat = stand.create_channel(A, "вестник", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+
+    stand.sleep_for(20 * DAY_MS);
+    assert_eq!(
+        stand.generation(A, chat),
+        0,
+        "раньше месяца ключ не поворачивается: каждый поворот стоит блока на читателя"
+    );
+
+    stand.sleep_for(15 * DAY_MS);
+    stand.settle();
+    assert_eq!(stand.generation(A, chat), 1, "через месяц ключ обязан повернуться сам");
+    // И это не бухгалтерия у владельца: новое поколение доехало
+    // до читателя, иначе он перестал бы читать канал на второй месяц.
+    assert_eq!(stand.generation(B, chat), 1, "новое поколение обязано доехать до читателя");
+
+    // Читатель по-прежнему читает — поворот не отрезал своего же.
+    stand.say(A, chat, "после поворота");
+    stand.settle();
+    stand.assert_seen(B, chat, &["после поворота"]);
+}
+
+#[test]
+fn an_open_channel_never_turns_its_key_by_itself() {
+    // Вторая половина того же расписания, и без неё первая ничего
+    // не значит: у открытого канала ключ лежит в ссылке и у всех, кому
+    // её переслали (§6.1, §10.7). Поворот там — ложь о том, что доступ
+    // закрыли.
+    //
+    // **Чего эта проверка не стережёт, сказано вслух.** Обещание держат
+    // два слоя: отбор пород в обходе расписания и отказ самой команды
+    // (`OpenChannelHasNoRotation`). Снятие **отбора** тест не роняет —
+    // проверено поломкой: команда всё равно откажет, и поколение
+    // останется нулевым. Отбор существует не ради поведения, а ради
+    // журнала: без него открытый канал писал бы туда отказ каждый час
+    // до скончания века. Сам отказ стережёт
+    // `an_open_channel_refuses_rotation_with_words` в `pair.rs`.
+    let mut stand = Stand::new(0x6803, 2);
+    let chat = stand.create_channel(A, "открытый", true);
+    stand.settle();
+
+    stand.sleep_for(70 * DAY_MS);
+    stand.settle();
+    assert_eq!(
+        stand.generation(A, chat),
+        0,
+        "в открытом канале поколение одно и не поворачивается никогда"
+    );
+}
+
+#[test]
+fn a_channel_owner_who_says_nothing_for_two_months_is_shown_as_silent() {
+    // §6.3: метка «владельца не слышно» и её порог в два месяца. В ядре
+    // она считается по **нашему приёму** — каталога пиров нет, — и
+    // говорит поэтому «от владельца ничего не приходило».
+    //
+    // Порог повторён руками, и это то же правило, что у месяца выше.
+    let mut stand = Stand::new(0x6804, 2);
+    let chat = stand.create_channel(A, "вестник", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.say(A, chat, "последнее слово");
+    stand.settle();
+
+    stand.sleep_for(50 * DAY_MS);
+    stand.settle();
+    assert!(
+        !stand.facts(B, chat).owner_unseen,
+        "полтора месяца — ещё не отсутствие: §6.3 называет два"
+    );
+
+    stand.sleep_for(15 * DAY_MS);
+    stand.settle();
+    let facts = stand.facts(B, chat);
+    assert!(facts.owner_unseen, "два месяца молчания обязаны стать меткой");
+    assert!(
+        facts.owner_quiet_ms.is_some_and(|quiet| quiet >= 60 * DAY_MS),
+        "рядом с меткой едет и сам срок: человеку показывают факт, а не вывод"
+    );
+
+    // Владелец сказал слово — и метка снялась. Без этой половины проверка
+    // стерегла бы только то, что счётчик растёт.
+    stand.say(A, chat, "я здесь");
+    stand.settle();
+    assert!(!stand.facts(B, chat).owner_unseen, "услышали владельца — метки быть не должно");
+}
+
+#[test]
+fn a_silent_owner_of_our_own_channel_is_not_a_thing() {
+    // Своё молчание метки не заводит: владелец сам себе ничего
+    // не присылает, и «от владельца ничего не приходило» на его же
+    // экране означало бы поломку там, где связь не нужна.
+    let mut stand = Stand::new(0x6805, 2);
+    let chat = stand.create_channel(A, "вестник", false);
+    stand.settle();
+
+    stand.sleep_for(70 * DAY_MS);
+    stand.settle();
+    let facts = stand.facts(A, chat);
+    assert!(!facts.owner_unseen, "владелец не бывает молчащим для себя");
+    assert!(facts.owner_quiet_ms.is_none(), "и считать тут нечего");
+}
+
+// --- Канал на многих читателях (фаза 2, §7.5.2, §17.1) --------------------
+//
+// «До какого n держит звезда» — вопрос §17.1, и ответ на него меряется,
+// а не угадывается. Здесь он и меряется: сколько шагов сети стоит слово
+// и сколько стоит впуск. Руками это не проверить — двадцать узлов человек
+// не разведёт, — и ровно за этим стенд и заведён.
+
+#[test]
+fn a_word_in_a_channel_costs_the_same_per_reader_however_many_there_are() {
+    // **Звезда линейна, и это её обещание** (§7.5.2: «ноль сидов — это
+    // звезда, и она обязана работать как состояние, а не как деградация»).
+    // Слово владельца стоит по два шага сети на читателя — отправка
+    // и квитанция, — и растёт ровно с числом читателей, а не быстрее.
+    //
+    // Проверяются **два размера разом**: одно число ничего не сказало бы
+    // о росте, а пара говорит наклон.
+    let mut cost = Vec::new();
+    for readers in [4u16, 8] {
+        let mut stand = Stand::new(0xA100 + u64::from(readers), readers + 1);
+        let chat = stand.create_channel(A, "лента", false);
+        for i in 1..=readers {
+            stand.admit(A, chat, NodeId(i));
+        }
+        stand.settle();
+
+        let before = stand.steps;
+        stand.say(A, chat, "всем читателям");
+        stand.settle();
+        cost.push(stand.steps - before);
+
+        // И услышать обязаны **все**: цена без доставки — не цена.
+        for i in 1..=readers {
+            stand.assert_seen(NodeId(i), chat, &["всем читателям"]);
+        }
+    }
+
+    let [small, large] = [cost[0], cost[1]];
+    assert_eq!(small, 8, "четыре читателя — по два шага на каждого");
+    assert_eq!(large, 16, "восемь читателей — ровно вдвое, а не вчетверо");
+}
+
+#[test]
+fn admitting_a_reader_costs_the_same_however_many_are_already_there() {
+    // **Замер, ставший проверкой.** Впуск шёл групповой дорогой:
+    // он рассказывал о новичке каждому уже впущенному и отдавал новичку
+    // карточки и цепочки всех остальных. Цена росла быстрее квадрата —
+    // 521 шаг на пятерых, 30 630 на двадцать пять, — и при двадцати
+    // читателях очередь отложенных кадров у новичка переполнялась,
+    // унося ключ чтения и представление: читатель оставался в составе
+    // и навсегда глухим.
+    //
+    // Теперь впуск канальный (§3.2): о новичке не узнаёт никто, а он
+    // получает только своё. Цена — постоянная на читателя.
+    let mut cost = Vec::new();
+    for readers in [4u16, 8] {
+        let mut stand = Stand::new(0xA300 + u64::from(readers), readers + 1);
+        let chat = stand.create_channel(A, "лента", false);
+        stand.settle();
+        let before = stand.steps;
+        for i in 1..=readers {
+            stand.admit(A, chat, NodeId(i));
+        }
+        stand.settle();
+        cost.push((stand.steps - before) / usize::from(readers));
+    }
+    assert_eq!(cost[0], cost[1], "впуск обязан стоить одинаково при четырёх и при восьми");
+}
+
+#[test]
+fn twenty_readers_all_hear_the_channel() {
+    // Размер, на котором ломалось. Двадцать читателей — это больше, чем
+    // вмещала очередь отложенных кадров у новичка (шестьдесят четыре),
+    // и один из них глох навсегда. Проверка держит именно число: меньше
+    // — и она перестанет стеречь то, ради чего написана.
+    let readers = 20u16;
+    let mut stand = Stand::new(0xA500, readers + 1);
+    let chat = stand.create_channel(A, "лента", false);
+    for i in 1..=readers {
+        stand.admit(A, chat, NodeId(i));
+    }
+    stand.settle();
+    stand.say(A, chat, "всем двадцати");
+    stand.settle();
+
+    for i in 1..=readers {
+        stand.assert_seen(NodeId(i), chat, &["всем двадцати"]);
+        let node = stand.sim.node(NodeId(i)).engine();
+        assert!(
+            node.store().pending_group().expect("очередь").is_empty(),
+            "у читателя не должно оставаться отложенных кадров: они и терялись"
+        );
+        // И §3.2 разом: в своём составе читатель видит только себя.
+        // Остальных девятнадцать он не знает — ни ключами, ни карточками.
+        assert_eq!(
+            node.groups().get(&chat).expect("канал").group.members().count(),
+            1,
+            "состав канала знает владелец, а не читатели"
+        );
+    }
+    assert_eq!(
+        stand.sim.node(A).engine().groups().get(&chat).expect("канал").group.members().count(),
+        usize::from(readers) + 1,
+        "владелец ведёт состав целиком: на нём держится звезда"
+    );
+}
+
+#[test]
+fn a_rotation_reaches_every_reader_and_leaves_the_one_who_left_behind() {
+    // Поворот ключа (§6.4) в канале на десятке читателей: новое поколение
+    // обязано доехать **до каждого**, кто в составе, и не доехать до того,
+    // кого там нет. На двух узлах это проверено в `pair.rs`; здесь —
+    // на десяти, с настоящим хранилищем, потому что рассылка по одному
+    // запечатанному блоку на читателя это и есть то место, где цена
+    // §6.4 становится видимой.
+    let readers = 9u16;
+    let mut stand = Stand::new(0xA200, readers + 1);
+    let chat = stand.create_channel(A, "лента", false);
+    for i in 1..=readers {
+        stand.admit(A, chat, NodeId(i));
+    }
+    stand.settle();
+
+    // Последний уходит сам — и поворот его уже не касается.
+    stand.unsubscribe(NodeId(readers), chat);
+    stand.settle();
+
+    stand.sim.act(A, |node, ctx| {
+        let effects = node
+            .engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::RotateChannelKey { chat }))
+            .expect("поворот");
+        node.apply(ctx, effects);
+    });
+    stand.settle();
+
+    for i in 1..readers {
+        assert_eq!(
+            stand.generation(NodeId(i), chat),
+            1,
+            "новое поколение обязано доехать до каждого читателя"
+        );
+    }
+    assert!(
+        !stand.sim.node(NodeId(readers)).engine().groups().contains_key(&chat),
+        "ушедшего поворот не касается: канала у него нет вовсе"
+    );
+
+    // И канал после поворота продолжает читаться — всеми, кто остался.
+    stand.say(A, chat, "после поворота");
+    stand.settle();
+    for i in 1..readers {
+        stand.assert_seen(NodeId(i), chat, &["после поворота"]);
+    }
 }

@@ -7410,6 +7410,49 @@ fn a_newcomer_in_a_channel_cannot_speak_until_he_is_given_the_right() {
         .expect("владелец пишет в свой канал");
 }
 
+/// Даёт подписчику **собрать и разослать** кадр в канал — так, как это
+/// сделала бы чужая сборка.
+///
+/// # Зачем это нужно проверкам
+///
+/// В звезде публикует только владелец ([`EngineError::OnlyOwnerPublishesYet`]):
+/// состав канала знает он один (§3.2), и держателю права «писать»
+/// доставлять некому. А приёмные проверки §6.2 стерегут ровно кадр,
+/// собранный **вопреки** этому: право истекло, право сняли, работа
+/// не посчитана. Своей сборкой такой кадр теперь не собрать — значит
+/// нужен способ изобразить чужую.
+///
+/// # Как именно
+///
+/// Узел становится владельцем канала **в своей копии** — строкой чата
+/// и документом, — и после подъёма впускает того, кому будет слать.
+/// Подпись под кадром при этом остаётся его собственной, а получатель
+/// судит по **своему** представлению, где владелец прежний. То есть
+/// проверяется ровно то, что и должно: чужая сборка отправителя против
+/// нашего судейства.
+///
+/// Возвращает кадры впуска — их надо прокачать, чтобы получатель узнал
+/// цепочку отправителя и смог открыть его слово.
+fn let_him_publish(who: &mut Node, chat: [u8; 16], at: u64, to: &Node) -> Vec<Effect> {
+    // Владельца называет **подписанный документ** (§6.1), и правило
+    // звезды спрашивает про него там же, где права. Чужая сборка тем
+    // и отличается, что считает владельцем себя.
+    let mut document = who.store().channel(&chat).unwrap().expect("представление доехало");
+    document.owner_ik = who.own_card().ik;
+    who.store_mut().put_channel(&document).unwrap();
+    // Впустить получателя — чтобы было кому слать и чтобы тот узнал
+    // нашу цепочку. Повторный вызов законен: владельца приходится
+    // чинить после каждой новой версии документа (она приезжает
+    // с прежним владельцем и затирает подмену), а впуск к тому моменту
+    // уже сделан.
+    match who.step(at, Input::Command(Command::AdmitToChannel { chat, peer_ik: to.own_card().ik }))
+    {
+        Ok(effects) => effects,
+        Err(EngineError::AlreadyInGroup) => Vec::new(),
+        Err(other) => panic!("чужая сборка не собралась: {other}"),
+    }
+}
+
 #[test]
 fn a_granted_right_travels_and_lets_the_newcomer_speak() {
     // **Главная проверка круга.** Владелец выдаёт право — новая версия
@@ -7443,13 +7486,30 @@ fn a_granted_right_travels_and_lets_the_newcomer_speak() {
     assert_eq!(stored.grants.len(), 1);
     assert_eq!(stored.grants[0].who, bob.own_card().ik);
 
+    // **Своей сборкой подписчик слова не скажет**: в звезде публикует
+    // владелец (§3.2, §7.5.2) — состав знает он один, и доставлять
+    // держателю права некому. Отказ по имени, а не «нет права»: право
+    // как раз есть.
+    assert!(
+        matches!(
+            bob.step(10_000, Input::Command(Command::SendText { chat, text: "спасибо".into() })),
+            Err(EngineError::OnlyOwnerPublishesYet)
+        ),
+        "звезда возит слово от владельца, и сказать об этом надо словами"
+    );
+
+    // А вот **принять** слово с правом владелец обязан: право доехало,
+    // и приёмная сторона судит по нему (§6.2). Кадр собирает чужая
+    // сборка — своей такого больше не собрать.
+    let effects = let_him_publish(&mut bob, chat, 10_500, &alice);
+    pump(&mut bob, &mut alice, 10_500, effects);
     let effects = bob
-        .step(10_000, Input::Command(Command::SendText { chat, text: "спасибо".into() }))
-        .expect("с правом — пишем");
-    pump(&mut bob, &mut alice, 10_000, effects);
+        .step(11_000, Input::Command(Command::SendText { chat, text: "спасибо".into() }))
+        .expect("чужая сборка кадр соберёт");
+    pump(&mut bob, &mut alice, 11_000, effects);
     assert!(
         group_history(&alice, chat).iter().any(|line| line == "спасибо"),
-        "слово подписчика с правом обязано дойти до владельца"
+        "слово того, у кого право есть, обязано быть принято"
     );
 }
 
@@ -7475,9 +7535,12 @@ fn taking_the_right_away_travels_too() {
         pump(alice, bob, at, effects);
     };
 
+    // **Сперва — путь документа**, обе версии подряд: выдача доезжает,
+    // снятие доезжает следом. Подмену владельца (ниже) делать до этого
+    // нельзя — документ с прежним владельцем чужая сборка уже не примет,
+    // и проверялось бы не то.
     grant(&mut alice, &mut bob, 9_000, ratatosk_proto::channel::Rights::WRITE.bits());
-    bob.step(9_500, Input::Command(Command::SendText { chat, text: "пока можно".into() }))
-        .expect("право есть");
+    assert_eq!(bob.store().channel(&chat).unwrap().unwrap().grants.len(), 1, "выдача доехала");
 
     grant(&mut alice, &mut bob, 10_000, 0);
     assert_eq!(bob.store().channel(&chat).unwrap().unwrap().version, 3);
@@ -7485,10 +7548,19 @@ fn taking_the_right_away_travels_too() {
         bob.store().channel(&chat).unwrap().unwrap().grants.is_empty(),
         "снятая выдача обязана исчезнуть из списка, а не остаться пустой строкой"
     );
+
+    // Теперь — приём. Кадр собирает чужая сборка: своей в звезде
+    // публикует только владелец, а судит получатель по **своему**
+    // документу, где права у Боба больше нет.
+    let effects = let_him_publish(&mut bob, chat, 10_400, &alice);
+    pump(&mut bob, &mut alice, 10_400, effects);
+    let effects = bob
+        .step(10_500, Input::Command(Command::SendText { chat, text: "а теперь".into() }))
+        .expect("чужая сборка соберёт и это");
+    pump(&mut bob, &mut alice, 10_500, effects);
     assert!(
-        bob.step(10_500, Input::Command(Command::SendText { chat, text: "а теперь".into() }))
-            .is_err(),
-        "право снято — слово не проходит"
+        !group_history(&alice, chat).iter().any(|line| line == "а теперь"),
+        "право снято — слово не принимается, и судит это получатель (§6.2)"
     );
 }
 
@@ -7518,6 +7590,8 @@ fn a_word_from_someone_whose_right_expired_is_not_taken() {
         .expect("право до 20 000");
     pump(&mut alice, &mut bob, 9_000, effects);
 
+    let effects = let_him_publish(&mut bob, chat, 9_500, &alice);
+    pump(&mut bob, &mut alice, 9_500, effects);
     let effects = bob
         .step(10_000, Input::Command(Command::SendText { chat, text: "успел собрать".into() }))
         .expect("кадр собран, пока право действует");
@@ -7546,7 +7620,19 @@ fn the_representation_is_judged_by_the_signature_and_not_by_a_right() {
     // никаких, и именно поэтому она и есть нужный случай.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     let chat = shared_channel(&mut alice, &mut bob, 1_000, true);
-    assert!(bob.store().channel(&chat).unwrap().is_none(), "у Боба ещё нет представления");
+    // Документ у Боба **уже есть**: его отдаёт впуск (см.
+    // `a_newcomer_gets_the_representation_as_it_stands_now`). Прав в нём
+    // при этом никаких — и это ровно тот случай, ради которого проверка
+    // написана: принять выдачу Бобу нечем, кроме подписи владельца.
+    assert!(
+        bob.store()
+            .channel(&chat)
+            .unwrap()
+            .expect("представление приезжает вместе с впуском")
+            .grants
+            .is_empty(),
+        "до первой выдачи прав у Боба нет"
+    );
 
     let effects = alice
         .step(
@@ -7660,6 +7746,340 @@ fn a_link_to_a_channel_by_invitation_leaves_us_waiting() {
         "канал по приглашению обязан ждать впуска"
     );
     assert!(bob.store().archive_keys(&chat).unwrap().is_empty(), "ключ выдаёт владелец");
+}
+
+#[test]
+fn a_newcomer_gets_the_representation_as_it_stands_now() {
+    // **Поломка, найденная стендом.** Впуск отдавал новичку всё групповое
+    // — состав, карточки, цепочки, название, — и **не отдавал
+    // представление**. А в нём лежит всё канальное: порода, права,
+    // цена слова, окно сидирования.
+    //
+    // Снаружи это выглядело так: канал у впущенного появился, читается,
+    // а «породы пока не знаем», версия ноль и прав нет ни у кого.
+    // Документ приезжал только со **следующей** правкой владельца —
+    // то есть у канала, который никто не правит, не приезжал никогда.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = create_channel_for(&mut alice, 2_000, "лента", false);
+    // **Право выдано до впуска**, и это главная половина проверки: оно
+    // живёт в документе, и без документа его у новичка нет. Именно так
+    // владелец и поступает — сперва решает, кого зовёт писать, потом зовёт.
+    let effects = alice
+        .step(
+            3_000,
+            Input::Command(Command::SetChannelRight {
+                chat,
+                who: bob.own_card().ik,
+                rights: ratatosk_proto::channel::Rights::WRITE.bits(),
+                until_ms: u64::MAX,
+            }),
+        )
+        .expect("владелец выдаёт право");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    let effects = alice
+        .step(4_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    pump(&mut alice, &mut bob, 4_000, effects);
+
+    let mine = alice.channel_facts(&chat, 5_000).expect("факты у владельца");
+    let his = bob.channel_facts(&chat, 5_000).expect("факты у впущенного");
+    assert_eq!(his.version, mine.version, "новичок обязан получить **нынешнюю** версию");
+    assert_eq!(his.open, Some(false), "порода известна из подписанного документа");
+    assert_eq!(his.pow_bits, mine.pow_bits, "цена слова едет тем же документом");
+
+    // И право, выданное до впуска, у него **есть** — сразу, а не с первой
+    // правки документа, которой может не случиться никогда.
+    assert!(
+        bob.channel_facts(&chat, 5_000).expect("факты").rights
+            & ratatosk_proto::channel::Rights::WRITE.bits()
+            != 0,
+        "выданное до впуска право обязано доехать вместе с документом"
+    );
+    // Доставить он им в звезде всё равно ничего не может — состав знает
+    // владелец (§3.2), — и отказ говорит именно это, а не «права нет».
+    assert!(matches!(
+        bob.step(6_000, Input::Command(Command::SendText { chat, text: "я тут".into() })),
+        Err(EngineError::OnlyOwnerPublishesYet)
+    ));
+}
+
+#[test]
+fn a_channel_announces_itself_as_a_channel_to_the_one_admitted() {
+    // **§14 на самом видном месте.** Впущенный узнаёт о канале вводным
+    // блоком, и тот несёт породу чата (§3.2). Приди это `GroupCreated`,
+    // клиент нарисовал бы групповой экран со списком участников —
+    // которого в канале не существует, — и правил бы его задним числом,
+    // когда доедет представление.
+    //
+    // Породу (открытый или по приглашению) событие при этом **не
+    // называет**: вводный блок её не несёт, она живёт в подписанном
+    // представлении. `None` честнее выдуманного: порода решает, у кого
+    // ключ чтения.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let chat = create_channel_for(&mut alice, 2_000, "лента", false);
+
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    let events = pump(&mut alice, &mut bob, 3_000, effects);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ChannelCreated { chat: c, open: None, .. } if *c == chat
+        )),
+        "канал обязан объявиться каналом, и без выдуманной породы"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::GroupCreated { chat: c, .. } if *c == chat)),
+        "и не группой: экран у них разный"
+    );
+    // А породу называет представление, приехавшее следом.
+    assert_eq!(
+        bob.channel_facts(&chat, 4_000).expect("факты").open,
+        Some(false),
+        "порода берётся из подписанного документа"
+    );
+}
+
+#[test]
+fn a_group_still_announces_itself_as_a_group() {
+    // Пара к предыдущей: у группы вводный блок тот же, и развилка
+    // по профилю не должна задеть фазу 1.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = alice
+        .step(2_000, Input::Command(Command::CreateGroup { title: "у костра".into() }))
+        .expect("группа")
+        .iter()
+        .find_map(|e| match e {
+            Effect::Notify(Event::GroupCreated { chat, .. }) => Some(*chat),
+            _ => None,
+        })
+        .expect("событие о заведении");
+    let effects = alice
+        .step(3_000, Input::Command(Command::InviteToGroup { chat, peer_ik: bob.own_card().ik }))
+        .expect("приглашение");
+    let events = pump(&mut alice, &mut bob, 3_000, effects);
+
+    assert!(
+        events.iter().any(|e| matches!(e, Event::GroupCreated { chat: c, .. } if *c == chat)),
+        "группа обязана остаться группой"
+    );
+    assert!(bob.channel_facts(&chat, 4_000).is_none(), "и канальных фактов у неё не бывает");
+}
+
+#[test]
+fn readers_of_a_channel_do_not_learn_about_each_other() {
+    // **Обещание §3.2, и оно же — причина всей канальной дороги впуска.**
+    //
+    // | | `closed` | `channel` |
+    // |---|---|---|
+    // | Состав известен | всем | владельцу |
+    // | Адреса раскрыты | всем | только вызвавшимся раздавать |
+    //
+    // В группе вступление раскрывает адреса участников друг другу
+    // намеренно: §11.5 обещает это прямо, и `group::JOIN_DISCLOSURE`
+    // говорит это человеку **до** заведения. В канале обещано обратное,
+    // а дорога впуска была та же самая — и каждый читатель получал
+    // карточки всех прочих, заводя их **контактами**.
+    //
+    // Боб и Кэрол друг другу не представлены нарочно: знакомство здесь
+    // могло прийти только из канала.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let mut carol = node(3, "carol");
+    introduce(&mut alice, &mut bob);
+    introduce(&mut alice, &mut carol);
+    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+    let effects = send_text(&mut alice, &mut carol, 1_100, "привет");
+    pump(&mut alice, &mut carol, 1_100, effects);
+
+    let chat = create_channel_for(&mut alice, 2_000, "лента", false);
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск Боба");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    let effects = alice
+        .step(4_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: carol.own_card().ik }))
+        .expect("впуск Кэрол");
+    pump(&mut alice, &mut carol, 4_000, effects);
+
+    // Оба читают — значит впуск сработал, и проверка ниже не пуста.
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "обоим".into() }))
+        .expect("владелец пишет");
+    // Копия каждому читателю своя (§11.3), и прокачать надо обе.
+    pump(&mut alice, &mut bob, 5_000, effects.clone());
+    pump(&mut alice, &mut carol, 5_000, effects);
+    assert!(group_history(&bob, chat).iter().any(|line| line == "обоим"), "Боб слышит");
+    assert!(group_history(&carol, chat).iter().any(|line| line == "обоим"), "Кэрол слышит");
+
+    assert!(
+        !bob.contacts().contains_key(&carol.own_card().ik),
+        "читатель не должен узнавать других читателей (§3.2)"
+    );
+    assert!(!carol.contacts().contains_key(&bob.own_card().ik), "и в обратную сторону тоже");
+    assert_eq!(
+        bob.groups().get(&chat).expect("канал").group.members().count(),
+        1,
+        "в своём составе читатель видит только себя"
+    );
+    assert_eq!(
+        alice.groups().get(&chat).expect("канал").group.members().count(),
+        3,
+        "владелец ведёт состав: на нём держится звезда"
+    );
+}
+
+#[test]
+fn a_link_subscriber_hears_nothing_until_the_owner_admits_him() {
+    // **Это не поломка, а следствие спеки, и записано оно проверкой,
+    // чтобы не считалось поломкой каждый раз заново.**
+    //
+    // §10.4: у открытого канала владелец «не участвует и не узнаёт».
+    // Значит подписчиков он не знает, а звезда §7.5.2 рассылает
+    // `for member in targets` — по **составу**, которого у открытого
+    // канала не существует (§6.1). Ключ чтения из ссылки у подписчика
+    // есть, а доставки нет: до роя (очередь 3) её взять неоткуда.
+    //
+    // Практическое следствие, которое надо знать на стенде: пока владелец
+    // не впустил читателя своими руками, тот не услышит ни слова —
+    // независимо от породы канала.
+    //
+    // **Эта проверка обязана упасть**, когда появится заявка §10.4 или
+    // рой: тогда её надо переписать, а не подпереть.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let chat = create_channel_for(&mut alice, 2_000, "лента", true);
+    let link = alice.channel_link(chat).expect("ссылка");
+    bob.step(2_500, Input::Command(Command::SubscribeToChannel { uri: link })).expect("подписка");
+    assert!(
+        !bob.store().archive_keys(&chat).unwrap().is_empty(),
+        "ключ чтения у подписчика есть — молчание ниже не про ключ"
+    );
+
+    let effects = alice
+        .step(3_000, Input::Command(Command::SendText { chat, text: "до впуска".into() }))
+        .expect("владелец пишет в свой канал");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    assert!(
+        bob.store().messages(&chat, 10, None).unwrap().is_empty(),
+        "владелец не знает подписчика по ссылке — отправлять ему некуда (§10.4)"
+    );
+
+    // А впуск — работает, и у открытого канала тоже: породу он
+    // не спрашивает, потому что спрашивает **право** (§6.2). Это
+    // и есть сегодняшний способ довести слово до читателя.
+    let effects = alice
+        .step(4_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск в открытый канал законен: он про право, а не про породу");
+    pump(&mut alice, &mut bob, 4_000, effects);
+
+    let effects = alice
+        .step(5_000, Input::Command(Command::SendText { chat, text: "после впуска".into() }))
+        .expect("владелец пишет");
+    pump(&mut alice, &mut bob, 5_000, effects);
+    let seen: Vec<String> = bob
+        .store()
+        .messages(&chat, 10, None)
+        .unwrap()
+        .iter()
+        .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+        .collect();
+    assert_eq!(seen, vec!["после впуска".to_owned()], "впущенный слышит сказанное после впуска");
+    // Сказанное **до** впуска ему не полагается — по тому же правилу,
+    // по какому новичок группы не получает сказанного до вступления
+    // (§11.5): цепочка отдаётся на нынешней позиции.
+    assert_eq!(seen.len(), 1, "прошлое канала впуск не открывает");
+}
+
+#[test]
+fn waiting_stops_being_waiting_when_the_read_key_arrives() {
+    // §10.5 требует различать «заявка отправлена» и «впустили» — и после
+    // перезапуска тоже. Различие держится записью подписки, а снять с неё
+    // отметку ожидания больше нечем: заявки мы не шлём (§10.4 в ядре
+    // не собран), и ответа на неё не бывает. **Выданный ключ чтения —
+    // единственное, что владелец делает впуском и что до нас доезжает.**
+    //
+    // Без этого канал, который человек давно читает, показывал бы
+    // «ждём впуска» вечно.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &mut bob, 2_000, "привет");
+    pump(&mut alice, &mut bob, 2_000, effects);
+
+    bob.step(5_000, Input::Command(Command::SubscribeToChannel { uri: link })).expect("подписка");
+    assert!(
+        bob.channel_facts(&chat, 5_100).expect("факты канала").awaiting,
+        "до впуска человек обязан видеть ожидание, а не пустой чат"
+    );
+
+    let effects = alice
+        .step(6_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    pump(&mut alice, &mut bob, 6_000, effects);
+
+    assert!(
+        !bob.channel_facts(&chat, 7_000).expect("факты канала").awaiting,
+        "ключ чтения приехал — ожидание кончилось"
+    );
+    // И это переживает перезапуск: отметка лежит в записи подписки,
+    // а не в памяти.
+    bob.restore().expect("подъём");
+    assert!(
+        !bob.channel_facts(&chat, 7_100).expect("факты канала").awaiting,
+        "отметка ожидания обязана переживать перезапуск"
+    );
+    assert!(
+        bob.channel_facts(&chat, 7_100).expect("факты канала").readable,
+        "и читать теперь есть чем"
+    );
+}
+
+#[test]
+fn unsubscribing_tells_the_owner_and_stops_the_words() {
+    // §10.6: «по приглашению — дешевле прислать блок ухода, чем ждать
+    // срока». Проверяются обе половины: владелец перестаёт считать нас
+    // читателем, и сказанное после ухода до нас больше не доезжает.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_channel(&mut alice, &mut bob, 1_000, false);
+    assert_eq!(alice.groups().get(&chat).expect("канал").group.members().count(), 2);
+
+    let effects =
+        bob.step(9_000, Input::Command(Command::UnsubscribeFromChannel { chat })).expect("отписка");
+    pump(&mut bob, &mut alice, 9_000, effects);
+
+    assert_eq!(
+        alice.groups().get(&chat).expect("канал").group.members().count(),
+        1,
+        "блок ухода обязан доехать: иначе владелец платит рассылкой за ушедшего"
+    );
+    assert!(bob.groups().get(&chat).is_none(), "у ушедшего чата больше нет");
+
+    // И слово после ухода не воскрешает канал у того, кто отписался.
+    let effects = alice
+        .step(10_000, Input::Command(Command::SendText { chat, text: "после".into() }))
+        .expect("владелец пишет");
+    pump(&mut alice, &mut bob, 10_000, effects);
+    assert!(bob.groups().get(&chat).is_none(), "ушедший не заводит канал заново от чужого слова");
 }
 
 #[test]
@@ -8240,6 +8660,12 @@ fn a_block_without_the_work_is_refused_where_the_channel_asks_for_it() {
     drop(effects);
     assert_eq!(bob.store().channel(&chat).unwrap().unwrap().pow_bits, 0, "Боб цены не знает");
 
+    // Собирает кадр **чужая сборка**: в звезде публикует владелец
+    // (§3.2), а проверяется здесь приём — то, как судит получатель.
+    // Цены Боб по-прежнему не знает: подмена владельца в его копии
+    // документа не трогает ни `pow_bits`, ни права.
+    let effects = let_him_publish(&mut bob, chat, 5_500, &alice);
+    pump(&mut bob, &mut alice, 5_500, effects);
     let effects = bob
         .step(6_000, Input::Command(Command::SendText { chat, text: "без работы".into() }))
         .expect("Боб пишет, не зная цены");
@@ -8273,6 +8699,10 @@ fn the_same_word_in_a_channel_without_a_price_needs_no_work() {
         .expect("право писать");
     pump(&mut alice, &mut bob, 4_000, effects);
 
+    // Тем же способом, что и в предыдущей проверке: в звезде публикует
+    // владелец, и кадр подписчика собирает чужая сборка.
+    let effects = let_him_publish(&mut bob, chat, 5_500, &alice);
+    pump(&mut bob, &mut alice, 5_500, effects);
     let effects = bob
         .step(6_000, Input::Command(Command::SendText { chat, text: "без работы".into() }))
         .expect("Боб пишет");

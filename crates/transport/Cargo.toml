@@ -60,6 +60,15 @@ serde_json = { workspace = true, optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { workspace = true, optional = true }
 
+[dev-dependencies]
+# `test-util` — виртуальные часы tokio, и нужны они одной проверке: повтору
+# отметки о видимости в LAN (§5.1). Он спит настоящим `tokio::time::sleep`
+# раз в полминуты, и ждать его уступками планировщику нельзя — уступка
+# времени не двигает, а сколько цикл успеет, свойство машины, а не кода.
+#
+# В сборку не попадает: `dev-dependencies` живут только в тестах.
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = ["onion", "chatmail", "lan"]
 onion = ["dep:arti-client", "dep:tor-rtcompat"]

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatosk_crypto::identity::beacon;
-use ratatosk_proto::transport_policy::{Transport, LAN_CONNECT_TIMEOUT_MS};
+use ratatosk_proto::transport_policy::{Transport, LAN_CONNECT_TIMEOUT_MS, PRESENCE_TTL_MS};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -87,6 +87,17 @@ impl Default for LanConfig {
 /// в контакт-карточке (§4.1) и не может: он меняется при каждом подключении
 /// к другой сети.
 type Directory = Arc<Mutex<BTreeMap<[u8; 32], SocketAddr>>>;
+
+/// Как часто повторять отметку о видимости для известных адресов (§5.1).
+///
+/// Треть срока соседства: две потерянные отметки подряд оно ещё
+/// переживает, а третья и должна его погасить.
+///
+/// **Число выводится из `PRESENCE_TTL_MS`, а не пишется рядом.** Сдвинь
+/// кто-нибудь срок соседства — и повтор обязан сдвинуться с ним; разойдись
+/// они, соседство гасло бы между повторами, то есть ровно так, как
+/// и гасло до появления этого цикла.
+const PRESENCE_REFRESH_MS: u64 = PRESENCE_TTL_MS / 3;
 
 /// Чьи маяки сопоставлять. Приходит из ядра командой
 /// [`TransportCommand::WatchPeers`].
@@ -180,11 +191,14 @@ impl LanRunner {
         let (events_tx, events_rx) = mpsc::channel(64);
         spawn_accept_loop(listener, events_tx.clone());
 
+        let directory: Directory = Arc::new(Mutex::new(BTreeMap::new()));
+        spawn_presence_loop(Arc::clone(&directory), events_tx.clone());
+
         let mut runner = LanRunner {
             events_tx,
             events_rx,
             links: BTreeMap::new(),
-            directory: Arc::new(Mutex::new(BTreeMap::new())),
+            directory,
             watched: Arc::new(Mutex::new(Vec::new())),
             heard: Arc::new(Mutex::new(Vec::new())),
             my_ik,
@@ -503,6 +517,61 @@ impl Runner for LanRunner {
     async fn next_event(&mut self) -> Option<TransportEvent> {
         self.events_rx.recv().await
     }
+}
+
+/// Повторяет отметку о видимости для всех известных адресов (§5.1).
+///
+/// # Зачем это вообще нужно
+///
+/// «Знать адрес в локальной сети — и значит видеть контакт»: так сказано
+/// у [`LanDirectory::note`], и §5.4 на этом стоит — LAN выбирается по
+/// слышимости, потому что адреса собеседника в карточке нет. Но отметка
+/// живёт сроком ([`PRESENCE_TTL_MS`]), а `note` зовётся **событием**:
+/// анонсом mDNS либо рукой человека.
+///
+/// Пока анонсы идут, срок обновляется сам. А там, где mDNS недоступен —
+/// мультикаст режут и корпоративные сети, и гостевой Wi-Fi, и loopback
+/// на одной машине, — адрес назван один раз, и через полторы минуты
+/// ядро считает собеседника недостижимым, хотя адрес лежит здесь
+/// и связь по нему открыта. Снаружи это выглядит так: кадры ходят,
+/// а отправка отвечает «собеседника нет в сети» и кладёт сообщение
+/// в ожидание до тех пор, пока тот не заговорит первым.
+///
+/// Ровно то состояние, которое `LanDirectory::note` называет
+/// недопустимым: «адрес известен, а §5.4 всё равно не выбирает LAN».
+/// Цикл ниже его и не даёт.
+///
+/// # Почему это честно, а не «держать соседство вечно»
+///
+/// Повторяется не мнение о собеседнике, а **то, что у нас есть адрес**.
+/// Ушедший сосед выясняется первым же набором: не дозвонившись,
+/// транспорт забывает адрес ([`forget_address`]) — и повторять
+/// становится нечего. Цена ошибки — одна неудачная попытка соединения
+/// на ушедшего, после которой лестница честно спускается ниже.
+///
+/// # Включённость ступени здесь не спрашивается
+///
+/// Отметка говорит «адрес известен», а не «отправляй сюда». Выключен ли
+/// транспорт — отдельный вопрос, и лестница задаёт его сама: в разборе
+/// отказа это разные слова («выключен» против «адреса нет»). Так же
+/// ведёт себя и разовая отметка из [`LanDirectory::note`].
+///
+/// Цикл заканчивается вместе с раннером: приёмник событий уезжает
+/// с ним, и отправка перестаёт проходить.
+fn spawn_presence_loop(directory: Directory, events: mpsc::Sender<TransportEvent>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(PRESENCE_REFRESH_MS)).await;
+            // Список копируется, чтобы не держать блокировку через `.await`.
+            let peers: Vec<[u8; 32]> =
+                directory.lock().map(|dir| dir.keys().copied().collect()).unwrap_or_default();
+            for peer_ik in peers {
+                if events.send(TransportEvent::SeenOnLan { peer_ik }).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_accept_loop(listener: TcpListener, events: mpsc::Sender<TransportEvent>) {
@@ -841,6 +910,82 @@ mod tests {
             runner.next_event().await,
             Some(TransportEvent::ConnectFailed { via: Transport::Lan, .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_known_address_keeps_saying_that_the_contact_is_near() {
+        // **Поломка, найденная на стенде: «сессия потерялась на localhost».**
+        // Сессия была цела, а соседство гасло: адрес назван рукой один раз
+        // (mDNS на loopback не доходит), отметка о видимости живёт полторы
+        // минуты, и §5.4 переставал выбирать LAN при открытой связи.
+        // Сообщение уходило в ожидание до тех пор, пока собеседник
+        // не заговорит первым.
+        //
+        // Срок повтора здесь **повторён числом**, а не взят константой:
+        // проверка стережёт обещание «между повторами соседство не гаснет»,
+        // и возьми она `PRESENCE_REFRESH_MS`, растяжение повтора вдвое
+        // прошло бы молча.
+        let config = LanConfig { enabled: true, port: 0, discovery: false };
+        let mut runner = LanRunner::start(config, [1u8; 32]).await.unwrap();
+
+        // Разовая отметка — та, что была и раньше. Срок и здесь: без него
+        // сломанная заготовка вешала бы проверку вместо отказа.
+        runner.note_address([2u8; 32], SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9));
+        let first = tokio::time::timeout(Duration::from_millis(1_000), runner.next_event()).await;
+        assert!(
+            matches!(first, Ok(Some(TransportEvent::SeenOnLan { peer_ik })) if peer_ik == [2u8; 32]),
+            "названный рукой адрес обязан сразу значить «виден»"
+        );
+
+        // А это — повтор, и ждём мы его **таймером**, а не уступками:
+        // ожидание события даёт рантайму дойти до сна цикла, и виртуальные
+        // часы двигаются сами.
+        //
+        // Ожидание **ограничено сроком**, и это не перестраховка. Сними
+        // кто-нибудь повтор — часам стало бы некуда идти, и проверка
+        // не упала бы, а повисла: у виртуального времени без единого
+        // таймера нет следующего мгновения. Повисшая проверка хуже
+        // упавшей — она не говорит ничего, и её же первой выключат.
+        let again = tokio::time::timeout(
+            Duration::from_millis(PRESENCE_REFRESH_MS * 2),
+            runner.next_event(),
+        )
+        .await;
+        assert!(
+            matches!(
+                again,
+                Ok(Some(TransportEvent::SeenOnLan { peer_ik })) if peer_ik == [2u8; 32]
+            ),
+            "известный адрес обязан повторять отметку, пока он известен"
+        );
+        // И повтор приходит раньше, чем гаснет соседство: иначе между
+        // ними оставалась бы дыра, ради которой всё и затевалось.
+        assert!(PRESENCE_REFRESH_MS < 90_000, "повтор обязан быть чаще, чем срок соседства в §5.1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_forgotten_address_stops_being_announced() {
+        // Вторая половина, и без неё первая была бы обещанием вечного
+        // соседства: повторяется **известный адрес**, а не мнение
+        // о собеседнике. Забыли адрес — повторять нечего.
+        let config = LanConfig { enabled: true, port: 0, discovery: false };
+        let mut runner = LanRunner::start(config, [1u8; 32]).await.unwrap();
+        let dead = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9);
+        runner.note_address([2u8; 32], dead);
+        let first = tokio::time::timeout(Duration::from_millis(1_000), runner.next_event()).await;
+        assert!(matches!(first, Ok(Some(TransportEvent::SeenOnLan { .. }))), "заготовка верна");
+
+        forget_address(&runner.directory, &runner.heard, [2u8; 32]);
+        assert_eq!(runner.address_of(&[2u8; 32]), None, "адрес забыт — заготовка верна");
+
+        // Ждём дольше двух сроков повтора: отметок больше быть не должно,
+        // а значит `next_event` не вернёт ничего и время уедет вперёд.
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(PRESENCE_REFRESH_MS * 2 + 1_000),
+            runner.next_event(),
+        )
+        .await;
+        assert!(quiet.is_err(), "забытый адрес не должен объявляться заново");
     }
 
     #[tokio::test]

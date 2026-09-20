@@ -556,6 +556,23 @@ impl SqliteStore {
     }
 }
 
+/// Предел выборки — в то, что понимает SQLite.
+///
+/// Отдельно от [`sql_types::to_sql`], и это не дубль. Там — **величина
+/// протокола**: метка времени, счётчик, размер, и значение больше
+/// `i64::MAX` означает, что кто-то положил туда непрозрачный
+/// идентификатор; отладочная сборка ловит это паникой.
+///
+/// Предел выборки — не величина протокола, а наша собственная просьба,
+/// и `usize::MAX` в ней — законное «дай всё». Ровно так его и просит
+/// очистка чата (`on_clear_chat`) и отписка от канала (§10.6). Через
+/// `to_sql` эта просьба роняла отладочную сборку, а в релизе проходила
+/// насыщением — то есть поломка была видна только там, где её никто
+/// не ищет.
+fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<()> {
         let current = self.schema_version()?;
@@ -698,7 +715,7 @@ impl Store for SqliteStore {
                 &chat_id[..],
                 before.map(|b| sql_types::to_sql(b.wall_ms)),
                 before.map_or(0, |b| sql_types::to_sql(u64::from(b.logical))),
-                sql_types::to_sql(limit as u64),
+                sql_limit(limit),
             ],
             |row| {
                 Ok((
@@ -2095,6 +2112,18 @@ impl Store for SqliteStore {
             })
     }
 
+    fn last_heard_in_chat(&self, chat_id: &[u8; 16], sender_ik: &[u8; 32]) -> Result<Option<u64>> {
+        // `MAX`, а не «последняя строка по порядку показа»: порядок
+        // в истории задаёт метка HLC отправителя, а спрашивают здесь
+        // про наши часы.
+        let found: Option<i64> = self.conn.query_row(
+            "SELECT MAX(received_ms) FROM messages WHERE chat_id = ?1 AND sender_ik = ?2",
+            rusqlite::params![&chat_id[..], &sender_ik[..]],
+            |row| row.get(0),
+        )?;
+        Ok(found.map(sql_types::from_sql))
+    }
+
     fn replace_pending_group(&mut self, frames: &[StoredPendingGroup]) -> Result<()> {
         // Шифруется **до** сделки: `seal` берёт `&self`, а сделка занимает
         // соединение исключительно, и внутри неё до ключа уже не дотянуться.
@@ -2700,7 +2729,7 @@ impl Store for SqliteStore {
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(wanted.len() + 3);
         params.push(Box::new(chat_id.map(|id| id.to_vec())));
         params.push(Box::new(sql_types::to_sql(wanted.len() as u64)));
-        params.push(Box::new(sql_types::to_sql(limit as u64)));
+        params.push(Box::new(sql_limit(limit)));
         for token in &wanted {
             params.push(Box::new(token.to_vec()));
         }

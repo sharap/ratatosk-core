@@ -1392,7 +1392,7 @@ fn create_channel(engine: &mut Node, now_ms: u64, title: &str, open: bool) -> [u
         if let Effect::Notify(Event::ChannelCreated { chat, title: said, open: said_open }) = effect
         {
             assert_eq!(said, title, "название в событии — то же, что легло");
-            assert_eq!(said_open, open, "порода в событии — та же, что просили");
+            assert_eq!(said_open, Some(open), "порода в событии — та же, что просили");
             found = Some(chat);
         }
     }
@@ -1580,8 +1580,21 @@ fn a_granted_right_lets_the_words_through_and_an_expired_one_does_not() {
     me.store_mut().put_channel(&stored).unwrap();
     grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), 5_000);
 
-    me.step(4_999, Input::Command(Command::SendText { chat, text: "успел".to_owned() }))
-        .expect("пока срок не вышел — пишем");
+    // **Различают два отказа, и в этом вся проверка.** Пока срок идёт,
+    // право есть — и отправку останавливает правило звезды: доставлять
+    // некому, состав канала знает владелец (§3.2). Ровно в назначенный
+    // миг право кончается, и отказ меняется на «нет права».
+    //
+    // Порядок проверок в ядре и делает их различимыми: сперва право,
+    // потом доставка. Поменяй их местами — и «истекло» стало бы
+    // неотличимо от «в звезде публикует владелец».
+    assert!(
+        matches!(
+            me.step(4_999, Input::Command(Command::SendText { chat, text: "успел".to_owned() })),
+            Err(EngineError::OnlyOwnerPublishesYet)
+        ),
+        "пока срок идёт, право есть — и мешает не оно"
+    );
     assert!(
         matches!(
             me.step(5_000, Input::Command(Command::SendText { chat, text: "опоздал".to_owned() })),
@@ -1589,6 +1602,11 @@ fn a_granted_right_lets_the_words_through_and_an_expired_one_does_not() {
         ),
         "ровно в назначенный миг право уже не действует"
     );
+
+    // Чего эта проверка **не** стережёт: что истёкшее право отвергается
+    // на **приёме**. Сегодня своей сборкой такой кадр не собрать вовсе,
+    // и стережёт это `a_word_from_someone_whose_right_expired_is_not_taken`
+    // в `pair.rs` — там кадр собирает чужая сборка.
 }
 
 #[test]
@@ -1605,8 +1623,13 @@ fn the_write_right_does_not_let_you_rename_the_channel() {
     me.store_mut().put_channel(&stored).unwrap();
     grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), u64::MAX);
 
-    me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() }))
-        .expect("писать — вправе");
+    // Право писать у нас есть, и отказ на слово — не про него: в звезде
+    // публикует владелец (§3.2). Важно здесь именно **имя** отказа: оно
+    // и отличает «право есть» от «права нет», а проверка про это.
+    assert!(matches!(
+        me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() })),
+        Err(EngineError::OnlyOwnerPublishesYet)
+    ));
     // **Владельцем группы мы остались** — сменился владелец представления,
     // и правило §11.2 «только создатель» сюда не вмешивается. Значит
     // отказывает ровно то, ради чего проверка написана: у нас есть
@@ -1623,6 +1646,36 @@ fn the_write_right_does_not_let_you_rename_the_channel() {
         ),
         "право писать не даёт менять представление"
     );
+}
+
+#[test]
+fn even_with_the_edit_right_a_delegate_does_not_publish_in_a_star() {
+    // **Пара к правилу звезды, и она про `fans_out`.** Переименование
+    // и картинка расходятся по каналу веером — значит и они упираются
+    // в то же, что слово: состав знает владелец (§3.2), и развозить
+    // делегату некому.
+    //
+    // Проверяется на **праве, которое есть**: с `EDIT` отказ обязан
+    // быть про доставку, а не про право. Иначе объяви кто-нибудь
+    // переименование адресным — и оно прошло бы у делегата молча,
+    // не доехав ни до кого.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+    grant_in_channel(&mut me, &chat, mine, channel::Rights::EDIT.bits(), u64::MAX);
+
+    assert!(
+        matches!(
+            me.step(200, Input::Command(Command::RenameGroup { chat, title: "моё".to_owned() })),
+            Err(EngineError::OnlyOwnerPublishesYet)
+        ),
+        "право менять представление есть — мешает доставка, и сказать надо это"
+    );
+    assert_eq!(me.groups().get(&chat).expect("канал").title, "лента", "и название не сменилось");
 }
 
 #[test]
@@ -1822,4 +1875,215 @@ fn add_and_remove(engine: &mut Node, chat: [u8; 16], seed: u8, at: u64) -> [u8; 
         .step(at + 1, Input::Command(Command::EvictFromGroup { chat, peer_ik: who }))
         .expect("исключение");
     who
+}
+
+// --- Отписка (фаза 2, §10.6) ----------------------------------------------
+
+#[test]
+fn a_group_is_left_and_a_channel_is_unsubscribed_from() {
+    // Два разных действия с разными обещаниями: из группы **выходят**,
+    // и переписка остаётся; от канала **отписываются**, и вместе с ним
+    // уходят ключи чтения. Сведи их в одну команду — и одно обещание
+    // молча подменило бы другое.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    assert!(matches!(
+        me.step(200, Input::Command(Command::UnsubscribeFromChannel { chat })),
+        Err(EngineError::NotAChannel)
+    ));
+}
+
+#[test]
+fn the_owner_does_not_unsubscribe_from_his_own_channel() {
+    // Отписка местная: владелец открытого канала о подписчиках не знает
+    // (§10.4) и объявить им ничего не может. Удали он чат у себя —
+    // исчез бы ключ подписи представления, и канал остался бы жить
+    // у подписчиков без единой возможности им управлять.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", true);
+    assert!(matches!(
+        me.step(200, Input::Command(Command::UnsubscribeFromChannel { chat })),
+        Err(EngineError::CannotUnsubscribeOwnChannel)
+    ));
+}
+
+#[test]
+fn unsubscribing_wipes_the_read_keys_and_lets_the_same_link_be_taken_again() {
+    // Две половины одного обещания §10.6, и порознь они ничего не значат:
+    // ключи обязаны исчезнуть (иначе «архив закрылся» — ложь), а чат
+    // обязан перестать существовать настолько, чтобы та же ссылка снова
+    // считалась новой (иначе человек, передумавший дважды, упирается
+    // в «вы уже подписаны» навсегда).
+    let mut me = node(1);
+    let uri = open_channel_link();
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri: uri.clone() }))
+        .expect("подписка по ссылке");
+    let chat = *me.groups().keys().next().expect("канал завёлся");
+    assert!(
+        !me.store().archive_keys(&chat).unwrap().is_empty(),
+        "у открытого канала ключ чтения приезжает ссылкой — иначе проверка ниже пуста"
+    );
+
+    me.step(200, Input::Command(Command::UnsubscribeFromChannel { chat })).expect("отписка");
+    assert!(me.groups().get(&chat).is_none(), "чата больше нет");
+    assert!(me.store().archive_keys(&chat).unwrap().is_empty(), "ключи чтения стёрты");
+    assert!(me.store().subscription(&chat).unwrap().is_none(), "подписка стёрта");
+
+    me.step(300, Input::Command(Command::SubscribeToChannel { uri }))
+        .expect("та же ссылка снова считается новой");
+}
+
+/// Ссылка на открытый канал чужого владельца — как её присылает человек.
+///
+/// Собирается здесь, а не берётся у ядра: своя ссылка вела бы на свой же
+/// канал, а отписка от своего запрещена. Ключ в ссылке и есть порода
+/// (§6.1).
+fn open_channel_link() -> String {
+    channel::Invitation {
+        group: [77u8; 16],
+        owner: Identity::from_seed([200u8; 32]).public().ik,
+        min_version: 1,
+        key: Some([5u8; 32]),
+        endpoints: Vec::new(),
+    }
+    .to_uri()
+    .expect("ссылка собирается")
+}
+
+#[test]
+fn granting_a_right_to_the_owner_is_refused_by_its_own_name() {
+    // **Поломка, найденная на стенде.** Владелец набрал свой ключ вместо
+    // чужого и услышал «в этом канале у вас нет права на это действие» —
+    // то есть неправду: право у него как раз есть, и отнять его нельзя
+    // (5вп). Выдача ему бессмысленна по другой причине, и сказать надо
+    // именно её, иначе человек идёт искать, кто отнял у него права.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+
+    assert!(matches!(
+        me.step(
+            200,
+            Input::Command(Command::SetChannelRight {
+                chat,
+                who: mine,
+                rights: channel::Rights::WRITE.bits(),
+                until_ms: u64::MAX,
+            })
+        ),
+        Err(EngineError::OwnerNeedsNoGrant)
+    ));
+
+    // **Пара к ней, и без неё первая половина ничего не значит:** тот же
+    // отказ у не-владельца обязан остаться прежним — «нет права». Два
+    // разных отказа на два разных положения.
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+    assert!(matches!(
+        me.step(
+            300,
+            Input::Command(Command::SetChannelRight {
+                chat,
+                who: [7u8; 32],
+                rights: channel::Rights::WRITE.bits(),
+                until_ms: u64::MAX,
+            })
+        ),
+        Err(EngineError::NotAllowedInChannel)
+    ));
+}
+
+// --- Факты канала для клиента (фаза 2, §6.2, §6.3, §6.4) -------------------
+
+#[test]
+fn a_group_has_no_channel_facts_at_all() {
+    // Признак «это канал» выражен **наличием записи**: у группы канального
+    // экрана нет, и отдельного булева поля для этого не заводится.
+    let mut me = node(1);
+    let chat = create(&mut me, 100, "у костра");
+    assert!(me.channel_facts(&chat, 200).is_none(), "у группы канальных фактов не бывает");
+}
+
+#[test]
+fn the_facts_of_a_fresh_channel_say_what_the_owner_may_do() {
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    let facts = me.channel_facts(&chat, 200).expect("факты канала");
+
+    assert_eq!(facts.version, 1, "версия начинается с единицы: ссылка называет минимальную");
+    assert_eq!(facts.open, Some(false), "порода доказана подписанным документом");
+    assert_eq!(facts.rights, channel::Rights::all().bits(), "у владельца все права (5вп)");
+    assert_eq!(facts.rights_until_ms, 0, "у владельца срока нет и быть не может");
+    assert!(facts.readable, "ключ чтения родится вместе с каналом");
+    assert!(!facts.awaiting, "свой канал не ждёт ничьего впуска");
+    assert!(
+        facts.may_rotate,
+        "нулевое поколение никому не рассылалось: предел недели не считается"
+    );
+    assert_eq!(facts.grants_expiring, 0, "выдач нет — и продлевать нечего");
+}
+
+#[test]
+fn the_facts_do_not_promise_a_kind_the_link_only_claimed() {
+    // §10.2: адреса и обещания ссылки ничем не подписаны. Покажи мы
+    // обещанную породу установленной, человек прочёл бы «открытый канал»
+    // там, где владелец обещал другое, — и решил бы, что читать можно
+    // уже сейчас.
+    let mut me = node(1);
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri: open_channel_link() }))
+        .expect("подписка по ссылке");
+    let chat = *me.groups().keys().next().expect("канал завёлся");
+
+    let facts = me.channel_facts(&chat, 200).expect("факты канала");
+    assert_eq!(facts.open, None, "породу называет документ, а не ссылка");
+    assert_eq!(facts.version, 0, "документа ещё нет");
+    assert_eq!(facts.rights, 0, "«не знаю» отказывает вниз (§6.2)");
+    assert!(!facts.may_rotate, "не зная породы, поворот обещать нельзя");
+}
+
+#[test]
+fn an_expiring_grant_is_counted_for_the_owner_and_not_for_anyone_else() {
+    // §6.3 велит продлевать заранее: «владелец зашёл, у выдачи осталось
+    // меньше месяца — продлить». Число повторено руками, а не взято
+    // из ядра: оно стережёт обещание, и подними кто-нибудь порог
+    // до квартала, проверка обязана это заметить.
+    const MONTH_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    let stranger = Identity::from_seed([200u8; 32]).public().ik;
+
+    grant_in_channel(&mut me, &chat, stranger, channel::Rights::WRITE.bits(), MONTH_MS * 3);
+    let facts = me.channel_facts(&chat, MONTH_MS).expect("факты канала");
+    assert_eq!(facts.grants_expiring, 0, "до конца ещё два месяца — продлевать рано");
+
+    let facts = me.channel_facts(&chat, MONTH_MS * 2 + 1).expect("факты канала");
+    assert_eq!(facts.grants_expiring, 1, "осталось меньше месяца — сказать надо заранее");
+
+    let facts = me.channel_facts(&chat, MONTH_MS * 3 + 1).expect("факты канала");
+    assert_eq!(facts.grants_expiring, 0, "истёкшую продлевать уже поздно: она не действует");
+}
+
+#[test]
+fn our_own_grant_is_shown_with_its_deadline() {
+    // Вторая половина §6.3 — та, что видит подписчик: право кончается
+    // само, и «отказ наступает не внезапно» верно только если срок
+    // показан заранее.
+    let mut me = node(1);
+    let chat = create_channel(&mut me, 100, "лента", false);
+    let mine = Identity::from_seed([1u8; 32]).public().ik;
+
+    // Владелец — чужой: себе владелец прав не выдаёт (5вп).
+    let mut stored = me.store().channel(&chat).unwrap().unwrap();
+    stored.owner_ik = [200u8; 32];
+    me.store_mut().put_channel(&stored).unwrap();
+    grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), 9_000);
+
+    let facts = me.channel_facts(&chat, 5_000).expect("факты канала");
+    assert_eq!(facts.rights, channel::Rights::WRITE.bits());
+    assert_eq!(facts.rights_until_ms, 9_000, "срок показывается, пока выдача действует");
+
+    let facts = me.channel_facts(&chat, 9_000).expect("факты канала");
+    assert_eq!(facts.rights, 0, "истекло — значит нет");
+    assert_eq!(facts.rights_until_ms, 0, "и срока показывать больше нечего");
 }

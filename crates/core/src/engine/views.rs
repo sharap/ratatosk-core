@@ -213,6 +213,173 @@ impl<S: Store> Engine<S> {
         }
     }
 
+    /// Что клиент рисует у канала сверх группы (фаза 2, §6, §10).
+    ///
+    /// `None` у обычной группы — и это ответ, а не отсутствие ответа:
+    /// экрана канала там нет.
+    ///
+    /// # Почему всё считается здесь, а не у клиента
+    ///
+    /// Каждое поле — правило §6, а не поле таблицы: права с учётом срока
+    /// (§6.3), порода только из подписанного (§6.1), «можно ли
+    /// поворачивать» из трёх правил разом (§6.4), порог молчания
+    /// владельца (§6.3). Выведи их клиент из сырых строк — правила
+    /// оказались бы в двух местах, а §13.3 держит их в одном.
+    ///
+    /// # Отказ хранилища здесь — это `None`
+    ///
+    /// Список чатов не должен падать из-за того, что не прочиталась
+    /// одна выдача. Канал без документа выглядит так же, как канал,
+    /// документ которого не прочёлся, и в обоих случаях показывать
+    /// нечего, кроме ожидания.
+    #[must_use]
+    pub fn channel_facts(&self, chat: &ChatId, now_ms: u64) -> Option<ChannelFacts> {
+        let state = self.groups.get(chat)?;
+        if state.profile.everyone_writes() {
+            return None;
+        }
+        let me = self.identity.public().ik;
+        let stored = self.store.channel(chat).ok().flatten();
+        // Владелец известен и **без документа**: он приехал ссылкой
+        // (§10.3, шаг 3) либо вводным блоком и лёг владельцем чата.
+        // Ровно поэтому подпись документа есть чем проверить, когда он
+        // доедет.
+        let owner = stored.as_ref().map_or(state.group.owner, |it| it.owner_ik);
+
+        let grants: Vec<channel::Grant> = stored
+            .as_ref()
+            .map(|it| {
+                it.grants
+                    .iter()
+                    .map(|grant| channel::Grant {
+                        who: grant.who,
+                        rights: channel::Rights::from_bits(grant.rights),
+                        until_ms: grant.until_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rights = channel::rights_from(&owner, &grants, &me, now_ms);
+        // Свой срок — из своей же выдачи. У владельца её нет и быть
+        // не может (5вп), и ноль здесь значит «срока нет», а не «истёк».
+        let rights_until_ms = grants
+            .iter()
+            .filter(|grant| grant.who == me && grant.live_at(now_ms))
+            .map(|grant| grant.until_ms)
+            .max()
+            .unwrap_or(0);
+
+        let kind = stored.as_ref().and_then(|it| channel::Kind::from_code(u64::from(it.kind)));
+        let keys = self.store.archive_keys(chat).unwrap_or_default();
+        // Те же три правила, что в `on_rotate_channel_key`, и спрошены
+        // они здесь затем, чтобы человек не узнавал о них из отказа.
+        // Порода неизвестна — кнопки нет: обещать поворот, не зная,
+        // бывает ли он в этом канале, хуже, чем не обещать.
+        let may_rotate =
+            kind == Some(channel::Kind::ByInvite)
+                && rights.has(channel::Rights::EVICT)
+                && keys.iter().rev().find(|key| key.generation > 0).is_none_or(|last| {
+                    now_ms.saturating_sub(last.created_ms) >= MIN_KEY_ROTATION_MS
+                });
+
+        // Молчание владельца (§6.3). Считается по **нашему** приёму:
+        // приезд новой версии документа и последнее его слово в канале —
+        // единственные свидетельства, которые у нас есть.
+        let heard = [
+            stored.as_ref().map(|it| it.received_ms),
+            self.store.last_heard_in_chat(chat, &owner).ok().flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        // Своё же молчание не считается: владелец сам себе ничего
+        // не присылает, и метка «от владельца ничего не приходит»
+        // на его собственном экране означала бы поломку связи там,
+        // где связь не нужна.
+        let owner_quiet_ms =
+            if owner == me { None } else { heard.map(|at| now_ms.saturating_sub(at)) };
+
+        Some(ChannelFacts {
+            version: stored.as_ref().map_or(0, |it| it.version),
+            open: kind.map(|kind| kind == channel::Kind::Open),
+            owner_ik: owner,
+            rights: rights.bits(),
+            rights_until_ms,
+            pow_bits: stored.as_ref().map_or(0, |it| it.pow_bits),
+            awaiting: self
+                .store
+                .subscription(chat)
+                .ok()
+                .flatten()
+                .is_some_and(|it| it.state == SUBSCRIPTION_REQUESTED),
+            readable: !keys.is_empty(),
+            generation: keys.iter().map(|key| key.generation).max().unwrap_or(0),
+            may_rotate,
+            owner_quiet_ms,
+            owner_unseen: owner_quiet_ms.is_some_and(|quiet| quiet >= OWNER_SILENCE_MS),
+            // Чужие сроки — не наше дело: у не-владельца продлевать
+            // нечего, и число, которое не к чему применить, на экране
+            // только пугает.
+            grants_expiring: if owner == me {
+                u32::try_from(
+                    grants
+                        .iter()
+                        .filter(|grant| {
+                            grant.live_at(now_ms)
+                                && grant.until_ms.saturating_sub(now_ms) < GRANT_PROLONG_AHEAD_MS
+                        })
+                        .count(),
+                )
+                .unwrap_or(u32::MAX)
+            } else {
+                0
+            },
+        })
+    }
+
+    /// Выдачи прав канала — для экрана владельца (§6.2, §6.3).
+    ///
+    /// Пустой список означает и «выдач нет», и «документа ещё нет»:
+    /// различать их клиенту незачем — показывать в обоих случаях нечего,
+    /// а «есть ли документ» говорит [`ChannelFacts::version`].
+    #[must_use]
+    pub fn channel_grants(&self, chat: &ChatId, now_ms: u64) -> Vec<ChannelGrantView> {
+        let Some(stored) = self.store.channel(chat).ok().flatten() else { return Vec::new() };
+        stored
+            .grants
+            .iter()
+            .map(|grant| ChannelGrantView {
+                who: grant.who,
+                name: self.name_of(&grant.who),
+                rights: grant.rights,
+                until_ms: grant.until_ms,
+                live: now_ms < grant.until_ms,
+            })
+            .collect()
+    }
+
+    /// Записи о впусках — учёт владельца (§6.5).
+    ///
+    /// Показываются **все**, включая впуски делегатами: в этом весь смысл
+    /// учёта. Окно сидирования их не обрезает (§6.5), поэтому список
+    /// полон настолько, насколько полна наша копия канала.
+    #[must_use]
+    pub fn channel_admits(&self, chat: &ChatId) -> Vec<ChannelAdmitView> {
+        self.store
+            .admits(chat)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|admit| ChannelAdmitView {
+                who: admit.who,
+                name: self.name_of(&admit.who),
+                admitted_by: admit.admitted_by,
+                admitted_by_name: self.name_of(&admit.admitted_by),
+                generation: admit.generation,
+                created_ms: admit.created_ms,
+            })
+            .collect()
+    }
+
     /// Страница истории чата для десктопа.
     ///
     /// `None` означает, что **курсор мёртв**: сообщение, «перед» которым

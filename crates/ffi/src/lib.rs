@@ -123,6 +123,43 @@ fn engine_err(error: ratatosk_core::EngineError) -> RatatoskError {
                 limit: u32::try_from(ratatosk_proto::MAX_GROUP_MEMBERS).unwrap_or(u32::MAX),
             }
         }
+        // Отказы канала — по той же причине, по какой отделена полная
+        // группа: это обычные ответы, и человеку есть что с каждым
+        // сделать (фаза 2, §6, §10).
+        EngineError::NotAllowedInChannel => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::NoRight }
+        }
+        EngineError::OwnerNeedsNoGrant => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::OwnerNeedsNoGrant }
+        }
+        EngineError::OnlyOwnerPublishesYet => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::OnlyOwnerPublishesYet }
+        }
+        EngineError::NotAChannel | EngineError::NotAGroup => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::WrongProfile }
+        }
+        EngineError::OpenChannelHasNoRotation => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::OpenHasNoRotation }
+        }
+        EngineError::RotatedTooRecently => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::RotatedTooRecently }
+        }
+        EngineError::NoReadKeyYet => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::NoReadKeyYet }
+        }
+        EngineError::PowTooHard => RatatoskError::Channel { reason: FfiChannelRefusal::PowTooHard },
+        EngineError::BadChannelLink => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::BadLink }
+        }
+        EngineError::AlreadySubscribed => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::AlreadySubscribed }
+        }
+        EngineError::CannotUnsubscribeOwnChannel => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::OwnChannel }
+        }
+        EngineError::TooManyGrants => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::TooManyGrants }
+        }
         other => RatatoskError::internal(other),
     }
 }
@@ -149,12 +186,139 @@ pub enum RatatoskError {
         /// Предел, в который упёрлись, — чтобы клиенту не хранить его у себя.
         limit: u32,
     },
+    /// Канал отказал, и человеку есть что с этим сделать (фаза 2).
+    ///
+    /// **Одним вариантом с причиной, а не десятью вариантами.** Все они
+    /// про один экран и все требуют от человека действия — попросить
+    /// право, подождать, вставить другую ссылку. Развернув их в десять
+    /// вариантов, мы заставили бы клиент разбирать десять веток там,
+    /// где ему нужен один текст; свалив в [`RatatoskError::Internal`] —
+    /// посоветовали бы переустановить работающее.
+    ///
+    /// Текст к причине — [`channel_refusal_text`]; писать свой не надо.
+    #[error("{}", channel_refusal_text(*reason))]
+    Channel {
+        /// Что именно не дало команде пройти.
+        reason: FfiChannelRefusal,
+    },
     /// Внутренняя ошибка.
     #[error("внутренняя ошибка: {reason}")]
     Internal {
         /// Короткое описание для отчёта.
         reason: String,
     },
+}
+
+/// Почему канал отказал (фаза 2, §6, §10).
+///
+/// Каждая причина — отдельное действие человека, и в этом весь смысл
+/// их различать. Причина, по которой делать нечего, сюда не попадает:
+/// она остаётся [`RatatoskError::Internal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiChannelRefusal {
+    /// В канале нет такого права (§6.2), либо выдача истекла (§6.3).
+    ///
+    /// Отличить «не давали» от «истекло» можно по представлению, и это
+    /// дело показывающего экрана, а не отказа: делать человеку в обоих
+    /// случаях одно — просить владельца.
+    NoRight,
+    /// В звезде публикует только владелец (§3.2, §7.5.2).
+    ///
+    /// **Право «писать» при этом есть, и отказ не про него.** Слово
+    /// развозит сказавший, по своему составу, а состав канала §3.2
+    /// оставляет владельцу: читатели друг друга не знают, и держателю
+    /// права развозить некому. Доставку делегату вернёт рой (§7).
+    ///
+    /// Клиенту: поле ввода в канале стоит гасить всем, кроме владельца
+    /// (`FfiChannel::owner_ik` против своего ключа), а не по
+    /// `rights.write` — право может быть, а доставка нет.
+    OnlyOwnerPublishesYet,
+    /// Права выдают кому угодно, кроме владельца (§6.2).
+    ///
+    /// **Отдельно от [`FfiChannelRefusal::NoRight`], и разница
+    /// содержательная:** там права нет, здесь оно есть и потому выдача
+    /// бессмысленна. Свалив их в один ответ, клиент сказал бы владельцу,
+    /// что ему самому в своём канале ничего не разрешено.
+    OwnerNeedsNoGrant,
+    /// Команда про канал пришла в обычную группу — или наоборот (§3.2).
+    WrongProfile,
+    /// В открытом канале ключ чтения не поворачивается (§6.1, §10.7).
+    OpenHasNoRotation,
+    /// Ключ чтения поворачивали меньше недели назад (§6.4).
+    RotatedTooRecently,
+    /// У канала ещё нет ни одного поколения ключа чтения (§6.4).
+    NoReadKeyYet,
+    /// Работа, которую требует канал, этому устройству не по силам (§11).
+    PowTooHard,
+    /// Это не ссылка на канал (§10.3, шаг 1).
+    BadLink,
+    /// На этот канал мы уже подписаны.
+    AlreadySubscribed,
+    /// Канал наш собственный: от своего не отписываются (§10.6).
+    OwnChannel,
+    /// Выдач больше, чем помещается в одно представление (§6.2).
+    TooManyGrants,
+}
+
+/// Точные слова к отказу канала (§15).
+///
+/// На границе, а не в клиенте, по той же причине, что [`honest_notices`]:
+/// отказ обязан говорить то, что протокол на самом деле делает, и строка
+/// в Kotlin разошлась бы с поведением на первой же правке.
+#[uniffi::export]
+#[must_use]
+pub fn channel_refusal_text(reason: FfiChannelRefusal) -> String {
+    match reason {
+        FfiChannelRefusal::NoRight => {
+            "В этом канале у вас нет права на это действие. Права выдаёт \
+             владелец, и у выдачи есть срок: она может и закончиться сама."
+        }
+        FfiChannelRefusal::OnlyOwnerPublishesYet => {
+            "В этом канале публикует только владелец. Право писать \
+             у вас есть, но разослать написанное пока некому: состав \
+             канала знает он один."
+        }
+        FfiChannelRefusal::OwnerNeedsNoGrant => {
+            "Это владелец канала: у него и так все права, и отнять их \
+             нельзя. Выдавать их нужно другим."
+        }
+        FfiChannelRefusal::WrongProfile => {
+            "Это действие не для этого чата: у канала и у группы разные \
+             правила, и то, что можно в одном, не значит ничего в другом."
+        }
+        FfiChannelRefusal::OpenHasNoRotation => {
+            "В открытом канале ключ чтения лежит в самой ссылке — у всех, \
+             кому её переслали. Отбирать его не у кого: закрыть такой \
+             канал можно только заведя новый."
+        }
+        FfiChannelRefusal::RotatedTooRecently => {
+            "Ключ чтения поворачивали меньше недели назад. Каждый поворот \
+             — это отдельная посылка каждому читателю, поэтому чаще нельзя."
+        }
+        FfiChannelRefusal::NoReadKeyYet => {
+            "У канала ещё нет ключа чтения: впускать в него пока некуда. \
+             Поверните ключ — и впускайте."
+        }
+        FfiChannelRefusal::PowTooHard => {
+            "Этот канал требует работы, которую ваше устройство не смогло \
+             посчитать. Цену назначает владелец канала."
+        }
+        FfiChannelRefusal::BadLink => {
+            "Это не ссылка на канал. Ссылка начинается с ratatosk:v0:channel:"
+        }
+        FfiChannelRefusal::AlreadySubscribed => {
+            "Вы уже подписаны на этот канал — он есть в списке чатов."
+        }
+        FfiChannelRefusal::OwnChannel => {
+            "Это ваш канал. От своего канала не отписываются: подписчики \
+             останутся с ним, а управлять им стало бы нечем."
+        }
+        FfiChannelRefusal::TooManyGrants => {
+            "В представлении канала больше не помещается выдач. Снимите \
+             право у кого-нибудь, чтобы выдать новое."
+        }
+    }
+    .to_owned()
 }
 
 /// Почему передача файла стоит (§10.3).
@@ -518,6 +682,14 @@ pub enum FfiEvent {
         /// Название из новой версии.
         title: String,
     },
+    /// Отписались от канала (фаза 2, §10.6).
+    ///
+    /// Чата больше нет: ни истории, ни ключей чтения, ни представления.
+    /// Клиенту по нему делать ровно одно — убрать строку из списка чатов.
+    ChannelUnsubscribed {
+        /// Чат.
+        chat_id: Vec<u8>,
+    },
     /// Канал заведён (фаза 2, §6.1).
     ///
     /// Отдельно от [`FfiEvent::GroupCreated`]: у канала нет списка
@@ -526,12 +698,19 @@ pub enum FfiEvent {
     ChannelCreated {
         /// Чат.
         chat_id: Vec<u8>,
-        /// Название.
+        /// Название. У впущенного — из вводного блока; подписанным оно
+        /// доедет в представлении.
         title: String,
         /// Открытый ли канал (§6.1). Порода задана при заведении
         /// и не меняется: «Открытый канал» и «Канал по приглашению» —
         /// два разных обещания, и слово для каждого одно.
-        open: bool,
+        ///
+        /// `null` — **породу ещё не знаем**: так приходит событие тому,
+        /// кого впустили. Вводный блок говорит «это канал», а порода
+        /// живёт в подписанном представлении и приедет следом
+        /// ([`FfiEvent::ChannelChanged`]). До тех пор слова для неё нет,
+        /// и выдумывать его нельзя: порода решает, у кого ключ чтения.
+        open: Option<bool>,
     },
     /// Группу переименовали.
     ///
@@ -1071,6 +1250,158 @@ pub struct FfiGroupMember {
     pub mine: bool,
 }
 
+/// Права в канале, как их рисуют (фаза 2, §6.2).
+///
+/// Четыре булевых вместо битовой маски: маска на границе §13.3 означала бы,
+/// что клиент знает номера битов, то есть кусок протокола. Порядок полей —
+/// порядок §6.2.
+///
+/// **Незнакомое право сюда не попадает.** Биты, выданные сборкой новее
+/// нашей, переживают чтение и запись документа (`channel::Rights`), но
+/// показать их нечем: слова для них у нас нет. Выдавая права этой
+/// записью, клиент выданное незнакомое **снимет** — и это честно:
+/// он и правда не знает, что выдаёт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannelRights {
+    /// Публиковать в канал.
+    pub write: bool,
+    /// Впускать: выдавать ключ чтения (§6.5).
+    pub admit: bool,
+    /// Поворачивать ключ чтения, отсекая невписанных (§6.4).
+    ///
+    /// Это и есть исключение читателя; другого в канале нет.
+    pub evict: bool,
+    /// Править описательные поля представления.
+    pub edit: bool,
+}
+
+/// Что клиент знает о канале сверх того, что знает о группе (фаза 2).
+///
+/// Плоская, как и всё здесь: правила §6 посчитаны ядром, наружу едет
+/// то, что рисуют.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannel {
+    /// Принятая версия представления. `0` — документа ещё нет.
+    ///
+    /// Ноль обычен и законен: по ссылке чат заводится сразу, а документ
+    /// едет отдельно и вправе опоздать (§10.3). Рисовать тогда нечего,
+    /// кроме ожидания, — названия у канала в этот момент тоже нет.
+    pub version: u64,
+    /// Порода (§6.1): `true` — открытый, `false` — по приглашению.
+    ///
+    /// `null` — документа нет, и **обещание ссылки сюда не едет
+    /// нарочно**: ссылка ничем не подписана (§10.2). Показать обещанное
+    /// установленным значило бы сказать «открытый канал» там, где
+    /// владелец обещал другое.
+    pub open: Option<bool>,
+    /// Владелец: чья подпись здесь действительна (§10.3, шаг 3).
+    pub owner_ik: Vec<u8>,
+    /// Что вправе делать **мы** прямо сейчас (§6.2, §6.3).
+    ///
+    /// Считается с учётом срока и правила «владельцу всё» — тем же
+    /// местом, каким права спрашивает отправка. Поле ввода стоит гасить
+    /// по `rights.write`, а не по составу: в канале состоять и мочь
+    /// говорить — разные вещи.
+    pub rights: FfiChannelRights,
+    /// До какого момента действует наша выдача, мс. `0` — срока нет:
+    /// мы владелец либо прав нам не давали.
+    ///
+    /// Показывать стоит заранее: §6.3 обещает, что отказ не наступает
+    /// внезапно.
+    pub rights_until_ms: u64,
+    /// Сколько бит работы стоит слово (§11). `0` — работа не требуется.
+    ///
+    /// Цену назначает владелец, и отказ [`FfiChannelRefusal::PowTooHard`]
+    /// приходит **до** отправки, а не после.
+    pub pow_bits: u32,
+    /// Ждём впуска владельцем (§10.4, §10.5).
+    ///
+    /// Показывать надо именно ожидание, а не пустой чат: §10.5 требует
+    /// различать «заявка отправлена» и «впустили» — и после перезапуска
+    /// тоже.
+    pub awaiting: bool,
+    /// Есть ли чем читать: хоть одно поколение ключа чтения (§6.4).
+    ///
+    /// `false` означает, что сообщения приедут и не откроются. Рисовать
+    /// тогда надо ожидание, а не пустую ленту.
+    pub readable: bool,
+    /// Номер новейшего известного нам поколения ключа (§6.4).
+    pub generation: u64,
+    /// Показывать ли кнопку «повернуть ключ» (§6.4).
+    ///
+    /// Считает ядро по трём правилам разом: порода, право «исключать»
+    /// и нижний предел в неделю. Отдаётся затем же, зачем
+    /// [`FfiGroup::free_slots`], — чтобы отказ не понадобился.
+    pub may_rotate: bool,
+    /// Сколько миллисекунд от владельца ничего не приходило (§6.3).
+    ///
+    /// `null` — не приходило ни разу; это не «давно», а «считать ещё
+    /// нечего»: у свежей подписки владелец просто не успел ничего
+    /// сказать. У своего канала тоже `null`.
+    ///
+    /// **Утверждение — «от владельца ничего не приходило», а не
+    /// «владелец не выходил на связь».** §6.3 выводит метку из записи
+    /// пира со сроком годности, а каталога пиров в ядре нет; здесь
+    /// считается наш приём. Текст обязан говорить именно это.
+    pub owner_quiet_ms: Option<u64>,
+    /// Молчание перешло порог §6.3 (два месяца).
+    ///
+    /// Порог задан спекой и живёт в ядре: вычитание дат на этой стороне
+    /// границы означало бы второе место, где он записан.
+    pub owner_unseen: bool,
+    /// Сколько наших выдач истекает меньше чем через месяц (§6.3).
+    ///
+    /// **Только у владельца**, у остальных `0`: продлевать чужое нечем,
+    /// и число, которое не к чему применить, на экране только пугает.
+    /// §6.3 велит продлевать заранее — иначе требование превращается
+    /// в «зайти строго на третий месяц».
+    pub grants_expiring: u32,
+}
+
+/// Выдача права, как её рисуют владельцу (фаза 2, §6.2, §6.3).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannelGrant {
+    /// Кому выдано.
+    pub who: Vec<u8>,
+    /// Как его назвать. Пустым не бывает: у безымянного — начало отпечатка.
+    pub name: String,
+    /// Что выдано.
+    pub rights: FfiChannelRights,
+    /// До какого момента, мс.
+    pub until_ms: u64,
+    /// Действует ли прямо сейчас (§6.3).
+    ///
+    /// Истёкшая выдача остаётся в документе до следующей версии — снятие
+    /// выражается отсутствием строки, а не надгробием, — и показывать её
+    /// действующей нельзя.
+    pub live: bool,
+}
+
+/// Запись о впуске — учёт владельца (фаза 2, §6.5).
+///
+/// **Учёт, а не состав.** «Кто кого впустил» и «кто в канале» — разные
+/// вопросы с разными источниками. Впущенный мимо учёта здесь не виден
+/// вовсе: впускающий держит ключ и может передать его мимо протокола,
+/// и обещать обратное значило бы обещать невыполнимое (§6.5).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiChannelAdmit {
+    /// Кого впустили.
+    pub who: Vec<u8>,
+    /// Как его назвать.
+    pub name: String,
+    /// Кто впустил.
+    pub admitted_by: Vec<u8>,
+    /// Как назвать впустившего.
+    pub admitted_by_name: String,
+    /// Какое поколение ключа чтения ему тогда отдали.
+    ///
+    /// Именно выданное, а не нынешнее: поворот случится, номера
+    /// разойдутся, и запись останется утверждением о прошлом.
+    pub generation: u64,
+    /// Когда запись легла к нам, мс.
+    pub created_ms: u64,
+}
+
 /// Что клиент знает о группе (§11).
 ///
 /// Плоская, как и всё на этой границе: `Group` — тип протокольного слоя,
@@ -1150,6 +1481,18 @@ pub struct FfiGroup {
     /// `0` у полной группы и у той, из которой мы вышли: звать оттуда
     /// мы всё равно не вправе.
     pub free_slots: u32,
+    /// Всё, чем канал отличается от группы (фаза 2, §6, §10).
+    ///
+    /// `null` у обычной группы. Признак «это канал» выражен **наличием
+    /// записи**, а не отдельным булевым полем: рисовать канальный экран
+    /// не по чему, если записи нет, и два источника одного ответа
+    /// однажды разошлись бы.
+    ///
+    /// Всё групповое при этом остаётся верным: у канала есть состав,
+    /// название и создатель, потому что канал **и есть** группа со вторым
+    /// профилем (§3.2). Разница не в том, что это, а в том, что с этим
+    /// можно.
+    pub channel: Option<FfiChannel>,
 }
 
 /// Сообщение в том виде, в каком его показывает UI.
@@ -2876,6 +3219,226 @@ impl RatatoskClient {
         self.command(Command::CreateGroup { title })
     }
 
+    /// Заводит канал (фаза 2, §6.1).
+    ///
+    /// Отдельной командой от [`RatatoskClient::create_group`], а не флагом
+    /// у неё: порода задаётся при заведении и **не меняется** (§6.1),
+    /// а флаг у общей команды допускал бы умолчание там, где умолчания
+    /// быть не должно.
+    ///
+    /// **Перед заведением открытого канала обязателен
+    /// [`open_channel_notice`]** (§15): ключ чтения уедет в ссылку,
+    /// и закрыть доступ обратно нельзя никогда.
+    ///
+    /// **А [`private_channel_notice`] здесь показывать нечего** — он
+    /// обращён к тому, кто **подписывается** («впустить вас должен
+    /// владелец»), и место ему перед
+    /// [`RatatoskClient::subscribe_to_channel`]. Текста «завожу канал
+    /// по приглашению» в §15 нет, и придумывать его клиенту нельзя: §14
+    /// держит тексты связанными со свойствами протокола.
+    ///
+    /// Идентификатор придёт событием [`FfiEvent::ChannelCreated`] —
+    /// и только им: он случаен.
+    pub fn create_channel(&self, title: String, open: bool) -> Result<(), RatatoskError> {
+        self.command(Command::CreateChannel { title, open })
+    }
+
+    /// Ссылка на канал — для QR и пересылки (фаза 2, §10.1, §10.2).
+    ///
+    /// **Собирает её тот, кто делится**, поэтому ссылки на один канал
+    /// у двух людей — разные строки, и сравнивать их как строки нельзя
+    /// нигде: тождество канала — это `chat_id`.
+    ///
+    /// **Перед показом обязателен [`sharing_notice`]** (§15): в ссылку
+    /// попадает наш адрес, и всякий, к кому она попадёт дальше, узнает,
+    /// что мы этот канал читаем.
+    ///
+    /// У открытого канала ссылка несёт **ключ чтения**. Сокращать её
+    /// сторонним сервисом нельзя — ключ уедет сокращателю (§10.1).
+    pub fn channel_link(&self, chat_id: Vec<u8>) -> Result<String, RatatoskError> {
+        self.opened
+            .handle
+            .channel_link_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?
+            .map_err(engine_err)
+    }
+
+    /// Подписывается на канал по ссылке (фаза 2, §10.3, §10.4).
+    ///
+    /// **Перед вызовом обязателен текст породы** — [`open_channel_notice`]
+    /// либо [`private_channel_notice`] (§15), по тому, что обещает ссылка:
+    /// ключ в ней есть у открытого канала и нет у канала по приглашению.
+    /// Оба обращены к подписывающемуся и говорят ему разное: там — что
+    /// ключ раздаётся дальше вместе со ссылкой, здесь — что до впуска
+    /// владельцем канал не откроется.
+    ///
+    /// **Предпросмотр не бесплатен, и сказать это надо до вызова**
+    /// (§10.3): чтобы достать представление, мы соединимся с владельцем
+    /// или сидом, и он узнает, что кто-то интересуется каналом, даже
+    /// если человек потом откажется.
+    ///
+    /// Достать представление ядро пока не умеет — это работа транспорта,
+    /// — поэтому сразу после подписки у канала **нет названия**: оно
+    /// внутри документа. Честная строка в списке чатов — «канал, ссылку
+    /// прислал X», и рисует её клиент.
+    ///
+    /// У канала по приглашению событие придёт с `awaiting = true`:
+    /// впустить должен владелец, и до впуска читать будет нечего.
+    pub fn subscribe_to_channel(&self, uri: String) -> Result<(), RatatoskError> {
+        self.command(Command::SubscribeToChannel { uri })
+    }
+
+    /// Отписывается от канала (фаза 2, §10.6).
+    ///
+    /// **Отписка стирает ключи чтения, а с ними и архив.** Вернувшись
+    /// по той же ссылке, человек прочтёт только то, что приедет заново:
+    /// прежние поколения ключа хранятся у читателя и больше нигде.
+    /// Сказать это надо **до** вызова — после будет поздно.
+    ///
+    /// В открытом канале владелец ничего не узнает: он и о подписке
+    /// не знал. У канала по приглашению уедет блок ухода.
+    ///
+    /// От своего канала отписаться нельзя — придёт
+    /// [`FfiChannelRefusal::OwnChannel`].
+    pub fn unsubscribe_from_channel(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::UnsubscribeFromChannel { chat: to_chat(&chat_id)? })
+    }
+
+    /// Впускает человека в канал (фаза 2, §6.5, §10.4).
+    ///
+    /// Не то же, что пригласить в группу: впуск спрашивает право
+    /// «впускать», отдаёт впущенному **поколение ключа чтения** и
+    /// оставляет подписанную запись о себе. Поэтому
+    /// [`RatatoskClient::invite_to_group`] в канале отказывает.
+    ///
+    /// Впускаемый обязан быть контактом: без карточки ему нечем
+    /// запечатать ключ.
+    ///
+    /// **Впущенные остаются впущенными** после снятия права у того, кто
+    /// впускал (§6.5). Сказать это надо при **назначении** права —
+    /// [`admitter_grant_notice`], — а не при снятии.
+    pub fn admit_to_channel(
+        &self,
+        chat_id: Vec<u8>,
+        peer_ik: Vec<u8>,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::AdmitToChannel {
+            chat: to_chat(&chat_id)?,
+            peer_ik: to_ik(&peer_ik)?,
+        })
+    }
+
+    /// Выдаёт или снимает право в канале (фаза 2, §6.2, §6.3).
+    ///
+    /// Одна команда на то и другое: снятие — это выдача с пустым набором,
+    /// потому что список в новой версии представления **и есть** всё, что
+    /// действует. Подписывает документ владелец, и только он: «раздача
+    /// прав не делегируется никогда, иначе это совладение» (§6.2).
+    ///
+    /// **Срок обязателен.** Не продлил — истекло само (§6.3); право без
+    /// срока означало бы отзыв, а отзыв в рое не работает. Продлевать
+    /// стоит заранее: [`FfiChannel::grants_expiring`] считает выдачи,
+    /// которым осталось меньше месяца.
+    ///
+    /// Перед выдачей права «впускать» обязателен [`admitter_grant_notice`].
+    pub fn set_channel_right(
+        &self,
+        chat_id: Vec<u8>,
+        who: Vec<u8>,
+        rights: FfiChannelRights,
+        until_ms: u64,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::SetChannelRight {
+            chat: to_chat(&chat_id)?,
+            who: to_ik(&who)?,
+            rights: rights_back(rights),
+            until_ms,
+        })
+    }
+
+    /// Назначает цену слова в канале (фаза 2, §11).
+    ///
+    /// Уезжает новой версией представления: подписчик обязан знать цену
+    /// **до** того, как заплатит.
+    ///
+    /// PoW «поднимает пол против тривиального флуда; против видеокарты
+    /// не работает, телефон наказывает всерьёз» (§11) — это фильтр
+    /// первого уровня, а не защита, и обещать им больше нельзя.
+    /// Слишком большое число отвергается сразу
+    /// ([`FfiChannelRefusal::PowTooHard`]), а не превращает канал
+    /// в непишущий для всех, у кого телефон.
+    pub fn set_channel_pow(&self, chat_id: Vec<u8>, bits: u32) -> Result<(), RatatoskError> {
+        self.command(Command::SetChannelPow { chat: to_chat(&chat_id)?, bits })
+    }
+
+    /// Поворачивает ключ чтения канала (фаза 2, §6.4).
+    ///
+    /// **Перед вызовом обязателен [`key_rotation_notice`]** (§15): кнопка
+    /// называется последствием — все, кого нет в составе, теряют доступ
+    /// к будущему. Прочитанное они сохранят: поколения сосуществуют,
+    /// и архив не теряется.
+    ///
+    /// Показывать кнопку стоит по [`FfiChannel::may_rotate`]: там уже
+    /// учтены порода, право и нижний предел в неделю.
+    ///
+    /// Раз в месяц ядро поворачивает ключ **само** (§6.4); эта команда —
+    /// «повернуть сейчас», то есть исключение читателя.
+    pub fn rotate_channel_key(&self, chat_id: Vec<u8>) -> Result<(), RatatoskError> {
+        self.command(Command::RotateChannelKey { chat: to_chat(&chat_id)? })
+    }
+
+    /// Кому что выдано в канале (фаза 2, §6.2).
+    ///
+    /// Отдельным чтением, а не полем в [`FfiGroup`]: до шестидесяти
+    /// четырёх строк с именами на канал, а список чатов читается
+    /// на каждый показ экрана.
+    ///
+    /// Истёкшие выдачи остаются в списке до следующей версии документа
+    /// и помечены `live = false`: снятие выражается отсутствием строки,
+    /// а не надгробием (§6.2).
+    pub fn channel_grants(&self, chat_id: Vec<u8>) -> Result<Vec<FfiChannelGrant>, RatatoskError> {
+        let found = self
+            .opened
+            .handle
+            .channel_grants_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found
+            .into_iter()
+            .map(|grant| FfiChannelGrant {
+                who: grant.who.to_vec(),
+                name: grant.name,
+                rights: rights_of(grant.rights),
+                until_ms: grant.until_ms,
+                live: grant.live,
+            })
+            .collect())
+    }
+
+    /// Кто кого впустил в канал — учёт владельца (фаза 2, §6.5).
+    ///
+    /// Показывает тех, кто действовал **по правилам**, и ничего не говорит
+    /// про остальных: впускающий держит ключ и может передать его мимо
+    /// протокола — следа не останется. Чинится это не записью, а поворотом
+    /// ключа.
+    pub fn channel_admits(&self, chat_id: Vec<u8>) -> Result<Vec<FfiChannelAdmit>, RatatoskError> {
+        let found = self
+            .opened
+            .handle
+            .channel_admits_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(found
+            .into_iter()
+            .map(|admit| FfiChannelAdmit {
+                who: admit.who.to_vec(),
+                name: admit.name,
+                admitted_by: admit.admitted_by.to_vec(),
+                admitted_by_name: admit.admitted_by_name,
+                generation: admit.generation,
+                created_ms: admit.created_ms,
+            })
+            .collect())
+    }
+
     /// Приглашает в группу (§11.2, §11.5).
     ///
     /// Приглашать может любой участник. Приглашаемый обязан быть **контактом**:
@@ -3364,6 +3927,7 @@ fn group_of(status: &ratatosk_core::driver::GroupStatus) -> FfiGroup {
         chat_id: status.chat.to_vec(),
         title: status.title.clone(),
         created_ms: status.created_ms,
+        channel: status.channel.as_ref().map(channel_of),
         members: status
             .members
             .iter()
@@ -3374,6 +3938,65 @@ fn group_of(status: &ratatosk_core::driver::GroupStatus) -> FfiGroup {
         avatar_ms: status.avatar_ms,
         free_slots: status.free_slots,
     }
+}
+
+/// Переводит канальные факты наружу (фаза 2).
+///
+/// Ни одного решения здесь нет нарочно: всё посчитано ядром
+/// (`Engine::channel_facts`), и повтори мы тут хоть одно правило §6,
+/// оно зажило бы в двух местах.
+fn channel_of(facts: &ratatosk_core::engine::ChannelFacts) -> FfiChannel {
+    FfiChannel {
+        version: facts.version,
+        open: facts.open,
+        owner_ik: facts.owner_ik.to_vec(),
+        rights: rights_of(facts.rights),
+        rights_until_ms: facts.rights_until_ms,
+        pow_bits: facts.pow_bits,
+        awaiting: facts.awaiting,
+        readable: facts.readable,
+        generation: facts.generation,
+        may_rotate: facts.may_rotate,
+        owner_quiet_ms: facts.owner_quiet_ms,
+        owner_unseen: facts.owner_unseen,
+        grants_expiring: facts.grants_expiring,
+    }
+}
+
+/// Биты прав — в четыре вопроса (§6.2).
+fn rights_of(bits: u32) -> FfiChannelRights {
+    use ratatosk_proto::channel::Rights;
+
+    let rights = Rights::from_bits(bits);
+    FfiChannelRights {
+        write: rights.has(Rights::WRITE),
+        admit: rights.has(Rights::ADMIT),
+        evict: rights.has(Rights::EVICT),
+        edit: rights.has(Rights::EDIT),
+    }
+}
+
+/// И обратно — то, что человек отметил на экране, в биты (§6.2).
+///
+/// Незнакомых битов тут взяться неоткуда, и в этом названная цена
+/// записи: выдавая права отсюда, клиент снимает то, чего не знает.
+fn rights_back(rights: FfiChannelRights) -> u32 {
+    use ratatosk_proto::channel::Rights;
+
+    let mut bits = Rights::none();
+    if rights.write {
+        bits = bits.with(Rights::WRITE);
+    }
+    if rights.admit {
+        bits = bits.with(Rights::ADMIT);
+    }
+    if rights.evict {
+        bits = bits.with(Rights::EVICT);
+    }
+    if rights.edit {
+        bits = bits.with(Rights::EDIT);
+    }
+    bits.bits()
 }
 
 fn to_ik(bytes: &[u8]) -> Result<[u8; 32], RatatoskError> {
@@ -4047,6 +4670,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::ChannelSubscribed { chat, awaiting } => {
             FfiEvent::ChannelSubscribed { chat_id: chat.to_vec(), awaiting }
         }
+        Event::ChannelUnsubscribed { chat } => {
+            FfiEvent::ChannelUnsubscribed { chat_id: chat.to_vec() }
+        }
         Event::ChannelKeyRotated { chat, generation } => {
             FfiEvent::ChannelKeyRotated { chat_id: chat.to_vec(), generation }
         }
@@ -4294,6 +4920,73 @@ pub fn enable_file_logging(filter: String, path: String) {
 #[must_use]
 pub fn honest_notices() -> Vec<String> {
     ratatosk_core::honest::NOTICES.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Что означает открытый канал (фаза 2, §15, §6.1, §10.7).
+///
+/// Показывается **до** заведения открытого канала, до подписки на него
+/// и до того, как ссылкой поделятся: непоправимое здесь одно и то же
+/// для обеих сторон. Говорит непоправимое: ключ чтения лежит в самой ссылке,
+/// прочтёт её всякий, кому её перешлют, и закрыть доступ обратно нельзя.
+///
+/// Текст на границе, а не в клиенте, по той же причине, что
+/// [`honest_notices`]: §15 существует затем, чтобы обещания продукта
+/// не разошлись со свойствами протокола.
+#[uniffi::export]
+#[must_use]
+pub fn open_channel_notice() -> String {
+    ratatosk_proto::channel::OpenChannelConsequences::ui_text().to_owned()
+}
+
+/// Что означает канал по приглашению (фаза 2, §15, §6.1, §10.4).
+///
+/// Показывается **подписывающемуся** — при переходе по ссылке на такой
+/// канал, до подписки. Заводящему его показывать нечего: текст обращён
+/// к тому, кого впускают («впустить вас должен владелец»), и владелец
+/// прочёл бы в нём, что его самого кто-то должен впустить.
+///
+/// **Говорит правду о сегодняшнем дне, а не о спеке.** §15 обещает
+/// «он увидит вашу карточку», но заявки подписчика в ядре нет: переход
+/// по ссылке не отправляет владельцу ничего, и сказать ему о себе надо
+/// другим способом. Появится заявка — изменится и текст, и проверка
+/// при нём падает ровно затем, чтобы это не забылось.
+#[uniffi::export]
+#[must_use]
+pub fn private_channel_notice() -> String {
+    ratatosk_proto::channel::PrivateChannelConsequences::ui_text().to_owned()
+}
+
+/// Что означает передача права «впускать» (фаза 2, §15, §6.5).
+///
+/// Показывается при **назначении** права, а не при снятии, и это
+/// требование §6.5: впущенные остаются впущенными после того, как право
+/// у впускавшего снято. Сказанное при снятии уже ничего не меняет.
+#[uniffi::export]
+#[must_use]
+pub fn admitter_grant_notice() -> String {
+    ratatosk_proto::channel::AdmitterGrantConsequences::ui_text().to_owned()
+}
+
+/// Что означает поворот ключа чтения (фаза 2, §15, §6.4).
+///
+/// Показывается до кнопки «повернуть сейчас»: §6.4 требует, чтобы она
+/// называлась последствием. Все, кого нет в составе, теряют будущее;
+/// прочитанное остаётся у них, и обещать обратное нельзя.
+#[uniffi::export]
+#[must_use]
+pub fn key_rotation_notice() -> String {
+    ratatosk_proto::channel::KeyRotationConsequences::ui_text().to_owned()
+}
+
+/// Что означает «поделиться ссылкой» (фаза 2, §15, §10.2).
+///
+/// Показывается до показа ссылки: в неё попадает наш адрес, и всякий,
+/// к кому она попадёт дальше, узнает его — и то, что мы этот канал
+/// читаем, — даже если сам подписываться не станет.
+#[uniffi::export]
+#[must_use]
+pub fn sharing_notice() -> String {
+    ratatosk_proto::channel::SharingConsequences::ui_text().to_owned()
 }
 
 /// Наибольший размер аватарки в байтах.
@@ -4847,6 +5540,36 @@ mod tests {
             joined,
             avatar_ms,
             free_slots: 30,
+            // Заготовка — про **группу**: канальные поля у неё пусты,
+            // и этим же отличием проверяется, что «это канал» выражено
+            // наличием записи, а не полем.
+            channel: None,
+        }
+    }
+
+    /// Та же заготовка, но канал — с фактами §6.
+    fn channel_status(
+        facts: ratatosk_core::engine::ChannelFacts,
+    ) -> ratatosk_core::driver::GroupStatus {
+        ratatosk_core::driver::GroupStatus { channel: Some(facts), ..status(false, true) }
+    }
+
+    /// Факты канала, в котором нам ничего не разрешено.
+    fn plain_facts() -> ratatosk_core::engine::ChannelFacts {
+        ratatosk_core::engine::ChannelFacts {
+            version: 3,
+            open: Some(false),
+            owner_ik: [9u8; 32],
+            rights: 0,
+            rights_until_ms: 0,
+            pow_bits: 0,
+            awaiting: false,
+            readable: true,
+            generation: 2,
+            may_rotate: false,
+            owner_quiet_ms: None,
+            owner_unseen: false,
+            grants_expiring: 0,
         }
     }
 
@@ -4937,5 +5660,107 @@ mod tests {
                 "наружу выведен ровно тот отказ, с которым человеку есть что делать"
             );
         }
+    }
+
+    // --- Каналы на границе (фаза 2, §6, §10, §13.3) ------------------------
+
+    /// Канал отличается от группы **наличием записи**, а не полем.
+    #[test]
+    fn a_group_carries_no_channel_facts_and_a_channel_carries_them_all() {
+        assert!(
+            group_of(&status(true, true)).channel.is_none(),
+            "у группы канального экрана нет: рисовать по нему нечего"
+        );
+
+        let it = group_of(&channel_status(plain_facts()));
+        let channel = it.channel.expect("у канала факты обязаны доехать");
+        assert_eq!(channel.version, 3);
+        assert_eq!(channel.open, Some(false));
+        assert_eq!(channel.owner_ik, vec![9u8; 32], "по владельцу проверяется подпись (§10.3)");
+        assert_eq!(channel.generation, 2);
+        assert!(channel.readable);
+        assert!(!channel.rights.write, "право писать считает ядро, а не клиент по составу");
+    }
+
+    /// Права едут четырьмя вопросами и возвращаются теми же битами.
+    #[test]
+    fn rights_cross_the_boundary_in_both_directions() {
+        use ratatosk_proto::channel::Rights;
+
+        let bits = Rights::WRITE.with(Rights::EVICT).bits();
+        let shown = rights_of(bits);
+        assert!(shown.write && shown.evict, "выданное обязано быть видно");
+        assert!(!shown.admit && !shown.edit, "невыданное — не выдумано");
+        assert_eq!(rights_back(shown), bits, "обратный перевод обязан сойтись");
+
+        // **Названная цена этой записи.** Незнакомый бит переживает
+        // документ, но слова для него у нас нет: выдавая права отсюда,
+        // клиент его снимет. Проверка стоит затем, чтобы это осталось
+        // решением, а не неожиданностью.
+        let odd = bits | (1 << 17);
+        assert_eq!(
+            rights_back(rights_of(odd)),
+            bits,
+            "незнакомое право через экран не проходит — и об этом сказано в доке"
+        );
+    }
+
+    /// Отказ канала — ответ, а не сбой, и у каждого есть слова.
+    #[test]
+    fn every_channel_refusal_is_an_answer_with_words() {
+        use ratatosk_core::EngineError;
+
+        let named = [
+            (EngineError::NotAllowedInChannel, FfiChannelRefusal::NoRight),
+            (EngineError::OwnerNeedsNoGrant, FfiChannelRefusal::OwnerNeedsNoGrant),
+            (EngineError::OnlyOwnerPublishesYet, FfiChannelRefusal::OnlyOwnerPublishesYet),
+            (EngineError::NotAChannel, FfiChannelRefusal::WrongProfile),
+            (EngineError::NotAGroup, FfiChannelRefusal::WrongProfile),
+            (EngineError::OpenChannelHasNoRotation, FfiChannelRefusal::OpenHasNoRotation),
+            (EngineError::RotatedTooRecently, FfiChannelRefusal::RotatedTooRecently),
+            (EngineError::NoReadKeyYet, FfiChannelRefusal::NoReadKeyYet),
+            (EngineError::PowTooHard, FfiChannelRefusal::PowTooHard),
+            (EngineError::BadChannelLink, FfiChannelRefusal::BadLink),
+            (EngineError::AlreadySubscribed, FfiChannelRefusal::AlreadySubscribed),
+            (EngineError::CannotUnsubscribeOwnChannel, FfiChannelRefusal::OwnChannel),
+            (EngineError::TooManyGrants, FfiChannelRefusal::TooManyGrants),
+        ];
+        for (error, expected) in named {
+            let RatatoskError::Channel { reason } = engine_err(error) else {
+                panic!(
+                    "отказ канала, показанный внутренней ошибкой, советует переустановить \
+                        работающее"
+                );
+            };
+            assert_eq!(reason, expected, "каждая причина требует от человека своего действия");
+            // Текст не проверяется дословно — он правится, — но пустым
+            // он не бывает: молчащий отказ и есть та самая внутренняя
+            // ошибка, от которой причины и отделены.
+            assert!(!channel_refusal_text(reason).is_empty(), "у отказа обязаны быть слова");
+        }
+    }
+
+    /// А то, с чем человеку делать нечего, наружу не выводится.
+    #[test]
+    fn a_channel_refusal_that_says_nothing_to_a_human_stays_internal() {
+        assert!(
+            matches!(
+                engine_err(ratatosk_core::EngineError::UnknownGroup),
+                RatatoskError::Internal { .. }
+            ),
+            "«такой группы нет» — это сбой клиента, а не выбор человека"
+        );
+    }
+
+    /// Тексты §15 доезжают целиком и берутся у ядра.
+    #[test]
+    fn the_channel_notices_come_from_the_protocol_and_not_from_the_client() {
+        use ratatosk_proto::channel;
+
+        assert_eq!(open_channel_notice(), channel::OpenChannelConsequences::ui_text());
+        assert_eq!(private_channel_notice(), channel::PrivateChannelConsequences::ui_text());
+        assert_eq!(admitter_grant_notice(), channel::AdmitterGrantConsequences::ui_text());
+        assert_eq!(key_rotation_notice(), channel::KeyRotationConsequences::ui_text());
+        assert_eq!(sharing_notice(), channel::SharingConsequences::ui_text());
     }
 }

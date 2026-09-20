@@ -251,6 +251,18 @@ impl Store for MemoryStore {
         self.membership.retain(|(chat, ..), _| chat != chat_id);
         self.blocks.retain(|(chat, _), _| chat != chat_id);
         self.chains.retain(|(chat, _), _| chat != chat_id);
+        // Знак свёртки и всё канальное — тем же каскадом. Пять строк
+        // ниже появились не из полноты списка: без них отписка (§10.6)
+        // означала бы здесь «чата нет, а ключи чтения есть», то есть
+        // ровно то, чего она обещает не оставлять. В файловой базе их
+        // уносит `ON DELETE CASCADE`, и разойдись два хранилища —
+        // симуляция §16 проверяла бы отписку, которой на устройстве
+        // не бывает. Тот же класс, что нашли `group_avatars` абзацем выше.
+        self.baselines.remove(chat_id);
+        self.channels.remove(chat_id);
+        self.subscriptions.remove(chat_id);
+        self.archive_keys.retain(|(chat, _), _| chat != chat_id);
+        self.admits.retain(|(chat, _), _| chat != chat_id);
         Ok(())
     }
 
@@ -781,6 +793,19 @@ impl Store for MemoryStore {
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
         self.avatars.remove(owner_ik);
         Ok(())
+    }
+
+    fn last_heard_in_chat(&self, chat_id: &[u8; 16], sender_ik: &[u8; 32]) -> Result<Option<u64>> {
+        // Надгробия здесь **не** отсеиваются, как и в файловой базе:
+        // удалённое сообщение — всё равно свидетельство того, что человек
+        // тогда был. Отсеивай мы их, уборка §12 через три месяца молча
+        // превращала бы живого собеседника в пропавшего.
+        Ok(self
+            .messages
+            .iter()
+            .filter(|((chat, _, _), m)| chat == chat_id && m.sender_ik == *sender_ik)
+            .map(|(_, m)| m.received_ms)
+            .max())
     }
 
     fn replace_pending_group(&mut self, frames: &[StoredPendingGroup]) -> Result<()> {

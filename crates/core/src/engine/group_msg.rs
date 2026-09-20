@@ -272,9 +272,11 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         // Та же причина, что у списка карточек: ключи законно обгоняют
-        // состав. Кадр откладывается до появления обоих в составе.
-        let state = &self.groups[&chat];
-        if !state.group.contains(&peer_ik) || !state.group.contains(&block.member) {
+        // состав. Кадр откладывается до появления обоих в составе —
+        // а в канале владелец состоит по определению (`counts_as_member`):
+        // блоков про него у читателя нет и не будет (§3.2), и требуй мы
+        // их, цепочка владельца откладывалась бы навсегда.
+        if !self.counts_as_member(chat, &peer_ik) || !self.counts_as_member(chat, &block.member) {
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
             return Ok(Vec::new());
         }
@@ -420,6 +422,8 @@ impl<S: Store> Engine<S> {
         // (`Action::needs_right`). Отдельного вида у текста нет, оттого
         // и право названо здесь прямо.
         self.check_may_put(now_ms, chat, channel::Rights::WRITE)?;
+        // Слово расходится веером — значит его везёт владелец (§3.2).
+        self.check_may_publish(chat)?;
 
         // Цепочка продвигается **до** отправки и тут же ложится на диск.
         // Уроните процесс между продвижением и записью — и следующий запуск
@@ -647,6 +651,18 @@ impl<S: Store> Engine<S> {
             ratatosk_proto::group_action::Gate::OwnSignature => {
                 self.check_may_put(now_ms, chat, channel::Rights::none())?;
             }
+        }
+        // **Право — раньше доставки, и порядок тут значим.** Веерное
+        // в канале возит владелец (§3.2, §7.5.2); спроси мы это первым,
+        // «у вас нет такого права» стало бы неотличимо от «доставлять
+        // некому», и человек, которому права и правда не дали, пошёл бы
+        // ждать роя вместо того, чтобы попросить владельца.
+        //
+        // Спрашивается у **действия**: право и направление доставки —
+        // разные вопросы. Делегат не публикует, но впускает и выдаёт
+        // ключ чтения, а эти блоки едут адресатами.
+        if action.fans_out() {
+            self.check_may_publish(chat)?;
         }
 
         // Цепочка продвигается **до** отправки и тут же ложится на диск —
@@ -1294,6 +1310,21 @@ impl<S: Store> Engine<S> {
                         created_ms: now_ms,
                     },
                 )?;
+                // **Ключ пришёл — значит впустили** (§10.4). Пока
+                // подписка числится заявкой, человек видит «ждём впуска»
+                // (§10.5), и отметку эту снимать больше нечем: заявки мы
+                // не шлём, и ответа на неё не бывает. Выданный ключ
+                // чтения — единственное, что владелец делает впуском
+                // и что до нас доезжает.
+                //
+                // Своей же рассылки это не касается: у владельца записи
+                // подписки нет вовсе — ссылки не было.
+                if let Some(mut subscription) = self.store.subscription(&chat)? {
+                    if subscription.state == SUBSCRIPTION_REQUESTED {
+                        subscription.state = SUBSCRIPTION_JOINED;
+                        self.store.put_subscription(&subscription)?;
+                    }
+                }
                 Ok(vec![Effect::Notify(Event::ChannelKeyRotated { chat, generation: *generation })])
             }
             Action::Admission { bytes } => {

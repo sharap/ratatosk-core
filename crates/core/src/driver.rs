@@ -21,7 +21,7 @@ use ratatosk_transport::{Runner, TransportCommand, TransportError, TransportEven
 use tokio::sync::{mpsc, oneshot};
 
 use crate::engine::ExportScope;
-use crate::engine::{Engine, EngineError};
+use crate::engine::{ChannelAdmitView, ChannelFacts, ChannelGrantView, Engine, EngineError};
 use crate::io::{ArchiveKey, ChatId, Command, Effect, Event, Exported, Input, Merged, Swept};
 use crate::reader::FileReader;
 use ratatosk_transport::runner::PeerAddress;
@@ -289,6 +289,28 @@ enum Query {
     /// такого правила нет вовсе (`ratatosk_proto::avatar` объясняет, почему).
     /// Сведи их в один запрос — и однажды одно правило подменило бы другое.
     GroupAvatar { chat: ChatId, reply: oneshot::Sender<Option<Vec<u8>>> },
+    /// Ссылка на канал (фаза 2, §10.1, §10.2).
+    ///
+    /// Запросом, а не полем в [`GroupStatus`]: ссылку собирают **в момент
+    /// показа** — в неё едут нынешняя версия представления и наши адреса,
+    /// а они меняются. Положенная в список чатов, она устаревала бы молча.
+    ///
+    /// Отказ едет целиком: «это не канал» и «представления нет» человеку
+    /// значат разное.
+    ChannelLink { chat: ChatId, reply: oneshot::Sender<Result<String, EngineError>> },
+    /// Выдачи прав канала (фаза 2, §6.2).
+    ///
+    /// Отдельным запросом, а не полем в [`GroupStatus`], по той же
+    /// причине, что аватарка: до шестидесяти четырёх строк с именами
+    /// на канал, а список чатов читается на каждый показ экрана. Берут
+    /// их, дойдя до экрана прав.
+    ChannelGrants { chat: ChatId, reply: oneshot::Sender<Vec<ChannelGrantView>> },
+    /// Записи о впусках — учёт владельца (фаза 2, §6.5).
+    ///
+    /// Тоже отдельным: список растёт с каждым впуском и окном сидирования
+    /// не обрезается (§6.5), то есть он длиннее состава и никогда
+    /// не короче.
+    ChannelAdmits { chat: ChatId, reply: oneshot::Sender<Vec<ChannelAdmitView>> },
 }
 
 /// Своя карточка в том виде, в каком её показывают человеку.
@@ -555,6 +577,13 @@ pub struct GroupStatus {
     /// `0` означает «больше никого»: и у полной группы, и у той,
     /// из которой мы вышли, — звать оттуда мы всё равно не вправе.
     pub free_slots: u32,
+    /// Всё, чем канал отличается от группы (фаза 2, §6, §10).
+    ///
+    /// `None` у обычной группы. Признак «это канал» выражен здесь
+    /// **наличием записи**, а не отдельным булевым полем: клиенту
+    /// нечего рисовать на канальном экране, если этой записи нет,
+    /// и два источника одного ответа разошлись бы однажды.
+    pub channel: Option<ChannelFacts>,
 }
 
 /// Что клиент знает о сопряжённом десктопе (§13.4).
@@ -734,6 +763,30 @@ impl DriverHandle {
     pub async fn groups(&self) -> Option<Vec<GroupStatus>> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::Groups { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Собирает ссылку на канал (фаза 2, §10.1, §10.2). `None` — драйвер
+    /// остановлен.
+    pub async fn channel_link(&self, chat: ChatId) -> Option<Result<String, EngineError>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::ChannelLink { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает выдачи прав канала (фаза 2, §6.2). `None` — драйвер
+    /// остановлен.
+    pub async fn channel_grants(&self, chat: ChatId) -> Option<Vec<ChannelGrantView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::ChannelGrants { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает учёт впусков канала (фаза 2, §6.5). `None` — драйвер
+    /// остановлен.
+    pub async fn channel_admits(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::ChannelAdmits { chat, reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -1086,6 +1139,30 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Собирает ссылку на канал, блокируя вызывающий поток (фаза 2, §10.1).
+    ///
+    /// Внешний `None` — драйвер остановлен; внутренний отказ — «это
+    /// не канал» либо «представления у нас нет».
+    pub fn channel_link_blocking(&self, chat: ChatId) -> Option<Result<String, EngineError>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChannelLink { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает выдачи прав канала, блокируя вызывающий поток.
+    pub fn channel_grants_blocking(&self, chat: ChatId) -> Option<Vec<ChannelGrantView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChannelGrants { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Читает учёт впусков канала, блокируя вызывающий поток.
+    pub fn channel_admits_blocking(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChannelAdmits { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает аватарку, блокируя вызывающий поток.
     ///
     /// `owner` — `None` для своей. Внешний `None` означает «драйвер
@@ -1346,6 +1423,25 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 Ok(0) => {}
                 Ok(removed) => tracing::debug!(removed, "уборка прошла"),
                 Err(error) => tracing::warn!(%error, "уборка не удалась"),
+            }
+
+            // Поворот ключа чтения по расписанию (фаза 2, §6.4) — тем же
+            // поводом и по той же причине, что уборка: месяц не проверить
+            // таймером на устройстве, которое спит.
+            //
+            // **Эффекты исполняются здесь же**, как у слияния знакомств:
+            // поворот — это запечатанный блок каждому читателю, и отдай
+            // мы их наверх списком, они не уехали бы никуда.
+            let now = now_ms();
+            match self.engine.rotate_channels_if_due(now) {
+                Ok(effects) => {
+                    for effect in effects {
+                        if let Some(failed) = self.apply(now, effect).await {
+                            let _ = self.tolerate(failed).await;
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "поворот ключей по расписанию не удался"),
             }
         }
     }
@@ -1627,6 +1723,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::Groups { reply } => {
                 let me = self.engine.own_card().ik;
+                let now = now_ms();
                 let found = self
                     .engine
                     .groups()
@@ -1649,9 +1746,22 @@ impl<S: Store, R: Runner> Driver<S, R> {
                         } else {
                             0
                         },
+                        // Время берётся **одно на весь список**: права
+                        // истекают по часам (§6.3), и два чата, спрошенные
+                        // в одном показе, обязаны судиться одной секундой.
+                        channel: self.engine.channel_facts(chat, now),
                     })
                     .collect();
                 let _ = reply.send(found);
+            }
+            Query::ChannelLink { chat, reply } => {
+                let _ = reply.send(self.engine.channel_link(chat));
+            }
+            Query::ChannelGrants { chat, reply } => {
+                let _ = reply.send(self.engine.channel_grants(&chat, now_ms()));
+            }
+            Query::ChannelAdmits { chat, reply } => {
+                let _ = reply.send(self.engine.channel_admits(&chat));
             }
         }
     }

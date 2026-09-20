@@ -2129,6 +2129,87 @@ fn both_backends_answer_the_same_about_a_channel() {
     assert_eq!(memory.channel(&[8u8; 16]).unwrap(), None);
 }
 
+#[test]
+fn deleting_a_chat_takes_everything_of_the_channel_with_it_in_both_backends() {
+    // Отписка (§10.6) обещает: «чат удаляется, ключи стираются». Держится
+    // это обещание на удалении чата, а каскад у двух хранилищ устроен
+    // по-разному — внешним ключом в файловой базе и руками в памяти.
+    //
+    // **Паритет здесь и есть проверка.** Разойдись они, симуляция §16
+    // проверяла бы отписку, которой на устройстве не бывает: в памяти
+    // ключи чтения остались бы лежать, и «архив закрылся навсегда» было бы
+    // ложью ровно там, где её никто не ищет. Тем же классом однажды
+    // нашлись `group_avatars`.
+    for backend in 0..2 {
+        let db = TempDb::new(&format!("channel-delete-{backend}"));
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        let mut memory = MemoryStore::new();
+        memory.migrate().unwrap();
+        let store: &mut dyn Store = if backend == 0 { &mut sqlite } else { &mut memory };
+        let who = if backend == 0 { "файловая база" } else { "память" };
+
+        with_a_channel_chat(store);
+        store.put_channel(&channel(2, vec![grant(1, 1, 9_000)])).unwrap();
+        store.put_subscription(&subscription(3, 1, 2)).unwrap();
+        store
+            .put_archive_key(
+                &[7u8; 16],
+                &StoredArchiveKey { generation: 0, key: [42u8; 32], created_ms: 1_000 },
+            )
+            .unwrap();
+        store
+            .put_admit(
+                &[7u8; 16],
+                &ratatosk_store::StoredAdmit {
+                    who: [1u8; 32],
+                    admitted_by: [107u8; 32],
+                    generation: 0,
+                    block_bytes: vec![1, 2, 3],
+                    signature: [4u8; 64],
+                    created_ms: 1_000,
+                },
+            )
+            .unwrap();
+        // Заготовка обязана быть непустой — иначе проверка ниже была бы
+        // истинной на пустом месте.
+        assert!(!store.archive_keys(&[7u8; 16]).unwrap().is_empty(), "{who}: ключ не положился");
+
+        store.delete_chat(&[7u8; 16]).unwrap();
+
+        assert!(store.channel(&[7u8; 16]).unwrap().is_none(), "{who}: представление осталось");
+        assert!(store.subscription(&[7u8; 16]).unwrap().is_none(), "{who}: подписка осталась");
+        assert!(
+            store.archive_keys(&[7u8; 16]).unwrap().is_empty(),
+            "{who}: ключи чтения остались — архив остался бы открытым после отписки"
+        );
+        assert!(store.admits(&[7u8; 16]).unwrap().is_empty(), "{who}: учёт впусков остался");
+    }
+}
+
+#[test]
+fn asking_for_every_message_of_a_chat_does_not_bring_the_store_down() {
+    // Поломка, найденная стендом отписки: «дай все сообщения» — это
+    // `usize::MAX`, и он шёл в SQLite через перевод **величины протокола**,
+    // где значение больше `i64::MAX` означает испорченные данные и роняет
+    // отладочную сборку. Предел выборки — не величина протокола, а наша
+    // собственная просьба.
+    //
+    // Тем же путём ходит очистка чата (`on_clear_chat`), то есть роняла
+    // она не только отписку, и не в релизе: там перевод насыщался молча.
+    let db = TempDb::new("limit-max");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    store.put_group(&group(7, "лента", 1_000)).unwrap();
+    let mut row = message(1, 1_000);
+    row.chat_id = [7u8; 16];
+    store.put_message(&row).unwrap();
+
+    let all = store.messages(&[7u8; 16], usize::MAX, None).unwrap();
+    assert_eq!(all.len(), 1, "«дай всё» обязано отдавать всё, а не падать");
+    assert_eq!(store.search(Some(&[7u8; 16]), "привет", usize::MAX).unwrap().len(), 0);
+}
+
 // --- Подписка и поколения ключа (фаза 2, §10.4, §6.4) ----------------------
 
 fn subscription(min_version: u64, kind_claimed: u32, state: u32) -> StoredSubscription {

@@ -7943,6 +7943,226 @@ fn readers_of_a_channel_do_not_learn_about_each_other() {
     );
 }
 
+// --- Приёмная сторона §8.3: незнакомец ложится пиром ----------------------
+
+#[test]
+fn a_handshake_from_a_stranger_leaves_a_peer_and_not_a_contact() {
+    // **§8.3 дословно: «третий вид записи за сессией».** Сессия
+    // по-прежнему не бывает беспризорной — но за ней стоит запись пира,
+    // а не карточка в списке знакомых. Иначе «список контактов у читателя
+    // двух каналов зарастает сотнями незнакомцев».
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    // Алиса знает Боба, Боб о ней — ничего: так выглядит переход
+    // по ссылке (§10.1) и так же — письмо от незнакомого человека.
+    let b_card = bob.own_card().encode().unwrap();
+    alice
+        .step(0, Input::Command(Command::AddContact { card_bytes: b_card, met_in_person: true }))
+        .unwrap();
+
+    // **Только рукопожатие, без слова**: слово — это уже разговор,
+    // и оно заводит контакт своей дорогой (проверка ниже). Здесь нужен
+    // ровно первый кадр.
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    let hello = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Send { frame, .. } => Some(frame),
+            _ => None,
+        })
+        .expect("первый кадр — рукопожатие §8.2");
+    bob.step(1_100, Input::Received { via: Transport::Lan, frame: hello }).expect("шаг");
+
+    let alice_ik = alice.own_card().ik;
+    assert!(bob.contacts().is_empty(), "рукопожатие контакта не заводит (§8.3)");
+    let peer = bob.peers().get(&alice_ik).expect("а запись пира — заводит");
+    assert_eq!(peer.known_as, ratatosk_store::PEER_STRANGER, "и знаем мы его как незнакомца");
+    assert!(!peer.card.is_empty(), "с карточкой: ею проверяются его подписи");
+    assert!(
+        bob.store().peers().unwrap().iter().any(|it| it.ik == alice_ik),
+        "и на диске: сессия переживает перезапуск, запись обязана тоже"
+    );
+}
+
+#[test]
+fn the_first_personal_word_is_what_makes_a_stranger_a_contact() {
+    // Вторая половина правила: разговор-то начаться может, и тогда контакт
+    // нужен — у личного чата без него нет ни строки в списке, ни имени,
+    // ни отметки сверки. Граница проходит по `starts_a_personal_chat`.
+    //
+    // Проверка **не** стережёт: что запись пира уходит при повышении —
+    // это ниже, своей проверкой.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let b_card = bob.own_card().encode().unwrap();
+    alice
+        .step(0, Input::Command(Command::AddContact { card_bytes: b_card, met_in_person: true }))
+        .unwrap();
+
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    let events = pump(&mut alice, &mut bob, 1_000, effects);
+
+    let alice_ik = alice.own_card().ik;
+    assert!(bob.contacts().contains_key(&alice_ik), "слово — это разговор, и он заводит контакт");
+    assert!(
+        !bob.contacts()[&alice_ik].verified,
+        "карточка приехала по сети, а не из QR: контакт непроверенный (§4.2)"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ContactAdded { peer_ik, .. } if *peer_ik == alice_ik)),
+        "и человек об этом узнаёт — событием, а не молча: {events:?}"
+    );
+    assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned()], "само слово при этом не теряется");
+}
+
+#[test]
+fn promotion_leaves_exactly_one_record_of_a_person() {
+    // Одна запись на человека. Оставь мы обе, один и тот же ключ попал бы
+    // в список наблюдаемых дважды, а §5.4 спрашивал бы адреса у той,
+    // которая старше, — то есть у случайной.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let b_card = bob.own_card().encode().unwrap();
+    alice
+        .step(0, Input::Command(Command::AddContact { card_bytes: b_card, met_in_person: true }))
+        .unwrap();
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    let alice_ik = alice.own_card().ik;
+    assert!(bob.contacts().contains_key(&alice_ik));
+    assert!(bob.peers().get(&alice_ik).is_none(), "запись пира уходит вместе с повышением");
+    assert!(
+        bob.store().peers().unwrap().is_empty(),
+        "и с диска тоже: после перезапуска она завелась бы заново"
+    );
+
+    // Перезапуск: ровно один — и это контакт.
+    bob.restore().expect("подъём");
+    assert!(bob.contacts().contains_key(&alice_ik));
+    assert!(bob.peers().is_empty());
+}
+
+#[test]
+fn a_channel_request_does_not_make_the_asker_a_contact() {
+    // **То, ради чего приёмная сторона и делалась.** До неё каждый
+    // заявитель (§10.4) появлялся у владельца в списке знакомых: канал
+    // на сотню читателей — сотня «контактов», которым владелец не сказал
+    // ни слова. §3.2 обещает обратное: состав канала знает владелец,
+    // а список знакомых — это про разговоры.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+
+    let bob_ik = bob.own_card().ik;
+    assert_eq!(
+        alice.store().channel_requests(&chat).unwrap().len(),
+        1,
+        "заявка обязана доехать — иначе проверка ниже пуста"
+    );
+    assert!(alice.contacts().is_empty(), "а знакомым заявитель не становится (§8.3, §3.2)");
+    assert!(alice.peers().contains_key(&bob_ik), "он пир: карточка есть, разговора нет");
+
+    // И впуск работает **по пиру**: требуй впуск контакта, он отказывал бы
+    // ровно тому, кто только что попросился.
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob_ik }))
+        .expect("владелец впускает пира");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    assert_eq!(
+        alice.groups().get(&chat).expect("канал").group.members().count(),
+        2,
+        "впущенный стоит в составе"
+    );
+    assert!(alice.contacts().is_empty(), "и после впуска знакомым не стал");
+
+    // А читает он канал по-настоящему: слово владельца доходит.
+    let effects = alice
+        .step(4_000, Input::Command(Command::SendText { chat, text: "слово".into() }))
+        .expect("владелец пишет");
+    pump(&mut alice, &mut bob, 4_000, effects);
+    let seen: Vec<String> = bob
+        .store()
+        .messages(&chat, 10, None)
+        .unwrap()
+        .into_iter()
+        .map(|m| String::from_utf8(m.body).unwrap())
+        .collect();
+    assert_eq!(seen, vec!["слово".to_owned()], "пир — законный получатель канальных кадров");
+}
+
+#[test]
+fn a_reader_who_is_only_a_peer_can_still_leave_the_channel() {
+    // Подпись читателя проверяется его карточкой, а карточка теперь лежит
+    // в записи пира. Не храни мы её — блок ухода (§10.6) от читателя,
+    // который не контакт, проверять было бы нечем, и состав у владельца
+    // остался бы с тем, кто ушёл.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    pump(&mut alice, &mut bob, 3_000, effects);
+    assert_eq!(alice.groups().get(&chat).expect("канал").group.members().count(), 2);
+
+    let effects = bob
+        .step(4_000, Input::Command(Command::UnsubscribeFromChannel { chat }))
+        .expect("читатель отписывается");
+    pump(&mut bob, &mut alice, 4_000, effects);
+    assert_eq!(
+        alice.groups().get(&chat).expect("канал").group.members().count(),
+        1,
+        "блок ухода подписан читателем и обязан быть проверен его карточкой (§10.6)"
+    );
+}
+
+#[test]
+fn a_reader_does_not_gain_the_owner_as_a_contact() {
+    // Та же приёмная сторона, но с другого конца провода. При впуске
+    // читателю приезжают две карточки (§10.4) — владельца и впустившего, —
+    // и обе ему нужны: первой проверяется представление (§10.3, шаг 3),
+    // второй — блок впуска. Нужны — но в списке знакомых им делать
+    // нечего: читатель не разговаривал ни с тем, ни с другим.
+    //
+    // У группы правило обратное, и оно остаётся: §11.5 прямо обещает,
+    // что участники увидят адреса друг друга. Держат это
+    // `a_roster_never_strips_a_verified_contact` (карточки списка вообще
+    // применяются) и стендовые сценарии на трёх узлах, где третий пишет
+    // тому, кого узнал списком.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = create_channel_for(&mut alice, 1_000, "лента", false);
+    let link = alice.channel_link(chat).expect("ссылка");
+    let effects = bob
+        .step(2_000, Input::Command(Command::SubscribeToChannel { uri: link }))
+        .expect("подписка");
+    pump(&mut bob, &mut alice, 2_000, effects);
+    let effects = alice
+        .step(3_000, Input::Command(Command::AdmitToChannel { chat, peer_ik: bob.own_card().ik }))
+        .expect("впуск");
+    pump(&mut alice, &mut bob, 3_000, effects);
+
+    let alice_ik = alice.own_card().ik;
+    assert!(bob.contacts().is_empty(), "владелец читателю не знакомый (§8.3)");
+    let peer = bob.peers().get(&alice_ik).expect("а пир — да, иначе проверять подписи нечем");
+    assert!(!peer.card.is_empty(), "с карточкой: ею проверяется представление (§10.3, шаг 3)");
+
+    // И представление при этом принято: проверка выше была бы пустой,
+    // если бы карточка не доехала вовсе.
+    assert_eq!(
+        bob.store().channel(&chat).expect("документ").expect("есть").version,
+        1,
+        "подпись владельца проверена карточкой из записи пира"
+    );
+}
+
 #[test]
 fn a_request_reaches_the_owner_without_making_him_a_contact() {
     // **То, ради чего §8.3 и делался.** §10.4: «заявка владельцу — блок

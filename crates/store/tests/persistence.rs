@@ -2224,6 +2224,9 @@ fn peer(byte: u8) -> ratatosk_store::StoredPeer {
         // столбец — `a_peer_survives_reopening_with_every_address`
         // краснеет, потому что сравнивает запись целиком.
         nostr: vec![5u8; 32],
+        // Карточка — принятыми байтами (миграция 0034). Здесь она
+        // не разбирается: хранилище возит байты, а разбирает их ядро.
+        card: vec![0xa3, 0x01, 0x02],
         known_as: ratatosk_store::PEER_CHANNEL_OWNER,
         added_ms: 1_000,
     }

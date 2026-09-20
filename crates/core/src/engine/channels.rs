@@ -545,6 +545,11 @@ impl<S: Store> Engine<S> {
             return Ok(());
         }
 
+        // Карточка сохраняется, если она у нас уже была: пожавший руку
+        // незнакомец мог стать владельцем канала, чью ссылку нам дали, —
+        // и терять его карточку из-за адресов из ссылки нельзя. Адреса
+        // же из ссылки недоверенные (§10.2), а карточка подписана.
+        let known = self.peers.get(&peer_ik);
         let mut stored = ratatosk_store::StoredPeer {
             ik: peer_ik,
             onion: String::new(),
@@ -552,8 +557,11 @@ impl<S: Store> Engine<S> {
             ygg: Vec::new(),
             relays: Vec::new(),
             nostr: Vec::new(),
+            card: known.map(|peer| peer.card.clone()).unwrap_or_default(),
             known_as: ratatosk_store::PEER_CHANNEL_OWNER,
-            added_ms: now_ms,
+            // Знакомство не переписывается: пир, пожавший руку раньше,
+            // узнан тогда, а не сейчас.
+            added_ms: known.map_or(now_ms, |peer| peer.added_ms),
         };
         for endpoint in endpoints {
             match endpoint {
@@ -603,7 +611,12 @@ impl<S: Store> Engine<S> {
                 relays: stored.relays,
                 nostr: stored.nostr,
                 availability,
+                sk: ContactCard::decode(&stored.card)
+                    .ok()
+                    .map_or([0u8; 32], |card| card.into_parts().1.sk),
+                card: stored.card,
                 known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+                added_ms: stored.added_ms,
             },
         );
         Ok(())
@@ -769,7 +782,11 @@ impl<S: Store> Engine<S> {
         if state.group.contains(&peer_ik) {
             return Err(EngineError::AlreadyInGroup);
         }
-        if !self.contacts.contains_key(&peer_ik) {
+        // Контакт **или пир** (§8.3): заявитель пожал руку и лёг пиром,
+        // а контактом владельцу не становится — §3.2 не обещал ему
+        // списка знакомых из читателей. Требуй мы здесь контакта, впуск
+        // отказывал бы ровно тому, кто только что попросился.
+        if !self.contacts.contains_key(&peer_ik) && !self.peers.contains_key(&peer_ik) {
             return Err(EngineError::UnknownPeer);
         }
         if !self.right_holds(now_ms, chat, &me, channel::Rights::ADMIT)? {

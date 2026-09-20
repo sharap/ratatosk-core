@@ -2158,8 +2158,8 @@ impl Store for SqliteStore {
         // строк стоила бы больше, чем экономит.
         self.conn.execute(
             "INSERT OR REPLACE INTO peers
-                 (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr, card)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 &peer.ik[..],
                 peer.onion,
@@ -2169,6 +2169,7 @@ impl Store for SqliteStore {
                 sql_types::to_sql(u64::from(peer.known_as)),
                 sql_types::to_sql(peer.added_ms),
                 peer.nostr,
+                peer.card,
             ],
         )?;
         Ok(())
@@ -2176,7 +2177,7 @@ impl Store for SqliteStore {
 
     fn peers(&self) -> Result<Vec<StoredPeer>> {
         let mut statement = self.conn.prepare(
-            "SELECT ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr
+            "SELECT ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr, card
              FROM peers ORDER BY ik",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2189,11 +2190,12 @@ impl Store for SqliteStore {
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
             ))
         })?;
         let mut found = Vec::new();
         for row in rows {
-            let (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr) = row?;
+            let (ik, onion, chatmail, ygg, relays, known_as, added_ms, nostr, card) = row?;
             // Длина не та — строка испорчена. Пропускаем: недосчитаться
             // адреса хуже, чем уронить подъём на чужой строке.
             let Ok(ik) = <[u8; 32]>::try_from(ik.as_slice()) else { continue };
@@ -2204,6 +2206,7 @@ impl Store for SqliteStore {
                 ygg,
                 relays: relays.lines().map(str::to_owned).collect(),
                 nostr,
+                card,
                 known_as: u32::try_from(sql_types::from_sql(known_as)).unwrap_or(0),
                 added_ms: sql_types::from_sql(added_ms),
             });

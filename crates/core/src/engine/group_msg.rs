@@ -402,8 +402,24 @@ impl<S: Store> Engine<S> {
         if *who == self.identity.public().ik {
             return Ok(Some(self.identity.public()));
         }
-        let Some(contact) = self.contacts.get(who) else { return Ok(None) };
-        Ok(Some(ratatosk_crypto::PublicIdentity::from_bytes(contact.card.ik, contact.card.sk)?))
+        if let Some(contact) = self.contacts.get(who) {
+            return Ok(Some(ratatosk_crypto::PublicIdentity::from_bytes(
+                contact.card.ik,
+                contact.card.sk,
+            )?));
+        }
+        // **И пир** (§8.3): читатель канала владельцу не контакт, а блоки
+        // подписывает — тем же, чем все, — и уходит из канала подписанным
+        // блоком (§10.6). Проверять их нечем было бы, не храни запись пира
+        // карточку.
+        //
+        // Пир без карточки (владелец из ссылки, §10.1) отвечает `None`:
+        // «проверять нечем» — не «подпись не сошлась», и разбирается это
+        // там же, где раньше разбирался неизвестный ключ.
+        let Some(peer) = self.peers.get(who).filter(|peer| !peer.card.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some(ratatosk_crypto::PublicIdentity::from_bytes(*who, peer.sk)?))
     }
 
     pub(super) fn send_group_text(
@@ -520,7 +536,7 @@ impl<S: Store> Engine<S> {
         member: [u8; 32],
         envelope: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
-        if !self.contacts.contains_key(&member) {
+        if !self.contacts.contains_key(&member) && !self.peers.contains_key(&member) {
             // Участник, чьей карточки у нас нет: его добавил кто-то другой,
             // а карточка едет отдельным кадром (§11.5) и вправе опоздать.
             //

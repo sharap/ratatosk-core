@@ -273,6 +273,8 @@ enum Query {
     Contacts { reply: oneshot::Sender<Vec<ContactStatus>> },
     /// Сопряжённые десктопы и их состояние (§13.4).
     Devices { reply: oneshot::Sender<Vec<DeviceStatus>> },
+    /// Пиры-не-контакты: третий вид записи за сессией (§8.3).
+    Peers { reply: oneshot::Sender<Vec<PeerStatus>> },
     /// Группы и их состав (§11).
     Groups { reply: oneshot::Sender<Vec<GroupStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
@@ -590,6 +592,35 @@ pub struct GroupStatus {
     pub channel: Option<ChannelFacts>,
 }
 
+/// Что известно о пире, который **не контакт** (§8.3).
+///
+/// # Зачем это наружу
+///
+/// Затем же, зачем список сопряжённых устройств: иначе человек видит
+/// следствия записи, которой нет ни в одном списке. Владельцу канала
+/// приходит «просится такой-то» — и больше этот ключ нигде не значится:
+/// ни в контактах (их он не заводит), ни в составе (туда его ещё
+/// не впустили). Разбирать «почему заявка не едет» при этом нечем.
+///
+/// Границу UniFFI это не пересекает (§13.3): клиенту показывать пира
+/// нечего — у него есть заявка и состав, — а стенду нужно.
+#[derive(Debug, Clone)]
+pub struct PeerStatus {
+    /// Статический ключ Noise: им впускают и по нему называют адрес.
+    pub ik: [u8; 32],
+    /// Почему мы его знаем: `ratatosk_store::PEER_CHANNEL_OWNER`
+    /// либо `ratatosk_store::PEER_STRANGER`.
+    pub known_as: u32,
+    /// Есть ли у нас его карточка: пир из ссылки (§10.1) живёт без неё.
+    pub has_card: bool,
+    /// Когда узнали, мс.
+    pub added_ms: u64,
+    /// Лестница §5.4 — **та же самая**, что у контакта, и считает её
+    /// ядро. Своя копия правил на стенде однажды разошлась бы с ядром
+    /// молча: стенд говорит «пойдёт почтой», а уезжает через onion.
+    pub reachability: ratatosk_proto::transport_policy::Reachability,
+}
+
 /// Что клиент знает о сопряжённом десктопе (§13.4).
 #[derive(Debug, Clone)]
 pub struct DeviceStatus {
@@ -799,6 +830,13 @@ impl DriverHandle {
     pub async fn channel_admits(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
         let (reply, answer) = oneshot::channel();
         self.requests.send(Request::Query(Query::ChannelAdmits { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
+    /// Читает пиров-не-контактов (§8.3). `None` — драйвер остановлен.
+    pub async fn peers(&self) -> Option<Vec<PeerStatus>> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Peers { reply })).await.ok()?;
         answer.await.ok()
     }
 
@@ -1714,6 +1752,23 @@ impl<S: Store, R: Runner> Driver<S, R> {
                             .get(peer_ik)
                             .map(|(_, anomalies)| *anomalies)
                             .unwrap_or_default(),
+                    })
+                    .collect();
+                let _ = reply.send(found);
+            }
+            Query::Peers { reply } => {
+                let found = self
+                    .engine
+                    .peers()
+                    .iter()
+                    .map(|(ik, peer)| PeerStatus {
+                        ik: *ik,
+                        known_as: peer.known_as,
+                        has_card: !peer.card.is_empty(),
+                        added_ms: peer.added_ms,
+                        reachability: ratatosk_proto::transport_policy::Reachability::of(
+                            peer.availability,
+                        ),
                     })
                     .collect();
                 let _ = reply.send(found);

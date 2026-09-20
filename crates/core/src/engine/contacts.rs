@@ -48,6 +48,206 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
 
+    /// Запоминает **пожавшего руку незнакомца** (§8.3, приёмная сторона).
+    ///
+    /// # Почему не контакт
+    ///
+    /// §8.3 называет это «третьим видом записи за сессией»: контакт,
+    /// устройство, пир. Сессия по-прежнему не бывает беспризорной —
+    /// но за ней стоит запись пира, а не карточка в списке знакомых.
+    /// Иначе «список контактов у читателя двух каналов зарастает сотнями
+    /// незнакомцев»: каждый заявитель в канал (§10.4) появлялся у владельца
+    /// в списке людей, с которыми тот не сказал ни слова.
+    ///
+    /// # Карточка при этом сохраняется целиком
+    ///
+    /// Она и есть разница между пиром из ссылки (§10.1: одни адреса)
+    /// и пиром, пожавшим руку. Ею проверяются его подписи — блок,
+    /// которым он уходит из канала (§10.6), — и из неё же заводится
+    /// контакт, когда он заговорит лично
+    /// ([`Engine::promote_peer_to_contact`]).
+    ///
+    /// # Наружу — ничего
+    ///
+    /// Ни события, ни строки в списке чатов: человеку пока не о чем
+    /// узнавать. Скажет слово — будет `ContactAdded`; попросится в канал —
+    /// будет `ChannelRequested`. Отметку «слышно в эфире» запись при этом
+    /// забирает: она пришла, пока мы его ещё не знали.
+    ///
+    /// # Errors
+    ///
+    /// Карточка не разобралась либо отказало хранилище. Отказ разбора
+    /// здесь значит ровно то же, что раньше значил отказ `add_contact`:
+    /// незнакомцу без разбираемой карточки сессия не полагается вовсе.
+    pub(super) fn remember_stranger(
+        &mut self,
+        now_ms: u64,
+        card_bytes: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        self.remember_card_as(now_ms, card_bytes, ratatosk_store::PEER_STRANGER)
+    }
+
+    /// Запоминает карточку, приехавшую **списком канала** (§10.4).
+    ///
+    /// Владелец и впустивший: первым проверяется представление (§10.3,
+    /// шаг 3), вторым — блок впуска. Разговаривал читатель ни с тем,
+    /// ни с другим — значит запись пира, а не строка в списке знакомых.
+    ///
+    /// # Errors
+    ///
+    /// Карточка не разобралась либо отказало хранилище.
+    pub(super) fn remember_card_from_channel(
+        &mut self,
+        now_ms: u64,
+        card_bytes: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        self.remember_card_as(now_ms, card_bytes, ratatosk_store::PEER_CHANNEL_KNOWN)
+    }
+
+    /// Общее тело обоих: запись пира по карточке.
+    ///
+    /// Одно место, потому что расходятся они ровно в одном — в причине,
+    /// по которой мы этого человека знаем, — а всё остальное у них общее:
+    /// разбор карточки, адреса, доступность §5.4 и список наблюдаемых.
+    fn remember_card_as(
+        &mut self,
+        now_ms: u64,
+        card_bytes: &[u8],
+        why: u32,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let card = ContactCard::decode(card_bytes)?.into_parts().1;
+        let peer_ik = card.ik;
+        // Ключ подписи обязан сойтись с ключом сессии: карточка, в которой
+        // `ik` чужой, — это чужая карточка, и записывать её под этот ключ
+        // значило бы проверять его подписи не тем ключом.
+        ratatosk_crypto::PublicIdentity::from_bytes(card.ik, card.sk)?;
+
+        let stored = ratatosk_store::StoredPeer {
+            ik: peer_ik,
+            onion: card.onion.clone(),
+            chatmail: card.chatmail.clone(),
+            ygg: card.ygg.clone(),
+            relays: card.nostr_relays.clone(),
+            nostr: card.nostr.clone(),
+            card: card_bytes.to_vec(),
+            // Прежняя причина сильнее новой: владелец канала, узнанный
+            // из ссылки, остаётся владельцем и после рукопожатия — по этой
+            // записи отписка (§10.6) решает, кого забыть.
+            // Прежняя причина не переписывается: знать человека
+            // по каналу и пожать ему руку — не взаимоисключающие вещи,
+            // и первая из них говорит больше (по ней решает отписка,
+            // §10.6).
+            known_as: self.peers.get(&peer_ik).map_or(why, |peer| peer.known_as),
+            // Рукопожатие повторяется при каждом разрыве связи, и второе
+            // не делает знакомство новее первого.
+            added_ms: self.peers.get(&peer_ik).map_or(now_ms, |peer| peer.added_ms),
+        };
+        self.store.put_peer(&stored)?;
+
+        let availability = PeerAvailability {
+            has_ygg: !card.ygg.is_empty(),
+            has_onion: !card.onion.is_empty(),
+            has_nostr: !card.nostr.is_empty(),
+            has_chatmail: !card.chatmail.is_empty(),
+            enabled: self.announcing(),
+            ready: self.ready,
+            // Та же причина, что у контакта: объявление могло прозвучать
+            // раньше, чем приехало рукопожатие, и потерять отметку значит
+            // отправить почтой тому, кто сидит за стенкой.
+            seen_on_lan: self.seen_on_lan.remove(&peer_ik),
+            seen_on_bt: self.seen_on_bt.remove(&peer_ik),
+        };
+        self.peers.insert(
+            peer_ik,
+            Peer {
+                onion: card.onion,
+                chatmail: card.chatmail,
+                ygg: card.ygg,
+                relays: card.nostr_relays,
+                nostr: card.nostr,
+                availability,
+                card: card_bytes.to_vec(),
+                sk: card.sk,
+                known_as: stored.known_as,
+                added_ms: stored.added_ms,
+            },
+        );
+        // Маяк его транспорт ещё не ищет — список наблюдаемых изменился.
+        // Без этой строки мы не смогли бы **ответить** ему в локальной
+        // сети: соединения односторонние (`ARCHITECTURE.md`, 5ц).
+        Ok(vec![self.watch_peers()])
+    }
+
+    /// Заводит контакт из записи пира: он заговорил лично (§8.3).
+    ///
+    /// # Где проходит граница
+    ///
+    /// Её проводит [`PayloadType::starts_a_personal_chat`]: слово, файл,
+    /// реакция, пересланное — это разговор **со мной**, и у него обязан
+    /// быть чат, имя и отметка сверки. Кадр канала или группы разговора
+    /// не начинает: там собеседник — чат, а не человек.
+    ///
+    /// # Запись пира уходит вместе с повышением
+    ///
+    /// Одна запись на человека. Оставь мы обе, один и тот же ключ попал бы
+    /// в список наблюдаемых дважды, а §5.4 спрашивал бы адреса у той,
+    /// которая старше, — то есть у случайной.
+    ///
+    /// Видимость в эфире переносится руками: контакт заводится с нуля,
+    /// а «слышно рядом» — это то, что мы узнали до знакомства, и терять
+    /// его значит отправить почтой соседу за стенкой.
+    ///
+    /// Карточки у пира может не быть вовсе (владелец канала из ссылки —
+    /// §10.1): повышать нечем, и это законное «ничего не делаем».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища либо неразбираемая карточка.
+    pub(super) fn promote_peer_to_contact(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        // **Уже знаем — ничего не делаем**, и это не перестраховка:
+        // `add_contact` ставит `verified` по аргументу, а не сохраняет
+        // прежнее. Повышение сверенного контакта сняло бы сверку §4.2 —
+        // единственное, что отличает знакомого от приславшего ссылку.
+        // Того же требует метёлка `verified_guard` от всякого вызова
+        // с `false`: сперва `contains_key`.
+        if self.contacts.contains_key(&peer_ik) {
+            return Ok(Vec::new());
+        }
+        let Some(peer) = self.peers.get(&peer_ik) else { return Ok(Vec::new()) };
+        if peer.card.is_empty() {
+            return Ok(Vec::new());
+        }
+        let card_bytes = peer.card.clone();
+        let (seen_on_lan, seen_on_bt) =
+            (peer.availability.seen_on_lan, peer.availability.seen_on_bt);
+
+        // Карточка приехала по сети, а не из QR, — контакт непроверенный
+        // (§4.2). Тот же довод, по какому им был незнакомец раньше.
+        let mut effects = self.add_contact(now_ms, &card_bytes, false)?;
+        if let Some(contact) = self.contacts.get_mut(&peer_ik) {
+            contact.availability.seen_on_lan |= seen_on_lan;
+            contact.availability.seen_on_bt |= seen_on_bt;
+        }
+        self.peers.remove(&peer_ik);
+        self.store.delete_peer(&peer_ik)?;
+        // **И то, что рукопожатие делает новому контакту** (§4.3): свой
+        // адрес подписанным обновлением. Пиру он не уезжал — `push_own_card`
+        // молчит про тех, кто не контакт, — и без этой строки собеседник,
+        // знавший нас по старой ссылке, остался бы с мёртвым onion
+        // до следующего повода. Поймано проверкой
+        // `establishing_a_session_delivers_the_address_to_whoever_missed_it`.
+        effects.extend(self.push_own_card(now_ms, peer_ik)?);
+        // Список наблюдаемых пересобирается **после** удаления записи:
+        // `add_contact` уже просил его собрать, но тогда ключ стоял
+        // в нём дважды.
+        effects.push(self.watch_peers());
+        Ok(effects)
+    }
+
     pub(super) fn add_contact(
         &mut self,
         now_ms: u64,
@@ -478,6 +678,16 @@ impl<S: Store> Engine<S> {
         let mut effects =
             self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
 
+        // **У пира карточка тоже стареет** (§8.3). Обновление §4.3 правит
+        // запись пира так же, как запись контакта: иначе читатель канала
+        // держал бы годовалый onion владельца, а §5.4 ходил бы по мёртвому
+        // адресу и молчал об этом. Ветка своя, потому что у пира нет ни
+        // сверки, ни имени, ни события `ContactChanged` — показывать
+        // человеку нечего, а путь поправить надо.
+        if !self.contacts.contains_key(&peer_ik) {
+            effects.extend(self.update_peer_card(peer_ik, envelope)?);
+            return Ok(effects);
+        }
         let Some(known) = self.contacts.get(&peer_ik) else { return Ok(effects) };
 
         let card =
@@ -518,6 +728,65 @@ impl<S: Store> Engine<S> {
         // на той стороне отсеет лишнее, если рассказать нам было нечего.
         effects.extend(self.push_own_card(now_ms, peer_ik)?);
         Ok(effects)
+    }
+
+    /// Кладёт обновлённую карточку пира (§4.3 для записи §8.3).
+    ///
+    /// Всё то же, что у контакта, кроме показа: ни события, ни имени —
+    /// пира человек не видит. Отложенное будится: появившийся адрес —
+    /// это появившийся путь, и заявка в канал (§10.4) ждёт именно его.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn update_peer_card(
+        &mut self,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(peer) = self.peers.get(&peer_ik) else { return Ok(Vec::new()) };
+        // Карточки нет — сверять новую не с чем: §4.3 разрешает замену
+        // только по возросшей версии, а «версии не знаем» означало бы,
+        // что подсунуть можно любую. Владелец канала из ссылки (§10.1)
+        // остаётся с адресами из неё до первого рукопожатия.
+        let Ok(known) = ContactCard::decode(&peer.card) else { return Ok(Vec::new()) };
+        let known = known.into_parts().1;
+        let card = match ratatosk_proto::card_update::accept(&envelope.payload, &peer_ik, &known) {
+            Ok(card) => card,
+            Err(ratatosk_proto::card_update::UpdateError::Stale) => return Ok(Vec::new()),
+            Err(_) => {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                return Ok(Vec::new());
+            }
+        };
+        let bytes = card.encode()?;
+        let Some(peer) = self.peers.get_mut(&peer_ik) else { return Ok(Vec::new()) };
+        peer.availability.has_ygg = !card.ygg.is_empty();
+        peer.availability.has_onion = !card.onion.is_empty();
+        peer.availability.has_nostr = !card.nostr.is_empty();
+        peer.availability.has_chatmail = !card.chatmail.is_empty();
+        peer.onion.clone_from(&card.onion);
+        peer.chatmail.clone_from(&card.chatmail);
+        peer.ygg.clone_from(&card.ygg);
+        peer.relays.clone_from(&card.nostr_relays);
+        peer.nostr.clone_from(&card.nostr);
+        peer.sk = card.sk;
+        peer.card = bytes.clone();
+        let stored = ratatosk_store::StoredPeer {
+            ik: peer_ik,
+            onion: card.onion,
+            chatmail: card.chatmail,
+            ygg: card.ygg,
+            relays: card.nostr_relays,
+            nostr: card.nostr,
+            card: bytes,
+            known_as: peer.known_as,
+            // Время знакомства не выдумывается заново: новый адрес —
+            // не новое знакомство.
+            added_ms: peer.added_ms,
+        };
+        self.store.put_peer(&stored)?;
+        self.retry_deferred(Some(peer_ik))
     }
 
     /// Пришла карточка третьего человека.

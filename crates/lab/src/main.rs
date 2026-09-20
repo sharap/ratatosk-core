@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1861,6 +1861,10 @@ async fn console(
                 }
                 if line == "/who" {
                     show_contacts(&handle, &directory).await;
+                    continue;
+                }
+                if line == "/peers" {
+                    show_peers(&handle, &directory).await;
                     continue;
                 }
                 if line == "/devices" {
@@ -3396,6 +3400,57 @@ async fn show_groups(handle: &DriverHandle) {
                 member.name,
                 if member.mine { "  (вы)" } else { "" }
             );
+        }
+    }
+}
+
+/// Печатает пиров-не-контактов (§8.3) — третий вид записи за сессией.
+///
+/// **Без этой команды стенда их не видно вовсе.** Незнакомец, пожавший
+/// руку, контактом больше не становится: он в `/who` не появится, а если
+/// попросился в канал — виден только строкой заявки. Разбирать «почему
+/// заявка не едет» тогда нечем: ни адресов, ни лестницы §5.4.
+async fn show_peers(handle: &DriverHandle, directory: &LanDirectory) {
+    let Some(peers) = handle.peers().await else {
+        println!("< драйвер остановлен");
+        return;
+    };
+    if peers.is_empty() {
+        println!("< пиров нет: ими становятся владелец канала из ссылки и пожавший руку");
+        return;
+    }
+    for peer in peers {
+        let why = match peer.known_as {
+            ratatosk_store::PEER_CHANNEL_OWNER => "владелец канала (из ссылки)",
+            ratatosk_store::PEER_STRANGER => "пожал руку",
+            _ => "неизвестно почему",
+        };
+        // Ключ целиком: им впускают (`/admit`) и им же называют адрес
+        // (`/peeraddr`), а обрезанный пришлось бы искать глазами.
+        println!("< {} — {why}", data_encoding::HEXLOWER.encode(&peer.ik));
+        println!(
+            "    карточка: {}, узнан: {} мс",
+            if peer.has_card {
+                "есть"
+            } else {
+                "нет — только адреса из ссылки"
+            },
+            peer.added_ms
+        );
+        let seen = match directory.get(&peer.ik) {
+            Some(addr) => format!("{addr}"),
+            None => "адреса нет — /peeraddr".to_owned(),
+        };
+        println!("    LAN: {seen}");
+        // Вердикт лестницы — тот же, что у контакта, и считает его ядро:
+        // разбор «почему не едет» у пира и у контакта обязан отвечать
+        // одинаково, потому что путь у них один (§5.4).
+        match (peer.reachability.route(), peer.reachability.rising()) {
+            (Some(via), _) => println!("    → §5.4: пойдёт {}", via_name(via)),
+            (None, Some(via)) => {
+                println!("    → §5.4: {} ещё поднимается", via_name(via));
+            }
+            (None, None) => println!("    → §5.4: отправлять некуда — назовите адрес"),
         }
     }
 }

@@ -525,7 +525,13 @@ impl<S: Store> Engine<S> {
         // его добавил кто-то другой, а карточка до нас ещё не доехала.
         // Слать ему нечем и незачем — тот, кто его пригласил, расскажет ему
         // всё сам.
-        if !self.contacts.contains_key(&member) {
+        //
+        // **Пир — знаем** (§8.3): у впущенного в канал читателя карточка
+        // приехала рукопожатием, а контактом он не стал и не станет,
+        // пока не заговорит лично. Не будь этой строки, впуск §10.4 отдавал
+        // бы новичку пустоту — и починка приёмной стороны сломала бы
+        // каналы целиком.
+        if !self.contacts.contains_key(&member) && !self.peers.contains_key(&member) {
             return Ok(Vec::new());
         }
         let (_, effects) = self.enqueue_request(now_ms, member, payload_type, payload)?;
@@ -1200,6 +1206,16 @@ impl<S: Store> Engine<S> {
         }
 
         let me = self.identity.public().ik;
+        // **В канале список карточек заводит пиров, а не контактов**
+        // (§8.3, приёмная сторона). Читателю при впуске приезжают двое —
+        // владелец и впустивший (§10.4), — и разговаривал он ни с тем,
+        // ни с другим: у него нет к ним ни чата, ни повода. Карточки
+        // нужны обе (подпись представления и подпись впуска), а место им
+        // в записи пира.
+        //
+        // У группы правило обратное и остаётся: §11.5 прямо обещает, что
+        // участники увидят адреса друг друга.
+        let as_peers = self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes());
         let mut effects = Vec::new();
         for card_bytes in roster.cards {
             // Карточка чужой сборки может не разобраться — это не повод
@@ -1219,6 +1235,10 @@ impl<S: Store> Engine<S> {
             // Тем же приёмом бережётся приём рукопожатия: там `add_contact`
             // зовут только для незнакомца.
             if self.contacts.contains_key(&who) {
+                continue;
+            }
+            if as_peers {
+                effects.extend(self.remember_card_from_channel(now_ms, &card_bytes)?);
                 continue;
             }
             // `met_in_person: false` — сверки здесь нет и быть не может.

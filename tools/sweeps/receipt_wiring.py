@@ -25,6 +25,14 @@
 Кадры, уходящие прямым `Effect::Send` мимо очереди (аватарка, чанк файла,
 просьба о чанке, сама квитанция), сюда не попадают вовсе: у них нет срока,
 и подтверждать нечего.
+
+Находок при заведении: **пять**. Сегодня их должно быть **ноль**.
+
+Развилка приёма ищется **по содержимому** — по числу плеч
+`PayloadType::X =>`, — а не по имени функции: имя однажды уже менялось
+(`deliver` → `deliver_payload`, §8.3), и метелка, знавшая его наизусть,
+нашла пустоту и отчиталась десятью находками сразу. Имя развилки —
+не правило.
 """
 import re
 import sys
@@ -87,9 +95,36 @@ if not queued:
     sys.exit(1)
 
 # 2. Куда ведёт приём каждого типа.
-deliver = body_of(src, "deliver")
-if deliver is None:
-    print("не нашлась `fn deliver` — метелка ослепла")
+#
+# **Развилка ищется по содержимому, а не по имени.** Она звалась `deliver`,
+# а после §8.3 разбор нагрузки переехал в `deliver_payload` — знакомство
+# с незнакомцем обязано случаться один раз на конверт, а не в каждом
+# из двадцати плеч. Метелка, знавшая имя, нашла тогда пустое тело
+# и отчиталась десятью находками разом: она была права по форме («приём
+# никуда не ведёт») и слепа по сути. Имя развилки — не правило; правило
+# в том, что плечи `PayloadType::X =>` где-то есть.
+def dispatch():
+    """Функция ядра, в которой больше всего плеч `PayloadType::X =>`."""
+    best = (0, None, None)
+    for m in re.finditer(
+        r"\n    (?:pub )?(?:pub\(super\) )?(?:pub\(crate\) )?(?:const )?fn (\w+)\b", src
+    ):
+        name = m.group(1)
+        body = body_of(src, name)
+        if body is None:
+            continue
+        arms = len(re.findall(r"PayloadType::\w+[^\n]*=>", body))
+        if arms > best[0]:
+            best = (arms, name, body)
+    return best
+
+
+arms_found, dispatch_name, deliver = dispatch()
+if deliver is None or arms_found < len(queued):
+    print(
+        f"развилка приёма не нашлась (плеч: {arms_found}, типов в очереди: {len(queued)}) "
+        "— метелка ослепла"
+    )
     sys.exit(1)
 
 
@@ -147,6 +182,7 @@ for kind, why in bad:
     print("    немолчаливый кадр без квитанции: срок объявит неудачу, §5.4")
     print("    отправит сессию на покой, и кадры собеседника начнут пропадать")
 
+print(f"развилка приёма: fn {dispatch_name}, плеч {arms_found}")
 print(f"типов в очереди: {len(queued)} ({', '.join(sorted(queued))})")
 print("чисто" if not bad else f"находок: {len(bad)}")
 sys.exit(1 if bad else 0)

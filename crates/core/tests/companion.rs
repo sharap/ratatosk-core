@@ -1372,8 +1372,16 @@ fn a_contact_may_not_speak_the_companion_wire() {
     for frame in addressed_to(frames, wire.ik()) {
         wire.take(&frame, 1_000);
     }
-    assert!(wire.session.is_some(), "как контакт он рукопожатие проходит");
-    assert!(phone.contacts().contains_key(&stranger_ik), "и контактом становится (§8.2)");
+    assert!(wire.session.is_some(), "рукопожатие он проходит честно");
+    // §8.3, приёмная сторона: пожавший руку становится **пиром**, а не
+    // контактом. Проверке это неважно — важно, что он не устройство, —
+    // но сказать надо: имя её обещает контакта, и контакт мы заводим
+    // руками, как это делает человек.
+    assert!(!phone.contacts().contains_key(&stranger_ik), "сам по себе он контактом не стал");
+    phone
+        .step(1_050, Input::Command(Command::AddContact { card_bytes, met_in_person: true }))
+        .expect("человек добавил его сам");
+    assert!(phone.contacts().contains_key(&stranger_ik), "теперь он контакт — и сверенный");
 
     let before = phone.anomalies(&stranger_ik).malformed;
     let (_, frame) = wire.ask(&Request::Chats);

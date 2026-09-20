@@ -2201,6 +2201,44 @@ fn link_with_relays_only() -> (String, [u8; 32]) {
 }
 
 #[test]
+fn someone_who_is_both_a_peer_and_a_contact_is_watched_once() {
+    // Список наблюдаемых уезжает в эфир целиком, и повтор в нём стоит
+    // двойной сверки каждого чужого объявления — а заодно врёт о числе:
+    // на стенде это выглядело как «известных=2 ключи=afabc241,afabc241»
+    // про одного собеседника.
+    //
+    // Состояние законное и сегодня обычное: владелец канала лежит пиром
+    // (§10.4), а первым же рукопожатием становится ещё и несверенным
+    // контактом — приёмной стороны §8.3 пока нет.
+    let (mut me, (uri, owner)) = (node(1), link_with_addresses());
+    me.step(100, Input::Command(Command::SubscribeToChannel { uri })).expect("подписка");
+    befriend(&mut me, &stranger(200));
+    assert!(me.contacts().contains_key(&owner), "он и контакт, и пир — иначе проверка пуста");
+    assert!(me.peers().contains_key(&owner));
+
+    let effects = me
+        .step(
+            200,
+            Input::Command(Command::SetTransportEnabled {
+                transport: ratatosk_proto::Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .expect("локальная сеть включена");
+    let watched = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::WatchPeers(peers) => Some(peers.clone()),
+            _ => None,
+        })
+        .expect("список наблюдаемых уезжает транспорту");
+    let mut unique = watched.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(watched.len(), unique.len(), "один собеседник — одна строка в списке: {watched:?}");
+}
+
+#[test]
 fn relays_without_a_key_do_not_make_the_owner_reachable_by_nostr() {
     // **Поломка, найденная на стенде у владельца с одним только nostr.**
     // Доступность пира считалась по списку реле, а раннеру получателем

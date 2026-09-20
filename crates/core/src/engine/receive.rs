@@ -413,6 +413,13 @@ impl<S: Store> Engine<S> {
             return self.on_file_stall(now_ms, file_id);
         }
 
+        // Срок `T_graft` — про дерево раздачи, а не про доставку (§7.1):
+        // мы ждём **блок**, о котором позвали `IHAVE`, и ждём его
+        // от кого угодно, а не от того, кому что-то отправили.
+        if let Some(effects) = self.on_graft_timer(now_ms, token)? {
+            return Ok(effects);
+        }
+
         // Один и тот же счётчик меток обслуживает и рукопожатия, и доставку,
         // поэтому владельца ищем в обоих местах.
         let waiting = self
@@ -652,7 +659,20 @@ impl<S: Store> Engine<S> {
             // на тридцать двух получателей ничего не значит, и §14 такого
             // обещания не разрешает. Отправитель её и не ждёт — попытка
             // у него закрылась записью в сокет.
-            if Self::is_group_copy(envelope.payload_type) {
+            if Self::rides_silently(envelope.payload_type) {
+                // **Дубль в канале подрезает ребро** (§7.1, шаг 3): блок
+                // пришёл целиком двумя путями, значит eager-родителей
+                // у нас два там, где хватит одного. Лишние рёбра отмирают,
+                // дерево возникает само.
+                // Канал берётся **из самого блока**, а не из конверта:
+                // поля `group_id` снаружи ядро не заполняет никогда —
+                // группа живёт внутри запечатанного. Разбор здесь дешёвый
+                // (одна карта CBOR, без расшифровки) и случается только
+                // на дубле.
+                if let Ok(unchecked) = ratatosk_proto::group::parse_message(&envelope.payload) {
+                    let chat = *unchecked.claims_group();
+                    woken.extend(self.prune_duplicate_sender(now_ms, chat, peer_ik)?);
+                }
                 return Ok(woken);
             }
             let chat = Self::chat_id_for(&peer_ik);
@@ -851,6 +871,7 @@ impl<S: Store> Engine<S> {
             PayloadType::ChannelRequest => self.on_channel_request(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmPeer => self.on_seed_record(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmAttach => self.on_swarm_attach(now_ms, via, peer_ik, &envelope),
+            PayloadType::SwarmControl => self.on_swarm_control(now_ms, via, peer_ik, &envelope),
             // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
             // оно не ездит. Тип остаётся в перечислении, потому что он есть
             // в спецификации, а молча принимать то, чего мы не отправляем,

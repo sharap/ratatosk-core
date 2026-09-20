@@ -1358,6 +1358,19 @@ pub struct Engine<S: Store> {
     /// от молчания сети не отличается. Читатель повторяет привязку
     /// обходом (§7.5), и после нашего перезапуска она восстановится сама.
     attached: BTreeMap<ChatId, BTreeSet<[u8; 32]>>,
+    /// Дерево раздачи канала: кому целиком, кому зовом (§7.1).
+    ///
+    /// В памяти по той же причине, что привязка: дерево — свойство
+    /// живых связей, и после перезапуска оно отрастает само из первых же
+    /// раздач. Сохрани мы его, узел проснулся бы с eager-пиром, которого
+    /// давно нет, и ждал бы от него блоков.
+    tree: BTreeMap<ChatId, swarm::Tree>,
+    /// Хвост недавних блоков канала — то, чем отвечают на `GRAFT` (§7.1).
+    recent: BTreeMap<ChatId, std::collections::VecDeque<(MsgId, Vec<u8>)>>,
+    /// Блоки, о которых позвали `IHAVE`, и кто позвал.
+    awaited_blocks: BTreeMap<(ChatId, MsgId), [u8; 32]>,
+    /// Метки сроков `T_graft`: какая метка какой блок ждёт.
+    graft_timers: BTreeMap<u64, (ChatId, MsgId)>,
     by_chat: BTreeMap<ChatId, [u8; 32]>,
     /// Групповые кадры, приехавшие раньше самой группы (§9.2).
     ///
@@ -1887,6 +1900,10 @@ impl<S: Store> Engine<S> {
             clock: HlcClock::new(),
             peers: BTreeMap::new(),
             attached: BTreeMap::new(),
+            tree: BTreeMap::new(),
+            recent: BTreeMap::new(),
+            awaited_blocks: BTreeMap::new(),
+            graft_timers: BTreeMap::new(),
             sessions: SessionRegistry::new(),
             dedup: DedupWindow::default(),
             reassembler: Reassembler::new(),

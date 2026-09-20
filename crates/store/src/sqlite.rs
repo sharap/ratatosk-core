@@ -2950,6 +2950,12 @@ impl Store for SqliteStore {
         Ok(inserted == 1)
     }
 
+    fn seen(&self, msg_id: &MsgId) -> Result<bool> {
+        let mut statement = self.conn.prepare("SELECT 1 FROM dedup WHERE msg_id = ?1")?;
+        let mut rows = statement.query([&msg_id[..]])?;
+        Ok(rows.next()?.is_some())
+    }
+
     fn put_contact(&mut self, contact: &StoredContact) -> Result<()> {
         // Локальное имя — заметка о человеке, поэтому шифруется, как и тело
         // сообщения, и привязывается к своей строке.

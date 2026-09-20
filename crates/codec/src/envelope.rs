@@ -256,6 +256,18 @@ pub enum PayloadType {
     /// соединениям мы несём трафик наравне со всеми» — соединение
     /// открывает читатель, а дальше сид шлёт в него блоки.
     SwarmAttach,
+    /// Кадр дерева раздачи: `IHAVE`, `GRAFT`, `PRUNE` (фаза 2, §7.1).
+    ///
+    /// Один тип на три вида: механизм у них общий, а человеку они
+    /// не показываются никогда — правило «отдельный тип, а не признак»
+    /// защищает от показа незнакомого как знакомого, и защищать здесь
+    /// нечего. Разбор — `ratatosk_proto::swarm::Control`.
+    ///
+    /// Едет **молчаливо**: квитанции у кадра дерева нет и не нужно.
+    /// Подтверждением `IHAVE` служит `GRAFT`, а подтверждением `GRAFT` —
+    /// сам блок; лишняя квитанция удваивала бы трафик механизма,
+    /// заведённого ради его сокращения.
+    SwarmControl,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -322,7 +334,9 @@ impl PayloadType {
             // сообщает владельцу адрес, а не пишет ему.
             | PayloadType::SwarmPeer
             // Привязка — про раздачу, а не про разговор.
-            | PayloadType::SwarmAttach => false,
+            | PayloadType::SwarmAttach
+            // Дерево раздачи — про доставку, а не про разговор.
+            | PayloadType::SwarmControl => false,
             // Служебное: ни строки в чате, ни повода знакомиться.
             // Обновление карточки (§4.3) правит запись, которая уже есть,
             // и заводить её оно не вправе: иначе адреса известного
@@ -371,6 +385,7 @@ impl PayloadType {
             PayloadType::ChannelRequest => 25,
             PayloadType::SwarmPeer => 26,
             PayloadType::SwarmAttach => 27,
+            PayloadType::SwarmControl => 28,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -406,6 +421,7 @@ impl PayloadType {
             25 => PayloadType::ChannelRequest,
             26 => PayloadType::SwarmPeer,
             27 => PayloadType::SwarmAttach,
+            28 => PayloadType::SwarmControl,
             other => PayloadType::Unknown(other),
         }
     }
@@ -615,7 +631,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 27;
+        const HIGHEST: u64 = 28;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

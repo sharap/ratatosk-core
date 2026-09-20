@@ -61,7 +61,31 @@ def engine_source():
 # Молчаливые по построению: копия каждому участнику группы (§11.3).
 # Квитанции у них нет и быть не может — один значок на тридцать двух
 # получателей §14 не разрешает, и отправитель её не ждёт.
-SILENT = {"GroupMessage", "GroupAction"}
+def silent_types(src):
+    """Типы, которые едут **без квитанции**, — из самого ядра.
+
+    Список берётся у `rides_silently`, а не пишется здесь: разойдись они,
+    метёлка требовала бы квитанции от кадра, который её не ждёт (и такой
+    кадр пришлось бы «чинить» лишней), либо молчала бы о забытой у того,
+    кто ждёт. Ровно это и случилось с кадрами дерева раздачи (§7.1).
+    """
+    body = body_of(src, "rides_silently")
+    if body is None:
+        print("не нашлась `fn rides_silently` — метелка ослепла")
+        sys.exit(1)
+    found = set(re.findall(r"PayloadType::(\w+)", body))
+    # Один уровень вглубь, как у `acknowledges`: `rides_silently` шире
+    # `is_group_copy` ровно на кадры дерева и зовёт его по имени.
+    # Не пойди мы за этим зовом, метёлка увидела бы половину списка —
+    # и объявила бы «ослепла» ровно там, где список цел.
+    for inner in set(re.findall(r"Self::(\w+)\(", body)):
+        nested = body_of(src, inner)
+        if nested:
+            found |= set(re.findall(r"PayloadType::(\w+)", nested))
+    if not found:
+        print("`rides_silently` не называет ни одного типа — метелка ослепла")
+        sys.exit(1)
+    return found
 
 
 def body_of(src, name):
@@ -89,7 +113,7 @@ for m in re.finditer(r"tell_member\(\s*[^;]*?PayloadType::(\w+)", src):
 for m in re.finditer(r"PayloadType::(\w+)[^;]*?\n\s*(?:let mut effects = )?self\.enqueue\(", src):
     queued.add(m.group(1))
 
-queued -= SILENT
+queued -= silent_types(src)
 if not queued:
     print("ни одного типа в очереди — метелка ослепла")
     sys.exit(1)

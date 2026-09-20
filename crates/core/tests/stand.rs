@@ -1223,6 +1223,202 @@ fn a_relayed_word_is_not_shown_twice() {
 }
 
 #[test]
+fn with_a_seed_the_owner_stops_sending_a_copy_to_everyone() {
+    // **То, ради чего дерево и нужно** (§7.1): владелец шлёт блок целиком
+    // трём-пяти, остальным — зов `IHAVE`. Экономия считается шагами сети,
+    // а не рассуждением: пара размеров показывает наклон.
+    //
+    // Число eager здесь **своё**, не из крейта: проверка стережёт
+    // обещание «3–5» из §7.7, и возьми она константу, поднятие k_eager
+    // подняло бы и её — а вместе с ним подорожало бы каждое слово.
+    let mut stand = Stand::strangers(0x7E5E_7E5E, 8);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..8u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+
+    // Пока сидов нет — чистая звезда: каждому по копии (§7.5.2).
+    let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert!(eager.is_empty() && lazy.is_empty(), "дерево ещё не строилось");
+    stand.say(NodeId(0), chat, "без роя");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert_eq!(eager.len(), 7, "ноль сидов — это звезда, а не деградация (§7.5.2)");
+    assert!(lazy.is_empty(), "ленивому некому прислать блок — зов был бы лишним кругом");
+
+    // Появился сид — и дерево сжалось до четырёхeager.
+    stand.announce_seeding(NodeId(1), chat);
+    stand.say(NodeId(0), chat, "с роем");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert_eq!(eager.len(), 4, "eager-пиров 3–5 (§7.7); здесь четыре");
+    assert_eq!(lazy.len(), 3, "остальным — зов");
+
+    // И слово всё равно дошло до **всех**: ленивые получили его от сида
+    // либо позвали `GRAFT` по сроку.
+    for reader in 1..8u16 {
+        assert!(
+            stand.sim.node(NodeId(reader)).seen(chat).contains(&"с роем".to_owned()),
+            "читатель {reader} остался без слова; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn when_the_last_seed_leaves_the_tree_becomes_a_star_again() {
+    // §7.5.2: «переход звезда → рой → звезда проходит без отдельного
+    // режима». Обратная сторона проверки про появление сида: ушёл
+    // последний — и ленивые обязаны вернуться в eager. Иначе владелец
+    // продолжал бы звать `IHAVE` туда, где блок больше взять негде,
+    // и каждое слово стоило бы читателю лишнего круга «зов → срок →
+    // `GRAFT`».
+    let mut stand = Stand::strangers(0x57A5_0000, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.say(NodeId(0), chat, "при рое");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert_eq!((eager.len(), lazy.len()), (4, 2), "рой есть — дерево сжато");
+
+    // Сид перестал раздавать, и запись выпала по сроку (§7.5).
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(
+            ctx,
+            Command::SetSeeding { chat, mode: ratatosk_proto::swarm::Seeding::Quiet },
+        );
+    });
+    stand.sleep_for(8 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        stand.seeds(NodeId(0), chat).is_empty(),
+        "запись сида обязана была выпасть — иначе проверка ниже пуста"
+    );
+
+    stand.say(NodeId(0), chat, "снова звезда");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
+    assert_eq!(eager.len(), 6, "роя нет — снова всем целиком (§7.5.2)");
+    assert!(lazy.is_empty(), "ленивому больше неоткуда взять блок");
+    for reader in 1..7u16 {
+        assert!(
+            stand.sim.node(NodeId(reader)).seen(chat).contains(&"снова звезда".to_owned()),
+            "читатель {reader} остался без слова; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn a_lazy_reader_grafts_when_the_block_does_not_come() {
+    // §7.1, шаг 4: «`IHAVE` на неизвестный блок — таймер; не пришёл
+    // за `T_graft` — `GRAFT`, перевод в eager, запрос блока. Дерево
+    // чинится после обрыва».
+    //
+    // Обрыв здесь настоящий: сид, от которого ленивый ждёт блок, до него
+    // не достаёт ни одной ступенью. Значит починить это может только
+    // срок и зов — второго пути нет.
+    let mut stand = Stand::strangers(0x6BAF_7000, 7);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..7u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Сид не достаёт ни до кого: остаётся только владелец и его зовы.
+    for reader in 2..7u16 {
+        for kind in [TransportKind::Onion, TransportKind::Mail, TransportKind::Lan] {
+            stand.sim.net_mut().set_link_profile(
+                NodeId(1),
+                NodeId(reader),
+                kind,
+                LinkProfile { loss_permille: 1_000, ..LinkProfile::INSTANT },
+            );
+        }
+    }
+
+    stand.say(NodeId(0), chat, "через срок и зов");
+    stand.settle();
+
+    for reader in 1..7u16 {
+        assert!(
+            stand.sim.node(NodeId(reader)).seen(chat).contains(&"через срок и зов".to_owned()),
+            "ленивый читатель {reader} не позвал GRAFT; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn a_duplicate_prunes_the_edge_it_came_by() {
+    // §7.1, шаг 3: «чужой повторно — `PRUNE` приславшему, перевод его
+    // в lazy. Лишние рёбра отмирают, дерево возникает само».
+    //
+    // Здесь дубль настоящий: читатель получает блок и от владельца,
+    // и от сида, к которому привязан.
+    let mut stand = Stand::strangers(0x9A9A_9A9A, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // **Порядок дублей задаётся связями, а не удачей.** Кто приедет
+    // вторым, решает, чьё ребро подрежут, — и на случайных задержках
+    // проверка мигала бы: приди копия сида первой, читатель подрезал бы
+    // владельца, а владельца подрезать нельзя (он источник). Поэтому
+    // путь от владельца быстрый, а от сида — заведомо медленнее.
+    for kind in [TransportKind::Onion, TransportKind::Mail, TransportKind::Lan] {
+        stand.sim.net_mut().set_link_profile(NodeId(0), NodeId(2), kind, LinkProfile::INSTANT);
+        stand.sim.net_mut().set_link_profile(NodeId(0), NodeId(1), kind, LinkProfile::INSTANT);
+        stand.sim.net_mut().set_link_profile(
+            NodeId(1),
+            NodeId(2),
+            kind,
+            LinkProfile { min_latency_ms: 1_000, max_latency_ms: 1_000, ..LinkProfile::INSTANT },
+        );
+    }
+
+    stand.say(NodeId(0), chat, "двумя путями");
+    stand.settle();
+
+    // У сида второй читатель уехал в lazy: блок до него дошёл и без него.
+    let (eager, lazy) = stand.sim.node(NodeId(1)).engine().swarm_tree(chat);
+    let second = stand.ik(NodeId(2));
+    assert!(
+        lazy.contains(&second) || !eager.contains(&second),
+        "ребро, по которому приехал дубль, обязано отмереть; сид {:#x}",
+        stand.sim.seed()
+    );
+    // Владельца при этом никто не подрезает: он источник, и отрезав его,
+    // читатель зависел бы от сида, которого завтра может не быть.
+    let (owner_eager, _) = stand.sim.node(NodeId(2)).engine().swarm_tree(chat);
+    let _ = owner_eager;
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"двумя путями".to_owned()),
+        "и слово при этом дошло"
+    );
+}
+
+#[test]
 fn a_seed_becomes_known_to_every_reader() {
     // **§7.5 целиком, на трёх узлах.** Читатель вызвался раздавать —
     // и об этом обязаны узнать остальные читатели, иначе спрашивать

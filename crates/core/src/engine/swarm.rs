@@ -486,36 +486,350 @@ impl<S: Store> Engine<S> {
         // Что блоки пошли, читатель увидит по самим блокам.
         Ok(effects)
     }
+}
 
-    /// Пересылает принятый блок канала тем, кто к нам привязался (§7.1).
+impl<S: Store> Engine<S> {
+    /// Кому мы **можем** слать блоки этого канала.
     ///
-    /// **Байты те же**, что приехали: блок подписан автором и запечатан
-    /// его цепочкой, курьер в нём ничего не меняет. Пересобери мы его —
-    /// подпись перестала бы сходиться, а номер поехал бы.
+    /// У владельца это состав (§3.2 оставляет его ему), у остальных —
+    /// те, кто привязался к нам сам (§7.5.1). Третьего источника нет:
+    /// читатель, к которому мы не подключены и который не подключился
+    /// к нам, для нас не существует.
+    fn push_candidates(&self, chat: ChatId) -> Vec<[u8; 32]> {
+        let me = self.identity.public().ik;
+        if self.channel_owner(chat).is_some_and(|owner| owner == me) {
+            return self
+                .groups
+                .get(&chat)
+                .map(|state| state.group.recipients(&me))
+                .unwrap_or_default();
+        }
+        self.attached.get(&chat).map(|set| set.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// Делит тех, кому можем слать, на eager и lazy (§7.1).
     ///
-    /// Приславшему не возвращаем: у него блок уже есть, и вернуть
-    /// означало бы устроить кольцо из двух узлов.
+    /// # Почему по порядку ключа, а не случайно
+    ///
+    /// Прогон обязан воспроизводиться по сиду (§16). Случайный выбор
+    /// eager дал бы дерево, которое у двух прогонов разное, и падение
+    /// на нём не повторить. Случайность §7.1 нужна в другом месте —
+    /// в повышении при опустевшем eager, и там она берётся из того же
+    /// сида.
+    ///
+    /// # Минимальная степень
+    ///
+    /// «Опустело eager — повысить случайного из lazy, не дожидаясь
+    /// `IHAVE`» (§7.1). Иначе запруненный узел оглохнет: ему некому
+    /// слать целиком, а `IHAVE` он рассылает в пустоту.
+    fn split_tree(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+    ) -> Result<(Vec<[u8; 32]>, Vec<[u8; 32]>), EngineError> {
+        let candidates = self.push_candidates(chat);
+        // **Ноль сидов — это звезда, и она обязана работать как состояние,
+        // а не как деградация** (§7.5.2). Ленивый пир получает зов вместо
+        // блока и ждёт, что блок придёт другим путём; путей этих ровно
+        // столько, сколько в канале сидов. Нет сидов — нет и путей, и
+        // `IHAVE` означал бы «подожди `T_graft` и попроси ещё раз» —
+        // то есть задержку и **лишний** круг вместо экономии.
+        //
+        // Поймано замером, а не рассуждением:
+        // `a_word_in_a_channel_costs_the_same_per_reader_however_many_there_are`
+        // показал 124 шага вместо 16 в ту же минуту, как дерево завелось
+        // без этой оговорки.
+        let me = self.identity.public().ik;
+        let swarm_alive = self.seeds(chat, now_ms)?.iter().any(|seed| seed.ik != me);
+        let tree = self.tree.entry(chat).or_default();
+        // Ушедшие забываются: состав меняется, привязки истекают вместе
+        // с сессией, и дерево не вправе помнить того, кому слать нечем.
+        tree.eager.retain(|ik| candidates.contains(ik));
+        tree.lazy.retain(|ik| candidates.contains(ik));
+        for peer in &candidates {
+            if tree.eager.contains(peer) || tree.lazy.contains(peer) {
+                continue;
+            }
+            if !swarm_alive || tree.eager.len() < K_EAGER {
+                tree.eager.insert(*peer);
+            } else {
+                tree.lazy.insert(*peer);
+            }
+        }
+        // **Появился рой — лишние eager уходят в ленивые.** Без этой
+        // строки дерево, выросшее звездой, звездой бы и осталось: новые
+        // кандидаты делились бы по `k_eager`, а прежние сидели бы
+        // в eager навсегда. Переход «звезда → рой» §7.5.2 обещает без
+        // отдельного режима — вот он.
+        //
+        // Кого именно понизить, решает порядок ключа: прогон обязан
+        // воспроизводиться по сиду (§16).
+        if swarm_alive && tree.eager.len() > K_EAGER {
+            let extra: Vec<[u8; 32]> = tree.eager.iter().skip(K_EAGER).copied().collect();
+            for peer in extra {
+                tree.eager.remove(&peer);
+                tree.lazy.insert(peer);
+            }
+        }
+        // Роя не стало — все обратно в eager: переход «рой → звезда»
+        // проходит без отдельного режима (§7.5.2), и ленивый, оставшийся
+        // ленивым после ухода последнего сида, замолчал бы навсегда.
+        if !swarm_alive && !tree.lazy.is_empty() {
+            let waiting: Vec<[u8; 32]> = tree.lazy.iter().copied().collect();
+            for peer in waiting {
+                tree.lazy.remove(&peer);
+                tree.eager.insert(peer);
+            }
+        }
+        if tree.eager.is_empty() {
+            if let Some(first) = tree.lazy.iter().next().copied() {
+                tree.lazy.remove(&first);
+                tree.eager.insert(first);
+            }
+        }
+        Ok((tree.eager.iter().copied().collect(), tree.lazy.iter().copied().collect()))
+    }
+
+    /// Раздаёт блок по дереву: целиком eager, зовом — lazy (§7.1).
+    ///
+    /// `from` — тот, кто блок принёс; ему не возвращают ничего, иначе
+    /// получилось бы кольцо из двух узлов.
     ///
     /// # Errors
     ///
     /// Отказ хранилища на постановке в очередь.
-    pub(super) fn relay_to_attached(
+    pub(super) fn push_block(
         &mut self,
         now_ms: u64,
         chat: ChatId,
-        from: [u8; 32],
+        from: Option<[u8; 32]>,
         msg_id: MsgId,
-        envelope: &[u8],
+        bytes: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
-        let Some(attached) = self.attached.get(&chat) else { return Ok(Vec::new()) };
-        let targets: Vec<[u8; 32]> =
-            attached.iter().copied().filter(|reader| *reader != from).collect();
+        // Блок кладётся в хвост **до** раздачи: на `GRAFT` отвечает он,
+        // и ответить надо будет тому, кто сейчас получит зов.
+        self.remember_recent(chat, msg_id, bytes);
+
+        let (eager, lazy) = self.split_tree(now_ms, chat)?;
         let mut effects = Vec::new();
-        for reader in targets {
-            effects.extend(self.send_group_copy(now_ms, msg_id, reader, envelope)?);
+        for peer in eager {
+            if from == Some(peer) {
+                continue;
+            }
+            match self.send_group_copy(now_ms, msg_id, peer, bytes) {
+                Ok(produced) => effects.extend(produced),
+                // Отказ по одному не обрывает раздачу остальным — тот же
+                // довод, что у веера: получателей много, и неудача с одним
+                // ничего не говорит про других.
+                Err(error) => tracing::warn!(?error, "копия eager-пиру не поставилась"),
+            }
+        }
+        for peer in lazy {
+            if from == Some(peer) {
+                continue;
+            }
+            let call = swarm::Control::IHave { group: chat, block: msg_id };
+            match self.send_swarm_control(now_ms, peer, &call) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::warn!(?error, "зов lazy-пиру не поставился"),
+            }
         }
         Ok(effects)
     }
+
+    /// Ставит в очередь §5.4 один кадр дерева (§7.1).
+    ///
+    /// Молчаливый: квитанции у него нет. Подтверждение `IHAVE` — это
+    /// `GRAFT`, подтверждение `GRAFT` — сам блок; лишняя квитанция
+    /// удваивала бы трафик механизма, заведённого ради его сокращения.
+    pub(super) fn send_swarm_control(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        control: &swarm::Control,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let (_, effects) =
+            self.enqueue_request(now_ms, peer_ik, PayloadType::SwarmControl, control.value())?;
+        Ok(effects)
+    }
+
+    /// Держит хвост недавних блоков — то, чем отвечают на `GRAFT`.
+    ///
+    /// **Хвост, а не архив.** §7.2 велит чинить долгое отсутствие
+    /// анти-энтропией, и ей нужен архив с окном сидирования (§9.3);
+    /// здесь же нужно продержать блок ровно столько, сколько идёт
+    /// срок `T_graft`, — секунды и десятки секунд. Память для этого
+    /// честнее диска: переживи хвост перезапуск, он стал бы архивом,
+    /// у которого нет ни окна, ни обрезки.
+    fn remember_recent(&mut self, chat: ChatId, msg_id: MsgId, bytes: &[u8]) {
+        let tail = self.recent.entry(chat).or_default();
+        if tail.iter().any(|(id, _)| *id == msg_id) {
+            return;
+        }
+        tail.push_back((msg_id, bytes.to_vec()));
+        while tail.len() > RECENT_BLOCKS {
+            tail.pop_front();
+        }
+    }
+
+    /// Пришёл кадр дерева: `IHAVE`, `GRAFT` или `PRUNE` (§7.1).
+    pub(super) fn on_swarm_control(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Ok(control) = swarm::Control::from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        let chat = *control.group();
+        // Канала не знаем — дерева по нему у нас нет. Молча: кадр
+        // не по адресу, и рассказывать о нём нечего.
+        let Some(state) = self.groups.get(&chat) else { return Ok(Vec::new()) };
+        if state.profile.everyone_writes() {
+            return Ok(Vec::new());
+        }
+
+        match control {
+            swarm::Control::IHave { block, .. } => {
+                // Блок уже есть — зов опоздал, и это штатная работа дерева,
+                // а не ошибка: у нас он приехал целиком от eager-пира.
+                // Молчим: `PRUNE` подрезает ребро, по которому приходит
+                // **лишний блок**, а не лишний зов, — иначе мы отрезали бы
+                // ленивых за то, ради чего они и существуют.
+                if self.store.seen(&block)? {
+                    return Ok(Vec::new());
+                }
+                // Срок берётся у ступени, которой приехал зов (§7.7).
+                // У почты и реле его нет вовсе — там `GRAFT` значил бы
+                // «попроси ещё раз то, что и так в пути».
+                let Some(wait) = swarm::graft_wait_ms(via) else { return Ok(Vec::new()) };
+                // Второй зов на тот же блок сроку не мешает: ждём мы
+                // **блок**, а не зовущего, и первый ответивший закроет
+                // ожидание всем.
+                if self.awaited_blocks.contains_key(&(chat, block)) {
+                    return Ok(Vec::new());
+                }
+                let token = self.allocate_timer();
+                self.awaited_blocks.insert((chat, block), peer_ik);
+                self.graft_timers.insert(token, (chat, block));
+                Ok(vec![Effect::SetTimer { after_ms: wait, token }])
+            }
+            swarm::Control::Graft { block, .. } => {
+                // Просят блок — значит просят и стать eager: §7.1 велит
+                // чинить дерево там, где оно порвалось.
+                let tree = self.tree.entry(chat).or_default();
+                tree.lazy.remove(&peer_ik);
+                tree.eager.insert(peer_ik);
+                let Some(bytes) = self
+                    .recent
+                    .get(&chat)
+                    .and_then(|tail| tail.iter().find(|(id, _)| *id == block))
+                    .map(|(_, bytes)| bytes.clone())
+                else {
+                    // Блока в хвосте нет: он старше окна. Молчим —
+                    // чинить это дерево не умеет, и §7.2 не зря отдаёт
+                    // историю анти-энтропии.
+                    return Ok(Vec::new());
+                };
+                self.send_group_copy(now_ms, block, peer_ik, &bytes)
+            }
+            swarm::Control::Prune { .. } => {
+                // Ребро подрезано: лишние отмирают, дерево возникает само
+                // (§7.1, шаг 3).
+                let tree = self.tree.entry(chat).or_default();
+                tree.eager.remove(&peer_ik);
+                tree.lazy.insert(peer_ik);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Сработал срок `T_graft`: блок так и не приехал (§7.1, шаг 4).
+    ///
+    /// Отдаёт `None`, если метка не наша, — у ядра один счётчик меток
+    /// на всё, и чужую трогать нельзя.
+    pub(super) fn on_graft_timer(
+        &mut self,
+        now_ms: u64,
+        token: u64,
+    ) -> Result<Option<Vec<Effect>>, EngineError> {
+        let Some((chat, block)) = self.graft_timers.remove(&token) else { return Ok(None) };
+        let Some(who) = self.awaited_blocks.remove(&(chat, block)) else {
+            return Ok(Some(Vec::new()));
+        };
+        // Приехал, пока ждали, — чинить нечего.
+        if self.store.seen(&block)? {
+            return Ok(Some(Vec::new()));
+        }
+        // Зовущий становится eager: мы просим у него блок и хотим, чтобы
+        // следующий он прислал целиком, не спрашивая.
+        let tree = self.tree.entry(chat).or_default();
+        tree.lazy.remove(&who);
+        tree.eager.insert(who);
+        let ask = swarm::Control::Graft { group: chat, block };
+        Ok(Some(self.send_swarm_control(now_ms, who, &ask)?))
+    }
+
+    /// Блок приехал вторым путём: подрезать ребро (§7.1, шаг 3).
+    ///
+    /// Зовётся на **дубле** — том, что съела дедупликация §9.2. Дубль
+    /// в дереве значит ровно одно: у нас два eager-родителя там, где
+    /// хватит одного.
+    pub(super) fn prune_duplicate_sender(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(state) = self.groups.get(&chat) else { return Ok(Vec::new()) };
+        if state.profile.everyone_writes() {
+            return Ok(Vec::new());
+        }
+        // Владелец **не подрезается**: он источник, и отрезав его,
+        // читатель остался бы со вторым путём вместо первого — то есть
+        // зависел бы от сида, которого завтра может не быть.
+        if self.channel_owner(chat) == Some(peer_ik) {
+            return Ok(Vec::new());
+        }
+        // **Своё дерево здесь не трогается, и это не забывчивость.**
+        // Дерево у нас **направленное**: в нём те, кому шлём мы. От кого
+        // приходит нам — решает их дерево, и подрезать его может только
+        // сам приславший. Поэтому единственное, что тут делается, —
+        // говорится `PRUNE`.
+        //
+        // Здесь сперва стояло `if !tree.eager.remove(&peer_ik) { … }`,
+        // и оно молча отменяло подрезку у всякого, кто сам никому
+        // не раздаёт, — то есть у обычного читателя, ради которого дубль
+        // и случается. Поймано проверкой, а не рассуждением.
+        let cut = swarm::Control::Prune { group: chat };
+        self.send_swarm_control(now_ms, peer_ik, &cut)
+    }
+}
+
+/// Сколько eager-пиров держит узел. §7.1: 3–5.
+///
+/// Четыре — середина названного спекой промежутка. Больше значит
+/// больше копий каждого блока, меньше — дольше чинить дерево после
+/// обрыва: ленивому придётся дождаться срока и позвать `GRAFT`.
+pub(super) const K_EAGER: usize = 4;
+
+/// Сколько блоков держим в хвосте — тем, чем отвечаем на `GRAFT`.
+///
+/// Хвост, а не архив: держать надо ровно столько, сколько идёт срок
+/// `T_graft`. Шестьдесят четыре — с запасом на живую ленту, где блоки
+/// идут пачкой.
+pub(super) const RECENT_BLOCKS: usize = 64;
+
+/// Дерево раздачи одного канала (§7.1).
+#[derive(Debug, Default, Clone)]
+pub(super) struct Tree {
+    /// Кому блоки уходят целиком.
+    pub(super) eager: BTreeSet<[u8; 32]>,
+    /// Кому уходит только зов `IHAVE`.
+    pub(super) lazy: BTreeSet<[u8; 32]>,
 }
 
 /// Сколько сидов держит читатель. §7.1: eager-пиров 3–5.
@@ -536,6 +850,25 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const SWARM_KEY_GROUP: u8 = 1;
 /// Ключ поля «подписанная запись».
 const SWARM_KEY_RECORD: u8 = 2;
+
+impl<S: Store> Engine<S> {
+    /// Форма дерева раздачи: кому целиком, кому зовом (§7.1).
+    ///
+    /// Наружу — ради разбора. «Слово не дошло» в рое означает одно
+    /// из трёх: не тот, кого считали eager; ленивый, которому некому
+    /// прислать; подрезанное ребро. Различить их по журналу нельзя,
+    /// а по форме дерева — можно.
+    ///
+    /// Границу UniFFI это не пересекает (§13.3): клиенту показывать
+    /// дерево нечего.
+    #[must_use]
+    pub fn swarm_tree(&self, chat: ChatId) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        self.tree.get(&chat).map_or_else(
+            || (Vec::new(), Vec::new()),
+            |tree| (tree.eager.iter().copied().collect(), tree.lazy.iter().copied().collect()),
+        )
+    }
+}
 
 /// Что клиент показывает про сида (§7.5).
 #[derive(Debug, Clone, PartialEq, Eq)]

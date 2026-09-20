@@ -1182,6 +1182,10 @@ impl Store for MemoryStore {
         Ok(self.seen.insert(*msg_id, now_ms).is_none())
     }
 
+    fn seen(&self, msg_id: &MsgId) -> Result<bool> {
+        Ok(self.seen.contains_key(msg_id))
+    }
+
     fn compact(&mut self, task: Task, now_ms: u64) -> Result<u64> {
         // Ветки перечислены поимённо: новая задача уборки обязана сломать
         // компиляцию здесь, а не тихо остаться невыполненной.

@@ -343,6 +343,136 @@ impl UncheckedRecord {
     }
 }
 
+/// Кадр дерева раздачи: `IHAVE`, `GRAFT`, `PRUNE` (§7.1).
+///
+/// # Один тип на три вида, и это не экономия
+///
+/// Правило «отдельный тип, а не признак» защищает от одного: показать
+/// незнакомое как знакомое. Здесь показывать нечего вовсе — эти кадры
+/// человек не видит никогда. А вот механизм у них один: дерево, в котором
+/// `IHAVE` зовёт, `GRAFT` чинит, `PRUNE` подрезает. Сборка, которая знает
+/// один из трёх, обязана знать все три: понимающая `IHAVE`, но не
+/// понимающая `GRAFT`, звала бы к себе блоки и не умела бы их попросить.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// «У меня есть такой блок» — зов ленивому пиру (§7.1).
+    IHave {
+        /// Какого канала.
+        group: GroupId,
+        /// Какой блок: номер конверта.
+        block: [u8; 16],
+    },
+    /// «Пришли его и переведи меня в eager» — починка дерева (§7.1, шаг 4).
+    Graft {
+        /// Какого канала.
+        group: GroupId,
+        /// Какой блок.
+        block: [u8; 16],
+    },
+    /// «Не шли мне целиком, я уже получил это иначе» (§7.1, шаг 3).
+    ///
+    /// Блок не называется: подрезается **ребро**, а не доставка. Назови
+    /// мы блок, пришлось бы решать, что делать со следующим, — а ответ
+    /// один: лишние рёбра отмирают, дерево возникает само.
+    Prune {
+        /// Какого канала.
+        group: GroupId,
+    },
+}
+
+const KIND_IHAVE: u64 = 1;
+const KIND_GRAFT: u64 = 2;
+const KIND_PRUNE: u64 = 3;
+const KEY_KIND: u8 = 9;
+const KEY_BLOCK_ID: u8 = 10;
+
+impl Control {
+    /// Какого канала кадр — это есть у всех трёх видов.
+    #[must_use]
+    pub const fn group(&self) -> &GroupId {
+        match self {
+            Control::IHave { group, .. } | Control::Graft { group, .. } => group,
+            Control::Prune { group } => group,
+        }
+    }
+
+    /// То, что едет по проводу.
+    #[must_use]
+    pub fn value(&self) -> Value {
+        let (kind, group, block) = match self {
+            Control::IHave { group, block } => (KIND_IHAVE, group, Some(block)),
+            Control::Graft { group, block } => (KIND_GRAFT, group, Some(block)),
+            Control::Prune { group } => (KIND_PRUNE, group, None),
+        };
+        let mut fields = vec![
+            (Value::Integer(KEY_KIND.into()), Value::Integer(kind.into())),
+            (Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec())),
+        ];
+        if let Some(block) = block {
+            fields.push((Value::Integer(KEY_BLOCK_ID.into()), Value::Bytes(block.to_vec())));
+        }
+        Value::Map(fields)
+    }
+
+    /// Читает кадр дерева с провода.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelError::Malformed`] — не та форма, не та длина или
+    /// незнакомый вид. Незнакомый вид — отказ, а не пропуск: кадр
+    /// управления, которого мы не понимаем, менять дерево не должен.
+    pub fn from_value(value: &Value) -> Result<Control, ChannelError> {
+        let map = canonical::as_map(value).map_err(|_| ChannelError::Malformed)?;
+        let kind = canonical::require(map, KEY_KIND.into())
+            .and_then(canonical::as_u64)
+            .map_err(|_| ChannelError::Malformed)?;
+        let group = canonical::require(map, KEY_GROUP.into())
+            .and_then(canonical::as_array::<16>)
+            .map_err(|_| ChannelError::Malformed)?;
+        let block = || {
+            canonical::require(map, KEY_BLOCK_ID.into())
+                .and_then(canonical::as_array::<16>)
+                .map_err(|_| ChannelError::Malformed)
+        };
+        match kind {
+            KIND_IHAVE => Ok(Control::IHave { group, block: block()? }),
+            KIND_GRAFT => Ok(Control::Graft { group, block: block()? }),
+            KIND_PRUNE => Ok(Control::Prune { group }),
+            _ => Err(ChannelError::Malformed),
+        }
+    }
+}
+
+/// Сколько ждать блок после `IHAVE`, прежде чем звать `GRAFT` (§7.1, §7.7).
+///
+/// # Число берётся у ступени, а не выдумывается здесь
+///
+/// §7.7 говорит «секунды в LAN, десятки секунд в onion» — то есть ровно
+/// то, что у ступени уже посчитано сроком ответа. Заведи мы своё число,
+/// оно разошлось бы с ним при первой же правке: у ступени срок меняют,
+/// когда меняют её саму, а про срок дерева в тот день никто не вспомнит.
+///
+/// # У медленных ступеней `GRAFT` не зовут вовсе
+///
+/// Почта и реле ответа не обещают (§5.3, 0.3): блок едет минутами
+/// и часами, и `GRAFT` там значил бы «попроси ещё раз то, что и так
+/// в пути» — то есть удвоение трафика ради нетерпения. Потерянное
+/// на медленной ступени чинит анти-энтропия (§7.2), а не дерево.
+#[must_use]
+pub fn graft_wait_ms(via: crate::transport_policy::Transport) -> Option<u64> {
+    use crate::transport_policy::{
+        Transport, BT_RECEIPT_TIMEOUT_MS, LAN_RECEIPT_TIMEOUT_MS, ONION_REPLY_TIMEOUT_MS,
+        YGG_RECEIPT_TIMEOUT_MS,
+    };
+    match via {
+        Transport::Lan => Some(LAN_RECEIPT_TIMEOUT_MS),
+        Transport::Bt => Some(BT_RECEIPT_TIMEOUT_MS),
+        Transport::Ygg => Some(YGG_RECEIPT_TIMEOUT_MS),
+        Transport::Onion => Some(ONION_REPLY_TIMEOUT_MS),
+        Transport::Nostr | Transport::Mail => None,
+    }
+}
+
 /// Привязка к сиду: «я читаю этот канал» (§7.5.1).
 ///
 /// # Подписи нет, и она была бы лишней

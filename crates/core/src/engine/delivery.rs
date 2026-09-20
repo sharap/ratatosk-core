@@ -200,7 +200,14 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
-            silent: false,
+            // **Молчаливость выводится из типа, а не ставится словом.**
+            // Здесь стояло `false`, и кадр дерева раздачи (§7.1) получал
+            // срок, которого ему никто не закроет: подтверждение `IHAVE` —
+            // это `GRAFT`, а не квитанция. Вышедший срок §5.4 читает как
+            // «прямой канал не удался» и отправляет сессию на покой —
+            // то есть механизм, заведённый ради экономии, ломал бы сессии
+            // на каждом зове. Нашла метёлка `receipt_wiring`.
+            silent: Self::rides_silently(payload_type),
         })?;
         Ok((msg_id, effects))
     }

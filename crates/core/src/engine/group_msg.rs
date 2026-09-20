@@ -510,7 +510,19 @@ impl<S: Store> Engine<S> {
             reply_to: None,
         })?;
 
-        self.fan_out_group(now_ms, chat, msg_id, &bytes)
+        // **Своё слово в канале раздаётся деревом** (§7.1): целиком —
+        // eager-пирам, зовом `IHAVE` — ленивым. В группе веер остаётся
+        // как был: §11.3 велит каждому рассылать свои копии самому,
+        // и дерева там нет вовсе.
+        //
+        // Деревом раздаются **слова**, а не документы: представление,
+        // ключи чтения и записи каталога едут веером. Документ редок
+        // и важен, и лишний круг `IHAVE` → `GRAFT` стоил бы читателю
+        // отложенного впуска ради экономии одного кадра.
+        if self.groups[&chat].profile.everyone_writes() {
+            return self.fan_out_group(now_ms, chat, msg_id, &bytes);
+        }
+        self.push_block(now_ms, chat, None, msg_id, &bytes)
     }
 
     /// Молчалива ли доставка такого кадра (см. [`Delivery::silent`]).
@@ -521,7 +533,21 @@ impl<S: Store> Engine<S> {
     /// из двух — та, что ничего не ломает.
     pub(super) fn silent_frame(bytes: &[u8]) -> bool {
         let Ok(raw) = Envelope::decode(bytes) else { return false };
-        Self::is_group_copy(raw.into_parts().1.payload_type)
+        Self::rides_silently(raw.into_parts().1.payload_type)
+    }
+
+    /// Едет ли кадр такого типа **без квитанции и без срока**.
+    ///
+    /// Шире, чем [`Engine::is_group_copy`], ровно на кадры дерева (§7.1),
+    /// и вторая причина у них своя: подтверждение `IHAVE` — это `GRAFT`,
+    /// подтверждение `GRAFT` — сам блок. Квитанция удваивала бы трафик
+    /// механизма, заведённого ради его сокращения.
+    ///
+    /// Два предиката, а не один список: вопросы разные. «Копия группового»
+    /// отвечает ещё и на «слать ли статус в историю», а кадру дерева
+    /// в истории места нет вовсе.
+    pub(super) const fn rides_silently(payload_type: PayloadType) -> bool {
+        Self::is_group_copy(payload_type) || matches!(payload_type, PayloadType::SwarmControl)
     }
 
     /// Ставит в очередь §5.4 одну копию группового сообщения.
@@ -1218,10 +1244,10 @@ impl<S: Store> Engine<S> {
             vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })];
         if !self.groups[&chat].profile.everyone_writes() {
             let bytes = envelope.encode()?;
-            effects.extend(self.relay_to_attached(
+            effects.extend(self.push_block(
                 now_ms,
                 chat,
-                peer_ik,
+                Some(peer_ik),
                 envelope.msg_id,
                 &bytes,
             )?);

@@ -190,6 +190,8 @@ RatatoskClient::open(db_path: String, pin: Option<String>, display_name: String)
 | `rotate_channel_key(chat_id: Vec<u8>)` | повернуть ключ чтения (§6.4) — это и есть исключение читателя |
 | `set_seeding(chat_id, mode: FfiSeeding)` | раздавать ли канал и объявлять ли адрес (§7.5.1); текст §15 — **до** `Announced` |
 | `seeding_mode(chat_id) -> FfiSeeding` | наше участие в раздаче: `Off`, `Quiet`, `Announced` |
+| `set_sharing_level(chat_id: Option<..>, level: Option<FfiSharingLevel>)` | кому отдаём (§12): аккаунт или канал; текст §12 — **до** сужения |
+| `sharing_level(chat_id) -> FfiSharingLevel` | **действующий** уровень канала — с учётом умолчания аккаунта |
 | `seeding(chat_id) -> bool` | объявлен ли наш адрес в каталоге (короткий вопрос к тому же состоянию) |
 | `channel_seeds(chat_id) -> Vec<FfiChannelSeed>` | кто раздаёт канал (§7.5); протухшие не показываются |
 | `set_transport_enabled(transport: FfiTransport, enabled: bool)` | включить или выключить транспорт (§5.4); выбор хранит ядро |
@@ -1383,6 +1385,8 @@ fn channel_admits(chat_id: Vec<u8>) -> Result<Vec<FfiChannelAdmit>, RatatoskErro
 fn channel_requests(chat_id: Vec<u8>) -> Result<Vec<FfiChannelRequest>, RatatoskError>
 fn set_seeding(chat_id: Vec<u8>, mode: FfiSeeding) -> Result<(), RatatoskError>
 fn seeding_mode(chat_id: Vec<u8>) -> Result<FfiSeeding, RatatoskError>
+fn set_sharing_level(chat_id: Option<Vec<u8>>, level: Option<FfiSharingLevel>) -> Result<(), RatatoskError>
+fn sharing_level(chat_id: Vec<u8>) -> Result<FfiSharingLevel, RatatoskError>
 fn seeding(chat_id: Vec<u8>) -> Result<bool, RatatoskError>
 fn channel_seeds(chat_id: Vec<u8>) -> Result<Vec<FfiChannelSeed>, RatatoskError>
 
@@ -1392,6 +1396,7 @@ admitter_grant_notice() -> String   // **при выдаче** права «вп
 key_rotation_notice() -> String     // **до** кнопки «повернуть ключ» (§6.4)
 sharing_notice() -> String          // **до** показа ссылки (§10.2)
 seeding_notice() -> String          // **до** объявления себя раздающим (§7.5.1)
+sharing_level_notice() -> String    // **до** сужения круга отдачи (§12) — не путать с `sharing_notice`
 channel_refusal_text(reason) -> String  // слова к отказу канала
 ```
 
@@ -2045,6 +2050,21 @@ FfiMerged { own_graph: bool, added: u64, known: u64, refused: u64 }
 включая тех, кто привязался раньше. Право на обслуживание спрашивается
 на каждой раздаче, а не один раз при привязке, — иначе кнопка врала бы:
 новых не берём, прежним отдаём.
+
+**Ручек две, и это не удвоение одной.** Участие в раздаче отвечает
+«раздаём ли вообще», уровень (`FfiSharingLevel`, §12) — «кому»: всем
+(умолчание), только контактам, только сверенным. Уровень ставится
+на аккаунт (`chat_id: None`) или на один канал; `level: None` снимает
+переопределение канала, и канал возвращается к умолчанию аккаунта.
+`sharing_level(chat_id)` отдаёт **действующий** уровень: клиенту нужен
+ответ на вопрос «кому сейчас отдаём», а не «нажимали ли тут кнопку».
+
+**Перед сужением обязателен `sharing_level_notice()`** — §12 требует
+сказать, что платят не только за себя: сузив круг, человек оставляет
+новому подписчику меньше тех, у кого можно спросить, и заметит это
+не он. Не путать с `sharing_notice()`: тот про показ **ссылки** (§10.2).
+Клиенту стоит называть «только сверенным» тем, что оно есть, — это
+ближе к «не раздавать», чем к середине.
 
 **Чего кнопка не делает: не закрывает сессии и не отзывает записи.**
 Объявленная запись живёт до конца срока и просто перестаёт продлеваться

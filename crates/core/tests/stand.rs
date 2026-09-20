@@ -629,6 +629,19 @@ impl Stand {
         self.settle();
     }
 
+    /// Ставит уровень отдачи — на аккаунт (`chat: None`) или на канал (§12).
+    fn set_sharing(
+        &mut self,
+        who: NodeId,
+        chat: Option<[u8; 16]>,
+        level: Option<ratatosk_proto::swarm::Sharing>,
+    ) {
+        self.sim.act(who, |node, ctx| {
+            node.command(ctx, Command::SetSharing { chat, level });
+        });
+        self.settle();
+    }
+
     /// Сколько кадров отдали сети все узлы вместе (§7.1).
     fn frames_sent(&self) -> usize {
         self.sim.nodes().iter().map(|node| node.sent).sum()
@@ -1867,6 +1880,141 @@ fn a_node_that_stopped_seeding_serves_no_one() {
     assert!(
         stand.sim.node(NodeId(1)).seen(chat).contains(&"после выключателя".to_owned()),
         "сам он слово принял: выключен не канал, а раздача; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+/// Канал, где до читателя достаёт **только** сид: владелец оборван.
+///
+/// Отдаёт стенд, канал и узлы «сид» (1) и «читатель» (2). Нужен
+/// проверкам про уровни отдачи (§12) и про выключатель: только так
+/// «не отдал» отличимо от «дошло само».
+fn a_channel_where_the_reader_depends_on_the_seed(seed: u64, strangers: bool) -> (Stand, [u8; 16]) {
+    let mut stand = if strangers { Stand::strangers(seed, 3) } else { Stand::new(seed, 3) };
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    for kind in [
+        TransportKind::Onion,
+        TransportKind::Mail,
+        TransportKind::Lan,
+        TransportKind::Bt,
+        TransportKind::Ygg,
+        TransportKind::Nostr,
+    ] {
+        stand.sim.net_mut().set_link_profile(
+            NodeId(0),
+            NodeId(2),
+            kind,
+            LinkProfile { loss_permille: 1_000, ..LinkProfile::INSTANT },
+        );
+    }
+    (stand, chat)
+}
+
+#[test]
+fn a_seed_that_shares_only_with_contacts_does_not_serve_a_stranger() {
+    // §12, «уровни отдачи»: всем (умолчание) / только контактам / только
+    // сверенным. Читатель канала контактом сиду **не становится** (§8.3,
+    // третий вид записи), и это ровно тот случай, ради которого §12
+    // предупреждает: рой сворачивается в граф контактов.
+    let (mut stand, chat) = a_channel_where_the_reader_depends_on_the_seed(0x0_5A6E, true);
+
+    // Умолчание — «всем», и через сида слово доходит.
+    stand.say(NodeId(0), chat, "при умолчании");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"при умолчании".to_owned()),
+        "умолчание §12 открытое — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек сузил круг до контактов.
+    stand.set_sharing(NodeId(1), Some(chat), Some(ratatosk_proto::swarm::Sharing::Contacts));
+    stand.say(NodeId(0), chat, "после сужения");
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"после сужения".to_owned()),
+        "«только контактам» не отдаёт незнакомому читателю (§12); сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_seed_that_shares_only_with_contacts_still_serves_a_contact() {
+    // Вторая половина того же правила: уровень отсекает **чужих**,
+    // а не всех. Без этой проверки «только контактам» было бы
+    // неотличимо от «не раздаю» — а §12 держит их разными.
+    let (mut stand, chat) = a_channel_where_the_reader_depends_on_the_seed(0x0_C0A7AC7, false);
+    stand.set_sharing(NodeId(1), Some(chat), Some(ratatosk_proto::swarm::Sharing::Contacts));
+
+    stand.say(NodeId(0), chat, "своему");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"своему".to_owned()),
+        "контакту отдаём и при суженном круге (§12); сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_channel_override_beats_the_account_default() {
+    // §12 держит уровень «на аккаунт, с переопределением на группу».
+    // Проверяется то, ради чего переопределение и заведено: аккаунт
+    // сужен, а один канал человек оставил открытым — и этот канал
+    // раздаётся.
+    //
+    // Пустая клетка у канала обязана отличаться от кода «всем»: сотри
+    // мы разницу, поднятое умолчание аккаунта не поднялось бы ни в одном
+    // канале, где когда-то нажимали кнопку.
+    let (mut stand, chat) = a_channel_where_the_reader_depends_on_the_seed(0x0_0BE11A, true);
+
+    stand.set_sharing(NodeId(1), None, Some(ratatosk_proto::swarm::Sharing::Contacts));
+    stand.say(NodeId(0), chat, "при суженном аккаунте");
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"при суженном аккаунте".to_owned()),
+        "умолчание аккаунта действует и без переопределения; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Этот канал человек оставляет открытым — и только этот.
+    stand.set_sharing(NodeId(1), Some(chat), Some(ratatosk_proto::swarm::Sharing::Everyone));
+    stand.say(NodeId(0), chat, "с переопределением");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"с переопределением".to_owned()),
+        "переопределение канала сильнее умолчания аккаунта (§12); сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // И снятое переопределение возвращает канал к умолчанию аккаунта —
+    // а не к «всем».
+    stand.set_sharing(NodeId(1), Some(chat), None);
+    stand.say(NodeId(0), chat, "после снятия");
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"после снятия".to_owned()),
+        "пустая клетка значит «как у аккаунта», а не «всем» (§12); сид {:#x}",
         stand.sim.seed()
     );
 }

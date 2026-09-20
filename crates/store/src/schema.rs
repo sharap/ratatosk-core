@@ -10,7 +10,7 @@
 //! но места, которые они чистят, заданы уже здесь.
 
 /// Версия схемы. Увеличивается на каждую миграцию.
-pub const SCHEMA_VERSION: u32 = 36;
+pub const SCHEMA_VERSION: u32 = 37;
 
 /// Прагмы, выставляемые при каждом открытии соединения.
 pub const PRAGMAS: &str = "\
@@ -1448,6 +1448,27 @@ CREATE INDEX channel_archive_by_msg ON channel_archive(chat_id, msg_id);
 CREATE INDEX channel_archive_by_time ON channel_archive(chat_id, received_ms);
 "#;
 
+/// Уровень отдачи на канал (фаза 2, §12, «уровни отдачи»).
+///
+/// Своя таблица, а не столбец к `swarm_seeding`, и разница смысловая.
+/// Участие в раздаче есть всегда — умолчанием тихая (§7.5.1), поэтому
+/// отсутствие строки там значит «умолчание». Переопределение уровня
+/// **бывает или не бывает**: §12 держит уровень «на аккаунт,
+/// с переопределением на группу», и пустота здесь значит «как
+/// у аккаунта», а не «всем». Сотри мы разницу, поднятое умолчание
+/// не поднялось бы ни в одном канале, где человек когда-то нажимал
+/// кнопку.
+///
+/// Уровень аккаунта лежит в `meta` — он один на базу, и таблицы
+/// на одно число заводить незачем.
+pub const MIGRATION_0037: &str = r#"
+CREATE TABLE channel_sharing (
+    chat_id         BLOB PRIMARY KEY NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    level           INTEGER NOT NULL,            -- 0 всем, 1 контактам, 2 сверенным
+    changed_ms      INTEGER NOT NULL
+) STRICT;
+"#;
+
 /// Все таблицы базы — поимённо.
 ///
 /// Список нужен вывозу «социального графа» (§12): он оставляет
@@ -1457,7 +1478,7 @@ CREATE INDEX channel_archive_by_time ON channel_archive(chat_id, received_ms);
 ///
 /// Сверяется тестом с тем, что на самом деле создают миграции, — чтобы
 /// «список отстал от схемы» было падением сборки, а не тихой утечкой.
-pub const ALL_TABLES: [&str; 38] = [
+pub const ALL_TABLES: [&str; 39] = [
     "avatars",
     "causal_refs",
     "channel_admits",
@@ -1465,6 +1486,7 @@ pub const ALL_TABLES: [&str; 38] = [
     "channel_grants",
     "channel_representations",
     "channel_requests",
+    "channel_sharing",
     "swarm_peers",
     "swarm_seeding",
     "channel_archive",
@@ -1525,7 +1547,7 @@ pub const GRAPH_META_KEYS: [&str; 5] =
     ["identity_seed", "onion_key", "db_salt", "self_card", "mail_account"];
 
 /// Все миграции по порядку.
-pub const MIGRATIONS: [&str; 36] = [
+pub const MIGRATIONS: [&str; 37] = [
     MIGRATION_0001,
     MIGRATION_0002,
     MIGRATION_0003,
@@ -1562,6 +1584,7 @@ pub const MIGRATIONS: [&str; 36] = [
     MIGRATION_0034,
     MIGRATION_0035,
     MIGRATION_0036,
+    MIGRATION_0037,
 ];
 
 #[cfg(test)]
@@ -1642,7 +1665,7 @@ mod tests {
     /// **Что делать, если тест упал.** Почти наверняка вы правите выпущенную
     /// миграцию — верните её как было и заведите следующий номер. Число здесь
     /// меняют только вместе с добавлением новой миграции в конец списка.
-    const FROZEN: [u64; 36] = [
+    const FROZEN: [u64; 37] = [
         0xa3f5_d87f_eeaa_0e3c,
         0x7996_4d61_828d_b650,
         0x67d3_78d4_c2cc_c4f1,
@@ -1679,6 +1702,7 @@ mod tests {
         0x168c_0f81_36d1_241c,
         0xf79c_2798_5608_5547,
         0xe075_9acf_4dd9_5b12,
+        0x486a_7674_7421_471d,
     ];
 
     #[test]

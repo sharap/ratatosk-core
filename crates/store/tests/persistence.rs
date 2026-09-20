@@ -2260,6 +2260,49 @@ fn a_have_vector_says_the_first_and_the_last() {
 }
 
 #[test]
+fn an_empty_sharing_cell_is_not_the_same_as_the_open_level() {
+    // §12 держит уровень «на аккаунт, с переопределением на группу».
+    // Пустая клетка значит «как у аккаунта»; код «всем» значит «всем
+    // независимо от аккаунта». Сотри хранилище эту разницу — поднятое
+    // умолчание не поднялось бы ни в одном канале, где человек когда-то
+    // нажимал кнопку.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+
+    assert_eq!(store.sharing(&chat).unwrap(), None, "переопределения нет у нового канала");
+    store.set_sharing(&chat, Some(1), 10).unwrap();
+    assert_eq!(store.sharing(&chat).unwrap(), Some(1));
+    store.set_sharing(&chat, Some(0), 20).unwrap();
+    assert_eq!(store.sharing(&chat).unwrap(), Some(0), "«всем» — это выбор, а не пустота");
+    store.set_sharing(&chat, None, 30).unwrap();
+    assert_eq!(store.sharing(&chat).unwrap(), None, "снятое переопределение стирается");
+}
+
+#[test]
+fn the_sharing_level_survives_a_restart_and_both_backends_agree() {
+    // Настройка, не переживающая перезапуск, — не настройка: человек
+    // сузил круг, приложение перезапустилось, и канал снова раздаётся
+    // всем. И два хранилища обязаны отвечать одно: разойдись они,
+    // расходилась бы и раздача.
+    let db = TempDb::new("sharing-level");
+    let chat = [3u8; 16];
+    {
+        let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+        sqlite.migrate().unwrap();
+        sqlite.put_group(&group(3, "канал", 1_000)).unwrap();
+        sqlite.set_sharing(&chat, Some(2), 10).unwrap();
+    }
+    let sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    assert_eq!(sqlite.sharing(&chat).unwrap(), Some(2), "уровень пережил перезапуск");
+
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+    memory.set_sharing(&chat, Some(2), 10).unwrap();
+    assert_eq!(sqlite.sharing(&chat).unwrap(), memory.sharing(&chat).unwrap());
+}
+
+#[test]
 fn a_gap_in_the_middle_breaks_the_have_vector_in_two() {
     // §7.3: «узел, имеющий 46 и 48, **знает**, что 47 существует».
     // Знает он это по вектору, и вектор обязан сказать правду: две

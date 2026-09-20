@@ -2395,6 +2395,7 @@ impl<S: Store> Engine<S> {
             Command::SetYggMode(mode) => self.on_set_ygg_mode(now_ms, mode),
             Command::SetYggPeers(peers) => self.on_set_ygg_peers(now_ms, peers),
             Command::SetSeeding { chat, mode } => self.on_set_seeding(now_ms, chat, mode),
+            Command::SetSharing { chat, level } => self.on_set_sharing(now_ms, chat, level),
             Command::SetNostrRelays(relays) => self.on_set_nostr_relays(now_ms, relays),
             Command::SetNostrDirect(direct) => self.on_set_nostr_direct(now_ms, direct),
             Command::SetForeground(front) => self.on_set_foreground(now_ms, front),

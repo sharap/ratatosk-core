@@ -2348,6 +2348,35 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn sharing(&self, chat_id: &[u8; 16]) -> Result<Option<u32>> {
+        let mut statement =
+            self.conn.prepare("SELECT level FROM channel_sharing WHERE chat_id = ?1")?;
+        let mut rows = statement.query([&chat_id[..]])?;
+        let Some(row) = rows.next()? else { return Ok(None) };
+        let level: i64 = row.get(0)?;
+        Ok(Some(u32::try_from(sql_types::from_sql(level)).unwrap_or(0)))
+    }
+
+    fn set_sharing(&mut self, chat_id: &[u8; 16], level: Option<u32>, now_ms: u64) -> Result<()> {
+        // `None` — **строка уходит**, а не ложится нулём: пустота значит
+        // «как у аккаунта», и хранить её кодом «всем» значило бы навсегда
+        // отвязать канал от умолчания.
+        let Some(level) = level else {
+            self.conn.execute("DELETE FROM channel_sharing WHERE chat_id = ?1", [&chat_id[..]])?;
+            return Ok(());
+        };
+        self.conn.execute(
+            "INSERT OR REPLACE INTO channel_sharing (chat_id, level, changed_ms)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                &chat_id[..],
+                sql_types::to_sql(u64::from(level)),
+                sql_types::to_sql(now_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn put_channel_request(
         &mut self,
         chat_id: &[u8; 16],

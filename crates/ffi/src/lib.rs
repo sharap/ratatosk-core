@@ -564,6 +564,45 @@ impl From<ratatosk_proto::swarm::Seeding> for FfiSeeding {
     }
 }
 
+/// Кому отдаём, когда раздаём канал (фаза 2, §12).
+///
+/// **Вторая ручка, а не та же, что [`FfiSeeding`].** Участие в раздаче
+/// отвечает на вопрос «раздаём ли вообще», уровень — «кому». Сложи их
+/// в одну настройку, и «раздаю только контактам» стало бы неотличимо
+/// от «не раздаю».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSharingLevel {
+    /// Всем, кто спросил. **Умолчание, и §12 велит ему таким остаться.**
+    Everyone,
+    /// Только контактам.
+    Contacts,
+    /// Только сверенным.
+    ///
+    /// Клиенту стоит называть это тем, что оно есть: сверенных обычно
+    /// единицы, и это ближе к «не раздавать», чем к середине.
+    Verified,
+}
+
+impl From<FfiSharingLevel> for ratatosk_proto::swarm::Sharing {
+    fn from(value: FfiSharingLevel) -> ratatosk_proto::swarm::Sharing {
+        match value {
+            FfiSharingLevel::Everyone => ratatosk_proto::swarm::Sharing::Everyone,
+            FfiSharingLevel::Contacts => ratatosk_proto::swarm::Sharing::Contacts,
+            FfiSharingLevel::Verified => ratatosk_proto::swarm::Sharing::Verified,
+        }
+    }
+}
+
+impl From<ratatosk_proto::swarm::Sharing> for FfiSharingLevel {
+    fn from(value: ratatosk_proto::swarm::Sharing) -> FfiSharingLevel {
+        match value {
+            ratatosk_proto::swarm::Sharing::Everyone => FfiSharingLevel::Everyone,
+            ratatosk_proto::swarm::Sharing::Contacts => FfiSharingLevel::Contacts,
+            ratatosk_proto::swarm::Sharing::Verified => FfiSharingLevel::Verified,
+        }
+    }
+}
+
 /// Событие для UI.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiEvent {
@@ -3544,6 +3583,50 @@ impl RatatoskClient {
         self.command(Command::SetSeeding { chat: to_chat(&chat_id)?, mode: mode.into() })
     }
 
+    /// Кому отдавать блоки этого канала — или всех каналов (§12).
+    ///
+    /// `chat_id: None` ставит умолчание **аккаунта**; с каналом —
+    /// переопределение на него одного. `level: None` при названном
+    /// канале снимает переопределение, и канал возвращается
+    /// к умолчанию аккаунта.
+    ///
+    /// **Перед сужением клиент обязан показать [`sharing_level_notice`]**
+    /// (§12): платит за него не только тот, кто настраивал.
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Channel`] — названный чат не канал или неизвестен.
+    pub fn set_sharing_level(
+        &self,
+        chat_id: Option<Vec<u8>>,
+        level: Option<FfiSharingLevel>,
+    ) -> Result<(), RatatoskError> {
+        let chat = match chat_id {
+            Some(bytes) => Some(to_chat(&bytes)?),
+            None => None,
+        };
+        self.command(Command::SetSharing { chat, level: level.map(Into::into) })
+    }
+
+    /// Кому мы отдаём блоки этого канала (§12) — с учётом умолчания.
+    ///
+    /// Отдаётся **действующий** уровень, а не сырая настройка: у канала
+    /// без переопределения это уровень аккаунта. Клиенту нужен ответ
+    /// на вопрос «кому сейчас отдаём», а не на вопрос «нажимали ли тут
+    /// кнопку».
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn sharing_level(&self, chat_id: Vec<u8>) -> Result<FfiSharingLevel, RatatoskError> {
+        let level = self
+            .opened
+            .handle
+            .sharing_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(level.into())
+    }
+
     /// Наше участие в раздаче этого канала (фаза 2, §7.5.1).
     ///
     /// # Errors
@@ -5232,6 +5315,21 @@ pub fn sharing_notice() -> String {
     ratatosk_proto::channel::SharingConsequences::ui_text().to_owned()
 }
 
+/// Чем платит сужение круга отдачи (фаза 2, §15, §12).
+///
+/// Показывается **до** затягивания: §12 требует, чтобы UI сказал, что
+/// платят не только за себя. Уровни «только контактам» и «только
+/// сверенным» безобидны как личный выбор и разрушительны как
+/// популярный — рой сворачивается в граф контактов, а заметит это
+/// не тот, кто настраивал, а новый подписчик.
+///
+/// Сосед [`sharing_notice`] — про другое: там показ **ссылки** (§10.2).
+#[uniffi::export]
+#[must_use]
+pub fn sharing_level_notice() -> String {
+    ratatosk_proto::swarm::SharingLevelConsequences::ui_text().to_owned()
+}
+
 /// Что означает «объявить себя раздающим» (фаза 2, §15, §7.5.1).
 ///
 /// Показывается **до** включения: адрес узнаёт каждый читатель канала,
@@ -6016,5 +6114,34 @@ mod tests {
         assert_eq!(admitter_grant_notice(), channel::AdmitterGrantConsequences::ui_text());
         assert_eq!(key_rotation_notice(), channel::KeyRotationConsequences::ui_text());
         assert_eq!(sharing_notice(), channel::SharingConsequences::ui_text());
+        assert_eq!(seeding_notice(), ratatosk_proto::swarm::SeedingConsequences::ui_text());
+        assert_eq!(
+            sharing_level_notice(),
+            ratatosk_proto::swarm::SharingLevelConsequences::ui_text()
+        );
+        // **Два соседних текста про разное, и перепутать их легко.**
+        // `sharing_notice` — про показ ссылки (§10.2), `sharing_level_notice`
+        // — про то, кому мы отдаём блоки (§12). Совпади они, клиент
+        // показал бы человеку не то последствие, о котором спрашивает.
+        assert_ne!(sharing_notice(), sharing_level_notice(), "тексты про разное");
+    }
+
+    #[test]
+    fn the_sharing_level_crosses_the_boundary_in_both_directions() {
+        // Уровень отдачи — настройка, и на границе она обязана ходить
+        // туда и обратно без потери: перевод «в одну сторону» однажды
+        // показал бы человеку не тот уровень, который стоит у ядра.
+        for level in
+            [FfiSharingLevel::Everyone, FfiSharingLevel::Contacts, FfiSharingLevel::Verified]
+        {
+            let inner: ratatosk_proto::swarm::Sharing = level.into();
+            assert_eq!(FfiSharingLevel::from(inner), level, "уровень {level:?} вернулся другим");
+        }
+        // И три состояния участия — тем же порядком: это разные ручки
+        // (§12, «две ручки, а не одна»), и путать их на границе нельзя.
+        for mode in [FfiSeeding::Off, FfiSeeding::Quiet, FfiSeeding::Announced] {
+            let inner: ratatosk_proto::swarm::Seeding = mode.into();
+            assert_eq!(FfiSeeding::from(inner), mode, "состояние {mode:?} вернулось другим");
+        }
     }
 }

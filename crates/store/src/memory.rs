@@ -66,6 +66,9 @@ pub struct MemoryStore {
     seeds: BTreeMap<([u8; 16], [u8; 32]), StoredSeed>,
     /// Наше участие в раздаче (§7.5.1): код состояния и когда выбран.
     seeding: BTreeMap<[u8; 16], (u32, u64)>,
+    /// Переопределение уровня отдачи на канал (§12). Пусто — «как
+    /// у аккаунта», и это не то же, что уровень «всем».
+    sharing: BTreeMap<[u8; 16], u32>,
     /// Пиры-не-контакты (§8.3): владелец канала, до которого надо
     /// дотянуться заявкой. `BTreeMap` — по той же причине, что у контактов:
     /// порядок обхода обязан быть одинаков от запуска к запуску.
@@ -287,6 +290,11 @@ impl Store for MemoryStore {
         self.seeds.retain(|(chat, _), _| chat != chat_id);
         self.archive.retain(|(chat, _, _), _| chat != chat_id);
         self.seeding.remove(chat_id);
+        // И уровень отдачи (§12): переопределение на канал, которого
+        // больше нет, — это настройка, которую человеку уже не показать
+        // и не снять. Нашла эту строку метёлка `chat_cascade` в ту же
+        // минуту, как таблица появилась.
+        self.sharing.remove(chat_id);
         Ok(())
     }
 
@@ -947,6 +955,23 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn sharing(&self, chat_id: &[u8; 16]) -> Result<Option<u32>> {
+        Ok(self.sharing.get(chat_id).copied())
+    }
+
+    fn set_sharing(&mut self, chat_id: &[u8; 16], level: Option<u32>, _now_ms: u64) -> Result<()> {
+        // `None` — запись уходит: пустота значит «как у аккаунта», и это
+        // не то же, что уровень «всем» (§12).
+        match level {
+            Some(level) => {
+                self.sharing.insert(*chat_id, level);
+            }
+            None => {
+                self.sharing.remove(chat_id);
+            }
+        }
+        Ok(())
+    }
     fn put_channel_request(
         &mut self,
         chat_id: &[u8; 16],

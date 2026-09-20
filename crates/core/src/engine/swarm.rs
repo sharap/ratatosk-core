@@ -18,7 +18,7 @@
 //! Это и есть «ноль сидов — это звезда» в обратную сторону: пока роя
 //! нет, каталог тоже возит звезда, и переход к рою её не отменит.
 
-use ratatosk_proto::swarm::{self, PeerRecord, Seeding};
+use ratatosk_proto::swarm::{self, PeerRecord, Seeding, Sharing};
 
 use super::*;
 
@@ -143,6 +143,46 @@ impl<S: Store> Engine<S> {
         let mut effects = self.publish_own_record(now_ms, chat)?;
         effects.push(Effect::Notify(Event::SeedingChanged { chat, announced: true }));
         Ok(effects)
+    }
+
+    /// Ставит уровень отдачи — на аккаунт или на один канал (§12).
+    ///
+    /// # Ничего не уезжает
+    ///
+    /// Уровень локален: он про то, кому **мы** отдаём, и в чужой записи
+    /// ему делать нечего. Тем он и отличается от объявления адреса
+    /// (§7.5), которое по сети едет.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownGroup`] — канала нет;
+    /// [`EngineError::NotAChannel`] — это группа: уровни отдачи живут
+    /// у каналов, а в группе раздачи нет вовсе (§7.5).
+    pub(super) fn on_set_sharing(
+        &mut self,
+        now_ms: u64,
+        chat: Option<ChatId>,
+        level: Option<Sharing>,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(chat) = chat else {
+            // Умолчание аккаунта. `None` здесь — возврат к «всем»:
+            // строки просто не будет, и это то же самое, что её
+            // отсутствие у новой базы.
+            match level {
+                Some(level) => self.store.put_meta(
+                    ratatosk_store::META_SHARING,
+                    &[u8::try_from(level.code()).unwrap_or(0)],
+                )?,
+                None => self.store.put_meta(ratatosk_store::META_SHARING, &[])?,
+            }
+            return Ok(Vec::new());
+        };
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if state.profile.everyone_writes() {
+            return Err(EngineError::NotAChannel);
+        }
+        self.store.set_sharing(&chat, level.map(Sharing::code), now_ms)?;
+        Ok(Vec::new())
     }
 
     /// Подписывает свою запись каталога и отправляет её (§7.5).
@@ -535,11 +575,64 @@ impl<S: Store> Engine<S> {
         if self.channel_owner(chat).is_some_and(|owner| owner == me) {
             return Ok(true);
         }
-        Ok(match self.seeding(chat)? {
+        let participates = match self.seeding(chat)? {
             Seeding::Off => false,
             Seeding::Quiet => self.dialed.get(&chat).is_some_and(|dialed| dialed.contains(peer_ik)),
             Seeding::Announced => true,
+        };
+        // **Две ручки, а не одна** (§12). Участие в раздаче отвечает
+        // на вопрос «раздаём ли вообще», уровень — «кому». Сложи их
+        // в одну настройку, и «раздаю только контактам» стало бы
+        // неотличимо от «не раздаю», а это разные вещи и для человека,
+        // и для роя.
+        Ok(participates && self.sharing_allows(chat, peer_ik)?)
+    }
+
+    /// Проходит ли этот пир по уровню отдачи (§12, «уровни отдачи»).
+    ///
+    /// Уровень берётся у канала, а нет своего — у аккаунта: §12 держит
+    /// его «на аккаунт, с переопределением на группу».
+    fn sharing_allows(&self, chat: ChatId, peer_ik: &[u8; 32]) -> Result<bool, EngineError> {
+        Ok(match self.sharing(chat)? {
+            Sharing::Everyone => true,
+            Sharing::Contacts => self.contacts.contains_key(peer_ik),
+            // **Сверенность спрашивается у контакта, и только у него.**
+            // Пир роя (§8.3) сверенным не бывает: сверка — это сличение
+            // отпечатков двумя людьми, а за пиром человека мы не знаем.
+            Sharing::Verified => self.contacts.get(peer_ik).is_some_and(|who| who.verified),
         })
+    }
+
+    /// Уровень отдачи этого канала (§12): свой, а нет — аккаунта.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn sharing(&self, chat: ChatId) -> Result<Sharing, EngineError> {
+        if let Some(level) = self.store.sharing(&chat)?.and_then(Sharing::from_code) {
+            return Ok(level);
+        }
+        self.account_sharing()
+    }
+
+    /// Уровень отдачи аккаунта (§12). Умолчание — «всем».
+    ///
+    /// **Незнакомый код читается как «всем», и это осознанно.** У кодов
+    /// из будущей сборки смысл может быть любым, но строку кладём мы
+    /// сами, а не сеть; выбирая между «раздать лишнему» и «перестать
+    /// раздавать вовсе», §12 выбирает первое: «умолчание остаётся
+    /// открытым», потому что закрытый рой ломается тихо и не у того,
+    /// кто настраивал.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn account_sharing(&self) -> Result<Sharing, EngineError> {
+        let Some(bytes) = self.store.meta(ratatosk_store::META_SHARING)? else {
+            return Ok(Sharing::Everyone);
+        };
+        let Some(&code) = bytes.first() else { return Ok(Sharing::Everyone) };
+        Ok(Sharing::from_code(u32::from(code)).unwrap_or(Sharing::Everyone))
     }
 
     /// Пришла привязка: кто-то читает наш канал и просит блоки (§7.5.1).

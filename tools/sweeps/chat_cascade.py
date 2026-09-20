@@ -55,6 +55,7 @@ FIELDS = {
     "channel_requests": "requests",
     "swarm_peers": "seeds",
     "swarm_seeding": "seeding",
+    "channel_sharing": "sharing",
     "channel_archive": "archive",
 }
 

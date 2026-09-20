@@ -280,6 +280,9 @@ enum Query {
     ChannelSeeds { chat: ChatId, reply: oneshot::Sender<Vec<SeedView>> },
     /// Наше участие в раздаче этого канала (фаза 2, §7.5.1).
     Seeding { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Seeding> },
+    /// Кому мы отдаём блоки этого канала (§12) — **действующий** уровень,
+    /// то есть с учётом умолчания аккаунта.
+    Sharing { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Sharing> },
     /// Группы и их состав (§11).
     Groups { reply: oneshot::Sender<Vec<GroupStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
@@ -1246,6 +1249,20 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Читает действующий уровень отдачи (§12), блокируя вызывающий поток.
+    pub fn sharing_blocking(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Sharing> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::Sharing { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// То же без блокировки.
+    pub async fn sharing(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Sharing> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::Sharing { chat, reply })).await.ok()?;
+        answer.await.ok()
+    }
+
     /// Читает учёт впусков канала, блокируя вызывающий поток.
     pub fn channel_admits_blocking(&self, chat: ChatId) -> Option<Vec<ChannelAdmitView>> {
         let (reply, answer) = oneshot::channel();
@@ -1881,6 +1898,15 @@ impl<S: Store, R: Runner> Driver<S, R> {
             Query::Seeding { chat, reply } => {
                 let _ = reply.send(
                     self.engine.seeding(chat).unwrap_or(ratatosk_proto::swarm::Seeding::Quiet),
+                );
+            }
+            Query::Sharing { chat, reply } => {
+                // Отказ хранилища читается как умолчание §12 — «всем».
+                // Умолчание открытое, и подменять его на строгое тихо,
+                // из-за сбоя чтения, значило бы выключить раздачу тому,
+                // кто её не выключал.
+                let _ = reply.send(
+                    self.engine.sharing(chat).unwrap_or(ratatosk_proto::swarm::Sharing::Everyone),
                 );
             }
         }

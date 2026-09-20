@@ -7967,6 +7967,43 @@ fn readers_of_a_channel_do_not_learn_about_each_other() {
     );
 }
 
+#[test]
+fn a_broken_link_is_dialled_again_and_not_written_off() {
+    // **Находка живого меша.** Узел, вернувшийся из перезапуска, получал
+    // молчание: его собеседник упирался в мёртвое соединение, объявлял
+    // ступень пройденной — а другой у него не было, — и кадр ложился
+    // ждать повода, которого больше не случалось.
+    //
+    // Обрыв не говорит о ступени ничего (`Failure::Dropped`): соединение
+    // было и кончилось, собеседник обыкновенно на месте и «звонит снова
+    // через секунду». Значит звонить надо заново, а не идти дальше.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let effects = send_text(&mut alice, &bob, 1_000, "первое");
+    pump(&mut alice, &mut bob, 1_000, effects);
+
+    // Слово в пути, и связь обрывается. У Алисы одна ступень — onion.
+    let effects = send_text(&mut alice, &bob, 2_000, "второе");
+    drop(effects);
+    let after_break = alice
+        .step(2_100, Input::ConnectionLost { peer_ik: bob.own_card().ik, via: Transport::Onion })
+        .expect("обрыв");
+    assert!(
+        after_break.iter().any(|effect| matches!(effect, Effect::Send { .. })),
+        "после обрыва обязан уехать новый кадр — это и есть повторный звонок; {after_break:?}"
+    );
+
+    // Второй обрыв подряд — уже похоже на «собеседника там нет»,
+    // и право на повторный звонок больше не выдаётся.
+    let after_second = alice
+        .step(2_200, Input::ConnectionLost { peer_ik: bob.own_card().ik, via: Transport::Onion })
+        .expect("второй обрыв");
+    assert!(
+        !after_second.iter().any(|effect| matches!(effect, Effect::Send { .. })),
+        "право звонить заново даётся один раз на доставку; {after_second:?}"
+    );
+}
+
 // --- Каталог пиров роя (фаза 2, §7.5, §7.5.1) -----------------------------
 
 #[test]

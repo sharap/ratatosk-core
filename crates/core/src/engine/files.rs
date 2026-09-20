@@ -186,6 +186,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             silent: false,
         })?;
 
@@ -600,6 +601,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             silent: false,
         })?;
         // Предупреждение одно на сообщение — по первому файлу, которому

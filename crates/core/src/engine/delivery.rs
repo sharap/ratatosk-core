@@ -200,6 +200,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             // **Молчаливость выводится из типа, а не ставится словом.**
             // Здесь стояло `false`, и кадр дерева раздачи (§7.1) получал
             // срок, которого ему никто не закроет: подтверждение `IHAVE` —
@@ -371,6 +372,14 @@ impl<S: Store> Engine<S> {
                     "отправлять некуда: лестница §5.4 кончилась"
                 );
                 let (remembered, mut effects) = self.remember_undelivered(delivery)?;
+                if remembered {
+                    // **Срок повтора — здесь, а не только у присутствия.**
+                    // В локальной сети отложенное будит маяк §5.1,
+                    // а в меше и onion маяка нет: обе стороны ждут
+                    // события, которое может создать только другая.
+                    // Расписание §10.5 и есть выход из этого ожидания.
+                    effects.extend(self.arm_retry(delivery.peer_ik));
+                }
                 let status = if remembered {
                     DeliveryStatus::Waiting
                 } else {
@@ -661,6 +670,7 @@ impl<S: Store> Engine<S> {
             frame,
             binding: SessionBinding::of(transport),
             timer: Some(token),
+            redial_used: false,
         });
         Ok(effects)
     }
@@ -762,6 +772,7 @@ impl<S: Store> Engine<S> {
         &mut self,
         peer_ik: [u8; 32],
         via: Transport,
+        why: Failure,
     ) -> Result<(Vec<Effect>, HandshakeStep), EngineError> {
         let availability = match self.availability_of(&peer_ik) {
             Ok(a) => a,
@@ -774,6 +785,18 @@ impl<S: Store> Engine<S> {
         for handshake in &mut pending {
             if handshake.peer_ik != peer_ik || handshake.attempt.tried().last() != Some(&via) {
                 continue;
+            }
+            // **Оборвалась связь — звоним заново, а не идём дальше.**
+            // То же правило, что у доставки, и найдено тем же живым
+            // прогоном: у рукопожатия своя лестница, и без этой строки
+            // починка доставки не помогала вовсе — сессии-то не было,
+            // и в мёртвую связь упиралось именно рукопожатие.
+            //
+            // Один раз на попытку: второй обрыв подряд похож уже
+            // на «собеседника там нет», и лестница идёт дальше.
+            if why == Failure::Dropped && via.is_direct() && !handshake.redial_used {
+                handshake.redial_used = true;
+                handshake.attempt.forget(via);
             }
             match handshake.attempt.next(availability) {
                 Some(Decision::Use(next)) => {
@@ -1100,6 +1123,115 @@ impl<S: Store> Engine<S> {
         self.on_delivery_failed(peer_ik, via, why)
     }
 
+    /// Взводит срок повтора отложенного (§10.5).
+    ///
+    /// Один срок на собеседника: ждут все его копии одного и того же.
+    /// Уже взведённый не переставляется — иначе каждая новая копия
+    /// отодвигала бы повтор, и при потоке сообщений он не наступил бы
+    /// никогда.
+    pub(super) fn arm_retry(&mut self, peer_ik: [u8; 32]) -> Vec<Effect> {
+        // **Взвод один и только здесь.** Первая редакция взводила срок
+        // и при откладывании, и при его же срабатывании — и сроки делились
+        // надвое при каждом круге: симуляция не затихала за шестьдесят
+        // тысяч шагов. Один вход, один срок на собеседника.
+        if self.retry_timers.contains_key(&peer_ik) {
+            return Vec::new();
+        }
+        let step = self.retry_step.get(&peer_ik).copied().unwrap_or(0);
+        self.schedule_retry(peer_ik, step)
+    }
+
+    /// Ставит срок следующего шага расписания.
+    fn schedule_retry(&mut self, peer_ik: [u8; 32], step: u32) -> Vec<Effect> {
+        // Расписание кончилось — сутки прошли (§10.5: «прекращаем»).
+        // Отложенное не пропадает: его разбудит присутствие собеседника
+        // или обход ядра. Своего срока у него больше нет, и это честнее,
+        // чем стучать сутками в мёртвый адрес.
+        let Some(base) = ratatosk_proto::transport_policy::retry_after_ms(step) else {
+            return Vec::new();
+        };
+        // **Разброс обязателен** (§10.5): «популярную ссылку получают
+        // сотни людей почти одновременно; без дрожания они бьют в мёртвый
+        // адрес синхронно, а поднявшийся владелец получает залп».
+        let spread = base
+            .saturating_mul(u64::from(ratatosk_proto::transport_policy::RETRY_JITTER_PERMILLE))
+            / 1_000;
+        let jitter = if spread == 0 {
+            0
+        } else {
+            let mut raw = [0u8; 4];
+            self.entropy.fill(&mut raw);
+            u64::from(u32::from_le_bytes(raw)) % (2 * spread)
+        };
+        let after_ms = base.saturating_sub(spread).saturating_add(jitter);
+        let token = self.allocate_timer();
+        self.retry_timers.insert(peer_ik, (token, step));
+        // Шаг растёт **при взводе**, а не при срабатывании: сработавший
+        // срок может и не найти, что повторять, — а ступенька расписания
+        // всё равно пройдена.
+        self.retry_step.insert(peer_ik, step.saturating_add(1));
+        vec![Effect::SetTimer { after_ms, token }]
+    }
+
+    /// Сработал срок повтора: пробуем отложенное ещё раз (§10.5).
+    ///
+    /// Отдаёт `None`, если метка не наша.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn on_retry_timer(
+        &mut self,
+        token: u64,
+    ) -> Result<Option<Vec<Effect>>, EngineError> {
+        let Some((peer_ik, (_, step))) =
+            self.retry_timers.iter().find(|(_, (armed, _))| *armed == token).map(|(k, v)| (*k, *v))
+        else {
+            return Ok(None);
+        };
+        let _ = step;
+        self.retry_timers.remove(&peer_ik);
+        // **Будятся обе очереди, и это разбор живой поломки.** Сперва
+        // здесь стояло одно `retry_deferred`, и повтор не доходил
+        // до копии, застрявшей в очереди **ожидания сессии**: её
+        // рукопожатие упёрлось в молчание, лестница кончилась, и лежала
+        // она уже не в отложенных, а в очереди — где расписание её
+        // не искало. Снаружи: копия не уезжала никогда.
+        let mut effects = self.retry_deferred(Some(peer_ik))?;
+
+        // Попытка начинается заново: прошлая кончилась тем, что путей
+        // не нашлось, а с тех пор прошло время — за него собеседник мог
+        // и вернуться. Это не «повтор транспорта после отказа», который
+        // §5.4 запрещает: та попытка закрыта, эта новая.
+        let mut queue = std::mem::take(&mut self.outbox);
+        for delivery in &mut queue {
+            if delivery.peer_ik != peer_ik
+                || !matches!(delivery.state, DeliveryState::AwaitingSession)
+            {
+                continue;
+            }
+            delivery.attempt = Attempt::new();
+            match self.advance(delivery) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::warn!(?error, "повтор по расписанию не удался"),
+            }
+        }
+        queue.retain(|delivery| !delivery.attempt.is_finished());
+        self.outbox.extend(queue);
+        // Не вышло снова — отложенное ляжет обратно, и `arm_retry` даст
+        // ему следующую ступеньку. Взводить срок здесь значило бы завести
+        // второй вход и второй срок на того же собеседника.
+        //
+        // А вот застрявшей в очереди ожидания срок никто не взведёт:
+        // она не проходит через `remember_undelivered`. Взводим ей сами.
+        if self.outbox.iter().any(|delivery| {
+            delivery.peer_ik == peer_ik && matches!(delivery.state, DeliveryState::AwaitingSession)
+        }) {
+            effects.extend(self.arm_retry(peer_ik));
+        }
+        Ok(Some(effects))
+    }
+
     /// Прямой канал отказал — переходим к следующему транспорту (§5.4).
     pub(super) fn on_delivery_failed(
         &mut self,
@@ -1164,7 +1296,7 @@ impl<S: Store> Engine<S> {
 
         // Рукопожатие переносится первым: без сессии данные всё равно
         // упрутся в ожидание, и порядок эффектов станет непонятным.
-        let (mut effects, step) = self.retry_handshake(peer_ik, via)?;
+        let (mut effects, step) = self.retry_handshake(peer_ik, via, why)?;
         let availability = self.availability_of(&peer_ik).ok();
         let mut queue = std::mem::take(&mut self.outbox);
 
@@ -1211,6 +1343,24 @@ impl<S: Store> Engine<S> {
             if stale_session && !delivery.session_reset_used {
                 delivery.session_reset_used = true;
                 delivery.attempt = Attempt::new();
+                delivery.state = DeliveryState::AwaitingSession;
+            }
+            // **Оборвалась связь — звоним заново, а не идём дальше.**
+            // Обрыв не говорит о ступени ничего (`Failure::Dropped`):
+            // соединение было и кончилось, собеседник обыкновенно
+            // на месте. Забытая ступень предлагается снова, транспорт
+            // видит мёртвую связь закрытой и набирает заново.
+            //
+            // Найдено на живом меше: узел, вернувшийся из перезапуска,
+            // получал молчание. Его сид упирался в мёртвое соединение,
+            // объявлял ступень пройденной — а другой у него не было, —
+            // и кадр ложился ждать повода, которого больше не случалось.
+            //
+            // Один раз на доставку: второй обрыв подряд похож уже
+            // на «собеседника там нет».
+            if why == Failure::Dropped && via.is_direct() && !delivery.redial_used {
+                delivery.redial_used = true;
+                delivery.attempt.forget(via);
                 delivery.state = DeliveryState::AwaitingSession;
             }
             effects.extend(self.advance(delivery)?);

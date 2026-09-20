@@ -353,7 +353,7 @@ impl UncheckedRecord {
 /// `IHAVE` зовёт, `GRAFT` чинит, `PRUNE` подрезает. Сборка, которая знает
 /// один из трёх, обязана знать все три: понимающая `IHAVE`, но не
 /// понимающая `GRAFT`, звала бы к себе блоки и не умела бы их попросить.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     /// «У меня есть такой блок» — зов ленивому пиру (§7.1).
     IHave {
@@ -369,6 +369,35 @@ pub enum Control {
         /// Какой блок.
         block: [u8; 16],
     },
+    /// «Вот что у меня есть» — have-вектор анти-энтропии (§7.2).
+    ///
+    /// Дерево возит хвост, анти-энтропия — историю; рубеж тот же, что
+    /// «живая лента / архив». Вектор ключуется **по автору**, а авторов
+    /// в канале единицы: при одном публикаторе это одна строка, хоть
+    /// при десяти тысячах читателей (§7.5.2).
+    Have {
+        /// Какого канала.
+        group: GroupId,
+        /// Что есть по каждому автору.
+        ranges: Vec<Range>,
+    },
+    /// «Пришли мне вот это» — просьба анти-энтропии (§7.2).
+    ///
+    /// Спрашивается **диапазон**, а не отдельный номер, и это не удобство:
+    /// у читателя в журнале законные дыры — позиции адресных блоков,
+    /// которые до него не доезжали (`phase2-plan.md`, расхождение 13).
+    /// Попроси он «дай 47», ответом было бы молчание, неотличимое
+    /// от потери.
+    Want {
+        /// Какого канала.
+        group: GroupId,
+        /// Чья цепочка.
+        author: ActorId,
+        /// С какого номера, включительно.
+        from_seq: u64,
+        /// По какой, включительно. Ответ короче — законен.
+        to_seq: u64,
+    },
     /// «Не шли мне целиком, я уже получил это иначе» (§7.1, шаг 3).
     ///
     /// Блок не называется: подрезается **ребро**, а не доставка. Назови
@@ -380,18 +409,51 @@ pub enum Control {
     },
 }
 
+/// Строка have-вектора: что есть у пира по одному автору (§7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    /// Чья цепочка.
+    pub author: ActorId,
+    /// Самый ранний номер, который у него есть.
+    ///
+    /// «`first_seq` не равен нулю, если префикс обрезан окном
+    /// сидирования» (§7.2).
+    pub first_seq: u64,
+    /// Самый поздний.
+    pub last_seq: u64,
+}
+
+/// Сколько блоков отдают на одну просьбу (§7.2: «не более 128»).
+pub const MAX_WANT_BLOCKS: usize = 128;
+
+/// Сколько строк в have-векторе принимаем.
+///
+/// Авторов в канале единицы (§7.5.2), и вектор на тридцать две строки —
+/// это уже канал с тремя десятками публикаторов. Предел здесь против
+/// чужого кадра, а не против своего: §7.7 велит считать пределы на пира.
+pub const MAX_HAVE_RANGES: usize = 32;
+
 const KIND_IHAVE: u64 = 1;
 const KIND_GRAFT: u64 = 2;
 const KIND_PRUNE: u64 = 3;
+const KIND_HAVE: u64 = 4;
+const KIND_WANT: u64 = 5;
 const KEY_KIND: u8 = 9;
 const KEY_BLOCK_ID: u8 = 10;
+const KEY_RANGES: u8 = 11;
+const KEY_AUTHOR: u8 = 12;
+const KEY_FIRST: u8 = 13;
+const KEY_LAST: u8 = 14;
 
 impl Control {
-    /// Какого канала кадр — это есть у всех трёх видов.
+    /// Какого канала кадр — это есть у всех видов.
     #[must_use]
     pub const fn group(&self) -> &GroupId {
         match self {
-            Control::IHave { group, .. } | Control::Graft { group, .. } => group,
+            Control::IHave { group, .. }
+            | Control::Graft { group, .. }
+            | Control::Have { group, .. }
+            | Control::Want { group, .. } => group,
             Control::Prune { group } => group,
         }
     }
@@ -399,19 +461,58 @@ impl Control {
     /// То, что едет по проводу.
     #[must_use]
     pub fn value(&self) -> Value {
-        let (kind, group, block) = match self {
-            Control::IHave { group, block } => (KIND_IHAVE, group, Some(block)),
-            Control::Graft { group, block } => (KIND_GRAFT, group, Some(block)),
-            Control::Prune { group } => (KIND_PRUNE, group, None),
-        };
         let mut fields = vec![
-            (Value::Integer(KEY_KIND.into()), Value::Integer(kind.into())),
-            (Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec())),
+            (Value::Integer(KEY_KIND.into()), Value::Integer(self.kind().into())),
+            (Value::Integer(KEY_GROUP.into()), Value::Bytes(self.group().to_vec())),
         ];
-        if let Some(block) = block {
-            fields.push((Value::Integer(KEY_BLOCK_ID.into()), Value::Bytes(block.to_vec())));
+        match self {
+            Control::IHave { block, .. } | Control::Graft { block, .. } => {
+                fields.push((Value::Integer(KEY_BLOCK_ID.into()), Value::Bytes(block.to_vec())));
+            }
+            Control::Prune { .. } => {}
+            Control::Have { ranges, .. } => {
+                fields.push((
+                    Value::Integer(KEY_RANGES.into()),
+                    Value::Array(
+                        ranges
+                            .iter()
+                            .map(|range| {
+                                Value::Map(vec![
+                                    (
+                                        Value::Integer(KEY_AUTHOR.into()),
+                                        Value::Bytes(range.author.to_vec()),
+                                    ),
+                                    (
+                                        Value::Integer(KEY_FIRST.into()),
+                                        Value::Integer(range.first_seq.into()),
+                                    ),
+                                    (
+                                        Value::Integer(KEY_LAST.into()),
+                                        Value::Integer(range.last_seq.into()),
+                                    ),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ));
+            }
+            Control::Want { author, from_seq, to_seq, .. } => {
+                fields.push((Value::Integer(KEY_AUTHOR.into()), Value::Bytes(author.to_vec())));
+                fields.push((Value::Integer(KEY_FIRST.into()), Value::Integer((*from_seq).into())));
+                fields.push((Value::Integer(KEY_LAST.into()), Value::Integer((*to_seq).into())));
+            }
         }
         Value::Map(fields)
+    }
+
+    const fn kind(&self) -> u64 {
+        match self {
+            Control::IHave { .. } => KIND_IHAVE,
+            Control::Graft { .. } => KIND_GRAFT,
+            Control::Prune { .. } => KIND_PRUNE,
+            Control::Have { .. } => KIND_HAVE,
+            Control::Want { .. } => KIND_WANT,
+        }
     }
 
     /// Читает кадр дерева с провода.
@@ -434,10 +535,56 @@ impl Control {
                 .and_then(canonical::as_array::<16>)
                 .map_err(|_| ChannelError::Malformed)
         };
+        let number = |key: u8| {
+            canonical::require(map, key.into())
+                .and_then(canonical::as_u64)
+                .map_err(|_| ChannelError::Malformed)
+        };
         match kind {
             KIND_IHAVE => Ok(Control::IHave { group, block: block()? }),
             KIND_GRAFT => Ok(Control::Graft { group, block: block()? }),
             KIND_PRUNE => Ok(Control::Prune { group }),
+            KIND_HAVE => {
+                let Some(Value::Array(items)) = canonical::get(map, KEY_RANGES.into()) else {
+                    return Err(ChannelError::Malformed);
+                };
+                // Отказ, а не обрезка: приняв половину вектора, мы
+                // попросили бы не то и не у того, а объяснить это
+                // приславшему было бы нечем.
+                if items.len() > MAX_HAVE_RANGES {
+                    return Err(ChannelError::Malformed);
+                }
+                let mut ranges = Vec::with_capacity(items.len());
+                for item in items {
+                    let row = canonical::as_map(item).map_err(|_| ChannelError::Malformed)?;
+                    let field = |key: u8| {
+                        canonical::require(row, key.into()).map_err(|_| ChannelError::Malformed)
+                    };
+                    let author = canonical::as_array::<32>(field(KEY_AUTHOR)?)
+                        .map_err(|_| ChannelError::Malformed)?;
+                    let first = canonical::as_u64(field(KEY_FIRST)?)
+                        .map_err(|_| ChannelError::Malformed)?;
+                    let last =
+                        canonical::as_u64(field(KEY_LAST)?).map_err(|_| ChannelError::Malformed)?;
+                    // Перевёрнутый диапазон — испорченный кадр: «есть
+                    // с сорок восьмого по сорок шестой» не значит ничего.
+                    if last < first {
+                        return Err(ChannelError::Malformed);
+                    }
+                    ranges.push(Range { author, first_seq: first, last_seq: last });
+                }
+                Ok(Control::Have { group, ranges })
+            }
+            KIND_WANT => {
+                let author = canonical::require(map, KEY_AUTHOR.into())
+                    .and_then(canonical::as_array::<32>)
+                    .map_err(|_| ChannelError::Malformed)?;
+                let (from_seq, to_seq) = (number(KEY_FIRST)?, number(KEY_LAST)?);
+                if to_seq < from_seq {
+                    return Err(ChannelError::Malformed);
+                }
+                Ok(Control::Want { group, author, from_seq, to_seq })
+            }
             _ => Err(ChannelError::Malformed),
         }
     }
@@ -618,6 +765,69 @@ mod tests {
         let mut crowded = record(1, 1_000);
         crowded.endpoints = (0..=MAX_ENDPOINTS).map(|_| Endpoint::Nostr([1u8; 32])).collect();
         assert!(matches!(sign_record(&me, &crowded), Err(ChannelError::Malformed)));
+    }
+
+    #[test]
+    fn a_have_vector_survives_the_round_trip() {
+        // §7.2: «`Have{ ranges: [ { author_ik, first_seq, last_seq } ] }`».
+        let have = Control::Have {
+            group: [7u8; 16],
+            ranges: vec![
+                Range { author: [1u8; 32], first_seq: 0, last_seq: 9 },
+                Range { author: [2u8; 32], first_seq: 40, last_seq: 41 },
+            ],
+        };
+        assert_eq!(Control::from_value(&have.value()).expect("разбирается"), have);
+    }
+
+    #[test]
+    fn a_want_asks_for_a_range_and_not_for_a_number() {
+        // Спрашивается диапазон: у читателя в журнале законные дыры —
+        // позиции адресных блоков, которые до него не доезжали.
+        let want = Control::Want { group: [7u8; 16], author: [1u8; 32], from_seq: 40, to_seq: 60 };
+        assert_eq!(Control::from_value(&want.value()).expect("разбирается"), want);
+    }
+
+    #[test]
+    fn an_upside_down_range_is_refused() {
+        // «Есть с сорок восьмого по сорок шестой» не значит ничего,
+        // а спрошенное задом наперёд заставило бы отвечающего гадать.
+        let mut broken = Control::Have {
+            group: [7u8; 16],
+            ranges: vec![Range { author: [1u8; 32], first_seq: 9, last_seq: 0 }],
+        }
+        .value();
+        assert!(matches!(Control::from_value(&broken), Err(ChannelError::Malformed)));
+        broken =
+            Control::Want { group: [7u8; 16], author: [1u8; 32], from_seq: 9, to_seq: 0 }.value();
+        assert!(matches!(Control::from_value(&broken), Err(ChannelError::Malformed)));
+    }
+
+    #[test]
+    fn a_have_vector_longer_than_the_limit_is_refused_whole() {
+        // Обрезка здесь была бы хуже отказа: приняв половину вектора,
+        // мы попросили бы не то и не у того, а сказать об этом
+        // приславшему было бы нечем.
+        let ranges = (0..=MAX_HAVE_RANGES)
+            .map(|i| Range {
+                author: [u8::try_from(i).unwrap_or(0); 32],
+                first_seq: 0,
+                last_seq: 1,
+            })
+            .collect();
+        let crowded = Control::Have { group: [7u8; 16], ranges };
+        assert!(matches!(Control::from_value(&crowded.value()), Err(ChannelError::Malformed)));
+    }
+
+    #[test]
+    fn an_unknown_control_kind_is_refused() {
+        // Кадр управления, которого мы не понимаем, менять дерево
+        // не должен: незнакомое не читается как знакомое.
+        let Value::Map(mut fields) = Control::Prune { group: [7u8; 16] }.value() else {
+            panic!("карта")
+        };
+        fields[0] = (Value::Integer(KEY_KIND.into()), Value::Integer(99u64.into()));
+        assert!(matches!(Control::from_value(&Value::Map(fields)), Err(ChannelError::Malformed)));
     }
 
     #[test]

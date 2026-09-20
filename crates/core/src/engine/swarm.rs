@@ -439,6 +439,11 @@ impl<S: Store> Engine<S> {
                 swarm::attach_value(&chat),
             )?;
             effects.extend(sent);
+            // **Следом — свой have-вектор** (§7.2: «при установлении
+            // соединения — обмен have-векторами»). Дерево возит хвост,
+            // анти-энтропия — историю, и связь с сидом это единственный
+            // момент, когда мы знаем, что он нас слышит.
+            effects.extend(self.send_have(now_ms, chat, seed)?);
         }
         Ok(effects)
     }
@@ -464,7 +469,7 @@ impl<S: Store> Engine<S> {
         // заведён срок, и без подтверждения §5.4 объявит неудачу,
         // отправит сессию на покой и начнёт новое рукопожатие — на каждой
         // привязке, то есть на каждом обходе.
-        let effects =
+        let mut effects =
             self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
 
         let Ok(chat) = swarm::attach_from_value(&envelope.payload) else {
@@ -486,6 +491,11 @@ impl<S: Store> Engine<S> {
             return Ok(effects);
         }
         attached.insert(peer_ik);
+        // **И свой вектор в ответ** — вторая половина обмена §7.2.
+        // Без неё привязавшийся узнал бы только то, что появится
+        // **после** привязки, а пропущенное так и осталось бы
+        // пропущенным: дерево историю не возит.
+        effects.extend(self.send_have(now_ms, chat, peer_ik)?);
         // Наружу — ничего, кроме квитанции: привязка не разговор.
         // Что блоки пошли, читатель увидит по самим блокам.
         Ok(effects)
@@ -815,6 +825,10 @@ impl<S: Store> Engine<S> {
                 let (block, bytes) = (block.msg_id, block.frame);
                 self.send_group_copy(now_ms, block, peer_ik, &bytes)
             }
+            swarm::Control::Have { ranges, .. } => self.on_have(now_ms, chat, peer_ik, &ranges),
+            swarm::Control::Want { author, from_seq, to_seq, .. } => {
+                self.on_want(now_ms, chat, peer_ik, &author, from_seq, to_seq)
+            }
             swarm::Control::Prune { .. } => {
                 // Ребро подрезано: лишние отмирают, дерево возникает само
                 // (§7.1, шаг 3).
@@ -824,6 +838,126 @@ impl<S: Store> Engine<S> {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Говорит пиру, что у нас есть, — have-вектор (§7.2).
+    ///
+    /// Шлётся при установлении связи: §7.2 так и велит — «при
+    /// установлении соединения — обмен have-векторами». У нас связь
+    /// с роевым пиром начинается привязкой (§7.5.1), и вектор едет
+    /// следом за ней.
+    ///
+    /// Вектор ключуется **по автору**, а авторов в канале единицы
+    /// (§7.5.2): при одном публикаторе это одна строка, хоть при десяти
+    /// тысячах читателей. Поэтому его не жалко слать на каждую связь.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn send_have(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let ranges: Vec<swarm::Range> = self
+            .store
+            .archive_have(&chat)?
+            .into_iter()
+            .take(swarm::MAX_HAVE_RANGES)
+            .map(|range| swarm::Range {
+                author: range.author_ik,
+                first_seq: range.first_seq,
+                last_seq: range.last_seq,
+            })
+            .collect();
+        // Пустой вектор — не повод молчать: «у меня нет ничего» это
+        // ответ, по которому собеседник поймёт, что спрашивать у нас
+        // нечего, а сам он нам нужен.
+        let tell = swarm::Control::Have { group: chat, ranges };
+        self.send_swarm_control(now_ms, peer_ik, &tell)
+    }
+
+    /// Пришёл чужой have-вектор: просим то, чего нет у нас (§7.2).
+    ///
+    /// # Спрашивается диапазон, а не номер
+    ///
+    /// У читателя в журнале законные дыры: позиции адресных блоков —
+    /// ключ чтения впущенному, запись о впуске владельцу, — которые
+    /// до него не доезжали (`phase2-plan.md`, расхождение 13). Попроси
+    /// он «дай сорок седьмой», ответом было бы молчание, неотличимое
+    /// от потери.
+    ///
+    /// # Просим только хвост
+    ///
+    /// §7.4: «вступление не оплачивает историю, которую никто
+    /// не открыл». Спрашивается то, что **новее** нашего последнего:
+    /// глубину архива тянет прокрутка вверх, и её ещё нет.
+    fn on_have(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+        ranges: &[swarm::Range],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let mine = self.store.archive_have(&chat)?;
+        let mut effects = Vec::new();
+        for range in ranges.iter().take(swarm::MAX_HAVE_RANGES) {
+            let ours = mine.iter().find(|row| row.author_ik == range.author);
+            // Наш хвост — то, с чего просить. Нет ничего по этому
+            // автору — просим с его начала: это первая встреча с ним.
+            let from = match ours {
+                Some(row) if row.last_seq >= range.last_seq => continue,
+                Some(row) => row.last_seq.saturating_add(1),
+                None => range.first_seq,
+            };
+            if range.last_seq < from {
+                continue;
+            }
+            let ask = swarm::Control::Want {
+                group: chat,
+                author: range.author,
+                from_seq: from,
+                to_seq: range.last_seq,
+            };
+            effects.extend(self.send_swarm_control(now_ms, peer_ik, &ask)?);
+        }
+        Ok(effects)
+    }
+
+    /// Пришла просьба: отдаём кадры из архива (§7.2).
+    ///
+    /// # Право не спрашивается, и это §7.6
+    ///
+    /// «Любой, у кого есть идентификатор канала, вправе вытянуть
+    /// шифротекст; прочесть — нет». Сид состава не знает и проверить
+    /// право не может в принципе; защищаться надо не от чужих,
+    /// а от избыточных — отсюда предел в [`swarm::MAX_WANT_BLOCKS`]
+    /// блоков на просьбу (§7.2, §7.7).
+    ///
+    /// Ответ короче запрошенного законен: у нас могло не быть середины
+    /// (адресные блоки чужих) или начала (окно сидирования, §9.3).
+    fn on_want(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+        author: &[u8; 32],
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let width = usize::try_from(to_seq.saturating_sub(from_seq).saturating_add(1))
+            .unwrap_or(swarm::MAX_WANT_BLOCKS);
+        let limit = width.min(swarm::MAX_WANT_BLOCKS);
+        let blocks = self.store.archived_range(&chat, author, from_seq, limit)?;
+        let mut effects = Vec::new();
+        for block in blocks {
+            if block.seq > to_seq {
+                break;
+            }
+            effects.extend(self.send_group_copy(now_ms, block.msg_id, peer_ik, &block.frame)?);
+        }
+        Ok(effects)
     }
 
     /// Сработал срок `T_graft`: блок так и не приехал (§7.1, шаг 4).

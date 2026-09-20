@@ -405,6 +405,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             silent: false,
         })
     }

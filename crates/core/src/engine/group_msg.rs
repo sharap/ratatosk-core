@@ -592,6 +592,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             // Выводится из кадра, а не проставляется здесь словом `true`.
             // Проставь мы его руками, у одного факта стало бы два источника:
             // этот и `silent_frame`, которым та же копия поднимается после
@@ -636,6 +637,7 @@ impl<S: Store> Engine<S> {
             state: DeliveryState::AwaitingSession,
             queued_ms: now_ms,
             session_reset_used: false,
+            redial_used: false,
             silent: Self::silent_frame(envelope),
         };
         self.persist_delivery(&delivery)?;

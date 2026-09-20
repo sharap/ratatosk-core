@@ -2210,6 +2210,122 @@ fn asking_for_every_message_of_a_chat_does_not_bring_the_store_down() {
     assert_eq!(store.search(Some(&[7u8; 16]), "привет", usize::MAX).unwrap().len(), 0);
 }
 
+// --- Архив канала и окно сидирования (фаза 2, §7.2, §9.3) -----------------
+
+fn arch_block(author: u8, seq: u64, size: usize) -> ratatosk_store::ArchivedBlock {
+    ratatosk_store::ArchivedBlock {
+        author_ik: [author; 32],
+        seq,
+        msg_id: [u8::try_from(seq).unwrap_or(0); 16],
+        frame: vec![7u8; size],
+        received_ms: 1_000 + seq * 1_000,
+    }
+}
+
+#[test]
+fn an_archived_block_comes_back_by_its_envelope_number() {
+    // На `GRAFT` отвечают **по номеру конверта** (§7.1), а лежит блок
+    // под «автор и позиция» (§7.3). Два ключа у одной строки — и оба
+    // обязаны работать, иначе дерево не ответит на зов.
+    let db = TempDb::new("archive-one");
+    let chat = [3u8; 16];
+    {
+        let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+        store.migrate().unwrap();
+        store.put_group(&group(3, "канал", 1_000)).unwrap();
+        store.put_archived(&chat, &arch_block(9, 5, 10)).unwrap();
+    }
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let found = store.archived(&chat, &[5u8; 16]).unwrap().expect("кадр на месте");
+    assert_eq!(found, arch_block(9, 5, 10), "архив переживает перезапуск целиком");
+    assert!(store.archived(&chat, &[99u8; 16]).unwrap().is_none());
+}
+
+#[test]
+fn a_have_vector_says_the_first_and_the_last() {
+    // §7.2: «`Have{ ranges: [ { author_ik, first_seq, last_seq } ] }`»,
+    // и §7.3 держится на том, что **между ними дыр нет**.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    for seq in [3u64, 4, 5, 6] {
+        store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
+    }
+    store.put_archived(&chat, &arch_block(1, 42, 10)).unwrap();
+
+    let have = store.archive_have(&chat).unwrap();
+    assert_eq!(have.len(), 2, "по строке на автора");
+    let mine = have.iter().find(|r| r.author_ik == [9u8; 32]).expect("автор на месте");
+    assert_eq!((mine.first_seq, mine.last_seq), (3, 6));
+}
+
+#[test]
+fn the_window_cuts_the_prefix_and_never_the_middle() {
+    // §9.3 дословно: «удаляется **префикс** журнала, `first_seq`
+    // в have-векторе поднимается; дыр в середине не бывает». Дыра
+    // сделала бы have-вектор ложью, а §7.3 на нём стоит.
+    //
+    // Числа здесь свои, не из крейта: проверка стережёт обещание
+    // «окно», а не сегодняшнее умолчание в тридцать суток.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    for seq in 1..=6u64 {
+        store.put_archived(&chat, &arch_block(9, seq, 100)).unwrap();
+    }
+    // Шестьсот байт при окне в двести пятьдесят: влезают два кадра,
+    // остальные четыре — префикс — уходят.
+    let gone = store.prune_archive(&chat, 30, 250, 10_000).unwrap();
+    assert_eq!(gone, 4, "снимается ровно столько, сколько не влезает");
+    let have = store.archive_have(&chat).unwrap();
+    assert_eq!((have[0].first_seq, have[0].last_seq), (5, 6), "снят префикс, хвост цел");
+    let left = store.archived_range(&chat, &[9u8; 32], 0, 100).unwrap();
+    let seqs: Vec<u64> = left.iter().map(|b| b.seq).collect();
+    assert_eq!(seqs, vec![5, 6], "дыр в середине не бывает");
+}
+
+#[test]
+fn the_window_also_cuts_by_age() {
+    // Два предела, а не один: §9.3 называет `max_days` **и** `max_bytes`.
+    // Канал, в котором говорят редко, обрезается временем, а не размером.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    for seq in 1..=4u64 {
+        store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
+    }
+    // Кадры лежат на 2, 3, 4 и 5 секунде; час спустя при окне в сутки
+    // не уходит ничего, а при окне «ноль суток» уходит всё.
+    assert_eq!(store.prune_archive(&chat, 1, u64::MAX, 3_600_000).unwrap(), 0);
+    assert_eq!(store.prune_archive(&chat, 0, u64::MAX, 3_600_000).unwrap(), 4);
+    assert!(store.archive_have(&chat).unwrap().is_empty());
+}
+
+#[test]
+fn both_backends_cut_the_window_the_same_way() {
+    // Трейт с одной честной реализацией не бывает абстракцией, а рой
+    // на расхождении хранилищ дал бы have-векторы, которые не сходятся.
+    let db = TempDb::new("archive-both");
+    let chat = [3u8; 16];
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    sqlite.put_group(&group(3, "канал", 1_000)).unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        for seq in 1..=6u64 {
+            store.put_archived(&chat, &arch_block(9, seq, 100)).unwrap();
+        }
+        store.prune_archive(&chat, 30, 250, 10_000).unwrap();
+    }
+    assert_eq!(sqlite.archive_have(&chat).unwrap(), memory.archive_have(&chat).unwrap());
+    assert_eq!(
+        sqlite.archived_range(&chat, &[9u8; 32], 0, 10).unwrap(),
+        memory.archived_range(&chat, &[9u8; 32], 0, 10).unwrap()
+    );
+}
+
 // --- Пир, который не контакт (§8.3) ----------------------------------------
 
 fn peer(byte: u8) -> ratatosk_store::StoredPeer {

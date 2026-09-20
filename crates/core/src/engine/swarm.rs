@@ -343,6 +343,10 @@ impl<S: Store> Engine<S> {
     /// сутки прошли».
     pub(super) fn keep_catalogue_fresh(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
         self.store.prune_seeds(now_ms)?;
+        // Архив обрезается тем же обходом: окно §9.3 меряется сутками,
+        // и повод у него тот же, что у продления записи и поворота
+        // ключа — единственный, который случается на спящем телефоне.
+        self.prune_archives(now_ms)?;
         let me = self.identity.public().ik;
         let chats: Vec<ChatId> = self
             .groups
@@ -619,9 +623,10 @@ impl<S: Store> Engine<S> {
         msg_id: MsgId,
         bytes: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
-        // Блок кладётся в хвост **до** раздачи: на `GRAFT` отвечает он,
-        // и ответить надо будет тому, кто сейчас получит зов.
-        self.remember_recent(chat, msg_id, bytes);
+        // Блок кладётся в архив **до** раздачи: на `GRAFT` и на просьбу
+        // §7.2 отвечает он, и ответить надо будет тому, кто сейчас
+        // получит зов.
+        self.archive_channel_frame(now_ms, chat, msg_id, bytes)?;
 
         let (eager, lazy) = self.split_tree(now_ms, chat)?;
         let mut effects = Vec::new();
@@ -666,23 +671,87 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
-    /// Держит хвост недавних блоков — то, чем отвечают на `GRAFT`.
+    /// Кладёт кадр канала в архив — то, чем отвечают на просьбу (§7.2, §9.3).
     ///
-    /// **Хвост, а не архив.** §7.2 велит чинить долгое отсутствие
-    /// анти-энтропией, и ей нужен архив с окном сидирования (§9.3);
-    /// здесь же нужно продержать блок ровно столько, сколько идёт
-    /// срок `T_graft`, — секунды и десятки секунд. Память для этого
-    /// честнее диска: переживи хвост перезапуск, он стал бы архивом,
-    /// у которого нет ни окна, ни обрезки.
-    fn remember_recent(&mut self, chat: ChatId, msg_id: MsgId, bytes: &[u8]) {
-        let tail = self.recent.entry(chat).or_default();
-        if tail.iter().any(|(id, _)| *id == msg_id) {
-            return;
+    /// # Почему на диск, а не в память
+    ///
+    /// Здесь сперва стоял хвост в памяти: продержать блок на время
+    /// `T_graft` — секунды. Этого хватало дереву и не хватает
+    /// анти-энтропии: она чинит **долгое** отсутствие, а «долгое»
+    /// переживает перезапуск по определению. Окно у архива есть
+    /// (§9.3, `seed_days` и `seed_bytes` из подписанного представления),
+    /// и обрезает его обход.
+    ///
+    /// # Номер берётся из подписанного блока
+    ///
+    /// §7.3 держится на непрерывности номера у автора, и брать его
+    /// из конверта нельзя: конверт подписью не покрыт. Позиция цепочки
+    /// лежит **внутри** блока, там же, где подпись.
+    ///
+    /// # В архив идут **все** кадры канала, а не только слова
+    ///
+    /// §7.3 обещает, что «`seq` непрерывен у автора: узел, имеющий 46
+    /// и 48, **знает**, что 47 существует». Цепочка отправителя (§11.1)
+    /// одна на слова и на действия — представление, ключ чтения, запись
+    /// о впуске тоже занимают позиции. Клади мы в архив одни слова,
+    /// каждая правка документа выглядела бы дырой, и §7.3 врал бы
+    /// при каждом впуске. Поймано первой же проверкой архива: номер
+    /// первого слова оказался шестым, а не нулевым.
+    ///
+    /// Не разобрался блок — не кладём: в архив идёт то, что мы приняли
+    /// и проверили, а не всё, что приехало.
+    pub(super) fn archive_channel_frame(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        let Ok(envelope) = Envelope::decode(bytes) else { return Ok(()) };
+        let envelope = envelope.into_parts().1;
+        let Ok(unchecked) = ratatosk_proto::group::parse_message(&envelope.payload) else {
+            return Ok(());
+        };
+        self.store.put_archived(
+            &chat,
+            &ratatosk_store::ArchivedBlock {
+                author_ik: *unchecked.claims_sender(),
+                seq: unchecked.claims_counter(),
+                msg_id,
+                frame: bytes.to_vec(),
+                received_ms: now_ms,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Обрезает архивы каналов по их окнам (§9.3).
+    ///
+    /// Окно берётся из **подписанного представления**: §9.3 говорит прямо
+    /// — «для канала окно не технический параметр, оно определяет, что
+    /// означает „всё“ в глубине истории, значит лежит в подписанном
+    /// представлении». Документа нет — окно неизвестно, и обрезать нечем:
+    /// выдуманное значение стёрло бы то, что владелец обещал хранить.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn prune_archives(&mut self, now_ms: u64) -> Result<(), EngineError> {
+        let channels: Vec<ChatId> = self
+            .groups
+            .iter()
+            .filter(|(_, state)| !state.profile.everyone_writes())
+            .map(|(chat, _)| *chat)
+            .collect();
+        for chat in channels {
+            let Some(stored) = self.store.channel(&chat)? else { continue };
+            let gone =
+                self.store.prune_archive(&chat, stored.seed_days, stored.seed_bytes, now_ms)?;
+            if gone > 0 {
+                tracing::debug!(канал = ?chat, убрано = gone, "архив канала обрезан окном");
+            }
         }
-        tail.push_back((msg_id, bytes.to_vec()));
-        while tail.len() > RECENT_BLOCKS {
-            tail.pop_front();
-        }
+        Ok(())
     }
 
     /// Пришёл кадр дерева: `IHAVE`, `GRAFT` или `PRUNE` (§7.1).
@@ -736,17 +805,14 @@ impl<S: Store> Engine<S> {
                 let tree = self.tree.entry(chat).or_default();
                 tree.lazy.remove(&peer_ik);
                 tree.eager.insert(peer_ik);
-                let Some(bytes) = self
-                    .recent
-                    .get(&chat)
-                    .and_then(|tail| tail.iter().find(|(id, _)| *id == block))
-                    .map(|(_, bytes)| bytes.clone())
-                else {
-                    // Блока в хвосте нет: он старше окна. Молчим —
+                let Some(block) = self.store.archived(&chat, &block)? else {
+                    // Блока в архиве нет: он старше окна сидирования
+                    // (§9.3) либо мы его никогда не видели. Молчим —
                     // чинить это дерево не умеет, и §7.2 не зря отдаёт
                     // историю анти-энтропии.
                     return Ok(Vec::new());
                 };
+                let (block, bytes) = (block.msg_id, block.frame);
                 self.send_group_copy(now_ms, block, peer_ik, &bytes)
             }
             swarm::Control::Prune { .. } => {
@@ -828,13 +894,6 @@ impl<S: Store> Engine<S> {
 /// больше копий каждого блока, меньше — дольше чинить дерево после
 /// обрыва: ленивому придётся дождаться срока и позвать `GRAFT`.
 pub(super) const K_EAGER: usize = 4;
-
-/// Сколько блоков держим в хвосте — тем, чем отвечаем на `GRAFT`.
-///
-/// Хвост, а не архив: держать надо ровно столько, сколько идёт срок
-/// `T_graft`. Шестьдесят четыре — с запасом на живую ленту, где блоки
-/// идут пачкой.
-pub(super) const RECENT_BLOCKS: usize = 64;
 
 /// Дерево раздачи одного канала (§7.1).
 #[derive(Debug, Default, Clone)]

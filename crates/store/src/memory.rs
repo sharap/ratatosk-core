@@ -15,11 +15,11 @@ use ratatosk_crdt::{Hlc, MsgId};
 
 use crate::compaction::{self, Task};
 use crate::{
-    FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
-    StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGroup, StoredGroupAvatar,
-    StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox, StoredPairedDevice,
-    StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed, StoredSenderChain, StoredSession,
-    StoredSubscription,
+    ArchivedBlock, FileId, HaveRange, Result, StagedUpload, Store, StoreError, StoredAdmit,
+    StoredArchiveKey, StoredAvatar, StoredChannel, StoredContact, StoredContactShare, StoredFile,
+    StoredGroup, StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage,
+    StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed,
+    StoredSenderChain, StoredSession, StoredSubscription,
 };
 
 /// Хранилище в оперативной памяти.
@@ -58,6 +58,9 @@ pub struct MemoryStore {
     /// Заявки на подписку (фаза 2, §10.4): чат, затем проситель.
     /// Порядок обхода задан ключом и совпадает с `ORDER BY` файловой базы.
     requests: BTreeMap<([u8; 16], [u8; 32]), u64>,
+    /// Архив кадров канала (§7.2, §9.3): чат, автор, номер в цепочке.
+    /// Ключ упорядочен так же, как `ORDER BY seq` в файловой базе.
+    archive: BTreeMap<([u8; 16], [u8; 32], u64), ArchivedBlock>,
     /// Каталог роя (§7.5): чат, затем чей адрес. Порядок обхода задан
     /// ключом и совпадает с `ORDER BY` файловой базы.
     seeds: BTreeMap<([u8; 16], [u8; 32]), StoredSeed>,
@@ -282,6 +285,7 @@ impl Store for MemoryStore {
         // прекращается», а сидировать чат, которого нет, — это держать
         // адрес в чужих каталогах ради байтов, которых у нас уже нет.
         self.seeds.retain(|(chat, _), _| chat != chat_id);
+        self.archive.retain(|(chat, _, _), _| chat != chat_id);
         self.seeding.remove(chat_id);
         Ok(())
     }
@@ -813,6 +817,100 @@ impl Store for MemoryStore {
     fn delete_avatar(&mut self, owner_ik: &[u8; 32]) -> Result<()> {
         self.avatars.remove(owner_ik);
         Ok(())
+    }
+
+    fn put_archived(&mut self, chat_id: &[u8; 16], block: &ArchivedBlock) -> Result<()> {
+        // `or_insert`, как `OR IGNORE` в файловой базе: позиция одна,
+        // и второй кадр под тем же номером — ретрансляция того же самого.
+        self.archive.entry((*chat_id, block.author_ik, block.seq)).or_insert_with(|| block.clone());
+        Ok(())
+    }
+
+    fn archived(&self, chat_id: &[u8; 16], msg_id: &[u8; 16]) -> Result<Option<ArchivedBlock>> {
+        Ok(self
+            .archive
+            .iter()
+            .find(|((chat, _, _), block)| chat == chat_id && block.msg_id == *msg_id)
+            .map(|(_, block)| block.clone()))
+    }
+
+    fn archived_range(
+        &self,
+        chat_id: &[u8; 16],
+        author_ik: &[u8; 32],
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ArchivedBlock>> {
+        // Ключ карты — «чат, автор, номер», и обход по нему уже
+        // отсортирован: то же, что `ORDER BY seq` в файловой базе.
+        Ok(self
+            .archive
+            .iter()
+            .filter(|((chat, author, seq), _)| {
+                chat == chat_id && author == author_ik && *seq >= from_seq
+            })
+            .take(limit)
+            .map(|(_, block)| block.clone())
+            .collect())
+    }
+
+    fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+        let mut found: Vec<HaveRange> = Vec::new();
+        for ((chat, author, seq), _) in &self.archive {
+            if chat != chat_id {
+                continue;
+            }
+            match found.iter_mut().find(|range| range.author_ik == *author) {
+                Some(range) => {
+                    range.first_seq = range.first_seq.min(*seq);
+                    range.last_seq = range.last_seq.max(*seq);
+                }
+                None => {
+                    found.push(HaveRange { author_ik: *author, first_seq: *seq, last_seq: *seq })
+                }
+            }
+        }
+        found.sort_unstable_by_key(|range| range.author_ik);
+        Ok(found)
+    }
+
+    fn prune_archive(
+        &mut self,
+        chat_id: &[u8; 16],
+        max_days: u32,
+        max_bytes: u64,
+        now_ms: u64,
+    ) -> Result<usize> {
+        let day_ms = 24 * 60 * 60 * 1000u64;
+        let edge = now_ms.saturating_sub(u64::from(max_days).saturating_mul(day_ms));
+        let before = self.archive.len();
+        self.archive.retain(|(chat, _, _), block| chat != chat_id || block.received_ms >= edge);
+
+        // Снимается **префикс**: самое раннее по времени и номеру, пока
+        // канал не влезет в окно. Так же, как в файловой базе, — иначе
+        // have-вектор разошёлся бы у двух хранилищ.
+        loop {
+            let total: u64 = self
+                .archive
+                .iter()
+                .filter(|((chat, _, _), _)| chat == chat_id)
+                .map(|(_, block)| block.frame.len() as u64)
+                .sum();
+            if total <= max_bytes {
+                break;
+            }
+            let Some(oldest) = self
+                .archive
+                .iter()
+                .filter(|((chat, _, _), _)| chat == chat_id)
+                .min_by_key(|(&(_, _, seq), block)| (block.received_ms, seq))
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.archive.remove(&oldest);
+        }
+        Ok(before - self.archive.len())
     }
 
     fn put_seed(&mut self, chat_id: &[u8; 16], seed: &StoredSeed) -> Result<()> {

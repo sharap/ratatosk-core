@@ -1365,8 +1365,6 @@ pub struct Engine<S: Store> {
     /// раздач. Сохрани мы его, узел проснулся бы с eager-пиром, которого
     /// давно нет, и ждал бы от него блоков.
     tree: BTreeMap<ChatId, swarm::Tree>,
-    /// Хвост недавних блоков канала — то, чем отвечают на `GRAFT` (§7.1).
-    recent: BTreeMap<ChatId, std::collections::VecDeque<(MsgId, Vec<u8>)>>,
     /// Блоки, о которых позвали `IHAVE`, и кто позвал.
     awaited_blocks: BTreeMap<(ChatId, MsgId), [u8; 32]>,
     /// Метки сроков `T_graft`: какая метка какой блок ждёт.
@@ -1901,7 +1899,6 @@ impl<S: Store> Engine<S> {
             peers: BTreeMap::new(),
             attached: BTreeMap::new(),
             tree: BTreeMap::new(),
-            recent: BTreeMap::new(),
             awaited_blocks: BTreeMap::new(),
             graft_timers: BTreeMap::new(),
             sessions: SessionRegistry::new(),

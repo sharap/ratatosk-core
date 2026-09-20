@@ -10,7 +10,7 @@
 //! но места, которые они чистят, заданы уже здесь.
 
 /// Версия схемы. Увеличивается на каждую миграцию.
-pub const SCHEMA_VERSION: u32 = 35;
+pub const SCHEMA_VERSION: u32 = 36;
 
 /// Прагмы, выставляемые при каждом открытии соединения.
 pub const PRAGMAS: &str = "\
@@ -1411,6 +1411,43 @@ CREATE TABLE swarm_seeding (
 ) STRICT;
 "#;
 
+/// Архив кадров канала — то, чем отвечают на просьбу (фаза 2, §7.2, §9.3).
+///
+/// # Почему кадры, а не сообщения
+///
+/// Потому что отдавать придётся **шифротекст**: §7.6 разрешает вытянуть
+/// его всякому, у кого есть идентификатор канала, а прочесть сможет лишь
+/// тот, у кого ключ чтения. Наша расшифрованная копия для этого не годится
+/// дважды: её нельзя запечатать заново (ключ позиции цепочки стёрт сразу
+/// после использования, §8.4) и она не несёт подписи автора.
+///
+/// # Ключ — автор и номер, и это §7.3
+///
+/// «`seq` непрерывен у автора. Узел, имеющий 46 и 48, **знает**, что 47
+/// существует». Номер здесь — позиция в цепочке отправителя (§11.1),
+/// та самая, что лежит в подписанном блоке. Второй столбец, `msg_id`,
+/// нужен дереву: `IHAVE` и `GRAFT` зовут блок по номеру конверта.
+///
+/// # Обрезка снимает префикс
+///
+/// §9.3: «удаляется **префикс** журнала, `first_seq` в have-векторе
+/// поднимается; дыр в середине не бывает». Поэтому обрезка идёт
+/// по возрастанию номера, а не по размеру строки и не по дате каждой:
+/// дыра в середине сделала бы have-вектор ложью.
+pub const MIGRATION_0036: &str = r#"
+CREATE TABLE channel_archive (
+    chat_id         BLOB NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    author_ik       BLOB NOT NULL,               -- чья цепочка, 32 байта
+    seq             INTEGER NOT NULL,            -- позиция в цепочке (§7.3)
+    msg_id          BLOB NOT NULL,               -- номер конверта: им зовут IHAVE/GRAFT
+    frame           BLOB NOT NULL,               -- запечатанный конверт, как приехал
+    received_ms     INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, author_ik, seq)
+) STRICT;
+CREATE INDEX channel_archive_by_msg ON channel_archive(chat_id, msg_id);
+CREATE INDEX channel_archive_by_time ON channel_archive(chat_id, received_ms);
+"#;
+
 /// Все таблицы базы — поимённо.
 ///
 /// Список нужен вывозу «социального графа» (§12): он оставляет
@@ -1420,7 +1457,7 @@ CREATE TABLE swarm_seeding (
 ///
 /// Сверяется тестом с тем, что на самом деле создают миграции, — чтобы
 /// «список отстал от схемы» было падением сборки, а не тихой утечкой.
-pub const ALL_TABLES: [&str; 37] = [
+pub const ALL_TABLES: [&str; 38] = [
     "avatars",
     "causal_refs",
     "channel_admits",
@@ -1430,6 +1467,7 @@ pub const ALL_TABLES: [&str; 37] = [
     "channel_requests",
     "swarm_peers",
     "swarm_seeding",
+    "channel_archive",
     "channel_subscriptions",
     "chats",
     "contact_shares",
@@ -1487,7 +1525,7 @@ pub const GRAPH_META_KEYS: [&str; 5] =
     ["identity_seed", "onion_key", "db_salt", "self_card", "mail_account"];
 
 /// Все миграции по порядку.
-pub const MIGRATIONS: [&str; 35] = [
+pub const MIGRATIONS: [&str; 36] = [
     MIGRATION_0001,
     MIGRATION_0002,
     MIGRATION_0003,
@@ -1523,6 +1561,7 @@ pub const MIGRATIONS: [&str; 35] = [
     MIGRATION_0033,
     MIGRATION_0034,
     MIGRATION_0035,
+    MIGRATION_0036,
 ];
 
 #[cfg(test)]
@@ -1603,7 +1642,7 @@ mod tests {
     /// **Что делать, если тест упал.** Почти наверняка вы правите выпущенную
     /// миграцию — верните её как было и заведите следующий номер. Число здесь
     /// меняют только вместе с добавлением новой миграции в конец списка.
-    const FROZEN: [u64; 35] = [
+    const FROZEN: [u64; 36] = [
         0xa3f5_d87f_eeaa_0e3c,
         0x7996_4d61_828d_b650,
         0x67d3_78d4_c2cc_c4f1,
@@ -1639,6 +1678,7 @@ mod tests {
         0xbb0b_8b0d_1fd9_00e2,
         0x168c_0f81_36d1_241c,
         0xf79c_2798_5608_5547,
+        0xe075_9acf_4dd9_5b12,
     ];
 
     #[test]

@@ -759,7 +759,21 @@ impl<S: Store> Engine<S> {
         )?;
 
         let envelope = Envelope::new(msg_id, hlc, PayloadType::GroupAction, payload);
-        Ok((msg_id, hlc, envelope.encode()?))
+        let bytes = envelope.encode()?;
+        // **Свой кадр ложится в архив здесь, а не при рассылке** (§7.2).
+        // Цепочка отправителя одна на всё, и позиции в ней занимают
+        // и веерные действия, и адресные — ключ чтения впущенному,
+        // запись о впуске владельцу. Архивируй мы при рассылке веером,
+        // у автора получился бы журнал с дырами там, где он сам ничего
+        // не терял: адресный блок веером не едет.
+        //
+        // Отдавать адресный блок спросившему не страшно и даже нужно:
+        // §7.6 разрешает вытянуть шифротекст всякому, а открыть его
+        // сможет только тот, кому он запечатан.
+        if self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes()) {
+            self.archive_channel_frame(now_ms, chat, msg_id, &bytes)?;
+        }
+        Ok((msg_id, hlc, bytes))
     }
 
     /// Рассылает готовый групповой кадр — по копии каждому участнику (§11.3).
@@ -1278,7 +1292,17 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         };
         match ratatosk_proto::group_action::from_payload(&value) {
-            Ok(action) => self.apply_group_action(now_ms, chat, sender, envelope, &action),
+            Ok(action) => {
+                let effects = self.apply_group_action(now_ms, chat, sender, envelope, &action)?;
+                // **Принятое действие — тоже позиция цепочки** (§7.3),
+                // и в архиве ей место наравне со словом: спросивший
+                // историю обязан получить подряд всё, что было.
+                if self.groups.get(&chat).is_some_and(|s| !s.profile.everyone_writes()) {
+                    let bytes = envelope.encode()?;
+                    self.archive_channel_frame(now_ms, chat, envelope.msg_id, &bytes)?;
+                }
+                Ok(effects)
+            }
             Err(ratatosk_proto::ActionError::UnknownKind) => Ok(Vec::new()),
             Err(ratatosk_proto::ActionError::Malformed) => {
                 self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);

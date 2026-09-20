@@ -1440,6 +1440,116 @@ fn a_duplicate_prunes_the_edge_it_came_by() {
 }
 
 #[test]
+fn the_archive_outlives_a_restart_and_answers_a_graft() {
+    // **Хвост в памяти стал архивом на диске** (§9.3), и проверяется это
+    // тем, ради чего замена делалась: перезапуском. Сид, поднявшийся
+    // заново, обязан ответить на зов о блоке, который принял до того.
+    //
+    // Проверка **не** стережёт саму анти-энтропию (§7.2): have-вектора
+    // и просьбы ещё нет. Она стережёт то, на чём та будет стоять.
+    let mut stand = Stand::strangers(0xA5C0_FFEE, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.say(NodeId(0), chat, "в архив");
+    stand.settle();
+
+    let seed = NodeId(1);
+    let archived = stand.sim.node(seed).engine().store().archive_have(&chat).expect("архив");
+    assert_eq!(archived.len(), 1, "у читателя лёг журнал владельца");
+    assert_eq!(archived[0].first_seq, 0, "префикс ещё не обрезан окном");
+    // **У автора журнал непрерывен — у читателя нет, и это не поломка.**
+    // §7.3 обещает: «узел, имеющий 46 и 48, знает, что 47 существует».
+    // У нас цепочка отправителя одна на всё: и на то, что едет веером,
+    // и на **адресные** блоки — ключ чтения впущенному, запись о впуске
+    // владельцу. Адресный блок занимает позицию, но до остальных
+    // не доезжает, и дыра у читателя означает «не мне», а не «потеряно».
+    //
+    // Значит непрерывность проверяется **у владельца**: у него лежит
+    // всё, что он подписал.
+    let at_owner = stand
+        .sim
+        .node(NodeId(0))
+        .engine()
+        .store()
+        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000)
+        .expect("кадры");
+    let seqs: Vec<u64> = at_owner.iter().map(|b| b.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..seqs.len() as u64).collect::<Vec<_>>(),
+        "у автора номера идут подряд; сид {:#x}",
+        stand.sim.seed()
+    );
+    let all = stand
+        .sim
+        .node(seed)
+        .engine()
+        .store()
+        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000)
+        .expect("кадры");
+    assert!(
+        all.len() < at_owner.len(),
+        "читателю адресные блоки чужих не достаются — дыры законны"
+    );
+
+    stand.restart(seed);
+    let after = stand.sim.node(seed).engine().store().archive_have(&chat).expect("архив");
+    assert_eq!(after, archived, "архив на диске: перезапуск его не трогает");
+
+    // И сам кадр цел — им отвечают на `GRAFT`, а значит он обязан быть
+    // ровно тем, что приехало, байт в байт.
+    assert!(
+        all.iter().all(|block| !block.frame.is_empty()),
+        "кадры хранятся целиком, а не одними метками: отдавать придётся шифротекст (§7.6)"
+    );
+}
+
+#[test]
+fn the_window_from_the_representation_is_what_cuts_the_archive() {
+    // §9.3: «для канала окно не технический параметр… значит лежит
+    // в подписанном представлении». Обрезает обход, и берёт он окно
+    // **оттуда** — не умолчание крейта и не своё число.
+    let mut stand = Stand::strangers(0xB0_1111, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    for word in ["раз", "два", "три"] {
+        stand.say(NodeId(0), chat, word);
+        stand.settle();
+    }
+    let reader = NodeId(1);
+    let before = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
+    assert_eq!(before[0].first_seq, 0, "журнал с начала");
+    assert!(before[0].last_seq >= 2, "три слова добавили три позиции");
+
+    // Год спустя окно в тридцать суток (умолчание §9.3) снимает весь
+    // прежний префикс, и делает это обход, а не показ.
+    //
+    // **Проверяется поднявшийся `first_seq`, а не пустой архив**, и это
+    // не придирка: тот же обход поворачивает ключ чтения (§6.4), и его
+    // блок ложится в архив свежим. Пустоты тут не бывает — бывает
+    // сдвинутое начало, ровно как обещает §9.3: «удаляется префикс
+    // журнала, `first_seq` в have-векторе поднимается».
+    stand.sleep_for(365 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    let after = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
+    assert!(
+        after.iter().all(|range| range.first_seq > before[0].last_seq),
+        "окно обязано было снять весь прежний журнал: было {:?}, стало {after:?}; сид {:#x}",
+        before,
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_prune_at_a_seed_holds_and_the_second_word_costs_less() {
     // **Находка живого прогона на шести узлах поверх меша.** Дерево
     // подрезалось и тут же отрастало: каждое слово стоило восьми блоков

@@ -17,11 +17,11 @@ use crate::schema;
 use crate::sql_types;
 use crate::tokens;
 use crate::{
-    FileId, Result, StagedUpload, Store, StoreError, StoredAdmit, StoredArchiveKey, StoredAvatar,
-    StoredChannel, StoredContact, StoredContactShare, StoredFile, StoredGrant, StoredGroup,
-    StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage, StoredOutbox,
-    StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed,
-    StoredSenderChain, StoredSession, StoredSubscription,
+    ArchivedBlock, FileId, HaveRange, Result, StagedUpload, Store, StoreError, StoredAdmit,
+    StoredArchiveKey, StoredAvatar, StoredChannel, StoredContact, StoredContactShare, StoredFile,
+    StoredGrant, StoredGroup, StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp,
+    StoredMessage, StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup,
+    StoredReaction, StoredSeed, StoredSenderChain, StoredSession, StoredSubscription,
 };
 
 /// Хранилище на SQLite.
@@ -569,6 +569,28 @@ impl SqliteStore {
 /// `to_sql` эта просьба роняла отладочную сборку, а в релизе проходила
 /// насыщением — то есть поломка была видна только там, где её никто
 /// не ищет.
+/// Разбирает строку архива. Испорченная длина — пропуск, а не отказ:
+/// недосчитаться кадра лучше, чем уронить подъём на чужой строке.
+fn archived_from_row(row: &rusqlite::Row<'_>) -> Result<Option<ArchivedBlock>> {
+    let author: Vec<u8> = row.get(0)?;
+    let seq: i64 = row.get(1)?;
+    let msg: Vec<u8> = row.get(2)?;
+    let frame: Vec<u8> = row.get(3)?;
+    let received: i64 = row.get(4)?;
+    let (Ok(author_ik), Ok(msg_id)) =
+        (<[u8; 32]>::try_from(author.as_slice()), <[u8; 16]>::try_from(msg.as_slice()))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ArchivedBlock {
+        author_ik,
+        seq: sql_types::from_sql(seq),
+        msg_id,
+        frame,
+        received_ms: sql_types::from_sql(received),
+    }))
+}
+
 fn sql_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
@@ -2110,6 +2132,126 @@ impl Store for SqliteStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(StoreError::from(other)),
             })
+    }
+
+    fn put_archived(&mut self, chat_id: &[u8; 16], block: &ArchivedBlock) -> Result<()> {
+        // `OR IGNORE`, а не `REPLACE`: позиция в цепочке одна, и второй
+        // кадр под тем же номером — это ретрансляция того же самого.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO channel_archive
+                 (chat_id, author_ik, seq, msg_id, frame, received_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &chat_id[..],
+                &block.author_ik[..],
+                sql_types::to_sql(block.seq),
+                &block.msg_id[..],
+                block.frame,
+                sql_types::to_sql(block.received_ms),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn archived(&self, chat_id: &[u8; 16], msg_id: &[u8; 16]) -> Result<Option<ArchivedBlock>> {
+        let mut statement = self.conn.prepare(
+            "SELECT author_ik, seq, msg_id, frame, received_ms
+             FROM channel_archive WHERE chat_id = ?1 AND msg_id = ?2",
+        )?;
+        let mut rows = statement.query(rusqlite::params![&chat_id[..], &msg_id[..]])?;
+        let Some(row) = rows.next()? else { return Ok(None) };
+        Ok(archived_from_row(row)?)
+    }
+
+    fn archived_range(
+        &self,
+        chat_id: &[u8; 16],
+        author_ik: &[u8; 32],
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ArchivedBlock>> {
+        let mut statement = self.conn.prepare(
+            "SELECT author_ik, seq, msg_id, frame, received_ms
+             FROM channel_archive
+             WHERE chat_id = ?1 AND author_ik = ?2 AND seq >= ?3
+             ORDER BY seq LIMIT ?4",
+        )?;
+        let mut rows = statement.query(rusqlite::params![
+            &chat_id[..],
+            &author_ik[..],
+            sql_types::to_sql(from_seq),
+            sql_limit(limit),
+        ])?;
+        let mut found = Vec::new();
+        while let Some(row) = rows.next()? {
+            if let Some(block) = archived_from_row(row)? {
+                found.push(block);
+            }
+        }
+        Ok(found)
+    }
+
+    fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+        let mut statement = self.conn.prepare(
+            "SELECT author_ik, MIN(seq), MAX(seq)
+             FROM channel_archive WHERE chat_id = ?1 GROUP BY author_ik ORDER BY author_ik",
+        )?;
+        let rows = statement.query_map([&chat_id[..]], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (author, first, last) = row?;
+            let Ok(author_ik) = <[u8; 32]>::try_from(author.as_slice()) else { continue };
+            found.push(HaveRange {
+                author_ik,
+                first_seq: sql_types::from_sql(first),
+                last_seq: sql_types::from_sql(last),
+            });
+        }
+        Ok(found)
+    }
+
+    fn prune_archive(
+        &mut self,
+        chat_id: &[u8; 16],
+        max_days: u32,
+        max_bytes: u64,
+        now_ms: u64,
+    ) -> Result<usize> {
+        let day_ms = 24 * 60 * 60 * 1000u64;
+        let edge = now_ms.saturating_sub(u64::from(max_days).saturating_mul(day_ms));
+        let mut gone = self.conn.execute(
+            "DELETE FROM channel_archive WHERE chat_id = ?1 AND received_ms < ?2",
+            rusqlite::params![&chat_id[..], sql_types::to_sql(edge)],
+        )?;
+
+        // Размер считается **по всему каналу**, а обрезается **префикс
+        // каждой цепочки**: §9.3 обещает, что дыр в середине не бывает,
+        // и снимать надо самое раннее, а не самое большое.
+        loop {
+            let total: i64 = self.conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(frame)), 0) FROM channel_archive WHERE chat_id = ?1",
+                [&chat_id[..]],
+                |row| row.get(0),
+            )?;
+            if u64::try_from(total).unwrap_or(0) <= max_bytes {
+                break;
+            }
+            let removed = self.conn.execute(
+                "DELETE FROM channel_archive
+                 WHERE rowid IN (
+                     SELECT rowid FROM channel_archive
+                     WHERE chat_id = ?1 ORDER BY received_ms, seq LIMIT 1
+                 )",
+                [&chat_id[..]],
+            )?;
+            if removed == 0 {
+                break;
+            }
+            gone += removed;
+        }
+        Ok(gone)
     }
 
     fn put_seed(&mut self, chat_id: &[u8; 16], seed: &StoredSeed) -> Result<()> {

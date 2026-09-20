@@ -307,6 +307,21 @@ impl<S: Store> Engine<S> {
         if record.valid_until_ms <= now_ms {
             return Ok(false);
         }
+        // **Адреса из записи — это путь к сиду** (§8.3). Без них каталог
+        // остался бы списком ключей: привязаться (§7.5.1) не к чему,
+        // §5.4 честно ответил бы «отправлять некуда». Кладутся они тем же
+        // способом, что адреса владельца из ссылки, и с тем же доверием:
+        // недоверенные (§10.2), проверяются рукопожатием.
+        //
+        // Своя запись сюда не попадает — она кладётся при подписании.
+        if claimed != self.identity.public().ik {
+            self.remember_peer(
+                now_ms,
+                claimed,
+                &record.endpoints,
+                ratatosk_store::PEER_CHANNEL_SEED,
+            )?;
+        }
         let ceiling = now_ms.saturating_add(swarm::RECORD_TTL_MS).saturating_add(DAY_MS);
         self.store.put_seed(
             &chat,
@@ -351,9 +366,168 @@ impl<S: Store> Engine<S> {
                 effects.extend(self.publish_own_record(now_ms, chat)?);
             }
         }
+        // **Привязка повторяется обходом, и это не расточительство.**
+        // У сида она живёт только в памяти: соединение — не запись
+        // на диске, и после его перезапуска читателя надо назвать заново.
+        // Молчание читателя от молчания сети не отличается, поэтому
+        // единственный честный способ — повторять.
+        let channels: Vec<ChatId> = self
+            .groups
+            .iter()
+            .filter(|(_, state)| !state.profile.everyone_writes())
+            .map(|(chat, _)| *chat)
+            .collect();
+        for chat in channels {
+            effects.extend(self.attach_to_seeds(now_ms, chat)?);
+        }
         Ok(effects)
     }
 }
+
+impl<S: Store> Engine<S> {
+    /// Привязывается к сидам канала: «я читаю его, шлите блоки» (§7.5.1).
+    ///
+    /// # Соединение открывает читатель, и это не деталь
+    ///
+    /// Сид не знает, кто его читает: состава канала у него нет (§3.2),
+    /// а каталог ведёт в обратную сторону — читатели узнают сидов.
+    /// Значит первый шаг за читателем: он набирает сида и говорит, что
+    /// ему нужно. Дальше сид шлёт блоки в это соединение — ровно то,
+    /// что §7.5.1 называет тихой раздачей.
+    ///
+    /// # Сколько сидов держим
+    ///
+    /// Не больше [`MAX_ATTACHED_SEEDS`]: §7.1 держит 3–5 eager-пиров,
+    /// и здесь то же число по той же причине — каждый лишний сид стоит
+    /// лишней копии каждого блока. Выбор **по порядку ключа**, а не
+    /// случайный: прогон обязан воспроизводиться по сиду (§16).
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn attach_to_seeds(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        // Владельцу привязываться не к кому: он источник, и блоки
+        // начинаются с него.
+        if self.channel_owner(chat).is_some_and(|owner| owner == me) {
+            return Ok(Vec::new());
+        }
+        let seeds: Vec<[u8; 32]> = self
+            .seeds(chat, now_ms)?
+            .into_iter()
+            .map(|seed| seed.ik)
+            .filter(|ik| *ik != me)
+            .take(MAX_ATTACHED_SEEDS)
+            .collect();
+        let mut effects = Vec::new();
+        for seed in seeds {
+            // Молчаливой доставкой: квитанции у привязки нет и не нужно.
+            // Не доехала — доедет следующим обходом, а пока слово придёт
+            // от владельца звездой (§7.5.2).
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                seed,
+                PayloadType::SwarmAttach,
+                swarm::attach_value(&chat),
+            )?;
+            effects.extend(sent);
+        }
+        Ok(effects)
+    }
+
+    /// Пришла привязка: кто-то читает наш канал и просит блоки (§7.5.1).
+    ///
+    /// # Права не спрашиваем, и это §7.6
+    ///
+    /// «Любой, у кого есть идентификатор канала, вправе вытянуть
+    /// шифротекст; прочесть — нет». Сид состава не знает и проверить
+    /// право не может в принципе; защищаться надо не от чужих,
+    /// а от избыточных — отсюда предел [`MAX_ATTACHED_READERS`].
+    pub(super) fn on_swarm_attach(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Квитанция — до разбора, и метёлка `receipt_wiring` нашла здесь
+        // её отсутствие в ту же минуту, как привязка попала в очередь.
+        // Цепочка та же, что у заявки: кадр едет очередью §5.4, у него
+        // заведён срок, и без подтверждения §5.4 объявит неудачу,
+        // отправит сессию на покой и начнёт новое рукопожатие — на каждой
+        // привязке, то есть на каждом обходе.
+        let effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+
+        let Ok(chat) = swarm::attach_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        // Канала не знаем — отдавать нечего. Молча: это кадр не по адресу,
+        // и рассказывать о нём нечего ни человеку, ни счётчику.
+        let Some(state) = self.groups.get(&chat) else { return Ok(effects) };
+        if state.profile.everyone_writes() {
+            return Ok(effects);
+        }
+        let attached = self.attached.entry(chat).or_default();
+        // Предел — против избыточных (§7.7, §9.2), а не против чужих.
+        // Переполнение **не вытесняет** прежних: вытеснение отдало бы
+        // любому желающему возможность выбить чужого читателя из раздачи
+        // одним кадром.
+        if attached.len() >= MAX_ATTACHED_READERS && !attached.contains(&peer_ik) {
+            return Ok(effects);
+        }
+        attached.insert(peer_ik);
+        // Наружу — ничего, кроме квитанции: привязка не разговор.
+        // Что блоки пошли, читатель увидит по самим блокам.
+        Ok(effects)
+    }
+
+    /// Пересылает принятый блок канала тем, кто к нам привязался (§7.1).
+    ///
+    /// **Байты те же**, что приехали: блок подписан автором и запечатан
+    /// его цепочкой, курьер в нём ничего не меняет. Пересобери мы его —
+    /// подпись перестала бы сходиться, а номер поехал бы.
+    ///
+    /// Приславшему не возвращаем: у него блок уже есть, и вернуть
+    /// означало бы устроить кольцо из двух узлов.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища на постановке в очередь.
+    pub(super) fn relay_to_attached(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        from: [u8; 32],
+        msg_id: MsgId,
+        envelope: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(attached) = self.attached.get(&chat) else { return Ok(Vec::new()) };
+        let targets: Vec<[u8; 32]> =
+            attached.iter().copied().filter(|reader| *reader != from).collect();
+        let mut effects = Vec::new();
+        for reader in targets {
+            effects.extend(self.send_group_copy(now_ms, msg_id, reader, envelope)?);
+        }
+        Ok(effects)
+    }
+}
+
+/// Сколько сидов держит читатель. §7.1: eager-пиров 3–5.
+pub(super) const MAX_ATTACHED_SEEDS: usize = 4;
+
+/// Сколько читателей держит сид.
+///
+/// Предел против избыточных (§9.2), а не против чужих: сид не знает
+/// состава и отличить «лишнего» от «своего» не может. Число взято
+/// с запасом — канал на сотню читателей и один сид упрутся не в него,
+/// а в полосу.
+pub(super) const MAX_ATTACHED_READERS: usize = 256;
 
 /// Сутки в миллисекундах — запас на расхождение часов.
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;

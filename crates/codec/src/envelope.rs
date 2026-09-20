@@ -245,6 +245,17 @@ pub enum PayloadType {
     /// знает он (§3.2). Дальше запись едет уже действием
     /// (`Action::SeedRecord`), веером.
     SwarmPeer,
+    /// «Я читаю этот канал — шли мне блоки» (фаза 2, §7.5.1, §8.3).
+    ///
+    /// Привязка к сиду. Едет **один на один** тому, кто объявил себя
+    /// раздающим, и ничего не доказывает: §7.6 разрешает вытянуть
+    /// шифротекст всякому, у кого есть идентификатор канала, — прочесть
+    /// его сможет только тот, у кого есть ключ чтения.
+    ///
+    /// Так и работает тихая раздача (§7.5.1): «по своим исходящим
+    /// соединениям мы несём трафик наравне со всеми» — соединение
+    /// открывает читатель, а дальше сид шлёт в него блоки.
+    SwarmAttach,
     /// Тип, не известный этой сборке.
     ///
     /// Сохраняется, а не отбрасывается: неизвестное поле не повод терять
@@ -309,7 +320,9 @@ impl PayloadType {
             | PayloadType::ChannelRequest
             // Запись каталога — про раздачу, а не про разговор: сид
             // сообщает владельцу адрес, а не пишет ему.
-            | PayloadType::SwarmPeer => false,
+            | PayloadType::SwarmPeer
+            // Привязка — про раздачу, а не про разговор.
+            | PayloadType::SwarmAttach => false,
             // Служебное: ни строки в чате, ни повода знакомиться.
             // Обновление карточки (§4.3) правит запись, которая уже есть,
             // и заводить её оно не вправе: иначе адреса известного
@@ -357,6 +370,7 @@ impl PayloadType {
             PayloadType::Fragment => 24,
             PayloadType::ChannelRequest => 25,
             PayloadType::SwarmPeer => 26,
+            PayloadType::SwarmAttach => 27,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -391,6 +405,7 @@ impl PayloadType {
             24 => PayloadType::Fragment,
             25 => PayloadType::ChannelRequest,
             26 => PayloadType::SwarmPeer,
+            27 => PayloadType::SwarmAttach,
             other => PayloadType::Unknown(other),
         }
     }
@@ -600,7 +615,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 26;
+        const HIGHEST: u64 = 27;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

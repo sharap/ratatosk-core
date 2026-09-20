@@ -387,7 +387,12 @@ impl<S: Store> Engine<S> {
         // не подтверждён (§10.2), и не дозвонившись, лестница §5.4
         // спустится ниже сама. Приедет настоящая карточка — адреса
         // обновятся из неё.
-        self.remember_peer(now_ms, invitation.owner, &invitation.endpoints)?;
+        self.remember_peer(
+            now_ms,
+            invitation.owner,
+            &invitation.endpoints,
+            ratatosk_store::PEER_CHANNEL_OWNER,
+        )?;
 
         // Своя цепочка отправителя — как у всякого участника: без неё
         // нам нечем будет сказать ни слова, даже получив право.
@@ -538,6 +543,7 @@ impl<S: Store> Engine<S> {
         now_ms: u64,
         peer_ik: [u8; 32],
         endpoints: &[channel::Endpoint],
+        why: u32,
     ) -> Result<(), EngineError> {
         // Контакта пиром не переписываем: у него есть карточка, подпись
         // и сверка, и адрес из чужой ссылки её не улучшает.
@@ -558,7 +564,9 @@ impl<S: Store> Engine<S> {
             relays: Vec::new(),
             nostr: Vec::new(),
             card: known.map(|peer| peer.card.clone()).unwrap_or_default(),
-            known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+            // Прежняя причина сильнее новой: тот, кого мы знали владельцем
+            // канала, остаётся им, даже если потом объявился сидом.
+            known_as: known.map_or(why, |peer| peer.known_as),
             // Знакомство не переписывается: пир, пожавший руку раньше,
             // узнан тогда, а не сейчас.
             added_ms: known.map_or(now_ms, |peer| peer.added_ms),
@@ -615,7 +623,7 @@ impl<S: Store> Engine<S> {
                     .ok()
                     .map_or([0u8; 32], |card| card.into_parts().1.sk),
                 card: stored.card,
-                known_as: ratatosk_store::PEER_CHANNEL_OWNER,
+                known_as: stored.known_as,
                 added_ms: stored.added_ms,
             },
         );

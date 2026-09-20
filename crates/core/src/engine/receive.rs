@@ -850,6 +850,7 @@ impl<S: Store> Engine<S> {
             // там нет.
             PayloadType::ChannelRequest => self.on_channel_request(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmPeer => self.on_seed_record(now_ms, via, peer_ik, &envelope),
+            PayloadType::SwarmAttach => self.on_swarm_attach(now_ms, via, peer_ik, &envelope),
             // §10.3 отдаёт превью вместе с предложением файла, отдельным кадром
             // оно не ездит. Тип остаётся в перечислении, потому что он есть
             // в спецификации, а молча принимать то, чего мы не отправляем,

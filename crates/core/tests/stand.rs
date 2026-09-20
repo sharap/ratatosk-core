@@ -1141,6 +1141,88 @@ const D: NodeId = NodeId(3);
 // --- разговор двоих ---------------------------------------------------------
 
 #[test]
+fn a_word_reaches_a_reader_through_a_seed_when_the_owner_cannot_reach_him() {
+    // **Первая настоящая ретрансляция** (§3.1, §7.1 шаг 2). До неё ядро
+    // отвергало блок, принесённый не автором: «пересылать чужое некому».
+    // Для группы это верно и сейчас (§11.3), а в канале на этой строке
+    // стоял весь рой.
+    //
+    // Проверяется тем, ради чего заводился профиль на связь: путь
+    // от владельца к читателю рвётся наглухо, и слово обязано прийти
+    // **вторым путём** — через сида, к которому читатель привязался.
+    let mut stand = Stand::strangers(0x7EED_5EED, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    // Узел 1 вызывается раздавать; узел 2 узнаёт о нём каталогом
+    // и привязывается сам.
+    stand.announce_seeding(NodeId(1), chat);
+
+    // **Владелец больше не достаёт до второго читателя — ни одной
+    // ступенью.** Так выглядит читатель за NAT, которому не дозвониться,
+    // а почты у него нет.
+    for kind in [TransportKind::Onion, TransportKind::Mail, TransportKind::Lan] {
+        stand.sim.net_mut().set_link_profile(
+            NodeId(0),
+            NodeId(2),
+            kind,
+            LinkProfile { loss_permille: 1_000, ..LinkProfile::INSTANT },
+        );
+    }
+
+    stand.say(NodeId(0), chat, "слово через сида");
+    stand.settle();
+
+    assert_eq!(
+        stand.sim.node(NodeId(2)).seen(chat),
+        vec!["слово через сида".to_owned()],
+        "читатель обязан услышать владельца через сида; сид {:#x}",
+        stand.sim.seed()
+    );
+    // И это именно ретрансляция, а не «дошло само»: прямого пути нет.
+    assert_eq!(
+        stand.sim.node(NodeId(1)).seen(chat),
+        vec!["слово через сида".to_owned()],
+        "сид услышал первым — он и переслал"
+    );
+}
+
+#[test]
+fn a_relayed_word_is_not_shown_twice() {
+    // Обратная сторона ретрансляции: блок теперь приходит **двумя**
+    // путями — звездой от владельца и от сида. Показать его дважды
+    // означало бы менять переписку из-за устройства сети (§9.2).
+    //
+    // **Проверка опирается на то, что ретрансляция включена**: выключи
+    // её — и она пройдёт по неверной причине, потому что путь останется
+    // один. Что путь действительно второй, стережёт проверка выше;
+    // здесь — что он не удваивает строку.
+    let mut stand = Stand::strangers(0x2EED_2EED, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+
+    stand.say(NodeId(0), chat, "одно слово");
+    stand.settle();
+
+    assert_eq!(
+        stand.sim.node(NodeId(2)).seen(chat),
+        vec!["одно слово".to_owned()],
+        "две дороги — одна строка; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_seed_becomes_known_to_every_reader() {
     // **§7.5 целиком, на трёх узлах.** Читатель вызвался раздавать —
     // и об этом обязаны узнать остальные читатели, иначе спрашивать

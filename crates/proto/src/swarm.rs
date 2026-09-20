@@ -343,6 +343,32 @@ impl UncheckedRecord {
     }
 }
 
+/// Привязка к сиду: «я читаю этот канал» (§7.5.1).
+///
+/// # Подписи нет, и она была бы лишней
+///
+/// Привязка едет по установленной сессии: кто просит, доказано
+/// рукопожатием. А **право** просить не проверяется вовсе — §7.6:
+/// «любой, у кого есть идентификатор канала, вправе вытянуть
+/// шифротекст; прочесть — нет». Сид не знает состава и проверить
+/// всё равно не смог бы.
+#[must_use]
+pub fn attach_value(group: &GroupId) -> Value {
+    Value::Map(vec![(Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec()))])
+}
+
+/// Читает привязку с провода.
+///
+/// # Errors
+///
+/// [`ChannelError::Malformed`] — не та форма или не та длина.
+pub fn attach_from_value(value: &Value) -> Result<GroupId, ChannelError> {
+    let map = canonical::as_map(value).map_err(|_| ChannelError::Malformed)?;
+    canonical::require(map, KEY_GROUP.into())
+        .and_then(canonical::as_array::<16>)
+        .map_err(|_| ChannelError::Malformed)
+}
+
 /// Читает запись с провода — **без** проверки подписи.
 ///
 /// # Errors

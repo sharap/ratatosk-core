@@ -1522,7 +1522,7 @@ fn an_honest_seed_is_not_cooled_by_a_busy_channel() {
 /// Потеря здесь не годится — §10.5 повторяет, и копия доезжает
 /// всё равно; поэтому владельцу до читателей кладётся путь длиной
 /// в десять минут, а до сида он остаётся прежним.
-fn a_channel_where_only_the_seed_calls(seed: u64) -> (Stand, [u8; 16], [u8; 32], Vec<u16>) {
+fn a_channel_where_only_the_seed_calls(seed: u64) -> (Stand, [u8; 16], [u8; 32]) {
     let mut stand = Stand::strangers(seed, 7);
     let chat = stand.create_channel(NodeId(0), "лента", false);
     let link = stand.channel_link(NodeId(0), chat);
@@ -1539,10 +1539,6 @@ fn a_channel_where_only_the_seed_calls(seed: u64) -> (Stand, [u8; 16], [u8; 32],
     // слова делить нечего.
     stand.say(NodeId(0), chat, "нулевое");
     stand.settle();
-    // Кого из читателей сид зовёт, а не шлёт целиком, решает его дерево.
-    let (_, lazy) = stand.sim.node(NodeId(1)).engine().swarm_tree(chat);
-    let lazy_nodes: Vec<u16> = (2..7u16).filter(|i| lazy.contains(&stand.ik(NodeId(*i)))).collect();
-    assert!(!lazy_nodes.is_empty(), "у сида обязан быть ленивый читатель — иначе проверка пуста");
 
     let slow =
         LinkProfile { min_latency_ms: 600_000, max_latency_ms: 600_000, ..LinkProfile::INSTANT };
@@ -1558,7 +1554,19 @@ fn a_channel_where_only_the_seed_calls(seed: u64) -> (Stand, [u8; 16], [u8; 32],
             stand.sim.net_mut().set_link_profile(NodeId(0), NodeId(reader), kind, slow);
         }
     }
-    (stand, chat, seed_ik, lazy_nodes)
+    (stand, chat, seed_ik)
+}
+
+/// Кого узел зовёт, а не шлёт целиком, — прямо сейчас.
+///
+/// **Считается перед самой проверкой, а не в начале сценария.** Дерево
+/// живое: обмен have-векторами (§7.2) чинит пропуски, и тот, кто был
+/// ленивым на первом слове, к третьему получает блоки целиком. Первая
+/// редакция брала список один раз — и требовала остывания от читателя,
+/// которому сид к тому времени честно всё отдал.
+fn lazy_readers(stand: &Stand, at: NodeId, chat: [u8; 16], readers: &[u16]) -> Vec<u16> {
+    let (_, lazy) = stand.sim.node(at).engine().swarm_tree(chat);
+    readers.iter().copied().filter(|i| lazy.contains(&stand.ik(NodeId(*i)))).collect()
 }
 
 /// Столько ждёт проверка, чтобы у зова вышли **оба** срока: ожидание
@@ -1578,13 +1586,20 @@ fn a_seed_that_calls_and_disappears_cools_down() {
     // Сценарий честный: сид зовёт ленивых читателей и уходит из сети
     // между зовом и просьбой. Вторую половину имени — что **одного**
     // молчания мало — стережёт `a_single_silence_does_not_cool_a_seed`.
-    let (mut stand, chat, seed, lazy_nodes) = a_channel_where_only_the_seed_calls(0xFA_15E0);
+    let (mut stand, chat, seed) = a_channel_where_only_the_seed_calls(0xFA_15E0);
 
     // Два зова — и сид пропадает, не ответив ни на один.
+    //
+    // **Две секунды на слово, а не полсекунды.** Слово должно успеть
+    // дойти до сида и уехать от него зовом; полсекунды хватало впритык,
+    // и второй зов иногда не успевал родиться вовсе — проверка тогда
+    // краснела на «одном молчании вместо двух», то есть врала о причине.
     stand.say(NodeId(0), chat, "раз");
-    stand.sim.run_for(500);
+    stand.sim.run_for(2_000);
     stand.say(NodeId(0), chat, "два");
-    stand.sim.run_for(500);
+    stand.sim.run_for(2_000);
+    let lazy_nodes = lazy_readers(&stand, NodeId(1), chat, &[2, 3, 4, 5, 6]);
+    assert!(!lazy_nodes.is_empty(), "у сида обязан быть ленивый читатель — иначе проверка пуста");
     stand.offline(NodeId(1));
     stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
 
@@ -1629,15 +1644,14 @@ fn the_owner_is_never_cooled_however_long_he_is_silent() {
     stand.say(NodeId(0), chat, "нулевое");
     stand.settle();
     let owner = stand.ik(NodeId(0));
-    let (_, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
-    let lazy_nodes: Vec<u16> = (1..7u16).filter(|i| lazy.contains(&stand.ik(NodeId(*i)))).collect();
-    assert!(!lazy_nodes.is_empty(), "у владельца обязан быть ленивый читатель");
     stand.offline(NodeId(1));
 
     stand.say(NodeId(0), chat, "раз");
     stand.sim.run_for(500);
     stand.say(NodeId(0), chat, "два");
     stand.sim.run_for(500);
+    let lazy_nodes = lazy_readers(&stand, NodeId(0), chat, &[1, 2, 3, 4, 5, 6]);
+    assert!(!lazy_nodes.is_empty(), "у владельца обязан быть ленивый читатель");
     stand.offline(NodeId(0));
     stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
 
@@ -1661,10 +1675,12 @@ fn a_single_silence_does_not_cool_a_seed() {
     // Сценарий тот же, что у `a_seed_that_calls_and_disappears_cools_down`,
     // и отличается ровно одним словом вместо двух: разница между
     // проверками и есть то, что стережётся.
-    let (mut stand, chat, seed, lazy_nodes) = a_channel_where_only_the_seed_calls(0x5117_0000);
+    let (mut stand, chat, seed) = a_channel_where_only_the_seed_calls(0x5117_0000);
 
     stand.say(NodeId(0), chat, "раз");
     stand.sim.run_for(500);
+    let lazy_nodes = lazy_readers(&stand, NodeId(1), chat, &[2, 3, 4, 5, 6]);
+    assert!(!lazy_nodes.is_empty(), "у сида обязан быть ленивый читатель — иначе проверка пуста");
     stand.offline(NodeId(1));
     stand.sim.run_for(TWO_GRAFT_DEADLINES_MS);
 
@@ -1782,6 +1798,153 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
 }
 
 #[test]
+fn a_hole_in_the_middle_is_asked_for_and_not_written_off() {
+    // **§7.3 целиком**: «узел, имеющий 46 и 48, знает, что 47
+    // существует, а не догадывается по молчанию».
+    //
+    // Поломка, из-за которой проверка заведена: анти-энтропия просила
+    // только то, что **новее** нашего последнего, а have-вектор врал —
+    // отдавал на автора одну строку от первого номера до последнего.
+    // Читатель, пропавший на два слова и вернувшийся к третьему,
+    // объявлял пропущенное своим и не просил его никогда. Снаружи:
+    // «в середине ленты дырка, и она не зарастает».
+    let mut stand = Stand::strangers(0x40_1E15, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "первое");
+    stand.settle();
+
+    // Читателя нет — два слова проходят мимо него, но не мимо сида.
+    stand.offline(NodeId(2));
+    stand.say(NodeId(0), chat, "второе");
+    stand.settle();
+    stand.say(NodeId(0), chat, "третье");
+    stand.settle();
+
+    // **Очереди сдались** — иначе пропущенное доедет §5.4, и проверка
+    // пройдёт, ничего не проверив.
+    stand.drop_queue(NodeId(0));
+    stand.drop_queue(NodeId(1));
+    stand.online(NodeId(2));
+    stand.settle();
+
+    // Живая лента продолжается, и **дыра оказывается посередине**:
+    // четвёртое слово читатель принимает деревом, а второго и третьего
+    // у него по-прежнему нет.
+    stand.say(NodeId(0), chat, "четвёртое");
+    stand.settle();
+    let seen = stand.sim.node(NodeId(2)).seen(chat);
+    assert!(seen.contains(&"четвёртое".to_owned()), "живая лента идёт мимо дыры");
+    assert!(
+        !seen.contains(&"второе".to_owned()),
+        "пропущенное пока не вернулось — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Обход привязывает читателя заново, и обмен векторами показывает
+    // дыру **номером**. Час модельного времени обязателен: обход ходит
+    // не чаще раза в час.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    let seen = stand.sim.node(NodeId(2)).seen(chat);
+    for word in ["первое", "второе", "третье", "четвёртое"] {
+        assert!(
+            seen.contains(&word.to_owned()),
+            "дыра обязана зарасти: «{word}» не вернулось, видно {seen:?}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // **Чего проверка не стережёт.** Что дыра зарастает **раньше**
+    // обхода: другого повода спросить у ядра нет, и полтора часа тишины
+    // — честная цена. И что зарастёт дыра глубиной больше ста двадцати
+    // восьми блоков: ответ ограничен (§7.2), а второй круг спросит
+    // следующий кусок — но это уже про число обходов, а не про правило.
+}
+
+#[test]
+fn a_newcomer_does_not_pay_for_history_he_cannot_open() {
+    // §7.4: «вступление не оплачивает историю, которую никто не открыл».
+    // У нас это не бережливость, а факт §11.5: сказанное до выдачи
+    // цепочки не открывается **никогда**, сколько его ни вези. Спроси
+    // мы такое — новичок оплатил бы полосой кадры, которые молча
+    // исчезнут, и увидел бы ту же пустую ленту.
+    //
+    // Проверка — **замер**: считается, сколько кадров стоит появление
+    // новичка в канале с прожитой историей. Иначе правило неразличимо:
+    // блоки, которых не открыть, в его журнал всё равно не ложатся,
+    // и по журналу «спросили и выбросили» выглядит как «не спрашивали».
+    let mut stand = Stand::strangers(0x0_7A1E, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Двадцать слов до прихода новичка — история, которой ему не видать.
+    for i in 0..20 {
+        stand.say(NodeId(0), chat, &format!("слово {i}"));
+    }
+    stand.settle();
+
+    let before = stand.frames_sent();
+    stand.subscribe(NodeId(2), &link);
+    stand.admit(NodeId(0), chat, NodeId(2));
+    stand.settle();
+    // Обход: новичок привязывается к сиду и меняется с ним векторами.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    let joining = stand.frames_sent() - before;
+
+    // **Число своё, не из крейта, и с запасом в обе стороны.** Замерено:
+    // с границей открываемого вступление стоит тридцать один кадр,
+    // без неё — сто четыре: двадцать блоков истории, просьбы за ними
+    // и квитанции. Порог посередине; сдвинется цена вдвое в любую
+    // сторону — проверка скажет об этом.
+    assert!(
+        joining < 60,
+        "вступление не оплачивает непрочитаемую историю: {joining} кадров; сид {:#x}",
+        stand.sim.seed()
+    );
+    // **И привязка при этом состоялась** — иначе замер был бы пуст:
+    // не спросив никого, новичок не заплатил бы за историю и с самой
+    // дырявой границей.
+    assert!(
+        !stand.seeds(NodeId(2), chat).is_empty(),
+        "впущенному обязан приехать каталог: без него он не привяжется ни к кому; сид {:#x}",
+        stand.sim.seed()
+    );
+    // И ленты до себя он не увидел — это §11.5, а не §7.4.
+    let seen = stand.sim.node(NodeId(2)).seen(chat);
+    assert!(
+        !seen.iter().any(|word| word.starts_with("слово")),
+        "сказанного до вступления не открыть; видно {seen:?}"
+    );
+
+    // А живую ленту — видит: проверка выше была бы пуста, если бы канал
+    // просто не работал.
+    stand.say(NodeId(0), chat, "после прихода");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"после прихода".to_owned()),
+        "новичок обязан слышать канал с момента вступления; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn the_archive_outlives_a_restart_and_answers_a_graft() {
     // **Хвост в памяти стал архивом на диске** (§9.3), и проверяется это
     // тем, ради чего замена делалась: перезапуском. Сид, поднявшийся
@@ -1802,8 +1965,17 @@ fn the_archive_outlives_a_restart_and_answers_a_graft() {
 
     let seed = NodeId(1);
     let archived = stand.sim.node(seed).engine().store().archive_have(&chat).expect("архив");
-    assert_eq!(archived.len(), 1, "у читателя лёг журнал владельца");
+    let owner_ik = stand.ik(NodeId(0));
+    assert!(!archived.is_empty(), "у читателя лёг журнал владельца");
+    assert!(
+        archived.iter().all(|range| range.author_ik == owner_ik),
+        "в канале публикует владелец, и автор в векторе один; вектор: {archived:?}"
+    );
     assert_eq!(archived[0].first_seq, 0, "префикс ещё не обрезан окном");
+    // **Строк у одного автора бывает несколько, и это честность вектора.**
+    // Адресный блок — ключ чтения впущенному — занимает позицию, но
+    // до второго читателя не доезжает; вектор обязан показать провал,
+    // а не объявить пропущенное своим (§7.3).
     // **У автора журнал непрерывен — у читателя нет, и это не поломка.**
     // §7.3 обещает: «узел, имеющий 46 и 48, знает, что 47 существует».
     // У нас цепочка отправителя одна на всё: и на то, что едет веером,
@@ -1868,8 +2040,12 @@ fn the_window_from_the_representation_is_what_cuts_the_archive() {
     }
     let reader = NodeId(1);
     let before = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
+    // Последний номер берётся по всем строкам: у читателя вектор бывает
+    // из нескольких кусков — адресные блоки чужих до него не доезжают
+    // и оставляют провалы (§7.3).
+    let last_before = before.iter().map(|range| range.last_seq).max().expect("журнал не пуст");
     assert_eq!(before[0].first_seq, 0, "журнал с начала");
-    assert!(before[0].last_seq >= 2, "три слова добавили три позиции");
+    assert!(last_before >= 2, "три слова добавили три позиции");
 
     // Год спустя окно в тридцать суток (умолчание §9.3) снимает весь
     // прежний префикс, и делает это обход, а не показ.
@@ -1884,7 +2060,7 @@ fn the_window_from_the_representation_is_what_cuts_the_archive() {
     stand.settle();
     let after = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
     assert!(
-        after.iter().all(|range| range.first_seq > before[0].last_seq),
+        after.iter().all(|range| range.first_seq > last_before),
         "окно обязано было снять весь прежний журнал: было {:?}, стало {after:?}; сид {:#x}",
         before,
         stand.sim.seed()

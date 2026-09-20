@@ -985,11 +985,26 @@ impl<S: Store> Engine<S> {
     /// он «дай сорок седьмой», ответом было бы молчание, неотличимое
     /// от потери.
     ///
-    /// # Просим только хвост
+    /// # Спрашивается пропуск, а не только хвост
     ///
-    /// §7.4: «вступление не оплачивает историю, которую никто
-    /// не открыл». Спрашивается то, что **новее** нашего последнего:
-    /// глубину архива тянет прокрутка вверх, и её ещё нет.
+    /// §7.3: «узел, имеющий 46 и 48, **знает**, что 47 существует».
+    /// Первая редакция просила лишь то, что новее нашего последнего, —
+    /// и провал посередине не чинился никогда: читатель, пропавший
+    /// на сорок номеров, объявлял их своими (`MIN..MAX` в векторе)
+    /// и потому не просил. Теперь вектор честен, а разница считается
+    /// [`swarm::gaps`].
+    ///
+    /// **Пропуск спрашивается раньше хвоста** — §7.3, «настойчивее
+    /// хвоста». Хвост придёт и деревом: он живой, и за ним идёт
+    /// раздача. За пропуском не идёт ничего.
+    ///
+    /// # Ниже границы открываемого не спрашиваем
+    ///
+    /// §7.4: «вступление не оплачивает историю, которую никто не
+    /// открыл». У нас эта граница не выбор, а факт: сказанное до выдачи
+    /// цепочки (§11.5) не откроется никогда, сколько его ни вези.
+    /// Спрашивать такое — тратить полосу на кадры, которые молча
+    /// исчезнут, и обещать человеку историю, которой он не увидит.
     fn on_have(
         &mut self,
         now_ms: u64,
@@ -998,28 +1013,54 @@ impl<S: Store> Engine<S> {
         ranges: &[swarm::Range],
     ) -> Result<Vec<Effect>, EngineError> {
         let mine = self.store.archive_have(&chat)?;
-        let mut effects = Vec::new();
+        // Дыры, а не просьбы: сперва собираются все, потом отбираются
+        // самые нужные. Иначе порядок просьб зависел бы от порядка строк
+        // в чужом векторе, то есть от чужой прихоти.
+        let mut holes: Vec<(ActorId, u64, u64)> = Vec::new();
         for range in ranges.iter().take(swarm::MAX_HAVE_RANGES) {
-            let ours = mine.iter().find(|row| row.author_ik == range.author);
-            // Наш хвост — то, с чего просить. Нет ничего по этому
-            // автору — просим с его начала: это первая встреча с ним.
-            let from = match ours {
-                Some(row) if row.last_seq >= range.last_seq => continue,
-                Some(row) => row.last_seq.saturating_add(1),
-                None => range.first_seq,
-            };
-            if range.last_seq < from {
-                continue;
+            let floor = self.openable_from(chat, &range.author)?;
+            let from = range.first_seq.max(floor);
+            let ours: Vec<(u64, u64)> = mine
+                .iter()
+                .filter(|row| row.author_ik == range.author)
+                .map(|row| (row.first_seq, row.last_seq))
+                .collect();
+            for (first, last) in swarm::gaps((from, range.last_seq), &ours) {
+                holes.push((range.author, first, last));
             }
-            let ask = swarm::Control::Want {
-                group: chat,
-                author: range.author,
-                from_seq: from,
-                to_seq: range.last_seq,
-            };
+        }
+        // Порядок просьб: сперва то, за чем не идёт раздача. Хвост —
+        // это то, что новее последнего нашего у этого автора; всё
+        // остальное пропуск, и §7.3 велит спрашивать его настойчивее.
+        holes.sort_by_key(|(author, first, _)| {
+            let tail = mine
+                .iter()
+                .filter(|row| row.author_ik == *author)
+                .map(|row| row.last_seq)
+                .max()
+                .is_some_and(|last| *first > last);
+            (tail, *first)
+        });
+        let mut effects = Vec::new();
+        for (author, from_seq, to_seq) in holes.into_iter().take(swarm::MAX_WANTS_PER_ROUND) {
+            let ask = swarm::Control::Want { group: chat, author, from_seq, to_seq };
             effects.extend(self.send_swarm_control(now_ms, peer_ik, &ask)?);
         }
         Ok(effects)
+    }
+
+    /// С какого номера этого автора нам вообще есть смысл просить (§7.3).
+    ///
+    /// Граница — самый старый ключ, который у нас ещё есть: кэш пропусков
+    /// или позиция, с которой цепочку выдали (§11.5). Ниже неё блок
+    /// приедет и молча исчезнет — открыть его нечем и не будет чем.
+    ///
+    /// Цепочки нет вовсе — просим с нуля: она едет отдельным кадром
+    /// (§11.5) и может приехать позже, а до тех пор блок ложится
+    /// в отложенные, а не пропадает.
+    fn openable_from(&self, chat: ChatId, author: &ActorId) -> Result<u64, EngineError> {
+        let Some(stored) = self.store.sender_chain(&chat, author)? else { return Ok(0) };
+        Ok(Self::inbox_of(&stored).oldest_openable())
     }
 
     /// Пришла просьба: отдаём кадры из архива (§7.2).

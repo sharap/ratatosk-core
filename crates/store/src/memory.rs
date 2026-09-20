@@ -855,22 +855,22 @@ impl Store for MemoryStore {
     }
 
     fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+        // Склейка подряд идущих, а не `MIN..MAX` по автору: провал
+        // в журнале — не порча, а то, что §7.3 велит видеть по номеру.
+        // Ключ карты уже упорядочен (чат, автор, номер), и обход идёт
+        // в том же порядке, в каком строки едут на провод.
         let mut found: Vec<HaveRange> = Vec::new();
         for ((chat, author, seq), _) in &self.archive {
             if chat != chat_id {
                 continue;
             }
-            match found.iter_mut().find(|range| range.author_ik == *author) {
-                Some(range) => {
-                    range.first_seq = range.first_seq.min(*seq);
-                    range.last_seq = range.last_seq.max(*seq);
+            match found.last_mut() {
+                Some(run) if run.author_ik == *author && run.last_seq.saturating_add(1) == *seq => {
+                    run.last_seq = *seq;
                 }
-                None => {
-                    found.push(HaveRange { author_ik: *author, first_seq: *seq, last_seq: *seq })
-                }
+                _ => found.push(HaveRange { author_ik: *author, first_seq: *seq, last_seq: *seq }),
             }
         }
-        found.sort_unstable_by_key(|range| range.author_ik);
         Ok(found)
     }
 

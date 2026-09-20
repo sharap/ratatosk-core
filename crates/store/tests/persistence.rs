@@ -2260,6 +2260,72 @@ fn a_have_vector_says_the_first_and_the_last() {
 }
 
 #[test]
+fn a_gap_in_the_middle_breaks_the_have_vector_in_two() {
+    // §7.3: «узел, имеющий 46 и 48, **знает**, что 47 существует».
+    // Знает он это по вектору, и вектор обязан сказать правду: две
+    // строки с провалом между ними, а не одна от первого до последнего.
+    //
+    // Первая редакция отдавала `MIN..MAX` на автора, и читатель,
+    // пропустивший середину, объявлял, что она у него есть. Спросить
+    // её он не мог — по собственному вектору выходило, что всё на месте,
+    // — а сосед, попросивший у него пропущенное, получал молчание.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    // Читатель принял вступление (10), пропал на сорок номеров
+    // и вернулся к пятьдесят первому.
+    for seq in [10u64, 51, 52, 53] {
+        store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
+    }
+
+    let have = store.archive_have(&chat).unwrap();
+    assert_eq!(have.len(), 2, "провал разрывает строку надвое; вектор: {have:?}");
+    assert_eq!((have[0].first_seq, have[0].last_seq), (10, 10));
+    assert_eq!((have[1].first_seq, have[1].last_seq), (51, 53));
+    assert!(have.iter().all(|run| run.author_ik == [9u8; 32]), "автор у обеих строк один");
+}
+
+#[test]
+fn two_authors_with_gaps_do_not_glue_into_one_run() {
+    // Склейка идёт по **подряд идущим номерам одного автора**. Возьми
+    // она только номер, хвост одного автора и начало другого слиплись бы
+    // в одну строку — и вектор объявил бы чужие блоки своими.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    store.put_archived(&chat, &arch_block(1, 7, 10)).unwrap();
+    store.put_archived(&chat, &arch_block(9, 8, 10)).unwrap();
+
+    let have = store.archive_have(&chat).unwrap();
+    assert_eq!(have.len(), 2, "разные авторы — разные строки; вектор: {have:?}");
+    assert!(have.iter().all(|run| run.first_seq == run.last_seq));
+}
+
+#[test]
+fn both_backends_see_the_same_gap() {
+    // Трейт с одной честной реализацией не бывает абстракцией. Разойдись
+    // хранилища здесь — один узел просил бы пропущенное, а другой считал
+    // бы, что у него всё на месте.
+    let db = TempDb::new("archive-gap-both");
+    let chat = [3u8; 16];
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    sqlite.put_group(&group(3, "канал", 1_000)).unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        for seq in [1u64, 2, 5, 9, 10] {
+            store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
+        }
+        store.put_archived(&chat, &arch_block(1, 3, 10)).unwrap();
+    }
+    let have = sqlite.archive_have(&chat).unwrap();
+    assert_eq!(have, memory.archive_have(&chat).unwrap(), "хранилища обязаны видеть одно");
+    assert_eq!(have.len(), 4, "три куска у одного автора и один у другого; вектор: {have:?}");
+}
+
+#[test]
 fn the_window_cuts_the_prefix_and_never_the_middle() {
     // §9.3 дословно: «удаляется **префикс** журнала, `first_seq`
     // в have-векторе поднимается; дыр в середине не бывает». Дыра

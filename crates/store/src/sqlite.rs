@@ -2192,22 +2192,30 @@ impl Store for SqliteStore {
     }
 
     fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+        // **`MIN`/`MAX` по автору здесь не годятся**, и это разбор живой
+        // лжи: читатель, имеющий 10 и 51, объявил бы диапазон 10..51 —
+        // то есть и те сорок номеров, которых у него нет. Склейка идёт
+        // по подряд идущим номерам, а провал начинает новую строку.
         let mut statement = self.conn.prepare(
-            "SELECT author_ik, MIN(seq), MAX(seq)
-             FROM channel_archive WHERE chat_id = ?1 GROUP BY author_ik ORDER BY author_ik",
+            "SELECT author_ik, seq FROM channel_archive
+             WHERE chat_id = ?1 ORDER BY author_ik, seq",
         )?;
         let rows = statement.query_map([&chat_id[..]], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
         })?;
-        let mut found = Vec::new();
+        let mut found: Vec<HaveRange> = Vec::new();
         for row in rows {
-            let (author, first, last) = row?;
+            let (author, seq) = row?;
             let Ok(author_ik) = <[u8; 32]>::try_from(author.as_slice()) else { continue };
-            found.push(HaveRange {
-                author_ik,
-                first_seq: sql_types::from_sql(first),
-                last_seq: sql_types::from_sql(last),
-            });
+            let seq = sql_types::from_sql(seq);
+            match found.last_mut() {
+                Some(run)
+                    if run.author_ik == author_ik && run.last_seq.saturating_add(1) == seq =>
+                {
+                    run.last_seq = seq;
+                }
+                _ => found.push(HaveRange { author_ik, first_seq: seq, last_seq: seq }),
+            }
         }
         Ok(found)
     }

@@ -849,6 +849,33 @@ impl<S: Store> Engine<S> {
         let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &key_action)?;
         effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
 
+        // **Каталог — вместе с впуском** (§7.5, §7.4 шаг 1: «представление
+        // и `PeerRecord`ы — чтобы было у кого спрашивать»).
+        //
+        // Нашёл это замер: появление новичка в канале с сидом стоило
+        // ровно столько же, сколько без сида, — он не привязывался
+        // ни к кому. Записи каталога развозятся, когда сид объявляется
+        // или продлевает запись (раз в несколько суток), а впущенный
+        // между этими событиями не узнавал о сидах до следующего
+        // продления. Снаружи это выглядело как «рой работает только
+        // для тех, кто пришёл раньше сида».
+        //
+        // Едет тем же действием, что и развоз: подпись внутри — самого
+        // сида, и впущенный проверит её сам, когда узнает его карточку.
+        for seed in self.store.seeds(&chat)? {
+            if seed.valid_until_ms <= now_ms || seed.ik == peer_ik {
+                continue;
+            }
+            let record = ratatosk_proto::group_action::Action::SeedRecord {
+                bytes: ratatosk_codec::canonical::encode(&ratatosk_proto::swarm::wire_value(
+                    seed.record_bytes.clone(),
+                    &seed.signature,
+                ))?,
+            };
+            let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &record)?;
+            effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+        }
+
         // Запись о впуске — **всем**, а не только впущенному: это учёт,
         // и смотрит в него владелец.
         let admission = channel::Admission {

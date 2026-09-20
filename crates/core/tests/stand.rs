@@ -123,6 +123,8 @@ struct Peer {
     mail: bool,
     /// Повторяет ли эфир объявления. Ложь у всех, кроме эфирных сценариев.
     beacons: bool,
+    /// Сколько кадров узел отдал сети за прогон — им меряется рой (§7.1).
+    sent: usize,
     /// Когда последний раз объявлялись. Чаще срока маяку незачем.
     beacon_at_ms: u64,
 }
@@ -170,6 +172,7 @@ impl Peer {
             mail,
             beacons: false,
             beacon_at_ms: 0,
+            sent: 0,
         }
     }
 
@@ -231,6 +234,12 @@ impl Peer {
                     let Some(&to) = self.peers.get(&peer_ik) else {
                         panic!("некуда слать: узел с таким IK в стенде не заведён");
                     };
+                    // Счёт кадров — то, чем меряется рой (§7.1). Шагов сети
+                    // для этого мало: в них входят и квитанции, и таймеры,
+                    // и «почему слово стоит восьми блоков вместо пяти»
+                    // по ним не увидеть. Живой прогон меряет именно кадры,
+                    // и стенд обязан мерить то же самое.
+                    self.sent += 1;
                     ctx.send(to, to_sim(via), frame);
                     if let Some(handoff) = handoff {
                         handed.push(Input::Handed { peer_ik, via, handoff });
@@ -618,6 +627,11 @@ impl Stand {
             );
         });
         self.settle();
+    }
+
+    /// Сколько кадров отдали сети все узлы вместе (§7.1).
+    fn frames_sent(&self) -> usize {
+        self.sim.nodes().iter().map(|node| node.sent).sum()
     }
 
     /// Каталог раздающих, каким его видит этот узел (§7.5).
@@ -1249,13 +1263,20 @@ fn with_a_seed_the_owner_stops_sending_a_copy_to_everyone() {
     assert_eq!(eager.len(), 7, "ноль сидов — это звезда, а не деградация (§7.5.2)");
     assert!(lazy.is_empty(), "ленивому некому прислать блок — зов был бы лишним кругом");
 
-    // Появился сид — и дерево сжалось до четырёхeager.
+    // Появился сид — и дерево сжалось: кому-то теперь зов, а не блок.
+    //
+    // **Точного числа здесь не проверяется, и это не небрежность.**
+    // Начальное деление даёт `k_eager` (у нас четыре), но дерево живое:
+    // ленивый, не дождавшийся блока, зовёт `GRAFT` и переходит в eager
+    // (§7.1, шаг 4), а получивший дубль подрезает ребро обратно. Числа
+    // ходят вокруг `k_eager`, и требовать ровно его значило бы требовать,
+    // чтобы дерево не чинилось.
     stand.announce_seeding(NodeId(1), chat);
     stand.say(NodeId(0), chat, "с роем");
     stand.settle();
     let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
-    assert_eq!(eager.len(), 4, "eager-пиров 3–5 (§7.7); здесь четыре");
-    assert_eq!(lazy.len(), 3, "остальным — зов");
+    assert!(eager.len() < 7, "владелец больше не шлёт копию каждому: eager={}", eager.len());
+    assert!(!lazy.is_empty(), "кому-то теперь зов, а не блок");
 
     // И слово всё равно дошло до **всех**: ленивые получили его от сида
     // либо позвали `GRAFT` по сроку.
@@ -1288,7 +1309,7 @@ fn when_the_last_seed_leaves_the_tree_becomes_a_star_again() {
     stand.say(NodeId(0), chat, "при рое");
     stand.settle();
     let (eager, lazy) = stand.sim.node(NodeId(0)).engine().swarm_tree(chat);
-    assert_eq!((eager.len(), lazy.len()), (4, 2), "рой есть — дерево сжато");
+    assert!(!lazy.is_empty(), "рой есть — дерево сжато: eager={}", eager.len());
 
     // Сид перестал раздавать, и запись выпала по сроку (§7.5).
     stand.sim.act(NodeId(1), |node, ctx| {
@@ -1416,6 +1437,68 @@ fn a_duplicate_prunes_the_edge_it_came_by() {
         stand.sim.node(NodeId(2)).seen(chat).contains(&"двумя путями".to_owned()),
         "и слово при этом дошло"
     );
+}
+
+#[test]
+fn a_prune_at_a_seed_holds_and_the_second_word_costs_less() {
+    // **Находка живого прогона на шести узлах поверх меша.** Дерево
+    // подрезалось и тут же отрастало: каждое слово стоило восьми блоков
+    // вместо пяти, читатели слали `PRUNE` сиду при каждом слове, и он
+    // при каждом слове возвращал их в eager.
+    //
+    // Причина — в том, что «рой жив» считалось одинаково для всех.
+    // Сид смотрел в каталог, видел там **только себя** и решал, что роя
+    // нет, — а «роя нет» означает звезду (§7.5.2), то есть всем целиком.
+    // Для владельца это верно: второй путь для ленивого есть, только
+    // если в канале есть сид. Для всех остальных — неверно всегда:
+    // первый путь у ленивого это сам владелец, а мы и есть второй.
+    //
+    // Проверка меряет **блоки**, а не форму дерева: форма — средство,
+    // а обещание §7.1 — про цену.
+    let mut stand = Stand::strangers(0x9EED_5EED, 6);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..6u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Первое слово: дерево ещё не подрезано, дубли законны.
+    let before = stand.frames_sent();
+    stand.say(NodeId(0), chat, "раз");
+    stand.settle();
+    let first = stand.frames_sent() - before;
+    // Второе: `PRUNE` первого круга обязаны были осесть.
+    let before = stand.frames_sent();
+    stand.say(NodeId(0), chat, "два");
+    stand.settle();
+    let second = stand.frames_sent() - before;
+    // Третье: дерево уже сошлось, и цена не растёт.
+    let before = stand.frames_sent();
+    stand.say(NodeId(0), chat, "три");
+    stand.settle();
+    let third = stand.frames_sent() - before;
+
+    for reader in 1..6u16 {
+        assert!(
+            stand.sim.node(NodeId(reader)).seen(chat).contains(&"три".to_owned()),
+            "читатель {reader} остался без слова; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // **Дерево сходится, и это видно по кадрам.** Первое слово дороже:
+    // дубли ещё законны, и на них же едут `PRUNE`. Третье обязано стоить
+    // заметно меньше первого — иначе подрезка не держится, и рой шумит
+    // ровно столько же, сколько звезда, только с лишними кадрами.
+    assert!(
+        third < first,
+        "дерево не сошлось: первое слово {first} кадров, третье {third}; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert_eq!(third, second, "сошлось — значит цена перестала меняться");
 }
 
 #[test]

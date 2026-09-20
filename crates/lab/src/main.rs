@@ -4110,10 +4110,22 @@ async fn ygg_command(handle: &DriverHandle, rest: &str) {
                 // Прежде здесь стояло безусловное «меш включён». Оно
                 // и обмануло: ступень не поднималась, а стенд рапортовал
                 // успех, и разбираться приходилось по журналу.
-                let up = handle
-                    .transports()
-                    .await
-                    .is_some_and(|status| status.ready.contains(ratatosk_proto::Transport::Ygg));
+                // **Ждём, а не спрашиваем сразу.** Свой узел меша
+                // поднимается секунду-полторы: слушающий сокет, набор
+                // пиров, первый обмен. Спросив мгновенно, стенд печатал
+                // «включён, но не поднялся» ровно там, где через секунду
+                // всё работало, — и разбирать это приходилось по журналу.
+                // Поймано на живом узле в первую же минуту.
+                let mut up = false;
+                for _ in 0..20 {
+                    up = handle.transports().await.is_some_and(|status| {
+                        status.ready.contains(ratatosk_proto::Transport::Ygg)
+                    });
+                    if up {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
                 if up {
                     println!("< меш включён и работает — ступень между локальной сетью и onion");
                 } else {

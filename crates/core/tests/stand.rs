@@ -1798,6 +1798,130 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
 }
 
 #[test]
+fn a_node_that_stopped_seeding_serves_no_one() {
+    // §8.3, вторая половина — «право на обслуживание», и §7.5.1: «не
+    // раздаём — никому». Выключатель обязан гасить **и уже начатую**
+    // раздачу: привязка живёт в памяти, и проверяй мы право только
+    // на входе, прежние читатели получали бы блоки дальше, то есть
+    // кнопка врала бы человеку.
+    let mut stand = Stand::strangers(0x0_FF5EED, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    // **Владелец до читателя не достаёт** — иначе «дошло через сида»
+    // неотличимо от «дошло само» (тот же довод, что у ретрансляции).
+    for kind in [
+        TransportKind::Onion,
+        TransportKind::Mail,
+        TransportKind::Lan,
+        TransportKind::Bt,
+        TransportKind::Ygg,
+        TransportKind::Nostr,
+    ] {
+        stand.sim.net_mut().set_link_profile(
+            NodeId(0),
+            NodeId(2),
+            kind,
+            LinkProfile { loss_permille: 1_000, ..LinkProfile::INSTANT },
+        );
+    }
+
+    // Пока сид раздаёт — слово доходит через него.
+    stand.say(NodeId(0), chat, "через сида");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"через сида".to_owned()),
+        "рой работает — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек выключил раздачу.
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::SetSeeding { chat, mode: ratatosk_proto::swarm::Seeding::Off });
+    });
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "после выключателя");
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"после выключателя".to_owned()),
+        "выключивший раздачу не отдаёт ничего и никому (§7.5.1); сид {:#x}",
+        stand.sim.seed()
+    );
+    // **Чего проверка не стережёт.** Что выключивший продолжает
+    // **принимать**: раздача и чтение — разные вещи, и это видно
+    // по следующей строке, а не по правилу.
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"после выключателя".to_owned()),
+        "сам он слово принял: выключен не канал, а раздача; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn silent_seeding_gives_back_to_the_seed_it_dialled() {
+    // §7.5.1, тихая раздача — умолчание: «адрес не раскрывается, набрать
+    // нас нельзя, но по своим исходящим соединениям мы несём трафик
+    // наравне со всеми». Проверяется именно это: читатель отдаёт блок
+    // **своему** сиду — тому, к кому подключился сам.
+    //
+    // Сценарий обратный обычному: пропустил слово не читатель, а сид.
+    let mut stand = Stand::strangers(0x51_1E17, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    // Сида нет в сети; слово доходит до читателя напрямую от владельца.
+    stand.offline(NodeId(1));
+    stand.say(NodeId(0), chat, "мимо сида");
+    stand.settle();
+    // **Очередь владельца сдалась** — иначе слово доедет до сида ею,
+    // и «отдал читатель» будет неотличимо от «долежало в очереди».
+    stand.drop_queue(NodeId(0));
+    stand.online(NodeId(1));
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(1)).seen(chat).contains(&"мимо сида".to_owned()),
+        "сид пропустил слово — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Обход: читатель привязывается заново и шлёт свой вектор. Сид видит,
+    // что отстал, и просит — а читатель отдаёт, потому что это **его**
+    // сид, тот, к кому он подключился сам.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"мимо сида".to_owned()),
+        "тихая раздача отдаёт тому, к кому подключились сами (§7.5.1); сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_hole_in_the_middle_is_asked_for_and_not_written_off() {
     // **§7.3 целиком**: «узел, имеющий 46 и 48, знает, что 47
     // существует, а не догадывается по молчанию».

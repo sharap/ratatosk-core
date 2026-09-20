@@ -516,6 +516,54 @@ impl From<ratatosk_proto::ygg::YggMode> for FfiYggMode {
     }
 }
 
+/// Наше участие в раздаче канала — три состояния (§7.5.1).
+///
+/// Своё перечисление по той же причине, что у меша: типы протокола
+/// наружу не отдаются.
+///
+/// Наружу едут **все три**, и это изменение против прежней границы.
+/// Раньше ехали два (`announced: bool`): «тихо» и «не раздаём»
+/// различались только тем, отдаём ли мы по своим исходящим соединениям,
+/// а отдавать было нечего — дерева раздачи не существовало. Теперь оно
+/// есть, и выключатель §9.2 стал кнопкой, у которой есть последствие.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSeeding {
+    /// Не раздаём: никому и ничего.
+    ///
+    /// Канал при этом читается по-прежнему: выключается раздача,
+    /// а не подписка.
+    Off,
+    /// Тихо — **умолчание**. Адрес не объявлен, набрать нас нельзя,
+    /// но тем сидам, к кому мы подключились сами, мы отдаём наравне
+    /// со всеми.
+    Quiet,
+    /// Объявленный сид: адрес в каталоге, набирают незнакомые,
+    /// отдаём всякому, кто спросил (§7.6).
+    ///
+    /// Перед включением клиент обязан показать `seeding_notice`.
+    Announced,
+}
+
+impl From<FfiSeeding> for ratatosk_proto::swarm::Seeding {
+    fn from(value: FfiSeeding) -> ratatosk_proto::swarm::Seeding {
+        match value {
+            FfiSeeding::Off => ratatosk_proto::swarm::Seeding::Off,
+            FfiSeeding::Quiet => ratatosk_proto::swarm::Seeding::Quiet,
+            FfiSeeding::Announced => ratatosk_proto::swarm::Seeding::Announced,
+        }
+    }
+}
+
+impl From<ratatosk_proto::swarm::Seeding> for FfiSeeding {
+    fn from(value: ratatosk_proto::swarm::Seeding) -> FfiSeeding {
+        match value {
+            ratatosk_proto::swarm::Seeding::Off => FfiSeeding::Off,
+            ratatosk_proto::swarm::Seeding::Quiet => FfiSeeding::Quiet,
+            ratatosk_proto::swarm::Seeding::Announced => FfiSeeding::Announced,
+        }
+    }
+}
+
 /// Событие для UI.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiEvent {
@@ -3474,30 +3522,40 @@ impl RatatoskClient {
 
     /// Раздавать ли этот канал и объявлять ли адрес (фаза 2, §7.5.1).
     ///
-    /// Три состояния, а не переключатель: «не раздаём», «тихо»
-    /// (умолчание) и «объявлено». Тихая раздача — середина, ради которой
-    /// §7.5.1 и написан: рой не зависит от того, нажмёт ли кто-нибудь
-    /// кнопку, а адрес при этом не раскрывается.
+    /// Три состояния, а не переключатель: [`FfiSeeding::Off`],
+    /// [`FfiSeeding::Quiet`] (умолчание) и [`FfiSeeding::Announced`].
+    /// Тихая раздача — середина, ради которой §7.5.1 и написан: рой
+    /// не зависит от того, нажмёт ли кто-нибудь кнопку, а адрес при этом
+    /// не раскрывается.
     ///
-    /// **Перед `announced` клиент обязан показать [`seeding_notice`]**:
+    /// **Перед `Announced` клиент обязан показать [`seeding_notice`]**:
     /// объявленный адрес узнаёт каждый читатель канала, и отказ гасит
     /// объявление не сразу.
+    ///
+    /// **`Off` — это выключатель раздачи (§9.2), а не отписка.** Канал
+    /// продолжает читаться; перестаём мы только отдавать — и отдавать
+    /// сразу, включая тех, кто привязался раньше.
     ///
     /// # Errors
     ///
     /// [`RatatoskError::Channel`] — это не канал, или объявлять нечего:
     /// своих адресов нет вовсе.
-    pub fn set_seeding(&self, chat_id: Vec<u8>, announced: bool) -> Result<(), RatatoskError> {
-        // Наружу едут два состояния из трёх, и это не потеря: «тихо»
-        // и «не раздаём» различаются только тем, отдаём ли мы по своим
-        // исходящим, а отдавать сегодня нечего — дерева раздачи (§7.1)
-        // ещё нет. Третье состояние появится на границе вместе с ним.
-        let mode = if announced {
-            ratatosk_proto::swarm::Seeding::Announced
-        } else {
-            ratatosk_proto::swarm::Seeding::Quiet
-        };
-        self.command(Command::SetSeeding { chat: to_chat(&chat_id)?, mode })
+    pub fn set_seeding(&self, chat_id: Vec<u8>, mode: FfiSeeding) -> Result<(), RatatoskError> {
+        self.command(Command::SetSeeding { chat: to_chat(&chat_id)?, mode: mode.into() })
+    }
+
+    /// Наше участие в раздаче этого канала (фаза 2, §7.5.1).
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn seeding_mode(&self, chat_id: Vec<u8>) -> Result<FfiSeeding, RatatoskError> {
+        let mode = self
+            .opened
+            .handle
+            .seeding_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(mode.into())
     }
 
     /// Объявлен ли наш адрес в каталоге этого канала (фаза 2, §7.5.1).

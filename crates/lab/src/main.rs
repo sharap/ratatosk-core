@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off>   /seeds <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off|quiet>   /seeds <id канала>   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2178,18 +2178,24 @@ async fn console(
                     // состояния здесь не для полноты: тихая раздача
                     // умолчанием и есть то, на чём рой держится, а
                     // объявление адреса остаётся выбором с текстом §15.
-                    let (chat, tail) = split_group(rest, "/seed <id канала> <on|off>");
+                    let (chat, tail) = split_group(rest, "/seed <id канала> <on|off|quiet>");
                     if let Some(chat) = chat {
-                        let announced = matches!(tail.trim(), "on" | "да");
-                        if announced {
-                            // Текст — **до** команды: после неё адрес уже
-                            // уехал бы в каталог.
-                            println!("< {}", ratatosk_proto::swarm::SeedingConsequences::ui_text());
-                        }
-                        let mode = if announced {
-                            ratatosk_proto::swarm::Seeding::Announced
-                        } else {
-                            ratatosk_proto::swarm::Seeding::Quiet
+                        // Три состояния, и на стенде они теперь различимы:
+                        // «off» перестал быть синонимом тихой раздачи
+                        // с тех пор, как появилось право на обслуживание
+                        // (§8.3) — выключивший не отдаёт никому.
+                        let mode = match tail.trim() {
+                            "on" | "да" => {
+                                // Текст — **до** команды: после неё адрес
+                                // уже уехал бы в каталог.
+                                println!(
+                                    "< {}",
+                                    ratatosk_proto::swarm::SeedingConsequences::ui_text()
+                                );
+                                ratatosk_proto::swarm::Seeding::Announced
+                            }
+                            "off" | "нет" => ratatosk_proto::swarm::Seeding::Off,
+                            _ => ratatosk_proto::swarm::Seeding::Quiet,
                         };
                         handle.send(Command::SetSeeding { chat, mode }).await.ok();
                     }

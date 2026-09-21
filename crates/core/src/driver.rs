@@ -283,6 +283,8 @@ enum Query {
     /// Кому мы отдаём блоки этого канала (§12) — **действующий** уровень,
     /// то есть с учётом умолчания аккаунта.
     Sharing { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Sharing> },
+    /// Пределы отдачи (§9.2): сколько блоков одному и всем за минуту.
+    GivingLimits { reply: oneshot::Sender<ratatosk_proto::swarm::GivingLimits> },
     /// Группы и их состав (§11).
     Groups { reply: oneshot::Sender<Vec<GroupStatus>> },
     /// Байты аватарки: свои (`None`) или контакта (`Some`).
@@ -1249,6 +1251,20 @@ impl DriverHandle {
         answer.await.ok()
     }
 
+    /// Читает пределы отдачи (§9.2), блокируя вызывающий поток.
+    pub fn giving_limits_blocking(&self) -> Option<ratatosk_proto::swarm::GivingLimits> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::GivingLimits { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// То же без блокировки.
+    pub async fn giving_limits(&self) -> Option<ratatosk_proto::swarm::GivingLimits> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.send(Request::Query(Query::GivingLimits { reply })).await.ok()?;
+        answer.await.ok()
+    }
+
     /// Читает действующий уровень отдачи (§12), блокируя вызывающий поток.
     pub fn sharing_blocking(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Sharing> {
         let (reply, answer) = oneshot::channel();
@@ -1899,6 +1915,11 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let _ = reply.send(
                     self.engine.seeding(chat).unwrap_or(ratatosk_proto::swarm::Seeding::Quiet),
                 );
+            }
+            Query::GivingLimits { reply } => {
+                // Отказ чтения — умолчания крейта, а не нули: иначе сбой
+                // хранилища тихо выключил бы раздачу.
+                let _ = reply.send(self.engine.giving_limits().unwrap_or_default());
             }
             Query::Sharing { chat, reply } => {
                 // Отказ хранилища читается как умолчание §12 — «всем».

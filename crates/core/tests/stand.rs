@@ -638,6 +638,17 @@ impl Stand {
         self.settle();
     }
 
+    /// Ставит пределы отдачи (§9.2): на пира и общий, в блоках за минуту.
+    fn set_giving_limits(&mut self, who: NodeId, per_peer: u32, total: u32) {
+        self.sim.act(who, |node, ctx| {
+            node.command(
+                ctx,
+                Command::SetGivingLimits(ratatosk_proto::swarm::GivingLimits { per_peer, total }),
+            );
+        });
+        self.settle();
+    }
+
     /// Ставит уровень отдачи — на аккаунт (`chat: None`) или на канал (§12).
     fn set_sharing(
         &mut self,
@@ -1891,6 +1902,120 @@ fn a_reader_reachable_only_by_mail_is_never_lazy() {
     // **Чего проверка не стережёт.** Пакета блоков «за окно
     // с избыточностью», который §8.4 предлагает асинхронным ступеням:
     // его нет, блоки едут по одному.
+}
+
+#[test]
+fn the_total_limit_stops_giving_and_the_next_round_starts_it_again() {
+    // §9.2: «сервера нет, значит ограничителя частоты нет ни у кого,
+    // кроме нас самих. Нужны три числа и выключатель, все на диске».
+    // Общий предел — четвёртое число и единственное, которое считает
+    // не пира, а нас: предел на пира защищает от одного жадного, общий
+    // — от десяти вежливых.
+    //
+    // Проверяется дважды: что предел **останавливает** и что окно
+    // его **отпускает**. Имя обещает обе половины, и одной мало:
+    // предел, который не отпускает, — это тихо умерший рой.
+    let mut stand = Stand::strangers(0x0_1117, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    // Сид отдаёт **один блок за минуту** — число своё, не из крейта.
+    stand.set_giving_limits(NodeId(1), 128, 1);
+
+    // Два слова мимо читателя: вернуть их может только сид.
+    stand.offline(NodeId(2));
+    stand.say(NodeId(0), chat, "первое без тебя");
+    stand.settle();
+    stand.say(NodeId(0), chat, "второе без тебя");
+    stand.settle();
+    // **Очереди обоих сдались** — и владельца, и сида. Пока копия лежит
+    // в очереди §5.4, слово доедет ею, и «предел остановил отдачу» будет
+    // неотличимо от «очередь ещё не дошла».
+    stand.drop_queue(NodeId(0));
+    stand.drop_queue(NodeId(1));
+    stand.online(NodeId(2));
+    stand.settle();
+
+    // Первый обмен векторами: сид отдаёт ровно один блок и упирается
+    // в предел.
+    //
+    // **Здесь нельзя `settle`**, и это разбор покрасневшей проверки.
+    // Он гонит модельное время до тишины и сжигает ступеньки §10.5 —
+    // за один такой заход проходит не минута, а часы, окно предела
+    // успевает смениться, и сид отдаёт оба блока. Снаружи выглядело бы
+    // как «общий предел не работает», а на деле работал: просто окон
+    // было два. Поэтому дальше время двигается **руками**, отрезками
+    // короче окна.
+    stand.maintenance();
+    stand.run_for(30_000);
+    let after_first = stand.sim.node(NodeId(2)).seen(chat);
+    let got = ["первое без тебя", "второе без тебя"]
+        .iter()
+        .filter(|word| after_first.contains(&(**word).to_owned()))
+        .count();
+    assert_eq!(
+        got,
+        1,
+        "общий предел отдал ровно один блок за окно, а отдал {got}; видно {after_first:?}; \
+         сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Следующий обход — и остальное доезжает: предел **отпускает**.
+    // Это вторая половина имени, и без неё правило было бы «рой,
+    // умерший тихо»: предел, который не кончается, ничем не отличается
+    // от выключенной раздачи.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.run_for(30_000);
+    let after_second = stand.sim.node(NodeId(2)).seen(chat);
+    for word in ["первое без тебя", "второе без тебя"] {
+        assert!(
+            after_second.contains(&word.to_owned()),
+            "окно кончилось — отдача продолжилась: «{word}» не доехало; видно {after_second:?}; \
+             сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // **Чего проверка не стережёт — длины окна.** Между двумя половинами
+    // проходит обход, то есть час модельного времени, и минута окна
+    // в него входит с запасом. Значит проверено «предел отпускает»,
+    // а не «отпускает ровно через минуту»: спросить отдачу чаще, чем
+    // раз в час, ядру нечем — другого повода для обмена векторами нет.
+}
+
+#[test]
+fn the_giving_limits_survive_a_restart() {
+    // §9.2 велит держать числа **на диске**, и слово «на диске» здесь
+    // не про удобство: настройка, не пережившая перезапуск, ограничивает
+    // ровно до первого перезапуска. Проверяется настоящим перезапуском —
+    // база закрывается и открывается заново.
+    let mut stand = Stand::strangers(0x0_D15C, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    stand.settle();
+    let _ = chat;
+
+    stand.set_giving_limits(NodeId(0), 7, 11);
+    stand.restart(NodeId(0));
+    stand.settle();
+
+    let limits = stand.sim.node(NodeId(0)).engine().giving_limits().expect("пределы");
+    assert_eq!(
+        (limits.per_peer, limits.total),
+        (7, 11),
+        "пределы отдачи обязаны пережить перезапуск (§9.2); сид {:#x}",
+        stand.sim.seed()
+    );
 }
 
 #[test]

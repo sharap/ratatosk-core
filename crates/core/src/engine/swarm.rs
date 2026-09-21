@@ -1312,13 +1312,20 @@ impl<S: Store> Engine<S> {
             tracing::debug!(peer = ?&peer_ik[..4], "архив не отдаётся эфиром (§8.4)");
             return Ok(Vec::new());
         }
-        // **Предел на пира** (§7.7, «бесконечное вытягивание»). Считается
-        // за окно, а не на просьбу: предел на просьбу обходится десятью
-        // просьбами подряд.
+        // **Два предела, а не один** (§7.7 и §9.2). На пира — «бесконечное
+        // вытягивание»: защищает от одного жадного. Общий — от десяти
+        // вежливых: сервера нет, ограничителя частоты нет ни у кого,
+        // кроме нас самих, и платит за отдачу человек — трафиком,
+        // батареей, тарифом.
+        //
+        // Оба считаются **за окно**, а не на просьбу: предел на просьбу
+        // обходится десятью просьбами подряд.
+        let limits = self.giving_limits()?;
+        let served_total = self.given_this_window(now_ms);
         let budget = self.budget_of(now_ms, peer_ik);
-        let left = swarm::BLOCKS_PER_WINDOW.saturating_sub(budget.served);
+        let left = limits.left_for_peer(budget.served, served_total);
         if left == 0 {
-            tracing::debug!(peer = ?&peer_ik[..4], "предел отдачи за окно исчерпан (§7.7)");
+            tracing::debug!(peer = ?&peer_ik[..4], "предел отдачи за окно исчерпан (§7.7, §9.2)");
             return Ok(Vec::new());
         }
         let width = usize::try_from(to_seq.saturating_sub(from_seq).saturating_add(1))
@@ -1336,7 +1343,59 @@ impl<S: Store> Engine<S> {
         }
         let budget = self.budget_of(now_ms, peer_ik);
         budget.served = budget.served.saturating_add(given);
+        self.swarm_given.1 = self.swarm_given.1.saturating_add(given);
         Ok(effects)
+    }
+
+    /// Сколько отдано **всем вместе** за нынешнее окно (§9.2).
+    ///
+    /// Окно то же, что у счёта на пира: разойдись они, «за минуту»
+    /// означало бы две разные минуты, и читать счёт вместе с пределом
+    /// стало бы нельзя.
+    fn given_this_window(&mut self, now_ms: u64) -> u32 {
+        if now_ms.saturating_sub(self.swarm_given.0) >= swarm::BUDGET_WINDOW_MS {
+            self.swarm_given = (now_ms, 0);
+        }
+        self.swarm_given.1
+    }
+
+    /// Пределы отдачи — с диска, а нет строки — умолчания крейта (§9.2).
+    ///
+    /// §9.2 велит держать числа **на диске**: «сервера нет, значит
+    /// ограничителя частоты нет ни у кого, кроме нас самих». Настройка,
+    /// не пережившая перезапуск, ограничивает ровно до первого
+    /// перезапуска.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn giving_limits(&self) -> Result<swarm::GivingLimits, EngineError> {
+        let Some(bytes) = self.store.meta(ratatosk_store::META_GIVING_LIMITS)? else {
+            return Ok(swarm::GivingLimits::default());
+        };
+        // Не те байты — умолчание, а не ноль: запись из будущей сборки
+        // не должна выключать раздачу сегодняшней.
+        Ok(swarm::GivingLimits::from_bytes(&bytes).unwrap_or_default())
+    }
+
+    /// Ставит пределы отдачи (§9.2). Ничего не уезжает по сети.
+    ///
+    /// # Ноль законен и означает «блоков не отдаём»
+    ///
+    /// Но выключать раздачу нулём не стоит, и это разные вещи:
+    /// выключатель §7.5.1 гасит ещё и объявление, и привязки, а ноль
+    /// останавливает только отдачу блоков. Клиенту сказано то же самое
+    /// на границе.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn on_set_giving_limits(
+        &mut self,
+        limits: swarm::GivingLimits,
+    ) -> Result<Vec<Effect>, EngineError> {
+        self.store.put_meta(ratatosk_store::META_GIVING_LIMITS, &limits.to_bytes())?;
+        Ok(Vec::new())
     }
 
     /// Сработал срок `T_graft`: блок так и не приехал (§7.1, шаг 4).

@@ -603,6 +603,36 @@ impl From<ratatosk_proto::swarm::Sharing> for FfiSharingLevel {
     }
 }
 
+/// Пределы отдачи: сколько блоков отдаём за минуту (фаза 2, §9.2).
+///
+/// Два числа из четырёх, которые §9.2 называет «наши»: предел на пира
+/// и общий. Третье — окно сидирования — ставит владелец канала
+/// в подписанном представлении (§9.3), четвёртый пункт — выключатель
+/// раздачи ([`FfiSeeding`]).
+///
+/// **Ноль законен и означает «блоков не отдаём».** Но выключать
+/// раздачу нулём не стоит: выключатель гасит ещё и объявление адреса,
+/// и привязки читателей, а ноль останавливает только отдачу.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiGivingLimits {
+    /// Сколько блоков отдаём **одному** пиру за минуту.
+    pub per_peer: u32,
+    /// Сколько блоков отдаём **всем вместе** за минуту.
+    pub total: u32,
+}
+
+impl From<FfiGivingLimits> for ratatosk_proto::swarm::GivingLimits {
+    fn from(value: FfiGivingLimits) -> ratatosk_proto::swarm::GivingLimits {
+        ratatosk_proto::swarm::GivingLimits { per_peer: value.per_peer, total: value.total }
+    }
+}
+
+impl From<ratatosk_proto::swarm::GivingLimits> for FfiGivingLimits {
+    fn from(value: ratatosk_proto::swarm::GivingLimits) -> FfiGivingLimits {
+        FfiGivingLimits { per_peer: value.per_peer, total: value.total }
+    }
+}
+
 /// Событие для UI.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiEvent {
@@ -3583,6 +3613,33 @@ impl RatatoskClient {
         self.command(Command::SetSeeding { chat: to_chat(&chat_id)?, mode: mode.into() })
     }
 
+    /// Пределы отдачи: сколько блоков за минуту одному и всем (§9.2).
+    ///
+    /// Числа лежат **на диске** и переживают перезапуск: §9.2 требует
+    /// именно этого — «сервера нет, значит ограничителя частоты нет
+    /// ни у кого, кроме нас самих».
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn set_giving_limits(&self, limits: FfiGivingLimits) -> Result<(), RatatoskError> {
+        self.command(Command::SetGivingLimits(limits.into()))
+    }
+
+    /// Нынешние пределы отдачи (§9.2).
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::Internal`] — ядро остановлено.
+    pub fn giving_limits(&self) -> Result<FfiGivingLimits, RatatoskError> {
+        let limits = self
+            .opened
+            .handle
+            .giving_limits_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(limits.into())
+    }
+
     /// Кому отдавать блоки этого канала — или всех каналов (§12).
     ///
     /// `chat_id: None` ставит умолчание **аккаунта**; с каналом —
@@ -6124,6 +6181,17 @@ mod tests {
         // — про то, кому мы отдаём блоки (§12). Совпади они, клиент
         // показал бы человеку не то последствие, о котором спрашивает.
         assert_ne!(sharing_notice(), sharing_level_notice(), "тексты про разное");
+    }
+
+    #[test]
+    fn the_giving_limits_cross_the_boundary_in_both_directions() {
+        // Числа §9.2 человек правит экраном настроек, и на границе они
+        // обязаны ходить туда и обратно: перевод «в одну сторону»
+        // однажды показал бы не тот предел, который стоит у ядра.
+        let limits = FfiGivingLimits { per_peer: 7, total: 11 };
+        let inner: ratatosk_proto::swarm::GivingLimits = limits.into();
+        assert_eq!(FfiGivingLimits::from(inner), limits);
+        assert_eq!((inner.per_peer, inner.total), (7, 11), "числа не переставлены местами");
     }
 
     #[test]

@@ -1397,6 +1397,16 @@ pub struct Engine<S: Store> {
     awaited_blocks: BTreeMap<(ChatId, MsgId), swarm::Awaited>,
     /// Метки сроков `T_graft`: какая метка какой блок ждёт.
     graft_timers: BTreeMap<u64, (ChatId, MsgId)>,
+    /// Сколько блоков мы отдали **всем вместе** за нынешнее окно (§9.2).
+    ///
+    /// Пара к счёту на пира: тот защищает от одного жадного, этот —
+    /// от десяти вежливых. Начало окна и счёт, как у `Budget`.
+    ///
+    /// В памяти: после перезапуска счёт обнуляется, и это честнее, чем
+    /// хранить его на диске. Предел меряет **нагрузку сейчас** — трафик
+    /// и батарею, — а не долг; поднятый с диска счёт означал бы «не
+    /// отдаём, потому что отдавали вчера».
+    swarm_given: (u64, u32),
     /// Пределы и остывание роевых пиров (§7.7).
     ///
     /// В памяти: после перезапуска у всех чистый лист, и это честнее
@@ -1948,6 +1958,7 @@ impl<S: Store> Engine<S> {
             peers: BTreeMap::new(),
             attached: BTreeMap::new(),
             dialed: BTreeMap::new(),
+            swarm_given: (0, 0),
             tree: BTreeMap::new(),
             awaited_blocks: BTreeMap::new(),
             graft_timers: BTreeMap::new(),
@@ -2396,6 +2407,7 @@ impl<S: Store> Engine<S> {
             Command::SetYggPeers(peers) => self.on_set_ygg_peers(now_ms, peers),
             Command::SetSeeding { chat, mode } => self.on_set_seeding(now_ms, chat, mode),
             Command::SetSharing { chat, level } => self.on_set_sharing(now_ms, chat, level),
+            Command::SetGivingLimits(limits) => self.on_set_giving_limits(limits),
             Command::SetNostrRelays(relays) => self.on_set_nostr_relays(now_ms, relays),
             Command::SetNostrDirect(direct) => self.on_set_nostr_direct(now_ms, direct),
             Command::SetForeground(front) => self.on_set_foreground(now_ms, front),

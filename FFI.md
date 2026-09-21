@@ -192,6 +192,8 @@ RatatoskClient::open(db_path: String, pin: Option<String>, display_name: String)
 | `seeding_mode(chat_id) -> FfiSeeding` | наше участие в раздаче: `Off`, `Quiet`, `Announced` |
 | `set_sharing_level(chat_id: Option<..>, level: Option<FfiSharingLevel>)` | кому отдаём (§12): аккаунт или канал; текст §12 — **до** сужения |
 | `sharing_level(chat_id) -> FfiSharingLevel` | **действующий** уровень канала — с учётом умолчания аккаунта |
+| `set_giving_limits(limits: FfiGivingLimits)` | сколько блоков за минуту отдаём одному и всем (§9.2); лежит на диске |
+| `giving_limits() -> FfiGivingLimits` | нынешние пределы отдачи |
 | `seeding(chat_id) -> bool` | объявлен ли наш адрес в каталоге (короткий вопрос к тому же состоянию) |
 | `channel_seeds(chat_id) -> Vec<FfiChannelSeed>` | кто раздаёт канал (§7.5); протухшие не показываются |
 | `set_transport_enabled(transport: FfiTransport, enabled: bool)` | включить или выключить транспорт (§5.4); выбор хранит ядро |
@@ -1387,6 +1389,8 @@ fn set_seeding(chat_id: Vec<u8>, mode: FfiSeeding) -> Result<(), RatatoskError>
 fn seeding_mode(chat_id: Vec<u8>) -> Result<FfiSeeding, RatatoskError>
 fn set_sharing_level(chat_id: Option<Vec<u8>>, level: Option<FfiSharingLevel>) -> Result<(), RatatoskError>
 fn sharing_level(chat_id: Vec<u8>) -> Result<FfiSharingLevel, RatatoskError>
+fn set_giving_limits(limits: FfiGivingLimits) -> Result<(), RatatoskError>
+fn giving_limits() -> Result<FfiGivingLimits, RatatoskError>
 fn seeding(chat_id: Vec<u8>) -> Result<bool, RatatoskError>
 fn channel_seeds(chat_id: Vec<u8>) -> Result<Vec<FfiChannelSeed>, RatatoskError>
 
@@ -2065,6 +2069,13 @@ FfiMerged { own_graph: bool, added: u64, known: u64, refused: u64 }
 не он. Не путать с `sharing_notice()`: тот про показ **ссылки** (§10.2).
 Клиенту стоит называть «только сверенным» тем, что оно есть, — это
 ближе к «не раздавать», чем к середине.
+
+**Пределы отдачи (`FfiGivingLimits`, §9.2) — не то же, что кнопка.**
+Два числа: сколько блоков за минуту отдаём одному пиру и сколько всем
+вместе. Ноль законен и означает «блоков не отдаём», но выключать
+раздачу нулём не стоит: выключатель гасит ещё и объявление адреса,
+и привязки читателей. Под предел попадает **отдача из архива** —
+догоняющий рой, — а живая лента по дереву идёт мимо него.
 
 **Чего кнопка не делает: не закрывает сессии и не отзывает записи.**
 Объявленная запись живёт до конца срока и просто перестаёт продлеваться

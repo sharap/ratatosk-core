@@ -207,6 +207,65 @@ impl SharingLevelConsequences {
     }
 }
 
+/// Пределы отдачи — те самые «три числа» §9.2, которые наши (§9.2).
+///
+/// Третье число — окно сидирования — живёт не здесь: для канала оно
+/// «не технический параметр», а часть подписанного представления
+/// (§9.3), и ставит его владелец, а не мы. Наши — два: сколько блоков
+/// отдаём **одному** пиру за минуту и сколько **всем вместе**.
+///
+/// Выключатель §9.2 тоже отдельно: это участие в раздаче ([`Seeding`]).
+/// Ноль здесь означает то же самое для блоков, но не гасит объявление
+/// и не отменяет привязок — выключать раздачу надо выключателем,
+/// а не нулём.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GivingLimits {
+    /// Сколько блоков отдаём одному пиру за окно.
+    pub per_peer: u32,
+    /// Сколько блоков отдаём всем вместе за окно.
+    pub total: u32,
+}
+
+impl Default for GivingLimits {
+    fn default() -> GivingLimits {
+        GivingLimits { per_peer: BLOCKS_PER_WINDOW, total: BLOCKS_PER_WINDOW_TOTAL }
+    }
+}
+
+impl GivingLimits {
+    /// Восемь байт для диска: два `u32` старшим байтом вперёд.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[..4].copy_from_slice(&self.per_peer.to_be_bytes());
+        out[4..].copy_from_slice(&self.total.to_be_bytes());
+        out
+    }
+
+    /// Разбор записанного. Не те байты — `None`, и зовущий берёт
+    /// умолчание: настройка из будущей сборки не должна выключать
+    /// раздачу сегодняшней.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<GivingLimits> {
+        let bytes: [u8; 8] = bytes.try_into().ok()?;
+        let per_peer = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        Some(GivingLimits { per_peer, total })
+    }
+
+    /// Сколько ещё можно отдать этому пиру, зная отданное за окно.
+    #[must_use]
+    pub const fn left_for_peer(self, served_to_peer: u32, served_total: u32) -> u32 {
+        let by_peer = self.per_peer.saturating_sub(served_to_peer);
+        let by_total = self.total.saturating_sub(served_total);
+        if by_peer < by_total {
+            by_peer
+        } else {
+            by_total
+        }
+    }
+}
+
 /// Запись каталога пиров (§7.5).
 ///
 /// `PeerRecord{ group_id, ik, addresses[], valid_until, signature }`
@@ -553,6 +612,21 @@ pub const OUTSTANDING_CALLS: usize = 256;
 /// Вдвое больше, чем влезает в один ответ: догоняющий после отлучки
 /// вправе получить свой хвост, а тянущий бесконечно упрётся в предел.
 pub const BLOCKS_PER_WINDOW: u32 = 2 * MAX_WANT_BLOCKS as u32;
+
+/// Сколько блоков отдаём **всем вместе** за окно (§9.2, «общий предел»).
+///
+/// Четвёртое число §9.2 и единственное, которое считает не пира,
+/// а нас самих: предел на пира (`BLOCKS_PER_WINDOW`) защищает
+/// от одного жадного, общий — от десяти вежливых. Сервера нет,
+/// значит ограничителя частоты нет ни у кого, кроме нас самих, —
+/// и это тот случай, когда платит человек: его трафиком, его
+/// батареей, его тарифом.
+///
+/// Восемь полных ответов в минуту: заметно больше, чем нужно каналу
+/// с живой лентой, и заметно меньше, чем выест догоняющий рой
+/// на телефоне. Число — умолчание, а не предел: §9.2 велит держать
+/// его **на диске**, и человек вправе его подвинуть.
+pub const BLOCKS_PER_WINDOW_TOTAL: u32 = 8 * MAX_WANT_BLOCKS as u32;
 
 /// Сколько неответов подряд до остывания (§7.7, «ложное `have`»).
 ///
@@ -1122,6 +1196,31 @@ mod tests {
         assert!(text.contains("не сразу"), "гаснет по сроку, и об этом сказано до нажатия");
         assert!(text.contains("Тихая раздача"), "названа середина, которая адрес не раскрывает");
         assert!(!SeedingConsequences::STOPS_AT_ONCE);
+    }
+
+    #[test]
+    fn the_giving_limits_round_trip_and_the_smaller_one_wins() {
+        // §9.2, «три числа и выключатель, все на диске». Два из них наши,
+        // и на диск они едут восемью байтами: разбор обязан вернуть
+        // ровно то, что записали.
+        let limits = GivingLimits { per_peer: 7, total: 11 };
+        assert_eq!(GivingLimits::from_bytes(&limits.to_bytes()), Some(limits));
+        assert_eq!(GivingLimits::from_bytes(&[0u8; 7]), None, "не те байты — не настройка");
+        assert_eq!(GivingLimits::from_bytes(&[]), None);
+
+        // Предел на пира защищает от одного жадного, общий — от десяти
+        // вежливых, и побеждает **меньший из двух остатков**.
+        assert_eq!(limits.left_for_peer(0, 0), 7, "пока свободно — упираемся в предел на пира");
+        assert_eq!(limits.left_for_peer(0, 9), 2, "общий кончается раньше — он и решает");
+        assert_eq!(limits.left_for_peer(7, 0), 0, "свой предел исчерпан");
+        assert_eq!(limits.left_for_peer(99, 99), 0, "переполнения не бывает");
+
+        // Умолчание — не нули: база без строки не должна выключать
+        // раздачу никому.
+        let default = GivingLimits::default();
+        assert_eq!(default.per_peer, BLOCKS_PER_WINDOW);
+        assert_eq!(default.total, BLOCKS_PER_WINDOW_TOTAL);
+        assert!(default.total > default.per_peer, "общий предел шире, иначе он лишний");
     }
 
     #[test]

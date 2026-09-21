@@ -2145,6 +2145,117 @@ fn a_background_account_lets_its_record_fall_out_by_time() {
 }
 
 #[test]
+fn files_and_reactions_travel_in_a_channel_both_ways() {
+    // Живая находка: «в канале по приглашению файлы и реакции доходят
+    // только от владельца, от подписчиков — нет, хотя обычные сообщения
+    // ходят нормально. В открытых каналах иначе — файлы от владельца
+    // не загружаются».
+    //
+    // Одна причина на оба симптома: слово ходило **деревом**
+    // (`push_block`), а действие о слове — веером по составу
+    // (`fan_out_group`). У держателя права состава нет (§3.2), значит
+    // его веер пуст; у владельца открытого канала состава не существует
+    // вовсе (§6.1), значит пуст и его.
+    let mut stand = Stand::strangers(0x0_F17E5, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+        stand.accept_everything(NodeId(reader));
+    }
+    stand.accept_everything(NodeId(0));
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+
+    // Владелец говорит слово — на него отвечают реакцией и файлом.
+    stand.say(NodeId(0), chat, "о чём речь");
+    stand.settle();
+    let target = stand
+        .sim
+        .node(NodeId(1))
+        .engine()
+        .store()
+        .messages(&chat, 10, None)
+        .expect("история")
+        .into_iter()
+        .find(|m| m.body == "о чём речь".as_bytes())
+        .expect("слово владельца у читателя")
+        .msg_id;
+
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::SetReaction { chat, msg_id: target, emoji: "🔥".to_owned() });
+    });
+    stand.settle();
+    stand.send_file(NodeId(1), chat, "от-читателя.bin", &[7u8; 2048]);
+    stand.settle();
+
+    // Реакция держателя права видна и владельцу, и второму читателю.
+    for who in [NodeId(0), NodeId(2)] {
+        let reactions = stand.sim.node(who).engine().store().reactions(&target).expect("реакции");
+        assert!(
+            reactions.iter().any(|r| r.emoji == "🔥"),
+            "реакция читателя обязана дойти до {who:?}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // И файл его доходит **до владельца**: до него читатель дотянуться
+    // может — адрес владельца он знает из ссылки (§10.1).
+    assert!(
+        stand.received_file(NodeId(0), chat, "от-читателя.bin").is_some(),
+        "файл читателя обязан дойти до владельца; сид {:#x}",
+        stand.sim.seed()
+    );
+    // **А до второго читателя — пока нет, и это честная неполнота.**
+    // Предложение о файле до него доехало: сообщение он видит. Но
+    // за **байтами** идут к тому, кто их предложил (§10.2), а читатели
+    // канала друг друга не знают (§3.2) — адреса у него нет. Лечит это
+    // файловый рой §9.1 («куски расходятся между участниками»), и его
+    // ещё нет. Проверка записана так, чтобы завтра эту дыру не сочли
+    // закрытой.
+    let seen = stand
+        .sim
+        .node(NodeId(2))
+        .engine()
+        .store()
+        .messages(&chat, 50, None)
+        .expect("история")
+        .len();
+    assert!(seen >= 2, "сообщение с вложением до второго читателя доходит; видно {seen}");
+    assert!(
+        stand.received_file(NodeId(2), chat, "от-читателя.bin").is_none(),
+        "байты до второго читателя пока не доезжают — §9.1 не сделан; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_file_in_an_open_channel_reaches_the_subscriber() {
+    // Вторая половина той же находки: в **открытом** канале состава
+    // не существует (§6.1), и веер владельца пуст — файлы от него
+    // не доходили ни до кого.
+    let mut stand = Stand::strangers(0x0_F17E6, 2);
+    let chat = stand.create_channel(NodeId(0), "открытая лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.accept_everything(NodeId(1));
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    stand.send_file(NodeId(0), chat, "от-владельца.bin", &[3u8; 2048]);
+    stand.settle();
+
+    assert!(
+        stand.received_file(NodeId(1), chat, "от-владельца.bin").is_some(),
+        "файл владельца обязан дойти до подписчика по ссылке; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_channel_avatar_reaches_the_readers() {
     // Живая находка: «аватарку канала поставить можно, а у подписчиков
     // она не показывается — при том что имя и его смену они видят».

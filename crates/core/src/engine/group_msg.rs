@@ -554,10 +554,7 @@ impl<S: Store> Engine<S> {
         // ключи чтения и записи каталога едут веером. Документ редок
         // и важен, и лишний круг `IHAVE` → `GRAFT` стоил бы читателю
         // отложенного впуска ради экономии одного кадра.
-        if self.groups[&chat].profile.everyone_writes() {
-            return self.fan_out_group(now_ms, chat, msg_id, &bytes);
-        }
-        self.push_block(now_ms, chat, None, msg_id, &bytes)
+        self.spread_in_chat(now_ms, chat, msg_id, &bytes)
     }
 
     /// Молчалива ли доставка такого кадра (см. [`Delivery::silent`]).
@@ -891,6 +888,47 @@ impl<S: Store> Engine<S> {
     ///
     /// Одно место на сообщение и на действие. Разведи их по двум циклам,
     /// и однажды одно из них стало бы обходить состав иначе.
+    /// Разносит **слово или действие о слове** — в группе веером,
+    /// в канале деревом (§11.3, §7.1).
+    ///
+    /// # Зачем одно место на оба вида чата
+    ///
+    /// В группе состав знает каждый, и копию шлёт каждый сам (§11.3).
+    /// В канале состав знает **владелец** (§3.2), а держатель права
+    /// писать (§6.2) не знает никого: его веер пуст, и всё, что он
+    /// скажет, останется у него.
+    ///
+    /// Пока слова расходились одной дорогой (деревом), а действия
+    /// о словах — другой (веером), выходило ровно то, что описал живой
+    /// прогон: «обычные сообщения ходят нормально, а файлы и реакции
+    /// от подписчиков не доходят». И в открытом канале — то же самое
+    /// с другого конца: веер владельца пуст, потому что состава
+    /// не существует (§6.1), и до подписчиков не доходили **его** файлы
+    /// и реакции.
+    ///
+    /// # Документы каналов сюда не идут
+    ///
+    /// Представление, ключ чтения, запись о впуске и запись каталога
+    /// едут веером владельца и адресатами: они его и ничьи больше,
+    /// и дерево им не нужно (§7.1: «пересылаются слова, а не
+    /// документы»).
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки копии.
+    pub(super) fn spread_in_chat(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        bytes: &[u8],
+    ) -> Result<Vec<Effect>, EngineError> {
+        if self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes()) {
+            return self.push_block(now_ms, chat, None, msg_id, bytes);
+        }
+        self.fan_out_group(now_ms, chat, msg_id, bytes)
+    }
+
     pub(super) fn fan_out_group(
         &mut self,
         now_ms: u64,
@@ -965,7 +1003,7 @@ impl<S: Store> Engine<S> {
         if self.store.edit_message(&msg_id, trimmed.as_bytes(), now_ms)? {
             effects.push(Effect::Notify(Event::MessageEdited { chat, msg_id }));
         }
-        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        effects.extend(self.spread_in_chat(now_ms, chat, frame_id, &bytes)?);
         Ok(effects)
     }
 
@@ -989,7 +1027,7 @@ impl<S: Store> Engine<S> {
         }
         let action = ratatosk_proto::group_action::Action::Retract { targets: ours };
         let (frame_id, _, bytes) = self.seal_group_action(now_ms, chat, &action)?;
-        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        effects.extend(self.spread_in_chat(now_ms, chat, frame_id, &bytes)?);
         Ok(effects)
     }
 
@@ -1024,7 +1062,7 @@ impl<S: Store> Engine<S> {
         })?;
         let mut effects =
             vec![Effect::Notify(Event::ReactionChanged { chat, msg_id, author_ik: own_ik })];
-        effects.extend(self.fan_out_group(now_ms, chat, frame_id, &bytes)?);
+        effects.extend(self.spread_in_chat(now_ms, chat, frame_id, &bytes)?);
         Ok(effects)
     }
 
@@ -1070,7 +1108,7 @@ impl<S: Store> Engine<S> {
             forwarded: false,
             reply_to: Some(reply_to),
         })?;
-        self.fan_out_group(now_ms, chat, msg_id, &bytes)
+        self.spread_in_chat(now_ms, chat, msg_id, &bytes)
     }
 
     /// Открывает групповой кадр: подпись, ключ отправителя, тело.
@@ -1497,13 +1535,41 @@ impl<S: Store> Engine<S> {
         };
         match ratatosk_proto::group_action::from_payload(&value) {
             Ok(action) => {
-                let effects = self.apply_group_action(now_ms, chat, sender, envelope, &action)?;
+                let mut effects =
+                    self.apply_group_action(now_ms, chat, sender, envelope, &action)?;
                 // **Принятое действие — тоже позиция цепочки** (§7.3),
                 // и в архиве ей место наравне со словом: спросивший
                 // историю обязан получить подряд всё, что было.
+                //
+                // **И едет оно дальше — как слово** (§7.1, шаг 2), если
+                // это действие **о слове**: реакция, правка, отзыв,
+                // ответ, файл. Пока этого не было, действие доходило
+                // ровно до одного соседа: сказавший не знает состава
+                // (§3.2), а тот, кто знает, дальше его не нёс. Снаружи —
+                // «сообщения ходят, а реакции и файлы от подписчиков
+                // не доходят».
+                //
+                // Документы канала — представление, ключ чтения, запись
+                // о впуске, запись каталога — так не ездят: их развозит
+                // владелец сам, и курьер им не нужен.
                 if self.groups.get(&chat).is_some_and(|s| !s.profile.everyone_writes()) {
                     let bytes = envelope.encode()?;
-                    self.archive_channel_frame(now_ms, chat, envelope.msg_id, &bytes)?;
+                    let about_a_word = matches!(
+                        action.gate(),
+                        ratatosk_proto::group_action::Gate::Right(right)
+                            if right == channel::Rights::WRITE
+                    );
+                    if about_a_word {
+                        effects.extend(self.push_block(
+                            now_ms,
+                            chat,
+                            Some(peer_ik),
+                            envelope.msg_id,
+                            &bytes,
+                        )?);
+                    } else {
+                        self.archive_channel_frame(now_ms, chat, envelope.msg_id, &bytes)?;
+                    }
                 }
                 Ok(effects)
             }

@@ -449,7 +449,7 @@ impl<S: Store> Engine<S> {
             reply_to: None,
         })?;
         self.store.put_contact_share(&StoredContactShare { msg_id, ik: peer_ik, card_bytes })?;
-        self.fan_out_group(now_ms, chat, msg_id, &bytes)
+        self.spread_in_chat(now_ms, chat, msg_id, &bytes)
     }
 
     /// Адреса устройства изменились — сказать об этом контактам (§4.3).

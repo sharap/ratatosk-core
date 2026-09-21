@@ -649,7 +649,7 @@ impl<S: Store> Engine<S> {
     /// # Errors
     ///
     /// Отказ хранилища на чтении состояния раздачи.
-    fn may_serve(&self, chat: ChatId, peer_ik: &[u8; 32]) -> Result<bool, EngineError> {
+    pub(super) fn may_serve(&self, chat: ChatId, peer_ik: &[u8; 32]) -> Result<bool, EngineError> {
         // **Фоновый аккаунт не раздаёт** (§12). «Активен ровно один
         // аккаунт… его сидирование прекращается»: второй аккаунт,
         // открытый на том же устройстве, отдаёт блоки тем же радио
@@ -1060,14 +1060,6 @@ impl<S: Store> Engine<S> {
         }
 
         let (eager, lazy) = self.split_tree(now_ms, chat, from.is_none())?;
-        eprintln!(
-            "PROBE push me={:02x}{:02x} own={} eager={} lazy={}",
-            self.identity.public().ik[0],
-            self.identity.public().ik[1],
-            from.is_none(),
-            eager.len(),
-            lazy.len()
-        ); //PROBE
         let mut effects = Vec::new();
         for peer in eager {
             if from == Some(peer) {

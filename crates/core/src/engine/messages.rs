@@ -706,7 +706,7 @@ impl<S: Store> Engine<S> {
                 let ik = ContactCard::decode(&card_bytes)?.value().ik;
                 self.store.put_contact_share(&StoredContactShare { msg_id, ik, card_bytes })?;
             }
-            effects.extend(self.fan_out_group(now_ms, chat, msg_id, &bytes)?);
+            effects.extend(self.spread_in_chat(now_ms, chat, msg_id, &bytes)?);
         }
         Ok(effects)
     }

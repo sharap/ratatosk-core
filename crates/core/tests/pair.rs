@@ -8459,10 +8459,19 @@ fn an_open_channel_does_not_get_requests_at_all() {
             ratatosk_codec::Envelope::decode(&row.envelope).expect("конверт").value().payload_type
         })
         .collect();
+    // Порядок в очереди — дело §5.4, а не подписки: сравнивается
+    // **набор**. Важно здесь другое: заявки (`ChannelRequest`) в нём нет.
+    let mut kinds = kinds;
+    kinds.sort_by_key(|kind| kind.code());
+    let mut expected = vec![
+        ratatosk_codec::PayloadType::ChannelIntroWanted,
+        ratatosk_codec::PayloadType::SwarmAttach,
+        ratatosk_codec::PayloadType::SwarmControl,
+    ];
+    expected.sort_by_key(|kind| kind.code());
     assert_eq!(
-        kinds,
-        vec![ratatosk_codec::PayloadType::ChannelIntroWanted],
-        "подписка на открытый канал просит представление — и только его"
+        kinds, expected,
+        "подписка на открытый канал просит представление и называется читателем"
     );
     pump(&mut bob, &mut alice, 5_000, effects);
     assert!(

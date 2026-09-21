@@ -2145,6 +2145,56 @@ fn a_background_account_lets_its_record_fall_out_by_time() {
 }
 
 #[test]
+fn a_channel_avatar_reaches_the_readers() {
+    // Живая находка: «аватарку канала поставить можно, а у подписчиков
+    // она не показывается — при том что имя и его смену они видят».
+    //
+    // Имя едет представлением (§6.1), картинка — отдельным действием
+    // (§11.2), и разница в путях: значит сторожить надо картинку,
+    // а не «документ доехал».
+    let mut stand = Stand::strangers(0x0_A7A2, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+
+    let picture = {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.resize(24 * 1024, 7);
+        bytes
+    };
+    let sent = picture.clone();
+    stand.sim.act(NodeId(0), |node, ctx| {
+        node.command(ctx, Command::SetGroupAvatar { chat, bytes: sent.clone() });
+    });
+    stand.settle();
+
+    // **И тот, кого впустили уже после**, картинку тоже получает:
+    // человек, пришедший в канал завтра, видит его таким же, как все.
+    stand.subscribe(NodeId(2), &link);
+    stand.admit(NodeId(0), chat, NodeId(2));
+    stand.settle();
+
+    for reader in 1..3u16 {
+        let got = stand
+            .sim
+            .node(NodeId(reader))
+            .engine()
+            .store()
+            .group_avatar(&chat)
+            .expect("чтение")
+            .map(|it| it.bytes);
+        assert_eq!(
+            got.as_deref(),
+            Some(picture.as_slice()),
+            "картинка канала обязана доехать до читателя {reader}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn a_reader_with_the_write_right_speaks_and_everyone_hears_him() {
     // §6.2 даёт право писать не одному владельцу — и до этой поставки
     // право было, а дороги не было: состав канала знает владелец (§3.2),

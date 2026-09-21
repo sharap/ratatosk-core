@@ -510,13 +510,32 @@ impl<S: Store> Engine<S> {
             .map(|seed| seed.ik)
             .filter(|ik| *ik != me)
             .collect();
+        // **Владелец — кандидат наравне с сидами, и для открытого канала
+        // он единственный.** §7.5.2 обещает звезду как рабочее состояние:
+        // «ноль сидов — это звезда». У канала по приглашению веер
+        // владельца идёт по составу и без привязки, а у открытого состава
+        // не существует (§6.1) — и пока мы не сказали владельцу «шли мне
+        // блоки», он не знает, кому их слать. Отсюда и была тишина:
+        // подписка по открытой ссылке не приносила ни слова.
+        //
+        // В конец списка: сиды затем и объявляются, чтобы снять нагрузку
+        // с владельца, и звать его первым значило бы не пользоваться ими.
+        if let Some(owner) = self.channel_owner(chat).filter(|owner| *owner != me) {
+            if !candidates.contains(&owner) {
+                candidates.push(owner);
+            }
+        }
+        let owner = self.channel_owner(chat);
         candidates.sort_by_key(|ik| {
             let budget = self.swarm_budget.get(ik);
             let cooling = u8::from(self.cooling(now_ms, ik));
+            // Владелец — последний из годных: сиды затем и есть, чтобы
+            // снять с него нагрузку (§7.5.2).
+            let is_owner = u8::from(owner == Some(*ik));
             // По убыванию «недавности»: чем позже ответил, тем раньше
             // в списке. Ключ добавлен третьим, чтобы порядок оставался
             // воспроизводимым по сиду (§16).
-            (cooling, std::cmp::Reverse(budget.map_or(0, |b| b.answered_ms)), *ik)
+            (cooling, is_owner, std::cmp::Reverse(budget.map_or(0, |b| b.answered_ms)), *ik)
         });
         let seeds: Vec<[u8; 32]> = candidates.into_iter().take(MAX_ATTACHED_SEEDS).collect();
         let mut effects = Vec::new();
@@ -728,11 +747,20 @@ impl<S: Store> Engine<S> {
     fn push_candidates(&self, chat: ChatId) -> Result<Vec<[u8; 32]>, EngineError> {
         let me = self.identity.public().ik;
         if self.channel_owner(chat).is_some_and(|owner| owner == me) {
-            return Ok(self
-                .groups
-                .get(&chat)
-                .map(|state| state.group.recipients(&me))
-                .unwrap_or_default());
+            // **Состав и привязавшиеся, а не одно только состав.**
+            // У открытого канала состава не существует (§6.1), и пока
+            // здесь был один `recipients`, слово владельца не уходило
+            // никуда: подписчик по ссылке владельцу неизвестен. Привязка
+            // (§7.5.1) — то, чем он о себе говорит, и для открытого
+            // канала она единственный список получателей.
+            let mut targets =
+                self.groups.get(&chat).map(|state| state.group.recipients(&me)).unwrap_or_default();
+            for peer in self.attached.get(&chat).into_iter().flatten() {
+                if !targets.contains(peer) {
+                    targets.push(*peer);
+                }
+            }
+            return Ok(targets);
         }
         // **Право спрашивается здесь, а не только при привязке** (§8.3).
         // Привязка живёт в памяти, а раздачу человек выключает когда

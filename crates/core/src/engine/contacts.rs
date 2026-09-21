@@ -746,18 +746,36 @@ impl<S: Store> Engine<S> {
         envelope: &Envelope,
     ) -> Result<Vec<Effect>, EngineError> {
         let Some(peer) = self.peers.get(&peer_ik) else { return Ok(Vec::new()) };
-        // Карточки нет — сверять новую не с чем: §4.3 разрешает замену
-        // только по возросшей версии, а «версии не знаем» означало бы,
-        // что подсунуть можно любую. Владелец канала из ссылки (§10.1)
-        // остаётся с адресами из неё до первого рукопожатия.
-        let Ok(known) = ContactCard::decode(&peer.card) else { return Ok(Vec::new()) };
-        let known = known.into_parts().1;
-        let card = match ratatosk_proto::card_update::accept(&envelope.payload, &peer_ik, &known) {
-            Ok(card) => card,
-            Err(ratatosk_proto::card_update::UpdateError::Stale) => return Ok(Vec::new()),
-            Err(_) => {
-                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
-                return Ok(Vec::new());
+        // **Карточки может не быть вовсе, и это не порча.** Владелец
+        // канала, узнанный из ссылки (§10.1), лежит пиром с одними
+        // адресами: карточку его мы не видели никогда. Пока здесь стояло
+        // «нет прежней — уходим», она не появлялась и потом: приехавшую
+        // сверять было не с чем, и её молча бросали. Снаружи это
+        // выглядело так, как описал живой прогон: «подписался
+        // по открытой ссылке — представление не пришло». Проверить
+        // подпись владельца было нечем, и всякий его блок откладывался
+        // навсегда.
+        //
+        // Первая карточка принимается **на силе сессии** — довод целиком
+        // в `card_update::accept_first`.
+        let card = if peer.card.is_empty() {
+            match ratatosk_proto::card_update::accept_first(&envelope.payload, &peer_ik) {
+                Ok(card) => card,
+                Err(_) => {
+                    self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+            }
+        } else {
+            let Ok(known) = ContactCard::decode(&peer.card) else { return Ok(Vec::new()) };
+            let known = known.into_parts().1;
+            match ratatosk_proto::card_update::accept(&envelope.payload, &peer_ik, &known) {
+                Ok(card) => card,
+                Err(ratatosk_proto::card_update::UpdateError::Stale) => return Ok(Vec::new()),
+                Err(_) => {
+                    self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
             }
         };
         let bytes = card.encode()?;

@@ -885,6 +885,9 @@ impl<S: Store> Engine<S> {
             // в канале заявитель ещё никто: ни состава, ни цепочки у него
             // там нет.
             PayloadType::ChannelRequest => self.on_channel_request(now_ms, via, peer_ik, &envelope),
+            PayloadType::ChannelIntroWanted => {
+                self.on_channel_intro_wanted(now_ms, via, peer_ik, &envelope)
+            }
             PayloadType::SwarmPeer => self.on_seed_record(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmAttach => self.on_swarm_attach(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmControl => self.on_swarm_control(now_ms, via, peer_ik, &envelope),
@@ -954,7 +957,19 @@ impl<S: Store> Engine<S> {
                 effects.extend(self.drain_pending_group(now_ms)?);
                 Ok(effects)
             }
-            PayloadType::CardUpdate => self.on_card_update(now_ms, via, peer_ik, &envelope),
+            PayloadType::CardUpdate => {
+                let mut effects = self.on_card_update(now_ms, via, peer_ik, &envelope)?;
+                // **Карточка тоже открывает дорогу отложенному.** Блок
+                // проверяется подписью автора, а проверить её нечем,
+                // пока карточки нет; такой блок откладывается (§9.2
+                // разрешает перестановку). Пока здесь не было разбора,
+                // он лежал до следующего группового кадра — а у канала
+                // по ссылке следующего может не быть вовсе: владелец
+                // отвечает документом **один раз**. Снаружи это
+                // выглядело как «подписался, а представление не пришло».
+                effects.extend(self.drain_pending_group(now_ms)?);
+                Ok(effects)
+            }
             // Компаньон (§13.4) едет по тем же кадрам и той же сессии,
             // но обслуживает его не эта ветка: у него своя сторона провода
             // и свой разбор. Пришедший **от контакта** такой кадр —

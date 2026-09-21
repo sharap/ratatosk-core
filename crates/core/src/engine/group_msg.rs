@@ -464,7 +464,7 @@ impl<S: Store> Engine<S> {
         )?;
 
         let sealed = ratatosk_crypto::group::seal_message(
-            &message_key,
+            &self.content_key(chat, &message_key, false)?,
             &chat,
             &me,
             counter,
@@ -649,6 +649,64 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
 
+    /// Ключ, которым запечатывается содержимое этого чата.
+    ///
+    /// # В канале это ключ чтения, а не ключ позиции цепочки
+    ///
+    /// §10.4 про открытый канал говорит прямо: «`AK` совпадает с ключом
+    /// из ссылки и не поворачивается никогда», а §6.1 кладёт этот ключ
+    /// **в саму ссылку**. Значит открыть слово канала обязан всякий,
+    /// у кого ключ чтения есть, — и никто другой (§7.6: «вытянуть
+    /// шифротекст вправе любой, прочесть — нет»).
+    ///
+    /// Цепочка отправителя (§11.1) для этого не годится и не годилась
+    /// никогда: её ключ одноразовый и выдаётся участникам поимённо.
+    /// Пока слова канала запечатывались ею, открытый канал не работал
+    /// вовсе — подписчик по ссылке не мог прочесть ни слова, — а архив
+    /// (§7.2) было бессмысленно хранить: пришедший позже не открыл бы
+    /// его ничем. Поймано живым прогоном: «подписка проходит,
+    /// а представление не приходит».
+    ///
+    /// # Что остаётся от цепочки
+    ///
+    /// **Номер.** §7.3 держится на непрерывности `seq` у автора, и его
+    /// по-прежнему выдаёт цепочка — просто ключ её больше не нужен.
+    /// Заводить второй счётчик значило бы завести второе место, где
+    /// нумерация однажды разойдётся.
+    ///
+    /// # Чем защищено авторство, раз ключ общий
+    ///
+    /// Подписью автора над блоком (§11.1) и правом на запись (§6.2).
+    /// Ключом чтения запечатать чужое слово может всякий читатель —
+    /// но подписать его чужим именем не может никто, а неподписанное
+    /// ядро не принимает.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NoReadKeyYet`] — канал есть, а ключа чтения нет:
+    /// так выглядит подписка по приглашению до впуска.
+    fn content_key(
+        &self,
+        chat: ChatId,
+        from_chain: &ratatosk_crypto::kdf::Key32,
+        carries_the_key: bool,
+    ) -> Result<ratatosk_crypto::kdf::Key32, EngineError> {
+        if self.groups.get(&chat).is_none_or(|state| state.profile.everyone_writes()) {
+            return Ok(from_chain.clone());
+        }
+        // **Выдача ключа чтения едет цепочкой, а не ключом чтения.**
+        // Иначе ключ был бы заперт сам в себе: впущенный не открыл бы
+        // блок, которым ему этот ключ и выдают. Цепочка у него к этому
+        // времени есть — её отдаёт вступление (§11.5).
+        if carries_the_key {
+            return Ok(from_chain.clone());
+        }
+        // Поколение берётся **новейшее**: §6.4 велит писать новым,
+        // а прежние держать ради архива.
+        let key = self.store.archive_keys(&chat)?.pop().ok_or(EngineError::NoReadKeyYet)?;
+        Ok(ratatosk_crypto::kdf::Key32::new(key.key))
+    }
+
     /// Собирает кадр группового действия.
     ///
     /// Продвигает цепочку отправителя, запечатывает действие её ключом,
@@ -736,8 +794,15 @@ impl<S: Store> Engine<S> {
         // `seal_action`, а не `seal_message`: тип нагрузки лежит в конверте,
         // а конверт подписью не покрыт, и разделитель в AAD не даёт выдать
         // действие за сообщение подменой одного числа по дороге.
-        let sealed =
-            ratatosk_crypto::group::seal_action(&message_key, &chat, &me, counter, &plain)?;
+        let carries_the_key =
+            matches!(action, ratatosk_proto::group_action::Action::ArchiveKey { .. });
+        let sealed = ratatosk_crypto::group::seal_action(
+            &self.content_key(chat, &message_key, carries_the_key)?,
+            &chat,
+            &me,
+            counter,
+            &plain,
+        )?;
         // Номер и метка — до блока, как и у сообщения: с фазы 2 они входят
         // в подпись (§4.1). Действие в группе подписывается тем же блоком,
         // что и текст, и правило у них одно.
@@ -1120,6 +1185,13 @@ impl<S: Store> Engine<S> {
             }
         }
 
+        // **В канале ключ содержимого — ключ чтения, а не цепочка**
+        // (§6.1, §10.4; см. `content_key`). Поэтому и цепочка отправителя
+        // здесь не спрашивается: у подписчика по ссылке её нет и быть
+        // не может — владелец о нём не знает (§10.4).
+        if self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes()) {
+            return self.open_channel_frame(now_ms, peer_ik, envelope, chat, sender, counter);
+        }
         let Some(stored) = self.store.sender_chain(&chat, &sender)? else {
             // Ключа отправителя ещё нет: он едет отдельным кадром (§11.5).
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
@@ -1193,6 +1265,85 @@ impl<S: Store> Engine<S> {
             },
         )?;
         Ok(Some((chat, sender, body)))
+    }
+
+    /// Распечатывает кадр **канала** ключом чтения (§6.1, §10.4, §7.6).
+    ///
+    /// # Поколения перебираются, а не называются в кадре
+    ///
+    /// §6.4: «поколения сосуществуют: прежние нужны для архива, новое —
+    /// для будущего». Их единицы, и перебор от новейшего к старому стоит
+    /// нескольких проверок тега — дешевле, чем поле в подписанном блоке,
+    /// которому пришлось бы верить до расшифровки.
+    ///
+    /// # Не открылось — откладываем, а не считаем аномалией
+    ///
+    /// Слово вправе обогнать выдачу ключа: впуск (§10.4) и поворот
+    /// (§6.4) едут отдельными блоками, и порядок §9.2 не обещан. Тот же
+    /// довод, что у группы с неприехавшей цепочкой, и та же цена
+    /// ошибки: посчитай мы это порчей, сказанное пропало бы навсегда.
+    ///
+    /// Счётчик аномалий здесь молчит нарочно: кадр вернётся сюда при
+    /// каждом разборе отложенного, и считай мы каждую попытку, один
+    /// неоткрываемый кадр надул бы счёт §7.3 без предела.
+    fn open_channel_frame(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+        chat: ChatId,
+        sender: ActorId,
+        counter: u64,
+    ) -> Result<Option<(ChatId, ActorId, zeroize::Zeroizing<Vec<u8>>)>, EngineError> {
+        let Ok(unchecked) = group::parse_message(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(None);
+        };
+        let sealed = unchecked.claims_sealed().to_vec();
+        let open_with = |key: &ratatosk_crypto::kdf::Key32| match envelope.payload_type {
+            PayloadType::GroupMessage => {
+                ratatosk_crypto::group::open_message(key, &chat, &sender, counter, &sealed).ok()
+            }
+            PayloadType::GroupAction => {
+                ratatosk_crypto::group::open_action(key, &chat, &sender, counter, &sealed).ok()
+            }
+            // Сюда зовут только эти два типа. Третий — ошибка ядра.
+            _ => None,
+        };
+        for key in self.store.archive_keys(&chat)?.into_iter().rev() {
+            if let Some(body) = open_with(&ratatosk_crypto::kdf::Key32::new(key.key)) {
+                return Ok(Some((chat, sender, body)));
+            }
+        }
+        // **Не открылось ключом чтения — пробуем цепочку.** Ею едет ровно
+        // один вид блока: выдача самого ключа чтения (§6.4), которую
+        // ключом чтения запечатать нельзя — она оказалась бы заперта
+        // сама в себе. Разбирать вид до расшифровки нечем, поэтому
+        // пробуется ключ, а не читается признак: видов два, и перебор
+        // стоит одной проверки тега.
+        if let Some(stored) = self.store.sender_chain(&chat, &sender)? {
+            let mut inbox = Self::inbox_of(&stored);
+            if let Ok(key) = inbox.peek(counter) {
+                if let Some(body) = open_with(&key) {
+                    inbox.commit(counter, now_ms)?;
+                    let (chain, next) = inbox.position();
+                    self.store.put_sender_chain(
+                        &chat,
+                        &StoredSenderChain {
+                            member_ik: sender,
+                            chain: *chain,
+                            counter: next,
+                            chain_wall: stored.chain_wall,
+                            chain_logical: stored.chain_logical,
+                            skipped: inbox.export().to_vec(),
+                        },
+                    )?;
+                    return Ok(Some((chat, sender, body)));
+                }
+            }
+        }
+        self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+        Ok(None)
     }
 
     /// Принимает сообщение в группе (§11.1).

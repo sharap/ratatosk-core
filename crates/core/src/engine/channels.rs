@@ -439,7 +439,29 @@ impl<S: Store> Engine<S> {
         // — присылает ключ», и впуск и есть ответ. Пока его нет, подписка
         // числится заявкой, и человек видит ожидание (§10.5).
         let mut effects = vec![Effect::Notify(Event::ChannelSubscribed { chat, awaiting: !open })];
-        if !open {
+        if open {
+            // **§10.3, шаг 2: достать представление по адресам.** У
+            // открытого канала это единственный путь к документу:
+            // состава не существует (§6.1), веер владельца до подписчика
+            // не доходит, и без документа канал остаётся без названия,
+            // без породы, без прав и без окна сидирования — ровно то,
+            // что живой прогон описал как «подписка проходит,
+            // а представление не приходит».
+            //
+            // Цена названа заранее (§10.3, §15,
+            // `channel::PreviewConsequences`): владелец увидит, что
+            // кто-то интересуется каналом. Для открытого канала это
+            // не нарушает §10.4 («не участвует и не узнаёт»): он узнаёт
+            // не состав, а то, что кто-то спросил документ, — и отличить
+            // спросившего от прохожего не может (§7.6).
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                invitation.owner,
+                PayloadType::ChannelIntroWanted,
+                channel::request_value(&chat),
+            )?;
+            effects.extend(sent);
+        } else {
             let (_, sent) = self.enqueue_request(
                 now_ms,
                 invitation.owner,
@@ -472,6 +494,102 @@ impl<S: Store> Engine<S> {
     /// ещё не ответили. Время в строке остаётся временем первой:
     /// §10.5 меряет ожидание от неё, и обновляй мы его, ожидание
     /// начиналось бы заново при каждом повторе.
+    /// Пришла просьба показать представление (фаза 2, §10.3, шаг 2).
+    ///
+    /// # Отвечаем только по открытому каналу
+    ///
+    /// У открытого ключ чтения лежит в ссылке (§6.1), значит документ
+    /// спросивший всё равно прочтёт — и §7.6 говорит то же самое про
+    /// любой блок канала: «вытянуть вправе любой». Отказывать здесь
+    /// значило бы держать закрытой дверь, ключ от которой роздан.
+    ///
+    /// У канала **по приглашению** ответа нет: там путь другой — заявка
+    /// §10.4 и впуск, и документ едет впуском. Молчим, а не отказываем:
+    /// «такого канала у меня нет» и «есть, но не покажу» для чужого
+    /// выглядят одинаково, и второе рассказало бы больше первого.
+    ///
+    /// # Что едет в ответ
+    ///
+    /// Представление — тем же действием, каким едут новые версии, чтобы
+    /// приём был один на все случаи. И записи каталога (§7.5): без них
+    /// подписчику не к кому привязаться, а §7.4 ставит их первым шагом
+    /// вытягивания — «чтобы было у кого спрашивать».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки блока.
+    pub(super) fn on_channel_intro_wanted(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Квитанция — до разбора, как у заявки: кадр едет очередью §5.4,
+        // и без подтверждения она объявит неудачу.
+        let mut effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+
+        let Ok(chat) = channel::request_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        let me = self.identity.public().ik;
+        let Some(state) = self.groups.get(&chat) else { return Ok(effects) };
+        if state.profile.everyone_writes() || state.group.owner != me {
+            return Ok(effects);
+        }
+        let Some(stored) = self.store.channel(&chat)? else { return Ok(effects) };
+        if channel::Kind::from_code(u64::from(stored.kind)) != Some(channel::Kind::Open) {
+            return Ok(effects);
+        }
+
+        // **Сперва карточка, потом документ.** Подписчик по ссылке знает
+        // о нас один `IK` (§10.1): проверить нашу подпись ему нечем,
+        // и всякий наш блок он отложит навсегда — ровно это живой прогон
+        // и показал как «представление не приходит». У канала
+        // по приглашению карточку отдаёт вступление (§11.5); у открытого
+        // вступления нет, значит отдаём здесь.
+        //
+        // Не `push_own_card`: тот шлёт **контактам** и только объявленное
+        // обновление, а читатель канала контактом нам не станет (§8.3,
+        // §3.2). Довод тот же, а путь свой.
+        let bytes = self.own_card().encode()?;
+        let signature = self.identity.sign(&bytes);
+        let (_, sent) = self.enqueue_request(
+            now_ms,
+            peer_ik,
+            PayloadType::CardUpdate,
+            ratatosk_proto::card_update::payload(&bytes, &signature),
+        )?;
+        effects.extend(sent);
+
+        let document = ratatosk_proto::group_action::Action::Representation {
+            bytes: ratatosk_codec::canonical::encode(&channel::wire_value(
+                stored.block_bytes,
+                &stored.signature,
+            ))?,
+        };
+        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &document)?;
+        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+
+        // И каталог — тем же, чем он едет впущенному (§7.4, шаг 1).
+        for seed in self.store.seeds(&chat)? {
+            if seed.valid_until_ms <= now_ms || seed.ik == peer_ik {
+                continue;
+            }
+            let record = ratatosk_proto::group_action::Action::SeedRecord {
+                bytes: ratatosk_codec::canonical::encode(&ratatosk_proto::swarm::wire_value(
+                    seed.record_bytes.clone(),
+                    &seed.signature,
+                ))?,
+            };
+            let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &record)?;
+            effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+        }
+        Ok(effects)
+    }
+
     pub(super) fn on_channel_request(
         &mut self,
         now_ms: u64,

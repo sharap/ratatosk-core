@@ -110,6 +110,46 @@ pub fn payload(card_bytes: &[u8], signature: &[u8; 64]) -> Value {
     ])
 }
 
+/// Принимает **первую** карточку от того, чья сессия уже установлена.
+///
+/// # Чем это отличается от [`accept`]
+///
+/// У [`accept`] есть якорь — карточка, известная до сих пор: ею
+/// проверяется подпись, и новой верят ровно настолько, насколько верили
+/// прежней. Здесь якоря нет, и взять его неоткуда: владелец канала,
+/// узнанный из ссылки (§10.1), приходит одним лишь `IK`.
+///
+/// Якорем становится **сессия**. Рукопожатие (§8.2) доказало, что
+/// собеседник владеет этим `IK`; карточка связывает `IK` с `SK` своей
+/// подписью, и проверяется она приехавшим `SK` — то есть подтверждает
+/// лишь внутреннюю связность. Столько же веры ей и есть: §10.2 говорит,
+/// что адрес из ссылки ничем не подтверждён, а личность устанавливает
+/// рукопожатие. Ровно на этих условиях заводится и незнакомец (§8.3).
+///
+/// # Errors
+///
+/// [`UpdateError::Malformed`] — карта не той формы, подпись не сошлась
+/// с приехавшим `SK`; [`UpdateError::NotFromOwner`] — карточка не про
+/// того, чья это сессия.
+pub fn accept_first(value: &Value, peer_ik: &[u8; 32]) -> Result<ContactCard, UpdateError> {
+    let map = canonical::as_map(value).map_err(|_| UpdateError::Malformed)?;
+    let Ok(Value::Bytes(card_bytes)) = canonical::require(map, KEY_CARD) else {
+        return Err(UpdateError::Malformed);
+    };
+    let Ok(Value::Bytes(signature)) = canonical::require(map, KEY_SIGNATURE) else {
+        return Err(UpdateError::Malformed);
+    };
+    let signature: [u8; 64] =
+        signature.as_slice().try_into().map_err(|_| UpdateError::Malformed)?;
+    let card = ContactCard::decode(card_bytes).map_err(|_| UpdateError::Malformed)?.into_parts().1;
+    if card.ik != *peer_ik {
+        return Err(UpdateError::NotFromOwner);
+    }
+    let who = PublicIdentity::from_bytes(card.ik, card.sk).map_err(|_| UpdateError::Malformed)?;
+    who.verify(card_bytes, &signature).map_err(|_| UpdateError::Malformed)?;
+    Ok(card)
+}
+
 /// Разбирает и проверяет обновление, возвращая новую карточку.
 ///
 /// `peer_ik` — чья это сессия, `known` — карточка, известная до сих пор.

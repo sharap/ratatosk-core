@@ -843,7 +843,7 @@ impl<S: Store> Engine<S> {
     /// те, кто привязался к нам сам (§7.5.1). Третьего источника нет:
     /// читатель, к которому мы не подключены и который не подключился
     /// к нам, для нас не существует.
-    fn push_candidates(&self, chat: ChatId) -> Result<Vec<[u8; 32]>, EngineError> {
+    fn push_candidates(&self, chat: ChatId, own: bool) -> Result<Vec<[u8; 32]>, EngineError> {
         let me = self.identity.public().ik;
         if self.channel_owner(chat).is_some_and(|owner| owner == me) {
             // **Состав и привязавшиеся, а не одно только состав.**
@@ -870,6 +870,29 @@ impl<S: Store> Engine<S> {
         for peer in self.attached.get(&chat).into_iter().flatten() {
             if self.may_serve(chat, peer)? {
                 candidates.push(*peer);
+            }
+        }
+        // **Своё слово едет ещё и вверх по течению** — владельцу и нашим
+        // сидам (§7.5.1, §7.5.2). Состав канала знает владелец (§3.2),
+        // и у того, кому дали право писать (§6.2), списка читателей нет
+        // и быть не может: единственная его дорога — отдать слово тому,
+        // у кого список есть.
+        //
+        // **Только своё.** Чужой блок пришёл к нам **от** кого-то
+        // из них, и возвращать его туда же значит слать дубль, который
+        // подрежет ребро (§7.1, шаг 3) и развалит дерево. Замер поймал
+        // это сразу: у владельца переставала работать экономия.
+        if !own {
+            return Ok(candidates);
+        }
+        if let Some(owner) = self.channel_owner(chat).filter(|owner| *owner != me) {
+            if !candidates.contains(&owner) {
+                candidates.push(owner);
+            }
+        }
+        for seed in self.dialed.get(&chat).into_iter().flatten() {
+            if !candidates.contains(seed) {
+                candidates.push(*seed);
             }
         }
         Ok(candidates)
@@ -909,8 +932,9 @@ impl<S: Store> Engine<S> {
         &mut self,
         now_ms: u64,
         chat: ChatId,
+        own: bool,
     ) -> Result<(Vec<[u8; 32]>, Vec<[u8; 32]>), EngineError> {
-        let candidates = self.push_candidates(chat)?;
+        let candidates = self.push_candidates(chat, own)?;
         // **Вопрос здесь один: есть ли у ленивого второй путь.** Ленивый
         // получает зов вместо блока и ждёт, что блок придёт иначе; нет
         // второго пути — нет и ленивых, иначе `IHAVE` означал бы «подожди
@@ -1035,7 +1059,15 @@ impl<S: Store> Engine<S> {
             self.note_swarm_answer(now_ms, from);
         }
 
-        let (eager, lazy) = self.split_tree(now_ms, chat)?;
+        let (eager, lazy) = self.split_tree(now_ms, chat, from.is_none())?;
+        eprintln!(
+            "PROBE push me={:02x}{:02x} own={} eager={} lazy={}",
+            self.identity.public().ik[0],
+            self.identity.public().ik[1],
+            from.is_none(),
+            eager.len(),
+            lazy.len()
+        ); //PROBE
         let mut effects = Vec::new();
         for peer in eager {
             if from == Some(peer) {

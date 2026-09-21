@@ -646,6 +646,15 @@ impl Stand {
         self.settle();
     }
 
+    /// Выдаёт право в канале (§6.2) на заданный срок.
+    fn grant(&mut self, owner: NodeId, chat: [u8; 16], who: NodeId, rights: u32, until_ms: u64) {
+        let peer_ik = self.ik(who);
+        self.sim.act(owner, |node, ctx| {
+            node.command(ctx, Command::SetChannelRight { chat, who: peer_ik, rights, until_ms });
+        });
+        self.settle();
+    }
+
     /// Ставит пределы отдачи (§9.2): на пира и общий, в блоках за минуту.
     fn set_giving_limits(&mut self, who: NodeId, per_peer: u32, total: u32) {
         self.sim.act(who, |node, ctx| {
@@ -2131,6 +2140,60 @@ fn a_background_account_lets_its_record_fall_out_by_time() {
     assert!(
         stand.seeds(NodeId(1), chat).is_empty(),
         "своя протухшая запись не показывается и себе; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_reader_with_the_write_right_speaks_and_everyone_hears_him() {
+    // §6.2 даёт право писать не одному владельцу — и до этой поставки
+    // право было, а дороги не было: состав канала знает владелец (§3.2),
+    // и держателю `WRITE` развозить было некому. Ядро честно отказывало
+    // заранее («в канале публикует владелец»), а человек видел кнопку,
+    // которая не работает.
+    //
+    // Дорога — рой: слово уезжает владельцу и своим сидам, владелец
+    // развозит по составу, сид раздаёт деревом (§7.1, шаг 2). Проверяется
+    // именно это: сказал **не владелец**, услышали все.
+    let mut stand = Stand::strangers(0x0_9217E, 4);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..4u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+
+    // Право выдаётся одному читателю — и уезжает представлением (§6.2).
+    // Срок — год: §6.3 велит сроку быть всегда, а «навсегда» база
+    // не примет (`i64`), да и §6.3 такого не знает.
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+
+    stand.say(NodeId(1), chat, "говорю не владелец");
+    stand.settle();
+
+    for who in [NodeId(0), NodeId(2), NodeId(3)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"говорю не владелец".to_owned()),
+            "слово держателя права обязано дойти до узла {:?}; видно {:?}; сид {:#x}",
+            who,
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+
+    // **А без права — по-прежнему отказ**, и это вторая половина §6.2:
+    // право пускает слово, а не порода канала.
+    let refused = stand.sim.act(NodeId(2), |node, ctx| {
+        node.engine_mut().step(
+            ctx.now_ms(),
+            Input::Command(Command::SendText { chat, text: "а я без права".to_owned() }),
+        )
+    });
+    assert!(
+        matches!(refused, Err(ratatosk_core::EngineError::NotAllowedInChannel)),
+        "без права слово не уходит; вышло {refused:?}; сид {:#x}",
         stand.sim.seed()
     );
 }

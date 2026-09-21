@@ -7510,16 +7510,22 @@ fn a_granted_right_travels_and_lets_the_newcomer_speak() {
     assert_eq!(stored.grants.len(), 1);
     assert_eq!(stored.grants[0].who, bob.own_card().ik);
 
-    // **Своей сборкой подписчик слова не скажет**: в звезде публикует
-    // владелец (§3.2, §7.5.2) — состав знает он один, и доставлять
-    // держателю права некому. Отказ по имени, а не «нет права»: право
-    // как раз есть.
+    // **И слово он теперь говорит.** Раньше здесь стоял отказ «в звезде
+    // публикует владелец»: состава держатель права не знает (§3.2),
+    // и доставлять ему было некому. Дорога появилась — слово едет
+    // владельцу и своим сидам, а дальше расходится обычной раздачей.
+    let effects = bob
+        .step(10_000, Input::Command(Command::SendText { chat, text: "спасибо".into() }))
+        .expect("право писать пускает слово");
+    pump(&mut bob, &mut alice, 10_000, effects);
     assert!(
-        matches!(
-            bob.step(10_000, Input::Command(Command::SendText { chat, text: "спасибо".into() })),
-            Err(EngineError::OnlyOwnerPublishesYet)
-        ),
-        "звезда возит слово от владельца, и сказать об этом надо словами"
+        alice
+            .store()
+            .messages(&chat, 10, None)
+            .unwrap()
+            .iter()
+            .any(|m| m.body == "спасибо".as_bytes()),
+        "владелец принимает слово держателя права и развозит его дальше"
     );
 
     // А вот **принять** слово с правом владелец обязан: право доехало,
@@ -7824,12 +7830,12 @@ fn a_newcomer_gets_the_representation_as_it_stands_now() {
             != 0,
         "выданное до впуска право обязано доехать вместе с документом"
     );
-    // Доставить он им в звезде всё равно ничего не может — состав знает
-    // владелец (§3.2), — и отказ говорит именно это, а не «права нет».
-    assert!(matches!(
-        bob.step(6_000, Input::Command(Command::SendText { chat, text: "я тут".into() })),
-        Err(EngineError::OnlyOwnerPublishesYet)
-    ));
+    // И сказать он им теперь может: слово едет владельцу, у которого
+    // состав, а тот развозит (§3.2, §7.1, шаг 2).
+    assert!(
+        bob.step(6_000, Input::Command(Command::SendText { chat, text: "я тут".into() })).is_ok(),
+        "выданное право пускает слово, а доставку даёт владелец"
+    );
 }
 
 #[test]
@@ -8852,7 +8858,10 @@ fn a_representation_older_than_the_link_promised_is_not_taken() {
             6_000,
             Input::Command(Command::SetChannelRight {
                 chat,
-                who: [9u8; 32],
+                // Кому угодно право не выдать: в выдачу едет ключ
+                // проверки (§6.2), и берётся он из того, что мы о нём
+                // знаем. Здесь это Кэрол — её только что впустили.
+                who: carol.own_card().ik,
                 rights: ratatosk_proto::channel::Rights::WRITE.bits(),
                 until_ms: 100_000,
             }),
@@ -8871,7 +8880,9 @@ fn a_representation_older_than_the_link_promised_is_not_taken() {
             7_000,
             Input::Command(Command::SetChannelRight {
                 chat,
-                who: [10u8; 32],
+                // Тот же довод, что у версии 2: право выдаётся тому,
+                // чей ключ проверки у нас есть. Боб — контакт Алисы.
+                who: bob.own_card().ik,
                 rights: ratatosk_proto::channel::Rights::WRITE.bits(),
                 until_ms: 100_000,
             }),

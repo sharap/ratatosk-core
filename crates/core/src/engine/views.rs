@@ -253,6 +253,7 @@ impl<S: Store> Engine<S> {
                     .iter()
                     .map(|grant| channel::Grant {
                         who: grant.who,
+                        sk: grant.sk,
                         rights: channel::Rights::from_bits(grant.rights),
                         until_ms: grant.until_ms,
                     })

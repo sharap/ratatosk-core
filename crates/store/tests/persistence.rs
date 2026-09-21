@@ -2004,7 +2004,7 @@ fn channel(version: u64, grants: Vec<StoredGrant>) -> StoredChannel {
 }
 
 fn grant(who: u8, rights: u32, until_ms: u64) -> StoredGrant {
-    StoredGrant { who: [who; 32], rights, until_ms }
+    StoredGrant { who: [who; 32], sk: [who ^ 0x5a; 32], rights, until_ms }
 }
 
 /// Чат заводится до представления: у `channel_representations` внешний

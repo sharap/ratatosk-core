@@ -1321,14 +1321,15 @@ impl Store for SqliteStore {
         tx.execute("DELETE FROM channel_grants WHERE chat_id = ?1", [&channel.chat_id[..]])?;
         for grant in &channel.grants {
             tx.execute(
-                "INSERT INTO channel_grants (chat_id, who, rights, until_ms, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO channel_grants (chat_id, who, rights, until_ms, version, sk)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     &channel.chat_id[..],
                     &grant.who[..],
                     sql_types::to_sql(u64::from(grant.rights)),
                     sql_types::to_sql(grant.until_ms),
-                    sql_types::to_sql(channel.version)
+                    sql_types::to_sql(channel.version),
+                    &grant.sk[..]
                 ],
             )?;
         }
@@ -1398,20 +1399,28 @@ impl Store for SqliteStore {
         // Порядок выдач задан целиком, без опоры на порядок вставки:
         // §16 требует, чтобы прогон по сиду повторялся.
         let mut stmt = self.conn.prepare(
-            "SELECT who, rights, until_ms FROM channel_grants
+            "SELECT who, rights, until_ms, sk FROM channel_grants
               WHERE chat_id = ?1 ORDER BY who",
         )?;
         let rows = stmt.query_map([&chat_id[..]], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
         })?;
         let mut grants = Vec::new();
         for row in rows {
-            let (who, rights, until_ms) = row?;
+            let (who, rights, until_ms, sk) = row?;
             grants.push(StoredGrant {
                 who: who
                     .as_slice()
                     .try_into()
                     .map_err(|_| StoreError::Backend("адресат выдачи не 32 байта".into()))?,
+                // Пусто — «проверить нечем»: так лежат выдачи в базах,
+                // заведённых до того, как ключ поехал вместе с правом.
+                sk: sk.as_slice().try_into().unwrap_or([0u8; 32]),
                 rights: u32::try_from(sql_types::from_sql(rights)).unwrap_or(u32::MAX),
                 until_ms: sql_types::from_sql(until_ms),
             });

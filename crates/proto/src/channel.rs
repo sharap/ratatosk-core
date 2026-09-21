@@ -52,6 +52,7 @@ const KEY_GRANTS: u64 = 9;
 const KEY_WHO: u64 = 10;
 const KEY_RIGHTS: u64 = 11;
 const KEY_UNTIL: u64 = 12;
+const KEY_GRANT_SK: u64 = 13;
 const KEY_BLOCK: u64 = 13;
 const KEY_SIGNATURE: u64 = 14;
 
@@ -223,6 +224,22 @@ impl Rights {
 pub struct Grant {
     /// Кому.
     pub who: ActorId,
+    /// Ключ, которым проверяются его слова, 32 байта.
+    ///
+    /// # Зачем он здесь, а не в карточке
+    ///
+    /// §3.2 оставляет состав владельцу: читатели друг друга не знают
+    /// и карточек друг друга не получают. Пока писал один владелец,
+    /// этого хватало — его карточка есть у всех. Дав право писать
+    /// второму (§6.2), мы обязаны дать и то, чем его слова проверить:
+    /// иначе читатель принимает блок, который не может ни проверить,
+    /// ни открыть, и откладывает его навсегда.
+    ///
+    /// Ключ стоит **в выдаче**, потому что в ней уже стоит всё
+    /// остальное про этого человека: что он может и до какого дня.
+    /// Появляются и гаснут они вместе, и подписывает их владелец —
+    /// один раз, одной подписью (§6.2).
+    pub sk: [u8; 32],
     /// Что может.
     pub rights: Rights,
     /// До какого момента, мс от эпохи.
@@ -468,6 +485,7 @@ pub fn accepts(
 fn grant_value(grant: &Grant) -> Value {
     Value::Map(vec![
         (Value::Integer(KEY_WHO.into()), Value::Bytes(grant.who.to_vec())),
+        (Value::Integer(KEY_GRANT_SK.into()), Value::Bytes(grant.sk.to_vec())),
         (Value::Integer(KEY_RIGHTS.into()), Value::Integer(grant.rights.bits().into())),
         (Value::Integer(KEY_UNTIL.into()), Value::Integer(grant.until_ms.into())),
     ])
@@ -598,6 +616,10 @@ fn grant_from_value(value: &Value) -> Result<Grant, ChannelError> {
             canonical::require(map, KEY_WHO).map_err(|_| ChannelError::Malformed)?,
         )
         .map_err(|_| ChannelError::Malformed)?,
+        sk: canonical::as_array::<32>(
+            canonical::require(map, KEY_GRANT_SK).map_err(|_| ChannelError::Malformed)?,
+        )
+        .map_err(|_| ChannelError::Malformed)?,
         rights: Rights::from_bits(u32::try_from(rights).map_err(|_| ChannelError::Malformed)?),
         until_ms: canonical::as_u64(
             canonical::require(map, KEY_UNTIL).map_err(|_| ChannelError::Malformed)?,
@@ -679,6 +701,7 @@ mod tests {
             seed_bytes: 64 * 1024 * 1024,
             grants: vec![Grant {
                 who: [9u8; 32],
+                sk: [9u8; 32],
                 rights: Rights::WRITE.with(Rights::ADMIT),
                 until_ms: 2_000,
             }],
@@ -767,6 +790,7 @@ mod tests {
         let mut representation = sample(3);
         representation.grants.push(Grant {
             who: representation.owner,
+            sk: [9u8; 32],
             rights: Rights::none(),
             until_ms: 0,
         });
@@ -826,6 +850,7 @@ mod tests {
         representation.grants = (0..=MAX_GRANTS)
             .map(|n| Grant {
                 who: [u8::try_from(n % 251).unwrap(); 32],
+                sk: [9u8; 32],
                 rights: Rights::WRITE,
                 until_ms: 1,
             })
@@ -847,6 +872,7 @@ mod tests {
         representation.grants = (0..=MAX_GRANTS)
             .map(|n| Grant {
                 who: [u8::try_from(n % 251).unwrap(); 32],
+                sk: [9u8; 32],
                 rights: Rights::WRITE,
                 until_ms: 1,
             })
@@ -1141,7 +1167,12 @@ mod tests {
         // и правил о содержимом перехода в спеке нет. Выдумай мы их
         // здесь, мы отвергали бы законные документы.
         let mut old = sample(3);
-        old.grants = vec![Grant { who: [1u8; 32], rights: Rights::all(), until_ms: u64::MAX }];
+        old.grants = vec![Grant {
+            who: [1u8; 32],
+            sk: [9u8; 32],
+            rights: Rights::all(),
+            until_ms: u64::MAX,
+        }];
         old.pow_bits = 20;
         old.seed_days = 365;
 

@@ -1518,13 +1518,21 @@ impl<S: Store> Engine<S> {
             .filter(|grant| grant.who != who)
             .map(|grant| channel::Grant {
                 who: grant.who,
+                sk: grant.sk,
                 rights: channel::Rights::from_bits(grant.rights),
                 until_ms: grant.until_ms,
             })
             .collect();
         if rights != 0 {
+            // **Ключ проверки — в выдачу** (§6.2, §3.2). Читатели друг
+            // друга не знают, и другого источника у них нет: без этого
+            // ключа слово второго автора никто не проверит, а значит
+            // и не примет. Берём из того, что о нём знаем сами:
+            // контакта или пира (§8.3).
+            let sk = self.public_identity_of(&who)?.ok_or(EngineError::UnknownPeer)?.sk;
             grants.push(channel::Grant {
                 who,
+                sk,
                 rights: channel::Rights::from_bits(rights),
                 until_ms,
             });
@@ -1592,6 +1600,7 @@ impl<S: Store> Engine<S> {
                 .iter()
                 .map(|grant| channel::Grant {
                     who: grant.who,
+                    sk: grant.sk,
                     rights: channel::Rights::from_bits(grant.rights),
                     until_ms: grant.until_ms,
                 })
@@ -1621,6 +1630,7 @@ impl<S: Store> Engine<S> {
                 .iter()
                 .map(|grant| ratatosk_store::StoredGrant {
                     who: grant.who,
+                    sk: grant.sk,
                     rights: grant.rights.bits(),
                     until_ms: grant.until_ms,
                 })
@@ -1773,6 +1783,7 @@ impl<S: Store> Engine<S> {
                     .iter()
                     .map(|grant| channel::Grant {
                         who: grant.who,
+                        sk: grant.sk,
                         rights: channel::Rights::from_bits(grant.rights),
                         until_ms: grant.until_ms,
                     })
@@ -1822,6 +1833,7 @@ impl<S: Store> Engine<S> {
                 .iter()
                 .map(|grant| ratatosk_store::StoredGrant {
                     who: grant.who,
+                    sk: grant.sk,
                     rights: grant.rights.bits(),
                     until_ms: grant.until_ms,
                 })

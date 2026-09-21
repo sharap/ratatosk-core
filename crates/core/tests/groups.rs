@@ -1529,7 +1529,10 @@ fn a_channel_title_obeys_the_same_two_limits_as_a_group() {
 fn grant_in_channel(engine: &mut Node, chat: &[u8; 16], who: [u8; 32], rights: u32, until_ms: u64) {
     let mut stored = engine.store().channel(chat).unwrap().expect("представление");
     stored.version += 1;
-    stored.grants = vec![ratatosk_store::StoredGrant { who, rights, until_ms }];
+    // Ключ проверки кладётся тем же, что у настоящей выдачи (§6.2):
+    // читателям канала брать его больше неоткуда (§3.2).
+    let sk = Identity::from_seed([1u8; 32]).public().sk;
+    stored.grants = vec![ratatosk_store::StoredGrant { who, sk, rights, until_ms }];
     engine.store_mut().put_channel(&stored).expect("новая версия легла");
 }
 
@@ -1580,20 +1583,15 @@ fn a_granted_right_lets_the_words_through_and_an_expired_one_does_not() {
     me.store_mut().put_channel(&stored).unwrap();
     grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), 5_000);
 
-    // **Различают два отказа, и в этом вся проверка.** Пока срок идёт,
-    // право есть — и отправку останавливает правило звезды: доставлять
-    // некому, состав канала знает владелец (§3.2). Ровно в назначенный
-    // миг право кончается, и отказ меняется на «нет права».
-    //
-    // Порядок проверок в ядре и делает их различимыми: сперва право,
-    // потом доставка. Поменяй их местами — и «истекло» стало бы
-    // неотличимо от «в звезде публикует владелец».
+    // **Пока срок идёт — слово уходит.** Раньше здесь стоял отказ
+    // «в канале публикует владелец»: у держателя права не было дороги —
+    // состава он не знает (§3.2). Дорога появилась (слово едет владельцу
+    // и своим сидам), и проверка сказала об этом первой: имя её обещало
+    // «право пускает слова», а стерегла она обратное.
     assert!(
-        matches!(
-            me.step(4_999, Input::Command(Command::SendText { chat, text: "успел".to_owned() })),
-            Err(EngineError::OnlyOwnerPublishesYet)
-        ),
-        "пока срок идёт, право есть — и мешает не оно"
+        me.step(4_999, Input::Command(Command::SendText { chat, text: "успел".to_owned() }))
+            .is_ok(),
+        "пока срок идёт, право пускает слово"
     );
     assert!(
         matches!(
@@ -1623,13 +1621,12 @@ fn the_write_right_does_not_let_you_rename_the_channel() {
     me.store_mut().put_channel(&stored).unwrap();
     grant_in_channel(&mut me, &chat, mine, channel::Rights::WRITE.bits(), u64::MAX);
 
-    // Право писать у нас есть, и отказ на слово — не про него: в звезде
-    // публикует владелец (§3.2). Важно здесь именно **имя** отказа: оно
-    // и отличает «право есть» от «права нет», а проверка про это.
-    assert!(matches!(
-        me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() })),
-        Err(EngineError::OnlyOwnerPublishesYet)
-    ));
+    // Право писать у нас есть — и слово уходит: §6.2 даёт право,
+    // а дорогу даёт рой (слово едет владельцу и своим сидам).
+    assert!(
+        me.step(200, Input::Command(Command::SendText { chat, text: "слово".to_owned() })).is_ok(),
+        "право писать пускает слово"
+    );
     // **Владельцем группы мы остались** — сменился владелец представления,
     // и правило §11.2 «только создатель» сюда не вмешивается. Значит
     // отказывает ровно то, ради чего проверка написана: у нас есть

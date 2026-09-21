@@ -395,6 +395,37 @@ impl<S: Store> Engine<S> {
     ///
     /// `None` означает «его карточки у нас нет», а не «подпись не сошлась»:
     /// карточка едет отдельным кадром и вправе опоздать.
+    /// Чем проверять слова этого автора в **этом канале** (§6.2).
+    ///
+    /// Сперва то, что знаем сами (карточка контакта или пира), потом —
+    /// ключ из выдачи права. Второй источник заведён потому, что первого
+    /// у читателя не бывает: §3.2 оставляет состав владельцу, и читатели
+    /// друг друга не знают. Ключ приезжает подписанным — в том же
+    /// документе, что и само право, — и гаснет вместе с ним.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn channel_identity_of(
+        &self,
+        chat: ChatId,
+        who: &[u8; 32],
+    ) -> Result<Option<ratatosk_crypto::PublicIdentity>, EngineError> {
+        if let Some(known) = self.public_identity_of(who)? {
+            return Ok(Some(known));
+        }
+        let Some(stored) = self.store.channel(&chat)? else { return Ok(None) };
+        let Some(grant) = stored.grants.iter().find(|grant| grant.who == *who) else {
+            return Ok(None);
+        };
+        // Пустой ключ — «проверить нечем»: так лежат выдачи из баз
+        // постарше, где ключ вместе с правом ещё не ездил.
+        if grant.sk == [0u8; 32] {
+            return Ok(None);
+        }
+        Ok(ratatosk_crypto::PublicIdentity::from_bytes(*who, grant.sk).ok())
+    }
+
     pub(super) fn public_identity_of(
         &self,
         who: &[u8; 32],
@@ -438,8 +469,12 @@ impl<S: Store> Engine<S> {
         // (`Action::needs_right`). Отдельного вида у текста нет, оттого
         // и право названо здесь прямо.
         self.check_may_put(now_ms, chat, channel::Rights::WRITE)?;
-        // Слово расходится веером — значит его везёт владелец (§3.2).
-        self.check_may_publish(chat)?;
+        // **А «публикует только владелец» здесь больше не спрашивается.**
+        // Отказ этот был про доставку, а не про право: состава канала
+        // держатель `WRITE` не знает (§3.2), и развозить ему было некому.
+        // Теперь его слово уезжает владельцу и своим сидам
+        // (`push_candidates`), а дальше идёт обычной раздачей — так же,
+        // как чужое слово идёт от сида.
 
         // Цепочка продвигается **до** отправки и тут же ложится на диск.
         // Уроните процесс между продвижением и записью — и следующий запуск
@@ -763,7 +798,16 @@ impl<S: Store> Engine<S> {
         // Спрашивается у **действия**: право и направление доставки —
         // разные вопросы. Делегат не публикует, но впускает и выдаёт
         // ключ чтения, а эти блоки едут адресатами.
-        if action.fans_out() {
+        // **Слово и всё, что о слове, публикует держатель права** —
+        // дорога у него есть: владелец и свои сиды (`push_candidates`).
+        // А документ канала по-прежнему возит владелец, и дело тут
+        // не в доставке: представление судится **его подписью** (§10.3,
+        // шаг 3), и подписанного делегатом не примет никто.
+        let word = matches!(
+            action.gate(),
+            ratatosk_proto::group_action::Gate::Right(right) if right == channel::Rights::WRITE
+        );
+        if action.fans_out() && !word {
             self.check_may_publish(chat)?;
         }
 
@@ -1129,7 +1173,14 @@ impl<S: Store> Engine<S> {
         let sender_may_speak = if self.groups[&chat].profile.everyone_writes() {
             self.groups[&chat].group.contains(&sender)
         } else {
-            self.groups[&chat].group.owner == sender || self.groups[&chat].group.contains(&sender)
+            // **В канале говорит тот, у кого право** (§6.2), а не тот,
+            // кто в составе: состава у читателя нет и не будет (§3.2).
+            // Пока здесь стоял только состав, слово второго автора
+            // откладывалось у всех, кроме владельца, — а он один и видел,
+            // что оно вообще было.
+            self.groups[&chat].group.owner == sender
+                || self.groups[&chat].group.contains(&sender)
+                || self.right_holds(now_ms, chat, &sender, channel::Rights::WRITE)?
         };
         if !sender_may_speak {
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
@@ -1157,7 +1208,7 @@ impl<S: Store> Engine<S> {
             }
         }
 
-        let Some(known) = self.public_identity_of(&sender)? else {
+        let Some(known) = self.channel_identity_of(chat, &sender)? else {
             // Карточка отправителя ещё не доехала — проверить подпись нечем.
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
             return Ok(None);

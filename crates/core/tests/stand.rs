@@ -638,6 +638,14 @@ impl Stand {
         self.settle();
     }
 
+    /// Уводит аккаунт с экрана или возвращает на него (§5.1, §12).
+    fn foreground(&mut self, who: NodeId, front: bool) {
+        self.sim.act(who, |node, ctx| {
+            node.command(ctx, Command::SetForeground(front));
+        });
+        self.settle();
+    }
+
     /// Ставит пределы отдачи (§9.2): на пира и общий, в блоках за минуту.
     fn set_giving_limits(&mut self, who: NodeId, per_peer: u32, total: u32) {
         self.sim.act(who, |node, ctx| {
@@ -2014,6 +2022,110 @@ fn the_giving_limits_survive_a_restart() {
         (limits.per_peer, limits.total),
         (7, 11),
         "пределы отдачи обязаны пережить перезапуск (§9.2); сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn an_account_off_the_screen_stops_seeding_and_starts_again_when_it_returns() {
+    // §12: «Активен ровно один аккаунт… неактивный аккаунт недостижим
+    // напрямую, его сидирование прекращается, `PeerRecord` выпадает
+    // по сроку».
+    //
+    // Довод не про вежливость к батарее. Второй аккаунт, раздающий
+    // с того же устройства, отдаёт блоки тем же каналом и тем же радио,
+    // что и первый: объём и время связывают их на проводе. §12 называет
+    // это прямо — «не экономия, а связывание аккаунтов».
+    //
+    // Имя обещает две половины, и вторая не мелочь: фон, из которого
+    // не возвращаются, — это рой, умерший от переключения экрана.
+    let (mut stand, chat) = a_channel_where_the_reader_depends_on_the_seed(0x0_FA50FF, true);
+
+    // На экране — раздаёт.
+    stand.say(NodeId(0), chat, "на экране");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"на экране".to_owned()),
+        "рой работает — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек переключился на другой аккаунт: этот ушёл в фон.
+    stand.foreground(NodeId(1), false);
+    stand.say(NodeId(0), chat, "в фоне");
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"в фоне".to_owned()),
+        "фоновый аккаунт не раздаёт (§12); сид {:#x}",
+        stand.sim.seed()
+    );
+    // Принимать при этом он не перестал: §12 начинается с того, что
+    // принимать почти бесплатно, а платит отдающий.
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"в фоне".to_owned()),
+        "в фоне он слушает канал по-прежнему; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Вернулся на экран — раздача продолжается.
+    stand.foreground(NodeId(1), true);
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"в фоне".to_owned()),
+        "вернувшийся на экран раздаёт снова, в том числе пропущенное; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_background_account_lets_its_record_fall_out_by_time() {
+    // §12: «его сидирование прекращается, `PeerRecord` выпадает
+    // по сроку». Выпадает — а не отзывается: отзыва §7.5 не знает вовсе,
+    // и цена переключения названа заранее — читатели набирают погасший
+    // адрес до конца недели.
+    //
+    // Числа здесь свои, не из крейта: запись живёт неделю и продлевается
+    // за двое суток до конца. Восемь суток переживают и то, и другое.
+    let mut stand = Stand::strangers(0x0_BAC6, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.seeds(NodeId(2), chat).is_empty(),
+        "читатель знает сида — иначе проверка ниже пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Аккаунт ушёл с экрана и восемь суток не возвращался.
+    stand.foreground(NodeId(1), false);
+    stand.sleep_for(8 * 24 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    assert!(
+        stand.seeds(NodeId(2), chat).is_empty(),
+        "запись фонового аккаунта выпадает по сроку (§12); сид {:#x}",
+        stand.sim.seed()
+    );
+    // И у самого себя тоже: держать в своём каталоге обещание, которого
+    // больше не даём, — значит врать самому себе.
+    assert!(
+        stand.seeds(NodeId(1), chat).is_empty(),
+        "своя протухшая запись не показывается и себе; сид {:#x}",
         stand.sim.seed()
     );
 }

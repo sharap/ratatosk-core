@@ -1413,6 +1413,14 @@ impl<S: Store> Engine<S> {
         // то есть был бы второй копией этого.
         let mut effects = self.keep_catalogue_fresh(now_ms)?;
 
+        // **И ключи проверки в выдачах** — тем же обходом и по той же
+        // причине, что каталог: другого повода у ядра нет, а без ключа
+        // слово держателя права не примет никто (см. `heal_grant_keys`).
+        match self.heal_grant_keys(now_ms) {
+            Ok(healed) => effects.extend(healed),
+            Err(error) => tracing::warn!(%error, "ключи проверки не дописались"),
+        }
+
         let me = self.identity.public().ik;
         let mine: Vec<ChatId> = self
             .groups
@@ -1546,6 +1554,65 @@ impl<S: Store> Engine<S> {
         }
 
         self.publish_representation(now_ms, chat, |next| next.grants = grants)
+    }
+
+    /// Дописывает в выдачи ключ проверки, если его там нет (§6.2).
+    ///
+    /// # Зачем это обходу
+    ///
+    /// Ключ поехал в выдаче не сразу: у каналов, заведённых раньше,
+    /// выдачи лежат без него. Читатель, не знакомый с автором лично,
+    /// проверить его слово не может — и не видит **ничего**, хотя двое
+    /// знакомых между собой прекрасно видят друг друга. Так эта дыра
+    /// и выглядела на живых устройствах: «третий пишет — у двух
+    /// появляется, а он их сообщений не видит».
+    ///
+    /// Починить это человеку нечем: он не знает ни про какой ключ.
+    /// Чинит владелец, и чинит молча — новой версией документа, которую
+    /// читатели примут обычным путём.
+    ///
+    /// # Только то, что знаем сами
+    ///
+    /// Ключ берётся из карточки контакта или пира. Не знаем — выдача
+    /// остаётся как была: выдумывать ключ нельзя, а отзывать право
+    /// за то, что мы забыли человека, тем более.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn heal_grant_keys(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
+        let me = self.identity.public().ik;
+        let mine: Vec<ChatId> = self
+            .groups
+            .iter()
+            .filter(|(_, state)| !state.profile.everyone_writes() && state.group.owner == me)
+            .map(|(chat, _)| *chat)
+            .collect();
+        let mut effects = Vec::new();
+        for chat in mine {
+            let Some(stored) = self.store.channel(&chat)? else { continue };
+            let mut keys: Vec<([u8; 32], [u8; 32])> = Vec::new();
+            for grant in &stored.grants {
+                if grant.sk != [0u8; 32] {
+                    continue;
+                }
+                if let Some(known) = self.public_identity_of(&grant.who)? {
+                    keys.push((grant.who, known.sk));
+                }
+            }
+            if keys.is_empty() {
+                continue;
+            }
+            tracing::debug!(канал = ?chat, выдач = keys.len(), "дописываю ключи проверки (§6.2)");
+            effects.extend(self.publish_representation(now_ms, chat, move |next| {
+                for grant in &mut next.grants {
+                    if let Some((_, sk)) = keys.iter().find(|(who, _)| *who == grant.who) {
+                        grant.sk = *sk;
+                    }
+                }
+            })?);
+        }
+        Ok(effects)
     }
 
     /// Подписывает и рассылает **следующую** версию представления (§6.1).

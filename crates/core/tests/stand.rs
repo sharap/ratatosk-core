@@ -2460,6 +2460,121 @@ fn a_channel_avatar_reaches_the_readers() {
 }
 
 #[test]
+fn a_grant_issued_before_the_key_travelled_heals_itself() {
+    // **Разбор живого случая.** Выдача права стала возить ключ проверки
+    // (`Grant.sk`) не сразу: у каналов, заведённых раньше, выдачи лежат
+    // без ключа. Читатель, который не знаком с автором лично, проверить
+    // его слово не может — и не видит ничего, хотя двое знакомых между
+    // собой видят друг друга прекрасно. Ровно это и описал прогон.
+    //
+    // Чинить это человеку нечем: он не знает ни про какой ключ. Значит
+    // чинит владелец — обходом, дописывая недостающее и подписывая
+    // новую версию документа.
+    let mut stand = Stand::strangers(0x0_9EA1, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+
+    // Выдача «из прошлой сборки»: право есть, ключа нет — ни у владельца,
+    // ни у читателей.
+    for node in 0..3u16 {
+        stand.sim.act(NodeId(node), |node, _| {
+            let mut stored = node.engine().store().channel(&chat).expect("чтение");
+            if let Some(stored) = stored.as_mut() {
+                for grant in &mut stored.grants {
+                    grant.sk = [0u8; 32];
+                }
+                node.engine_mut().store_mut().put_channel(stored).expect("старая выдача");
+            }
+        });
+    }
+
+    stand.say(NodeId(1), chat, "до починки");
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).contains(&"до починки".to_owned()),
+        "без ключа проверки слово не принимается — иначе проверка пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Обход владельца дописывает ключ и подписывает новую версию.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+
+    stand.say(NodeId(1), chat, "после починки");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"после починки".to_owned()),
+        "обход обязан дописать ключ проверки в выдачу; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(2)).seen(chat),
+        stand.sim.seed()
+    );
+    // И отложенное слово, которое ждало ключа, применяется тоже:
+    // кадр не выброшен, он лежал и дождался.
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"до починки".to_owned()),
+        "и сказанное до починки дождалось ключа; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(2)).seen(chat),
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn three_writers_in_a_channel_all_hear_each_other() {
+    // Живой прогон: «в канале по приглашению два человека пишут и у них
+    // всё появляется сразу; третий пишет — у двух появляется, а он
+    // их сообщений не видит».
+    //
+    // Проверка — ровно этот случай: три держателя права, каждый говорит,
+    // каждый обязан услышать всех.
+    let mut stand = Stand::strangers(0x0_37A1C, 4);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..4u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    for reader in 1..4u16 {
+        stand.grant(
+            NodeId(0),
+            chat,
+            NodeId(reader),
+            ratatosk_proto::channel::Rights::WRITE.bits(),
+            year,
+        );
+    }
+
+    for who in 1..4u16 {
+        stand.say(NodeId(who), chat, &format!("говорит {who}"));
+        stand.settle();
+    }
+
+    for who in 0..4u16 {
+        let seen = stand.sim.node(NodeId(who)).seen(chat);
+        for author in 1..4u16 {
+            let word = format!("говорит {author}");
+            if who == author {
+                continue;
+            }
+            assert!(
+                seen.contains(&word),
+                "узел {who} обязан слышать {author}; видно {seen:?}; сид {:#x}",
+                stand.sim.seed()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_reader_with_the_write_right_speaks_and_everyone_hears_him() {
     // §6.2 даёт право писать не одному владельцу — и до этой поставки
     // право было, а дороги не было: состав канала знает владелец (§3.2),

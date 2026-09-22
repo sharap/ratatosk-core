@@ -2527,6 +2527,132 @@ fn a_grant_issued_before_the_key_travelled_heals_itself() {
 }
 
 #[test]
+fn an_open_channel_with_nobody_serving_it_says_so() {
+    // §15 велит показывать признак «никто из достижимых не отдаёт этот
+    // канал». Живой прогон объяснил, зачем: «часть людей получает всё
+    // быстро, часть немного, часть вообще ничего» — и человеку неоткуда
+    // узнать, он в третьей части или просто ещё рано.
+    //
+    // Открытый канал держится на рое целиком: состава в нём нет (§10.4),
+    // владелец о читателе не знает и по списку ему ничего не шлёт.
+    let mut stand = Stand::strangers(0x0_5EED, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // Пока привязка жива, источник есть, и это половина проверки:
+    // без неё «ноль» ниже был бы истинным на пустом месте.
+    assert_eq!(
+        stand.facts(NodeId(1), chat).sources_now,
+        Some(1),
+        "подписавшийся привязался к владельцу — источник есть; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Перезапуск: привязка — свойство живого соединения (§7.5.1), она
+    // живёт только в памяти. После него брать блоки не у кого, и ровно
+    // это человеку и надо сказать.
+    stand.restart(NodeId(1));
+    let facts = stand.facts(NodeId(1), chat);
+    assert_eq!(
+        facts.sources_now,
+        Some(0),
+        "после перезапуска раздавать некому; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert_eq!(
+        facts.seeds_known,
+        0,
+        "и в каталоге пусто — это другая беда, чем «есть кому, да не дозвонились»; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Чего проверка не стережёт: «достижимость» тут наша привязка,
+    // а не опрос сети. Сид, объявленный в каталоге и молчащий, посчитан
+    // известным — различает их `seeds_known` рядом, и больше ядру
+    // сказать нечем.
+}
+
+#[test]
+fn a_channel_by_invite_counts_its_owner_as_a_source() {
+    // Оборотная сторона признака, и без неё он врал бы на здоровом
+    // канале: в канале по приглашению владелец развозит по составу
+    // (§3.2), привязки к нему не заводится — а блоки идут.
+    //
+    // Посчитай мы только привязки, совершенно исправный канал показывал
+    // бы «никто не отдаёт» и звал чинить то, что работает.
+    let mut stand = Stand::strangers(0x0_1_5EED, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.restart(NodeId(1));
+
+    assert_eq!(
+        stand.facts(NodeId(1), chat).sources_now,
+        Some(1),
+        "впущенный читатель берёт у владельца, и перезапуск этого не меняет; сид {:#x}",
+        stand.sim.seed()
+    );
+    // У своего канала считать нечего: себе не раздают.
+    assert_eq!(
+        stand.facts(NodeId(0), chat).sources_now,
+        None,
+        "у владельца признак неприменим, а не равен нулю; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn an_overdue_read_key_is_visible_to_the_owner_before_the_sweep_runs() {
+    // §15: «поворот просрочен» — владельцу. Расписание §6.4 — обещание
+    // владельца читателям, и нарушает его он.
+    //
+    // Обход поворачивает ключ и сам, но ходит, только когда ядро
+    // просыпается: на спящем телефоне между «просрочено» и «повёрнуто»
+    // могут лежать сутки. Всё это время сказать об этом человеку —
+    // единственное, что можно сделать.
+    let mut stand = Stand::strangers(0x0_0AD, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+
+    assert!(
+        !stand.facts(NodeId(0), chat).rotation_overdue,
+        "свежий ключ просроченным не бывает; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Время двигается **без** обслуживания: обход по дороге повернул бы
+    // ключ, и просрочки никто бы не увидел. Так и выглядит спящий
+    // телефон, которого никто не будил.
+    stand.sim.run_for(31 * 24 * 60 * 60 * 1000);
+    assert!(
+        stand.facts(NodeId(0), chat).rotation_overdue,
+        "месяц прошёл — владельцу пора поворачивать; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        !stand.facts(NodeId(1), chat).rotation_overdue,
+        "читателю эта метка не показывается: чужой ключ ему не повернуть; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Проснулись — обход повернул, и метка гаснет сама.
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.facts(NodeId(0), chat).rotation_overdue,
+        "после поворота просрочки нет; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn three_writers_in_a_channel_all_hear_each_other() {
     // Живой прогон: «в канале по приглашению два человека пишут и у них
     // всё появляется сразу; третий пишет — у двух появляется, а он

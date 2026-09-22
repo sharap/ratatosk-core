@@ -855,6 +855,196 @@ pub struct ChannelFacts {
     /// продлить», иначе требование превращается в «зайти строго
     /// на третий месяц». У остальных здесь ноль: чужие сроки не их дело.
     pub grants_expiring: u32,
+    /// Сколько у нас **сейчас** живых источников этого канала (§7.5.1).
+    ///
+    /// Ноль означает ровно §15: «никто из достижимых не отдаёт этот
+    /// канал». Это не «канал пуст» и не «мы без сети»: связь может
+    /// быть, а брать блоки не у кого.
+    ///
+    /// # Владелец считается источником, но не всегда
+    ///
+    /// В канале по приглашению он развозит **по составу** (§3.2):
+    /// привязки к нему не заводится, а блоки он шлёт сам. Не считай мы
+    /// его, совершенно здоровый канал показывал бы ноль. Поэтому
+    /// впущенный читатель канала по приглашению всегда имеет хотя бы
+    /// один источник — владельца, — а о том, жив ли тот, отвечает
+    /// [`ChannelFacts::owner_quiet_ms`] рядом.
+    ///
+    /// В открытом канале состава нет вовсе (§10.4), владелец о нас
+    /// не знает, и всё держится на рое: ноль здесь — настоящий ноль.
+    ///
+    /// `None` — канал наш: себе не раздают.
+    pub sources_now: Option<u32>,
+    /// Сколько годных записей каталога мы знаем (§7.5).
+    ///
+    /// Стоит рядом с [`ChannelFacts::sources_now`] нарочно: «раздавать
+    /// некому» и «есть кому, но мы не дозвонились» — разные беды
+    /// с разным продолжением, а снаружи они выглядят одинаково.
+    pub seeds_known: u32,
+    /// Сколько объявленных блоков мы ждём прямо сейчас (§7.1, шаг 4).
+    ///
+    /// Это и есть «видимая дыра» из §15: сосед позвал `IHAVE`, значит
+    /// блок существует, а у нас его нет. Число живое — приедет, и оно
+    /// уменьшится само.
+    ///
+    /// **Не всякая дыра сюда попадает.** Пропуск, увиденный по номерам
+    /// в have-векторе (§7.3), здесь не считается: у читателя такие дыры
+    /// есть всегда — адресные блоки чужих (ключ чтения впущенному,
+    /// запись о впуске) до него не доезжают и не доедут. Показывай мы
+    /// их, счётчик не обнулялся бы никогда.
+    pub awaiting_blocks: u32,
+    /// Владельцу: ключу чтения больше месяца (§6.4).
+    ///
+    /// Расписание §6.4 — обещание владельца читателям, и нарушает его
+    /// он, а не они. У остальных здесь `false`: поворачивать чужой ключ
+    /// нечем, и метка, с которой ничего не сделать, на экране только
+    /// пугает.
+    ///
+    /// Ядро поворачивает и само, обходом (`rotate_channels_if_due`), —
+    /// но обход ходит, только когда ядро просыпается, а на спящем
+    /// телефоне это может быть нескоро.
+    pub rotation_overdue: bool,
+}
+
+impl ChannelFacts {
+    /// Чем объяснить тишину — один признак на экран (§15).
+    ///
+    /// # Порядок — по тому, что человек может сделать
+    ///
+    /// Не «по важности вообще»: держать признаков может несколько
+    /// разом, а показывать надо тот, после которого остальные неважны.
+    ///
+    /// Ожидание впуска и отсутствие ключа стоят первыми: пока они
+    /// держат, записи не откроются, сколько их ни привези. Дальше
+    /// раздача — без источника не приедет ничего. «Владелец молчит»
+    /// ниже неё, потому что в открытом канале владелец говорить
+    /// и не обязан: канал там держится роем. «Едут» — предпоследнее:
+    /// это не беда, а ход дела.
+    ///
+    /// Просрочка поворота показывается, **только когда больше сказать
+    /// нечего**, и это не понижение её важности: у владельца свой канал
+    /// всегда читаем и всегда раздаётся им самим, так что ничего
+    /// из перечисленного выше у него держать и не может.
+    ///
+    /// # `None` у источников — не ноль
+    ///
+    /// Свой канал источников не считает вовсе. Прочти мы `None` нулём,
+    /// владелец видел бы «никто не отдаёт» у канала, который сам же
+    /// и раздаёт.
+    #[must_use]
+    pub fn signal(&self) -> channel::Signal {
+        if self.awaiting {
+            return channel::Signal::Awaiting;
+        }
+        if !self.readable {
+            return channel::Signal::NotReadable;
+        }
+        if self.sources_now == Some(0) {
+            return if self.seeds_known == 0 {
+                channel::Signal::NobodyServes
+            } else {
+                channel::Signal::SeedsUnreachable
+            };
+        }
+        if self.owner_unseen {
+            return channel::Signal::OwnerUnseen;
+        }
+        if self.awaiting_blocks > 0 {
+            return channel::Signal::Waiting;
+        }
+        if self.rotation_overdue {
+            return channel::Signal::RotationOverdue;
+        }
+        channel::Signal::Fine
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    /// Канал, в котором объяснять нечего. Правится по одному полю:
+    /// проверка про **порядок**, и менять в ней надо ровно то, чей
+    /// черёд проверяется.
+    fn fine() -> ChannelFacts {
+        ChannelFacts {
+            version: 3,
+            open: Some(false),
+            owner_ik: [9u8; 32],
+            rights: 0,
+            rights_until_ms: 0,
+            pow_bits: 0,
+            awaiting: false,
+            readable: true,
+            generation: 2,
+            may_rotate: false,
+            owner_quiet_ms: None,
+            owner_unseen: false,
+            grants_expiring: 0,
+            sources_now: Some(1),
+            seeds_known: 1,
+            awaiting_blocks: 0,
+            rotation_overdue: false,
+        }
+    }
+
+    #[test]
+    fn the_channel_signal_names_the_nearest_thing_a_person_can_do() {
+        // §15 велит показывать признаки, а не одно «канал молчит».
+        // Порядок здесь и есть вся содержательная часть: держать
+        // признаков может несколько разом, а на экране нужен один —
+        // тот, после которого остальные неважны.
+        let everything = ChannelFacts {
+            awaiting: true,
+            readable: false,
+            sources_now: Some(0),
+            seeds_known: 0,
+            owner_unseen: true,
+            awaiting_blocks: 3,
+            rotation_overdue: true,
+            ..fine()
+        };
+        // Держат все разом — показывается ожидание впуска: пока
+        // не впустили, ни ключа, ни раздачи не будет, и чинить
+        // остальное бессмысленно.
+        assert_eq!(everything.signal(), channel::Signal::Awaiting);
+
+        let no_key = ChannelFacts { awaiting: false, ..everything };
+        assert_eq!(no_key.signal(), channel::Signal::NotReadable);
+
+        // Читать есть чем, а брать не у кого — и это две разные беды.
+        // «Раздавать некому» лечится новым сидом, «не дозвонились» —
+        // связью; сведи мы их в один признак, человеку советовали бы
+        // не то.
+        let nobody = ChannelFacts { readable: true, ..no_key };
+        assert_eq!(nobody.signal(), channel::Signal::NobodyServes);
+        let unreachable = ChannelFacts { seeds_known: 2, ..nobody };
+        assert_eq!(unreachable.signal(), channel::Signal::SeedsUnreachable);
+
+        let quiet_owner = ChannelFacts { sources_now: Some(1), ..unreachable };
+        assert_eq!(quiet_owner.signal(), channel::Signal::OwnerUnseen);
+
+        // «Едут» стоит ниже всех бед нарочно: это не беда, а ход дела.
+        let rolling = ChannelFacts { owner_unseen: false, ..quiet_owner };
+        assert_eq!(rolling.signal(), channel::Signal::Waiting);
+
+        let overdue = ChannelFacts { awaiting_blocks: 0, ..rolling };
+        assert_eq!(overdue.signal(), channel::Signal::RotationOverdue);
+
+        let quiet = ChannelFacts { rotation_overdue: false, ..overdue };
+        assert_eq!(quiet.signal(), channel::Signal::Fine);
+
+        // Свой канал источников не считает вовсе, и `None` не должен
+        // читаться нулём: иначе владелец видел бы «никто не отдаёт»
+        // у канала, который сам же и раздаёт.
+        let mine = ChannelFacts { sources_now: None, ..quiet };
+        assert_eq!(mine.signal(), channel::Signal::Fine);
+
+        // **Чего проверка не стережёт.** Она про выбор из готовых
+        // фактов и ничего не говорит о том, верны ли сами факты:
+        // за это отвечает стенд (`an_open_channel_with_nobody_serving_it_says_so`
+        // и соседние), где факты считаются по настоящему состоянию.
+    }
 }
 
 /// Выдача права, как её рисуют владельцу (§6.2, §6.3).

@@ -1519,6 +1519,92 @@ pub struct FfiChannel {
     /// §6.3 велит продлевать заранее — иначе требование превращается
     /// в «зайти строго на третий месяц».
     pub grants_expiring: u32,
+    /// Сколько у нас **сейчас** живых источников этого канала (§7.5.1).
+    ///
+    /// Ноль — это §15: «никто из достижимых не отдаёт этот канал».
+    /// Не «канал пуст» и не «мы без сети»: связь может быть, а брать
+    /// блоки не у кого.
+    ///
+    /// **Владелец считается источником в канале по приглашению**: там
+    /// он развозит по составу (§3.2), привязки к нему не заводится.
+    /// Поэтому у впущенного читателя здесь всегда хотя бы единица,
+    /// а о том, жив ли владелец, отвечает [`FfiChannel::owner_quiet_ms`].
+    /// В открытом канале состава нет, и ноль здесь — настоящий ноль.
+    ///
+    /// `null` — канал наш: себе не раздают.
+    pub sources_now: Option<u32>,
+    /// Сколько годных записей каталога мы знаем (§7.5).
+    ///
+    /// Рядом с [`FfiChannel::sources_now`] нарочно: «раздавать некому»
+    /// и «есть кому, а мы не дозвонились» — разные беды, и снаружи
+    /// они неотличимы.
+    pub seeds_known: u32,
+    /// Сколько объявленных блоков мы ждём прямо сейчас (§7.1, шаг 4).
+    ///
+    /// «Видимая дыра» из §15: сосед позвал, значит блок есть, а у нас
+    /// его нет. Число живое — приедет, и оно уменьшится само.
+    ///
+    /// Пропуск, видимый по номерам в чужом have-векторе, сюда **не**
+    /// попадает: у читателя такие дыры есть всегда (адресные блоки
+    /// чужих), и счётчик не обнулялся бы никогда.
+    pub awaiting_blocks: u32,
+    /// Владельцу: ключу чтения больше месяца (§6.4).
+    ///
+    /// У остальных `false`: чужой ключ повернуть нечем.
+    pub rotation_overdue: bool,
+    /// Чем объяснить тишину — один признак на экран (§15).
+    ///
+    /// Складывается из полей выше и ничего к ним не добавляет: клиенту
+    /// нужен **один** ответ на вопрос «почему пусто», а выбор главного
+    /// из шести — то самое правило, которое в каждом клиенте написали бы
+    /// по-своему.
+    pub signal: FfiChannelSignal,
+}
+
+/// Почему канал молчит — признак интерфейса (§15).
+///
+/// Зеркало `channel::Signal`: правило, по которому из фактов выбирается
+/// главный признак, живёт в ядре (`ChannelFacts::signal`), а здесь
+/// только перевод наружу. Повтори мы выбор тут, он зажил бы в двух
+/// местах и разошёлся бы на первой правке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiChannelSignal {
+    /// Объяснять нечего: канал живёт обычной жизнью.
+    ///
+    /// Это не «всё доехало»: пустой канал, в котором просто ничего
+    /// не говорили, выглядит так же, и обещать обратное ядру нечем.
+    Fine,
+    /// Ждём впуска владельцем (§10.4, §10.5).
+    Awaiting,
+    /// Читать нечем: ключа чтения нет (§6.4).
+    NotReadable,
+    /// Никто из достижимых не отдаёт этот канал (§7.5, §15).
+    NobodyServes,
+    /// Раздающие известны, но ни один сейчас не отвечает (§7.5.1).
+    ///
+    /// Отдельно от [`FfiChannelSignal::NobodyServes`], и разница
+    /// не косметическая: там раздавать некому и помочь может только
+    /// новый сид, здесь дело в связи — и человеку стоит проверить её,
+    /// а не искать ссылку заново.
+    SeedsUnreachable,
+    /// От владельца ничего не приходило дольше порога §6.3.
+    OwnerUnseen,
+    /// Блоки объявлены и ещё едут (§7.1, шаг 4).
+    Waiting,
+    /// Владельцу: поворот ключа просрочен (§6.4).
+    RotationOverdue,
+}
+
+/// Точные слова к признаку канала (§15).
+///
+/// На границе, а не в клиенте, по той же причине, что [`honest_notices`]
+/// и [`channel_refusal_text`]: признак обязан говорить то, что протокол
+/// на самом деле знает, а строка в Kotlin разошлась бы с поведением
+/// на первой же правке.
+#[uniffi::export]
+#[must_use]
+pub fn channel_signal_text(signal: FfiChannelSignal) -> String {
+    core_signal(signal).ui_text().to_owned()
 }
 
 /// Выдача права, как её рисуют владельцу (фаза 2, §6.2, §6.3).
@@ -4379,6 +4465,50 @@ fn channel_of(facts: &ratatosk_core::engine::ChannelFacts) -> FfiChannel {
         owner_quiet_ms: facts.owner_quiet_ms,
         owner_unseen: facts.owner_unseen,
         grants_expiring: facts.grants_expiring,
+        sources_now: facts.sources_now,
+        seeds_known: facts.seeds_known,
+        awaiting_blocks: facts.awaiting_blocks,
+        rotation_overdue: facts.rotation_overdue,
+        signal: signal_of(facts.signal()),
+    }
+}
+
+/// Признак канала — наружу (§15).
+///
+/// Выбор главного признака сделан ядром (`ChannelFacts::signal`);
+/// здесь только перевод.
+fn signal_of(signal: ratatosk_proto::channel::Signal) -> FfiChannelSignal {
+    use ratatosk_proto::channel::Signal;
+
+    match signal {
+        Signal::Fine => FfiChannelSignal::Fine,
+        Signal::Awaiting => FfiChannelSignal::Awaiting,
+        Signal::NotReadable => FfiChannelSignal::NotReadable,
+        Signal::NobodyServes => FfiChannelSignal::NobodyServes,
+        Signal::SeedsUnreachable => FfiChannelSignal::SeedsUnreachable,
+        Signal::OwnerUnseen => FfiChannelSignal::OwnerUnseen,
+        Signal::Waiting => FfiChannelSignal::Waiting,
+        Signal::RotationOverdue => FfiChannelSignal::RotationOverdue,
+    }
+}
+
+/// Признак обратно — ради слов к нему.
+///
+/// Пара к [`signal_of`], и нужна она затем, чтобы слова брались оттуда
+/// же, где живёт признак. Без обратного перевода тексты §15 пришлось бы
+/// переписать здесь во второй раз.
+fn core_signal(signal: FfiChannelSignal) -> ratatosk_proto::channel::Signal {
+    use ratatosk_proto::channel::Signal;
+
+    match signal {
+        FfiChannelSignal::Fine => Signal::Fine,
+        FfiChannelSignal::Awaiting => Signal::Awaiting,
+        FfiChannelSignal::NotReadable => Signal::NotReadable,
+        FfiChannelSignal::NobodyServes => Signal::NobodyServes,
+        FfiChannelSignal::SeedsUnreachable => Signal::SeedsUnreachable,
+        FfiChannelSignal::OwnerUnseen => Signal::OwnerUnseen,
+        FfiChannelSignal::Waiting => Signal::Waiting,
+        FfiChannelSignal::RotationOverdue => Signal::RotationOverdue,
     }
 }
 
@@ -6025,7 +6155,64 @@ mod tests {
             owner_quiet_ms: None,
             owner_unseen: false,
             grants_expiring: 0,
+            sources_now: Some(1),
+            seeds_known: 1,
+            awaiting_blocks: 0,
+            rotation_overdue: false,
         }
+    }
+
+    #[test]
+    fn every_channel_signal_crosses_the_boundary_and_comes_back_itself() {
+        // Признак едет наружу переводом, а слова к нему берутся
+        // обратным переводом — значит пара обязана быть тождеством.
+        // Разойдись она хоть на одном варианте, человек прочёл бы
+        // объяснение не того, что видит.
+        //
+        // **Чего проверка не стережёт:** список набран руками, и новый
+        // вариант, забытый в переводе, ею не ловится. Ловит его
+        // компилятор: оба `match` исчерпывающие.
+        use ratatosk_proto::channel::Signal;
+
+        for signal in [
+            Signal::Fine,
+            Signal::Awaiting,
+            Signal::NotReadable,
+            Signal::NobodyServes,
+            Signal::SeedsUnreachable,
+            Signal::OwnerUnseen,
+            Signal::Waiting,
+            Signal::RotationOverdue,
+        ] {
+            let outside = signal_of(signal);
+            assert_eq!(core_signal(outside), signal, "перевод потерял признак: {signal:?}");
+            assert_eq!(
+                channel_signal_text(outside),
+                signal.ui_text(),
+                "слова разошлись с признаком: {signal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_channel_signal_but_fine_has_words() {
+        // Признак без слов — точка на экране, о которой в каждом
+        // клиенте напишут своё. §15 держит тексты в ядре ровно за этим.
+        for signal in [
+            FfiChannelSignal::Awaiting,
+            FfiChannelSignal::NotReadable,
+            FfiChannelSignal::NobodyServes,
+            FfiChannelSignal::SeedsUnreachable,
+            FfiChannelSignal::OwnerUnseen,
+            FfiChannelSignal::Waiting,
+            FfiChannelSignal::RotationOverdue,
+        ] {
+            assert!(!channel_signal_text(signal).is_empty(), "признак без слов: {signal:?}");
+        }
+        // А «всё как надо» слов не имеет и иметь не должно: показывать
+        // нечего, и строка «всё хорошо» на экране — шум, который
+        // человек через неделю перестанет читать вместе с остальными.
+        assert!(channel_signal_text(FfiChannelSignal::Fine).is_empty());
     }
 
     #[test]

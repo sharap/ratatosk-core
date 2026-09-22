@@ -335,6 +335,40 @@ impl<S: Store> Engine<S> {
             } else {
                 0
             },
+            // **У кого мы сейчас берём этот канал** (§7.5.1). Считаются
+            // те, к кому привязались мы, а не те, кто привязался к нам:
+            // признак отвечает на вопрос «почему не приходит», а не
+            // «кому я отдаю».
+            //
+            // Владелец канала по приглашению — источник без привязки:
+            // он развозит по составу (§3.2). Не считай мы его, здоровый
+            // канал показывал бы ноль и звал чинить исправное.
+            sources_now: if owner == me {
+                None
+            } else {
+                let dialed = self.dialed.get(chat).map_or(0, BTreeSet::len);
+                let owner_pushes =
+                    usize::from(kind == Some(channel::Kind::ByInvite) && !keys.is_empty());
+                Some(u32::try_from(dialed + owner_pushes).unwrap_or(u32::MAX))
+            },
+            seeds_known: u32::try_from(self.seeds(*chat, now_ms).map_or(0, |it| it.len()))
+                .unwrap_or(u32::MAX),
+            awaiting_blocks: u32::try_from(
+                self.awaited_blocks.keys().filter(|(it, _)| it == chat).count(),
+            )
+            .unwrap_or(u32::MAX),
+            // Просрочка считается от **действующего** ключа, какого бы
+            // он ни был поколения, — тем же правилом, что и обход
+            // (`rotate_channels_if_due`). Нулевое поколение — рождение
+            // канала (§6.5), и месяц идёт от него так же, как от
+            // поворота: §6.4 обещает возраст ключа, а не частоту кнопки.
+            rotation_overdue: owner == me
+                && kind == Some(channel::Kind::ByInvite)
+                && keys
+                    .iter()
+                    .map(|key| key.created_ms)
+                    .max()
+                    .is_some_and(|at| now_ms.saturating_sub(at) >= KEY_ROTATION_PERIOD_MS),
         })
     }
 

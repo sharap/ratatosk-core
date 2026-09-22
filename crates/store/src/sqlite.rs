@@ -3061,6 +3061,26 @@ impl Store for SqliteStore {
         Ok((expected < chunk_total).then_some(expected))
     }
 
+    fn chunk_bitmap(&self, file_id: &FileId, chunk_total: u64) -> Result<Vec<u8>> {
+        let bytes = usize::try_from(chunk_total.div_ceil(8)).unwrap_or(0);
+        let mut map = vec![0u8; bytes];
+        let mut statement =
+            self.conn.prepare("SELECT chunk_index FROM file_chunks WHERE file_id = ?1")?;
+        let rows = statement
+            .query_map([&file_id[..]], |row| Ok(sql_types::from_sql(row.get::<_, i64>(0)?)))?;
+        for row in rows {
+            let index: u64 = row?;
+            if index >= chunk_total {
+                continue;
+            }
+            let (byte, bit) = (index / 8, index % 8);
+            if let Some(cell) = map.get_mut(usize::try_from(byte).unwrap_or(usize::MAX)) {
+                *cell |= 1 << bit;
+            }
+        }
+        Ok(map)
+    }
+
     fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
         let mut statement = self.conn.prepare(
             "SELECT files.file_id, COALESCE(link.msg_id, zeroblob(16)), name_enc, size_bytes,

@@ -1567,7 +1567,15 @@ impl<S: Store> Engine<S> {
         // с диска (`incoming = false`) байты есть по построению, у принятого
         // — когда он собран. Незавершённый принятый отдавать нечем, и это
         // не аномалия собеседника, а наше «пока нет»: он просит законно.
-        let have_bytes = !file.incoming || file.complete;
+        // **Отдаём и недособранное** (§9.1): «куски расходятся между
+        // участниками», и частичный держатель — тоже держатель. Что
+        // у нас есть, тем и делимся; на первой дыре отдача остановится
+        // сама (`pump_file`), а спросивший пойдёт к тому, у кого
+        // продолжение есть, — карта кусков за тем и объявляется.
+        //
+        // Пока здесь стояло «только целое», объявленная карта ничего
+        // не стоила: держатель звал, а на просьбу отвечал отказом.
+        let have_bytes = !file.incoming || file.complete || file.accepted;
         if !may_ask {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
@@ -1885,7 +1893,7 @@ impl<S: Store> Engine<S> {
         // и подменённое тело не сойдётся ни у кого. Значит вопрос
         // не «от того ли», а «того ли файла».
         let expected = self.offerer_of(&file)? == Some(peer_ik)
-            || self.file_holders.get(&file_id).is_some_and(|who| who.contains(&peer_ik));
+            || self.file_holders.get(&file_id).is_some_and(|who| who.contains_key(&peer_ik));
         if !file.incoming || !file.accepted || !expected {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
@@ -1979,7 +1987,8 @@ impl<S: Store> Engine<S> {
         }
         // Тем же кругом, каким расходятся слова: владелец, сиды и те,
         // кто привязался к нам. Больше некому — состава у читателя нет.
-        let payload = ratatosk_proto::files::have_payload(file.file_id);
+        let bitmap = self.store.chunk_bitmap(&file.file_id, file.chunk_total)?;
+        let payload = ratatosk_proto::files::have_payload(file.file_id, &bitmap);
         let mut effects = Vec::new();
         for peer in self.push_candidates(chat, true)? {
             if peer == message.sender_ik {
@@ -2017,11 +2026,12 @@ impl<S: Store> Engine<S> {
         // §5.4: без неё отправитель объявит неудачу.
         let mut effects =
             self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
-        let Ok(file_id) = ratatosk_proto::files::have_from_payload(&envelope.payload) else {
+        let Ok((file_id, bitmap)) = ratatosk_proto::files::have_from_payload(&envelope.payload)
+        else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(effects);
         };
-        self.file_holders.entry(file_id).or_default().insert(peer_ik);
+        self.file_holders.entry(file_id).or_default().insert(peer_ik, bitmap);
 
         let Some(file) = self.store.file(&file_id)? else { return Ok(effects) };
         if file.complete || !file.incoming || !file.accepted {
@@ -2048,13 +2058,26 @@ impl<S: Store> Engine<S> {
                 return Ok(Some(offerer));
             }
         }
+        // **Спрашиваем того, у кого есть нужный кусок** (§9.1): карта
+        // затем и объявляется. Частичный держатель — тоже держатель,
+        // и у него берут то, что у него есть.
+        //
+        // **Проверкой это не покрыто, и покрывать дорого.** С одним
+        // держателем разницы не видно вовсе, а с двумя она только
+        // в числе попыток: спросив пустого, мы получим молчание,
+        // подождём срок и спросим следующего. То есть карта здесь —
+        // бережливость, а не правило, и стоит она одной строки.
+        let next = self.store.next_missing_chunk(&file.file_id, file.chunk_total)?;
         let mut holders: Vec<[u8; 32]> = self
             .file_holders
             .get(&file.file_id)
             .into_iter()
             .flatten()
-            .copied()
-            .filter(|ik| Some(*ik) != offerer)
+            .filter(|(ik, _)| Some(**ik) != offerer)
+            .filter(|(_, bitmap)| {
+                next.is_none_or(|index| ratatosk_proto::files::bitmap_has(bitmap, index))
+            })
+            .map(|(ik, _)| *ik)
             .filter(|ik| !matches!(self.file_route_of(ik, file.size_bytes), FileRoute::Nowhere))
             .collect();
         if holders.is_empty() {
@@ -2098,6 +2121,12 @@ impl<S: Store> Engine<S> {
         if file.complete || !file.incoming || !file.accepted {
             return Ok(Vec::new());
         }
+        // **Заминка — повод объявить, что у нас уже есть** (§9.1).
+        // Мы застряли, но часть кусков держим, и соседу они могут быть
+        // нужны: объявление стоит одного кадра и делает из застрявшего
+        // источник.
+        let mut effects = self.announce_file(now_ms, &file)?;
+
         // Срок вышел впустую — следующий будет длиннее (`watch_for_stall`).
         // Счётчик растёт здесь, до просьбы: просьба его и прочитает.
         let attempt = self.file_attempts.entry(file_id).or_insert(0);
@@ -2129,19 +2158,20 @@ impl<S: Store> Engine<S> {
             // спрашивать уже не у кого. Не нашлась — значит файл её
             // и не занимал, и вставать ему в очередь незачем.
             let Some(lane) = self.file_lane.get(&file_id).copied() else {
-                return Ok(Vec::new());
+                return Ok(effects);
             };
             self.leave_lane(&file_id);
             self.enqueue_file(file_id, lane);
-            return Ok(vec![Effect::Notify(Event::FileWaitsForChannel {
+            effects.push(Effect::Notify(Event::FileWaitsForChannel {
                 file_id,
                 reason: FileWait::Queued,
-            })]);
+            }));
+            return Ok(effects);
         }
 
         // Срок вышел — значит за всё это время не пришло ничего. Вот теперь
         // отправителю и правда надо начать с названного номера.
-        let mut effects = self.ask_for_file(now_ms, &file, true)?;
+        effects.extend(self.ask_for_file(now_ms, &file, true)?);
 
         // **Пятый случай, которого не было видно вовсе.** Если просьба
         // ушла — а она ушла, раз ожидания канала среди эффектов нет, —

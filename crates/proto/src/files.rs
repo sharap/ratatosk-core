@@ -755,6 +755,8 @@ const KEY_INDEX: u64 = 2;
 const KEY_BYTES: u64 = 3;
 /// Ключ признака «до меня ничего не доходит» в просьбе.
 const KEY_STALLED: u64 = 3;
+/// Карта кусков объявления §9.1: бит на кусок.
+const KEY_BITMAP: u64 = 4;
 
 /// Почему файл не принят.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -1097,33 +1099,48 @@ pub fn request_payload(file_id: FileId, next_index: u64, stalled: bool) -> Value
     ])
 }
 
-/// Объявление «этот файл у меня есть целиком» (§9.1).
+/// Объявление доступности вложения — `HaveChunks` из §9.1.
 ///
-/// # Почему целиком, а не картой кусков
+/// Карта по битам: бит на кусок, младший бит первого байта — кусок
+/// ноль. Пустая карта законна и означает «нет ничего» — так объявляет
+/// тот, у кого передача только началась.
 ///
-/// §9.1 предлагает `HaveChunks{ file_id, bitmap }` — объявление
-/// **частичной** доступности: тогда качающий берёт куски у нескольких
-/// сразу. Здесь объявляется только законченное, и это осознанная
-/// половина: она стоит одного поля, закрывает случай, ради которого
-/// рой вложений и нужен («читатели канала друг друга не знают, и файл
-/// от подписчика доходит только до владельца»), и не заводит ни карты
-/// кусков, ни правил её обновления.
+/// # Зачем карта, а не «есть целиком»
 ///
-/// Вторая половина — карта — появится, когда станет видно, что одного
-/// источника мало. Пока её нет, сказано это здесь и в `TESTING.md`.
+/// Частичный держатель — тоже держатель. У кого-то есть начало,
+/// у кого-то середина, и спрашивать надо того, у кого есть **нужный**
+/// кусок; §9.1 потому и объявляет карту, а не факт.
 #[must_use]
-pub fn have_payload(file_id: FileId) -> Value {
-    Value::Map(vec![(Value::Integer(KEY_FILE_ID.into()), Value::Bytes(file_id.to_vec()))])
+pub fn have_payload(file_id: FileId, bitmap: &[u8]) -> Value {
+    Value::Map(vec![
+        (Value::Integer(KEY_FILE_ID.into()), Value::Bytes(file_id.to_vec())),
+        (Value::Integer(KEY_BITMAP.into()), Value::Bytes(bitmap.to_vec())),
+    ])
 }
 
-/// Разбирает объявление о наличии файла (§9.1).
+/// Разбирает объявление доступности (§9.1).
 ///
 /// # Errors
 ///
 /// [`CodecError::TypeMismatch`].
-pub fn have_from_payload(value: &Value) -> Result<FileId, CodecError> {
+pub fn have_from_payload(value: &Value) -> Result<(FileId, Vec<u8>), CodecError> {
     let map = canonical::as_map(value)?;
-    canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)
+    let file_id = canonical::as_array::<16>(canonical::require(map, KEY_FILE_ID)?)?;
+    let Value::Bytes(bitmap) = canonical::require(map, KEY_BITMAP)? else {
+        return Err(CodecError::TypeMismatch);
+    };
+    Ok((file_id, bitmap.clone()))
+}
+
+/// Есть ли у объявившего этот кусок — по его карте (§9.1).
+///
+/// Карта короче номера означает «нет»: сборка постарше объявила
+/// меньше, чем у нас кусков, и придумывать за неё нельзя.
+#[must_use]
+pub fn bitmap_has(bitmap: &[u8], index: u64) -> bool {
+    let (byte, bit) = (index / 8, index % 8);
+    let Ok(byte) = usize::try_from(byte) else { return false };
+    bitmap.get(byte).is_some_and(|cell| cell & (1 << bit) != 0)
 }
 
 /// Разбирает просьбу продолжить передачу.

@@ -1251,6 +1251,21 @@ impl Store for MemoryStore {
         Ok((expected < chunk_total).then_some(expected))
     }
 
+    fn chunk_bitmap(&self, file_id: &FileId, chunk_total: u64) -> Result<Vec<u8>> {
+        let bytes = usize::try_from(chunk_total.div_ceil(8)).unwrap_or(0);
+        let mut map = vec![0u8; bytes];
+        for (id, index) in &self.chunks {
+            if id != file_id || *index >= chunk_total {
+                continue;
+            }
+            let (byte, bit) = (index / 8, index % 8);
+            if let Some(cell) = map.get_mut(usize::try_from(byte).unwrap_or(usize::MAX)) {
+                *cell |= 1 << bit;
+            }
+        }
+        Ok(map)
+    }
+
     fn unfinished_files(&self) -> Result<Vec<StoredFile>> {
         Ok(self.files.values().filter(|f| !f.complete).cloned().collect())
     }

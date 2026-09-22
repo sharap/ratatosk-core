@@ -866,6 +866,29 @@ impl Stand {
         });
     }
 
+    /// Сколько кусков этого вложения уже лежит у узла.
+    ///
+    /// Нужно проверкам §9.1: у частичного держателя файл не собран,
+    /// и `received_file` о нём молчит — а куски есть.
+    fn chunks_received(&self, who: NodeId, chat: [u8; 16], name: &str) -> u64 {
+        let node = self.sim.node(who).engine();
+        let Ok(messages) = node.store().messages(&chat, 200, None) else { return 0 };
+        for message in messages {
+            let Ok(files) = node.store().files_of(&message.msg_id) else { continue };
+            for file in files {
+                if !file.incoming || file.name != name {
+                    continue;
+                }
+                let Ok(next) = node.store().next_missing_chunk(&file.file_id, file.chunk_total)
+                else {
+                    continue;
+                };
+                return next.unwrap_or(file.chunk_total);
+            }
+        }
+        0
+    }
+
     /// Собранное содержимое принятого вложения с таким именем.
     ///
     /// `None` — вложения с таким именем нет или оно не собрано. Различать
@@ -1877,6 +1900,62 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
         "анти-энтропия обязана вернуть потерянное деревом; сид {:#x}",
         stand.sim.seed()
     );
+}
+
+#[test]
+fn a_partial_holder_gives_what_it_has() {
+    // §9.1: «отправитель выгружает файл один раз, дальше куски
+    // расходятся между участниками», и объявляется при этом **карта**
+    // кусков, а не факт. Смысл карты в том, что частичный держатель —
+    // тоже держатель: у кого-то есть начало, у кого-то середина,
+    // и спрашивать надо того, у кого есть нужное.
+    //
+    // Сценарий: автор уходит из сети посреди передачи; владелец
+    // остаётся с половиной файла и объявляет её; второй читатель,
+    // которому до автора не дотянуться вовсе (§3.2), берёт у владельца
+    // то, что у того есть.
+    let mut stand = Stand::strangers(0x0_9A47, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+        stand.accept_everything(NodeId(reader));
+    }
+    stand.accept_everything(NodeId(0));
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+
+    // Файл в несколько кусков — иначе «половина» не бывает.
+    let big = vec![9u8; 5 * ratatosk_proto::files::CHUNK_BYTES];
+    stand.send_file(NodeId(1), chat, "половина.bin", &big);
+    // Передача идёт, но автор пропадает, не досказав.
+    stand.sim.run_for(3_000);
+    stand.offline(NodeId(1));
+    // Дальше — тоже руками: передача не закончится, и `settle` ждал бы
+    // тишины, которой не будет (см. ниже).
+    stand.run_for(60_000);
+
+    // Владелец застрял на половине — и объявил, что у него есть.
+    // Второй читатель берёт это у него: до автора ему не дотянуться.
+    //
+    // **Время двигается руками, без `settle`.** Файл здесь не соберётся
+    // никогда — недостающего нет ни у кого, — и срок молчания будет
+    // взводиться, пока файл ждут. Для `settle` это «сеть не затихла»:
+    // он требует тишины, а честная тишина тут не наступит.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.run_for(120_000);
+
+    assert!(
+        stand.chunks_received(NodeId(2), chat, "половина.bin") > 0,
+        "частичный держатель отдаёт то, что у него есть (§9.1); сид {:#x}",
+        stand.sim.seed()
+    );
+    // **Чего проверка не стережёт.** Что файл в итоге соберётся:
+    // автор не вернулся, и недостающего нет ни у кого. §9.1 обещает
+    // «куски расходятся», а не «файл всегда доедет».
 }
 
 #[test]

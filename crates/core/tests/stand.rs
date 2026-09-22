@@ -1880,6 +1880,81 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
 }
 
 #[test]
+fn a_block_lost_on_the_mail_comes_back_with_the_next_packet() {
+    // §8.4: «Асинхронным ступеням шлётся пакет блоков за окно
+    // с избыточностью». Избыточность здесь — не запас прочности,
+    // а замена `GRAFT`: на почте ответа не обещают, зова там нет вовсе
+    // (`graft_wait_ms` — `None`), и потерянный блок ждал бы
+    // анти-энтропии, то есть следующего обхода.
+    //
+    // Проверяется то, ради чего пакет и собран: письмо потеряно —
+    // слово приезжает **следующим**, а не через час.
+    let mut stand = Stand::strangers_with_mail(0x0_BA7C4, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    for node in 0..3u16 {
+        stand.mail_only(NodeId(node));
+    }
+
+    // Первое слово теряется по дороге к читателю: письмо не дошло.
+    stand.sim.net_mut().set_link_profile(
+        NodeId(0),
+        NodeId(1),
+        TransportKind::Mail,
+        LinkProfile { loss_permille: 1_000, ..LinkProfile::MAIL },
+    );
+    stand.say(NodeId(0), chat, "потерянное");
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(1)).seen(chat).contains(&"потерянное".to_owned()),
+        "письмо и правда потеряно — иначе проверка пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Почта снова работает, и владелец говорит следующее слово.
+    stand.sim.net_mut().set_link_profile(
+        NodeId(0),
+        NodeId(1),
+        TransportKind::Mail,
+        LinkProfile::MAIL,
+    );
+    stand.say(NodeId(0), chat, "следующее");
+    stand.settle();
+
+    let seen = stand.sim.node(NodeId(1)).seen(chat);
+    assert!(
+        seen.contains(&"следующее".to_owned()),
+        "новое слово приехало; видно {seen:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        seen.contains(&"потерянное".to_owned()),
+        "и потерянное приехало с ним же — в том же пакете (§8.4); видно {seen:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    // **И ни одного двойника.** Пакет везёт повторы нарочно (§8.4),
+    // и съедать их обязано окно §9.2 — то же, что съедает всякий
+    // повтор. Спроси мы окно только у обёртки, каждое слово ложилось бы
+    // в историю столько раз, сколько пакетов его привезло.
+    let words: Vec<&String> =
+        seen.iter().filter(|w| *w == "потерянное" || *w == "следующее").collect();
+    assert_eq!(
+        words.len(),
+        2,
+        "каждое слово — по одному разу, хотя пакеты везли их дважды; видно {seen:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    // **Чего проверка не стережёт.** Размера пакета: три блока — число
+    // из крейта, а проверка смотрит на то, что предыдущий блок в пакете
+    // есть, а не на то, сколько их там.
+}
+
+#[test]
 fn a_reader_reachable_only_by_mail_is_never_lazy() {
     // §8.4 прямо: «почта, nostr — всегда eager, никогда lazy.
     // Асинхронные ступени не бывают lazy: `IHAVE` с ответом через часы

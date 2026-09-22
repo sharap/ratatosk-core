@@ -1037,6 +1037,76 @@ impl<S: Store> Engine<S> {
         Ok((tree.eager.iter().copied().collect(), tree.lazy.iter().copied().collect()))
     }
 
+    /// Кладёт блок в пакет, если ступень до пира асинхронная (§8.4).
+    ///
+    /// Отдаёт `true`, если блок уехал пакетом: вызывающему остаётся
+    /// не слать его ещё и по одному.
+    ///
+    /// # Почему пакет, а не отдельные кадры
+    ///
+    /// §8.4: «Асинхронные ступени не бывают lazy… Им шлётся пакет
+    /// блоков за окно с избыточностью». На почте и реле ответа
+    /// не обещают, `GRAFT` там не зовут вовсе, и потерянный блок ждал бы
+    /// анти-энтропии — то есть следующего обхода. Пакет везёт новый блок
+    /// вместе с парой предыдущих из архива: одно письмо вместо трёх
+    /// и втрое больший шанс, что пропущенное приедет само.
+    ///
+    /// Повторы съедает дедупликация §9.2 — та же, что у всякого кадра,
+    /// и ничего нового для них заводить не пришлось.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки кадра.
+    fn send_bundled(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        msg_id: MsgId,
+        peer: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Option<Vec<Effect>>, EngineError> {
+        // Пакет — только там, где нет обратной связи. У быстрых ступеней
+        // потерянное чинит `GRAFT` за секунды, и возить втрое больше
+        // ради этого незачем.
+        if self.rung_to(&peer).is_some_and(swarm::may_be_lazy) {
+            return Ok(None);
+        }
+        if !matches!(self.rung_to(&peer), Some(Transport::Mail | Transport::Nostr)) {
+            // Эфиру пакет противопоказан отдельно: §8.4 оставляет ему
+            // «только хвост», а класс S там мал.
+            return Ok(None);
+        }
+        let mut blocks = vec![bytes.to_vec()];
+        let mut total = bytes.len();
+        // Избыточность — **предыдущие** блоки этого же канала, самые
+        // свежие. Берутся из архива: он и есть окно (§9.3).
+        for older in self.store.archive_recent(&chat, swarm::BUNDLE_BLOCKS)? {
+            if blocks.len() >= swarm::BUNDLE_BLOCKS {
+                break;
+            }
+            if older.msg_id == msg_id {
+                continue;
+            }
+            if total.saturating_add(older.frame.len()) > swarm::BUNDLE_BYTES {
+                break;
+            }
+            total += older.frame.len();
+            blocks.push(older.frame);
+        }
+        if blocks.len() == 1 {
+            // Везти нечего, кроме самого блока: пакет из одного кадра —
+            // это тот же кадр, только в обёртке.
+            return Ok(None);
+        }
+        let (_, sent) = self.enqueue_request(
+            now_ms,
+            peer,
+            PayloadType::SwarmBundle,
+            swarm::bundle_value(&blocks),
+        )?;
+        Ok(Some(sent))
+    }
+
     /// Раздаёт блок по дереву: целиком eager, зовом — lazy (§7.1).
     ///
     /// `from` — тот, кто блок принёс; ему не возвращают ничего, иначе
@@ -1068,6 +1138,16 @@ impl<S: Store> Engine<S> {
         for peer in eager {
             if from == Some(peer) {
                 continue;
+            }
+            // **Асинхронной ступени — пакетом** (§8.4). Не вышло — едем
+            // как ехали, по одному.
+            match self.send_bundled(now_ms, chat, msg_id, peer, bytes) {
+                Ok(Some(sent)) => {
+                    effects.extend(sent);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(?error, "пакет блоков не собрался"),
             }
             match self.send_group_copy(now_ms, msg_id, peer, bytes) {
                 Ok(produced) => effects.extend(produced),

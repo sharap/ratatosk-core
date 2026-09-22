@@ -882,6 +882,22 @@ impl Store for MemoryStore {
         Ok(found)
     }
 
+    fn archive_recent(&self, chat_id: &[u8; 16], limit: usize) -> Result<Vec<ArchivedBlock>> {
+        let mut found: Vec<ArchivedBlock> = self
+            .archive
+            .iter()
+            .filter(|((chat, _, _), _)| chat == chat_id)
+            .map(|(_, block)| block.clone())
+            .collect();
+        // Свежие первыми — тем же правилом, что в файловой базе:
+        // по времени приёма, а при равном — по номеру.
+        found.sort_by_key(|block| {
+            (std::cmp::Reverse(block.received_ms), std::cmp::Reverse(block.seq))
+        });
+        found.truncate(limit);
+        Ok(found)
+    }
+
     fn prune_archive(
         &mut self,
         chat_id: &[u8; 16],

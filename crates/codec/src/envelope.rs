@@ -238,6 +238,17 @@ pub enum PayloadType {
     /// означал бы два источника одного и того же, и однажды они
     /// разошлись бы.
     ChannelRequest,
+    /// Пакет блоков канала для асинхронной ступени (фаза 2, §8.4).
+    ///
+    /// «Асинхронные ступени не бывают lazy… Им шлётся пакет блоков
+    /// за окно с избыточностью». На почте и реле ответа не обещают,
+    /// `GRAFT` там не зовут, и потерянный блок ждал бы анти-энтропии —
+    /// часа. Пакет везёт новый блок вместе с парой предыдущих: одно
+    /// письмо вместо трёх и втрое больший шанс, что пропущенное
+    /// приедет само.
+    ///
+    /// Повторы съедает дедупликация §9.2 — та же, что у всякого кадра.
+    SwarmBundle,
     /// «Этот файл у меня есть целиком» (фаза 2, §9.1).
     ///
     /// Объявление доступности вложения. Едет тем, кто читает этот канал
@@ -366,6 +377,8 @@ impl PayloadType {
             | PayloadType::ChannelIntroWanted
             // Объявление о файле — про раздачу, а не про разговор.
             | PayloadType::FileHave
+            // Пакет блоков — та же раздача, только пачкой.
+            | PayloadType::SwarmBundle
             // Запись каталога — про раздачу, а не про разговор: сид
             // сообщает владельцу адрес, а не пишет ему.
             | PayloadType::SwarmPeer
@@ -424,6 +437,7 @@ impl PayloadType {
             PayloadType::SwarmControl => 28,
             PayloadType::ChannelIntroWanted => 29,
             PayloadType::FileHave => 30,
+            PayloadType::SwarmBundle => 31,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -462,6 +476,7 @@ impl PayloadType {
             28 => PayloadType::SwarmControl,
             29 => PayloadType::ChannelIntroWanted,
             30 => PayloadType::FileHave,
+            31 => PayloadType::SwarmBundle,
             other => PayloadType::Unknown(other),
         }
     }
@@ -671,7 +686,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 30;
+        const HIGHEST: u64 = 31;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

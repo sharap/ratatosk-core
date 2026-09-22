@@ -579,7 +579,13 @@ impl<S: Store> Engine<S> {
     /// отвечает ещё и на «слать ли статус в историю», а кадру дерева
     /// в истории места нет вовсе.
     pub(super) const fn rides_silently(payload_type: PayloadType) -> bool {
-        Self::is_group_copy(payload_type) || matches!(payload_type, PayloadType::SwarmControl)
+        // Пакет блоков (§8.4) — те же копии, только пачкой: молчит он
+        // по той же причине, что и они. Метёлка `receipt_wiring`
+        // напомнила об этом в ту же минуту, как пакет появился:
+        // немолчаливый кадр без квитанции уводит сессию на покой,
+        // и кадры собеседника начинают пропадать.
+        Self::is_group_copy(payload_type)
+            || matches!(payload_type, PayloadType::SwarmControl | PayloadType::SwarmBundle)
     }
 
     /// Ставит в очередь §5.4 одну копию группового сообщения.

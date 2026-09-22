@@ -2229,6 +2229,42 @@ impl Store for SqliteStore {
         Ok(found)
     }
 
+    fn archive_recent(&self, chat_id: &[u8; 16], limit: usize) -> Result<Vec<ArchivedBlock>> {
+        let mut statement = self.conn.prepare(
+            "SELECT author_ik, seq, msg_id, frame, received_ms FROM channel_archive
+              WHERE chat_id = ?1 ORDER BY received_ms DESC, seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![&chat_id[..], sql_types::to_sql(limit as u64)],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (author, seq, msg_id, frame, received) = row?;
+            let (Ok(author_ik), Ok(msg_id)) =
+                (<[u8; 32]>::try_from(author.as_slice()), <[u8; 16]>::try_from(msg_id.as_slice()))
+            else {
+                continue;
+            };
+            found.push(ArchivedBlock {
+                author_ik,
+                seq: sql_types::from_sql(seq),
+                msg_id,
+                frame,
+                received_ms: sql_types::from_sql(received),
+            });
+        }
+        Ok(found)
+    }
+
     fn prune_archive(
         &mut self,
         chat_id: &[u8; 16],

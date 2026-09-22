@@ -854,6 +854,65 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Пришёл пакет блоков асинхронной ступени (§8.4).
+    ///
+    /// # Каждый блок проходит обычный путь
+    ///
+    /// Пакет — обёртка, а не новый вид блока: внутри те же конверты,
+    /// что приехали бы по одному. Поэтому каждый разбирается тем же
+    /// `deliver`, и дедупликация §9.2 спрашивается **для каждого**:
+    /// избыточность §8.4 в том и состоит, что повторы будут, и съедать
+    /// их обязано то же окно, что съедает всякий повтор.
+    ///
+    /// Спроси мы окно только у обёртки — повторный блок внутри пошёл бы
+    /// **дальше по дереву**: приём чужого блока в канале раздаёт его
+    /// своим eager-пирам (§7.1, шаг 2), и каждый пакет с избыточностью
+    /// плодил бы этот круг заново.
+    ///
+    /// **Проверкой это не покрыто, и покрыть нечем дёшево.** Двойников
+    /// в истории повтор не делает: и сообщение, и реакция, и архив
+    /// ключуются номером, то есть идемпотентны. Разница видна только
+    /// в трафике и только в цепочке из трёх узлов, где второй
+    /// пересылает третьему. Сказано здесь, чтобы «непокрыто» завтра
+    /// не прочли как «покрыто».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища на разборе вложенных конвертов.
+    fn on_swarm_bundle(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Ok(blocks) = ratatosk_proto::swarm::bundle_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(Vec::new());
+        };
+        let mut effects = Vec::new();
+        for block in blocks {
+            let Ok(inner) = Envelope::decode(&block) else {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                continue;
+            };
+            let inner = inner.into_parts().1;
+            // Окно §9.2 — на каждый вложенный конверт: пакет везёт
+            // повторы нарочно.
+            let fresh = self.dedup.check(inner.msg_id, now_ms).is_fresh()
+                && self.store.note_seen(&inner.msg_id, now_ms)?;
+            if !fresh {
+                continue;
+            }
+            if self.clock.observe(now_ms, inner.hlc).is_err() {
+                self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+                continue;
+            }
+            effects.extend(self.deliver(now_ms, via, peer_ik, inner)?);
+        }
+        Ok(effects)
+    }
+
     /// Разбор нагрузки по её виду — то, ради чего конверт ехал.
     ///
     /// Отделено от [`Engine::deliver`] затем, чтобы знакомство (§8.3)
@@ -889,6 +948,7 @@ impl<S: Store> Engine<S> {
             PayloadType::FileChunk => self.on_file_chunk(now_ms, via, peer_ik, &envelope),
             PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
             PayloadType::FileHave => self.on_file_have(now_ms, via, peer_ik, &envelope),
+            PayloadType::SwarmBundle => self.on_swarm_bundle(now_ms, via, peer_ik, &envelope),
             PayloadType::ContactShare => self.on_contact_share(now_ms, via, peer_ik, &envelope),
             // Заявка на подписку (фаза 2, §10.4). Один на один, потому что
             // в канале заявитель ещё никто: ни состава, ни цепочки у него

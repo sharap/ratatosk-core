@@ -194,6 +194,7 @@ RatatoskClient::open(db_path: String, pin: Option<String>, display_name: String)
 | `sharing_level(chat_id) -> FfiSharingLevel` | **действующий** уровень канала — с учётом умолчания аккаунта |
 | `set_giving_limits(limits: FfiGivingLimits)` | сколько блоков за минуту отдаём одному и всем (§9.2); лежит на диске |
 | `giving_limits() -> FfiGivingLimits` | нынешние пределы отдачи |
+| `pull_older_history(chat_id)` | дотянуть историю канала глубже (§7.4, шаг 3): одно движение — одна страница |
 | `seeding(chat_id) -> bool` | объявлен ли наш адрес в каталоге (короткий вопрос к тому же состоянию) |
 | `channel_seeds(chat_id) -> Vec<FfiChannelSeed>` | кто раздаёт канал (§7.5); протухшие не показываются |
 | `set_transport_enabled(transport: FfiTransport, enabled: bool)` | включить или выключить транспорт (§5.4); выбор хранит ядро |
@@ -1391,6 +1392,7 @@ fn set_sharing_level(chat_id: Option<Vec<u8>>, level: Option<FfiSharingLevel>) -
 fn sharing_level(chat_id: Vec<u8>) -> Result<FfiSharingLevel, RatatoskError>
 fn set_giving_limits(limits: FfiGivingLimits) -> Result<(), RatatoskError>
 fn giving_limits() -> Result<FfiGivingLimits, RatatoskError>
+fn pull_older_history(chat_id: Vec<u8>) -> Result<(), RatatoskError>
 fn seeding(chat_id: Vec<u8>) -> Result<bool, RatatoskError>
 fn channel_seeds(chat_id: Vec<u8>) -> Result<Vec<FfiChannelSeed>, RatatoskError>
 

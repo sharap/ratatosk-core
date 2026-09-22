@@ -2965,7 +2965,9 @@ async fn console(
                 match &event {
                     // Каталог роя строку разговора не заводит: его
                     // печатает `report`, а здесь выбирают собеседника.
-                    Event::SeedingChanged { .. } | Event::SeedAnnounced { .. } => {}
+                    Event::SeedingChanged { .. }
+                    | Event::SeedAnnounced { .. }
+                    | Event::ChannelHistoryEnd { .. } => {}
                     // Контакт, приехавший рукопожатием: отвечать ему можно
                     // сразу, ничего не набирая.
                     Event::ContactAdded { peer_ik, .. } => {
@@ -5032,6 +5034,9 @@ fn report(event: &Event) {
                     short(chat)
                 );
             }
+        }
+        Event::ChannelHistoryEnd { chat } => {
+            println!("< канал {}: глубже истории нет — спрошенные её не держат", short(chat));
         }
         Event::SeedAnnounced { chat, who } => {
             // Приходит владельцу: он и развозит каталог. Ключ целиком —

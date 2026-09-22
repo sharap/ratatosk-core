@@ -1407,6 +1407,13 @@ pub struct Engine<S: Store> {
     /// и батарею, — а не долг; поднятый с диска счёт означал бы «не
     /// отдаём, потому что отдавали вчера».
     swarm_given: (u64, u32),
+    /// Каналы, которым человек попросил историю глубже (§7.4, шаг 3).
+    ///
+    /// Живёт до ближайшего обмена have-векторами и гаснет: страница
+    /// за одно движение. В памяти — потому что это не настройка,
+    /// а незакрытая просьба; переживи она перезапуск, канал тянул бы
+    /// прошлое при каждом запуске, не спрашивая.
+    history_pull: BTreeSet<ChatId>,
     /// Кто объявил, что держит этот файл целиком (§9.1).
     ///
     /// **В памяти, и по той же причине, что привязка** (§7.5.1): это
@@ -1967,6 +1974,7 @@ impl<S: Store> Engine<S> {
             dialed: BTreeMap::new(),
             swarm_given: (0, 0),
             file_holders: BTreeMap::new(),
+            history_pull: BTreeSet::new(),
             tree: BTreeMap::new(),
             awaited_blocks: BTreeMap::new(),
             graft_timers: BTreeMap::new(),
@@ -2416,6 +2424,7 @@ impl<S: Store> Engine<S> {
             Command::SetSeeding { chat, mode } => self.on_set_seeding(now_ms, chat, mode),
             Command::SetSharing { chat, level } => self.on_set_sharing(now_ms, chat, level),
             Command::SetGivingLimits(limits) => self.on_set_giving_limits(limits),
+            Command::PullOlderHistory { chat } => self.on_pull_older_history(now_ms, chat),
             Command::SetNostrRelays(relays) => self.on_set_nostr_relays(now_ms, relays),
             Command::SetNostrDirect(direct) => self.on_set_nostr_direct(now_ms, direct),
             Command::SetForeground(front) => self.on_set_foreground(now_ms, front),

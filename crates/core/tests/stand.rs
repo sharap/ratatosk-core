@@ -646,6 +646,16 @@ impl Stand {
         self.settle();
     }
 
+    /// Просит историю глубже (§7.4, шаг 3) и отдаёт случившиеся новости.
+    fn pull_older(&mut self, who: NodeId, chat: [u8; 16]) -> Vec<Event> {
+        let before = self.sim.node(who).events.len();
+        self.sim.act(who, |node, ctx| {
+            node.command(ctx, Command::PullOlderHistory { chat });
+        });
+        self.settle();
+        self.sim.node(who).events[before..].to_vec()
+    }
+
     /// Выдаёт право в канале (§6.2) на заданный срок.
     fn grant(&mut self, owner: NodeId, chat: [u8; 16], who: NodeId, rights: u32, until_ms: u64) {
         let peer_ik = self.ik(who);
@@ -2755,6 +2765,92 @@ fn a_hole_in_the_middle_is_asked_for_and_not_written_off() {
     // — честная цена. И что зарастёт дыра глубиной больше ста двадцати
     // восьми блоков: ответ ограничен (§7.2), а второй круг спросит
     // следующий кусок — но это уже про число обходов, а не про правило.
+}
+
+#[test]
+fn scrolling_up_pulls_a_page_of_history_and_says_when_there_is_no_more() {
+    // §7.4, шаг 3: «архив — по требованию, при прокрутке вверх».
+    //
+    // Второй шаг (§7.4) обход не делает нарочно: «вступление
+    // не оплачивает историю, которую никто не открыл». Значит глубину
+    // тянет человек, и проверяется тут обе половины имени: страница
+    // приезжает — и когда её больше нет, об этом говорят словами,
+    // а не молчанием.
+    let mut stand = Stand::strangers(0x0_5C011, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Лента прожила шесть десятков слов — их слышал первый читатель.
+    // Число больше страницы (§7.4): одна прокрутка обязана принести
+    // не всё, иначе «одно движение — одна страница» проверить нечем.
+    for i in 0..60 {
+        stand.say(NodeId(0), chat, &format!("слово {i}"));
+    }
+    stand.settle();
+
+    // Второй приходит позже и видит пустоту: §7.4, шаг 3 ещё не позвали.
+    stand.subscribe(NodeId(2), &link);
+    stand.admit(NodeId(0), chat, NodeId(2));
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(
+        !stand.sim.node(NodeId(2)).seen(chat).iter().any(|w| w.starts_with("слово")),
+        "до просьбы истории не бывает (§7.4); сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек долистал до начала и попросил ещё.
+    let _ = stand.pull_older(NodeId(2), chat);
+    let after_first = stand.sim.node(NodeId(2)).seen(chat);
+    assert!(
+        after_first.iter().any(|w| w.starts_with("слово")),
+        "прокрутка обязана принести страницу; видно {after_first:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        !after_first.contains(&"слово 0".to_owned()),
+        "и ровно страницу, а не всю ленту; видно {} строк; сид {:#x}",
+        after_first.len(),
+        stand.sim.seed()
+    );
+
+    // **А сама по себе история дальше не тянется.** Обход проходит,
+    // вектора едут — и ничего не прибавляется: §7.4 отдаёт глубину
+    // по требованию, и требование было одно.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert_eq!(
+        stand.sim.node(NodeId(2)).seen(chat).len(),
+        after_first.len(),
+        "без просьбы обход глубины не тянет (§7.4); сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Листает дальше, пока лента не кончится — и тогда ему говорят
+    // «дальше некуда», а не молчат.
+    let mut ended = false;
+    for _ in 0..8 {
+        let events = stand.pull_older(NodeId(2), chat);
+        if events.iter().any(|e| matches!(e, Event::ChannelHistoryEnd { chat: c } if *c == chat)) {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended, "кончившаяся история объявляется словами; сид {:#x}", stand.sim.seed());
+    let seen = stand.sim.node(NodeId(2)).seen(chat);
+    assert!(
+        seen.contains(&"слово 0".to_owned()),
+        "долистали до начала — первое слово на месте; видно {seen:?}; сид {:#x}",
+        stand.sim.seed()
+    );
 }
 
 #[test]

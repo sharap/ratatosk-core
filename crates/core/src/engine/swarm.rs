@@ -1401,8 +1401,17 @@ impl<S: Store> Engine<S> {
         // самые нужные. Иначе порядок просьб зависел бы от порядка строк
         // в чужом векторе, то есть от чужой прихоти.
         let mut holes: Vec<(ActorId, u64, u64)> = Vec::new();
+        // **Есть ли куда листать дальше.** Считается по границе, а не
+        // по дырам: дыры у читателя есть всегда — адресные блоки чужих
+        // (ключ чтения впущенному, запись о впуске) до него не доезжают
+        // и не доедут. Считай мы «дальше некуда» по пустому списку дыр,
+        // этого «некуда» не наступило бы никогда.
+        let mut deeper_left = false;
         for range in ranges.iter().take(swarm::MAX_HAVE_RANGES) {
             let floor = self.openable_from(chat, &range.author, range)?;
+            if floor > range.first_seq {
+                deeper_left = true;
+            }
             let from = range.first_seq.max(floor);
             let ours: Vec<(u64, u64)> = mine
                 .iter()
@@ -1433,6 +1442,16 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         let mut effects = Vec::new();
+        // **Прокрутка вверх — одно движение, одна страница** (§7.4,
+        // шаг 3). Метка гаснет здесь: вектор пришёл, глубина посчитана,
+        // и держать её дальше значило бы тянуть прошлое каждым обменом.
+        //
+        // Нечего просить — говорим «дальше некуда». Молчание на этом
+        // месте клиенту неотличимо от «ещё едет», и полоска загрузки
+        // висела бы вечно (§14).
+        if self.history_pull.remove(&chat) && !deeper_left {
+            effects.push(Effect::Notify(Event::ChannelHistoryEnd { chat }));
+        }
         for (author, from_seq, to_seq) in holes.into_iter().take(swarm::MAX_WANTS_PER_ROUND) {
             let ask = swarm::Control::Want { group: chat, author, from_seq, to_seq };
             effects.extend(self.send_swarm_control(now_ms, peer_ik, &ask)?);
@@ -1479,11 +1498,17 @@ impl<S: Store> Engine<S> {
             // с первого живого слова.
             //
             // Страницу «последних N блоков» (§7.4, шаг 2) я пробовал
-            // тянуть здесь же — и снял: новичок тянет её у всех сразу,
+            // тянуть обходом — и снял: новичок тянет её у всех сразу,
             // дубли подрезают рёбра, дерево перестаёт сходиться, а цена
-            // вступления растёт вдвое. Место ей — в прокрутке вверх
-            // (§7.4, шаг 3), где её просит человек, а не обход.
-            return Ok(ours.unwrap_or_else(|| theirs.last_seq.saturating_add(1)));
+            // вступления растёт вдвое.
+            //
+            // **Просит её человек** (§7.4, шаг 3): пока метка прокрутки
+            // стоит, граница опускается на страницу — и ровно на одну.
+            let floor = ours.unwrap_or_else(|| theirs.last_seq.saturating_add(1));
+            if self.history_pull.contains(&chat) {
+                return Ok(floor.saturating_sub(swarm::HISTORY_PAGE).max(theirs.first_seq));
+            }
+            return Ok(floor);
         }
         // В группе граница — крипто: ниже самого старого ключа не открыть
         // ничего и никогда (§11.5).
@@ -1590,6 +1615,51 @@ impl<S: Store> Engine<S> {
         // Не те байты — умолчание, а не ноль: запись из будущей сборки
         // не должна выключать раздачу сегодняшней.
         Ok(swarm::GivingLimits::from_bytes(&bytes).unwrap_or_default())
+    }
+
+    /// Тянет историю канала глубже — «прокрутка вверх» (§7.4, шаг 3).
+    ///
+    /// # Как это устроено
+    ///
+    /// Просьба помечает канал и заново называется тем, у кого мы
+    /// спрашиваем блоки (§7.5.1): в ответ приедет их have-вектор,
+    /// а по нему — уже с опущенной границей — посчитается, чего нам
+    /// не хватает. Своей дороги у прокрутки нет и не нужно: она
+    /// пользуется тем же обменом §7.2, только просит глубже.
+    ///
+    /// # Одна просьба — одна страница
+    ///
+    /// Метка гаснет на ближайшем обмене. Человек листает дальше —
+    /// зовёт снова; это и есть «по требованию» из §7.4.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownGroup`] — канала нет;
+    /// [`EngineError::NotAChannel`] — это группа: глубины у неё нет,
+    /// история группы едет вступлением (§11.5).
+    pub(super) fn on_pull_older_history(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
+        if state.profile.everyone_writes() {
+            return Err(EngineError::NotAChannel);
+        }
+        self.history_pull.insert(chat);
+        let targets = self.attach_targets(now_ms, chat)?;
+        let mut effects = Vec::new();
+        for peer in targets {
+            effects.extend(self.attach_one(now_ms, chat, peer)?);
+        }
+        // Спросить некого — говорим об этом сразу, а не молчим: у канала
+        // без сидов и без владельца под рукой прокрутка просто не даст
+        // ничего, и полоску загрузки надо убрать (§14).
+        if effects.is_empty() {
+            self.history_pull.remove(&chat);
+            effects.push(Effect::Notify(Event::ChannelHistoryEnd { chat }));
+        }
+        Ok(effects)
     }
 
     /// Ставит пределы отдачи (§9.2). Ничего не уезжает по сети.

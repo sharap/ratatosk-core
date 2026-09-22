@@ -841,7 +841,7 @@ impl<S: Store> Engine<S> {
         file: &StoredFile,
         stalled: bool,
     ) -> Result<Vec<Effect>, EngineError> {
-        let Some(peer_ik) = self.offerer_of(file)? else { return Ok(Vec::new()) };
+        let Some(peer_ik) = self.source_for(file)? else { return Ok(Vec::new()) };
         if peer_ik == self.identity.public().ik {
             // Своё же вложение. Сюда не приходят — просят только за
             // входящим, — но правило дешевле привычки: просьба к самому
@@ -852,7 +852,7 @@ impl<S: Store> Engine<S> {
         let Some(next) = next else {
             // Просить нечего — всё на месте. Такое бывает у пустого файла
             // и у передачи, которая закончилась ровно перед перезапуском.
-            return self.finish_file(file);
+            return self.finish_file(now_ms, file);
         };
         let via = match self.file_route_of(&peer_ik, file.size_bytes) {
             FileRoute::Ready(via) => via,
@@ -1473,7 +1473,7 @@ impl<S: Store> Engine<S> {
 
         for record in records {
             if record.complete {
-                effects.extend(self.finish_file(&record)?);
+                effects.extend(self.finish_file(now_ms, &record)?);
             } else if record.accepted {
                 effects.extend(self.ask_for_file(now_ms, &record, true)?);
             }
@@ -1880,7 +1880,13 @@ impl<S: Store> Engine<S> {
         // для обоих случаев: чанки есть только у того, кто прислал
         // предложение, — пересылки в v1 нет (§11.3). Оно же зеркалит
         // `ask_for_file`: просим у отправителя, у него же и принимаем.
-        if !file.incoming || !file.accepted || self.offerer_of(&file)? != Some(peer_ik) {
+        // **И от объявившегося держателя — тоже** (§9.1). Куски
+        // самопроверяемы: `chunk_id` выводится из ключа блока-носителя,
+        // и подменённое тело не сойдётся ни у кого. Значит вопрос
+        // не «от того ли», а «того ли файла».
+        let expected = self.offerer_of(&file)? == Some(peer_ik)
+            || self.file_holders.get(&file_id).is_some_and(|who| who.contains(&peer_ik));
+        if !file.incoming || !file.accepted || !expected {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
         }
@@ -1926,7 +1932,7 @@ impl<S: Store> Engine<S> {
         })];
 
         if received >= file.chunk_total {
-            effects.extend(self.finish_file(&file)?);
+            effects.extend(self.finish_file(now_ms, &file)?);
             return Ok(effects);
         }
         // Подтверждение — оно же просьба продолжать. Реже, чем каждый чанк:
@@ -1943,17 +1949,143 @@ impl<S: Store> Engine<S> {
     }
 
     /// Файл собран.
-    pub(super) fn finish_file(&mut self, file: &StoredFile) -> Result<Vec<Effect>, EngineError> {
+    /// Объявляет «этот файл у меня есть» тем, кто читает канал с нами
+    /// (§9.1).
+    ///
+    /// # Зачем это нужно только каналу
+    ///
+    /// В переписке и в группе источник у файла один и известен:
+    /// отправитель, и адрес его есть у каждого. В канале это не так —
+    /// читатели друг друга не знают (§3.2), и файл, положенный
+    /// подписчиком, доходил **до владельца и дальше никуда**: остальные
+    /// видели сообщение с вложением, а взять байты им было не у кого.
+    ///
+    /// Объявление — второй источник, и большего §9.1 для начала
+    /// не требует: «отправитель выгружает файл один раз, дальше куски
+    /// расходятся между участниками».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn announce_file(
+        &mut self,
+        now_ms: u64,
+        file: &StoredFile,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(message) = self.store.message(&file.msg_id)? else { return Ok(Vec::new()) };
+        let chat = message.chat_id;
+        if self.groups.get(&chat).is_none_or(|state| state.profile.everyone_writes()) {
+            return Ok(Vec::new());
+        }
+        // Тем же кругом, каким расходятся слова: владелец, сиды и те,
+        // кто привязался к нам. Больше некому — состава у читателя нет.
+        let payload = ratatosk_proto::files::have_payload(file.file_id);
+        let mut effects = Vec::new();
+        for peer in self.push_candidates(chat, true)? {
+            if peer == message.sender_ik {
+                // Тому, кто файл и предложил, объявлять нечего.
+                continue;
+            }
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                peer,
+                ratatosk_codec::PayloadType::FileHave,
+                payload.clone(),
+            )?;
+            effects.extend(sent);
+        }
+        Ok(effects)
+    }
+
+    /// Пришло объявление «файл у меня есть» (§9.1).
+    ///
+    /// Кладём в список держателей и, если этот файл мы как раз ждём
+    /// и ждать его больше не от кого, просим сразу: объявившийся —
+    /// ровно тот второй источник, которого не было.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn on_file_have(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        // Квитанция — до разбора, как у прочих служебных кадров очереди
+        // §5.4: без неё отправитель объявит неудачу.
+        let mut effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+        let Ok(file_id) = ratatosk_proto::files::have_from_payload(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        self.file_holders.entry(file_id).or_default().insert(peer_ik);
+
+        let Some(file) = self.store.file(&file_id)? else { return Ok(effects) };
+        if file.complete || !file.incoming || !file.accepted {
+            return Ok(effects);
+        }
+        effects.extend(self.ask_for_file(now_ms, &file, false)?);
+        Ok(effects)
+    }
+
+    /// У кого просить куски этого файла (§9.1, §10.2).
+    ///
+    /// Сперва тот, кто предложил: у него байты есть по построению.
+    /// Не дотянуться — **любой объявившийся**, до кого дотянуться можно;
+    /// §9.1 велит брать «случайного среди объявивших», и случайность
+    /// берётся из того же сида, что и прочие решения (§16).
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn source_for(&mut self, file: &StoredFile) -> Result<Option<[u8; 32]>, EngineError> {
+        let offerer = self.offerer_of(file)?;
+        if let Some(offerer) = offerer {
+            if !matches!(self.file_route_of(&offerer, file.size_bytes), FileRoute::Nowhere) {
+                return Ok(Some(offerer));
+            }
+        }
+        let mut holders: Vec<[u8; 32]> = self
+            .file_holders
+            .get(&file.file_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|ik| Some(*ik) != offerer)
+            .filter(|ik| !matches!(self.file_route_of(ik, file.size_bytes), FileRoute::Nowhere))
+            .collect();
+        if holders.is_empty() {
+            return Ok(offerer);
+        }
+        let mut raw = [0u8; 4];
+        self.entropy.fill(&mut raw);
+        let pick = usize::try_from(u32::from_le_bytes(raw)).unwrap_or(0) % holders.len();
+        Ok(Some(holders.swap_remove(pick)))
+    }
+
+    pub(super) fn finish_file(
+        &mut self,
+        now_ms: u64,
+        file: &StoredFile,
+    ) -> Result<Vec<Effect>, EngineError> {
         self.store.complete_file(&file.file_id)?;
         self.file_timers.remove(&file.file_id);
         self.file_attempts.remove(&file.file_id);
         self.file_queued.retain(|(id, _)| *id != file.file_id);
         self.leave_lane(&file.file_id);
-        Ok(vec![Effect::Notify(Event::FileProgress {
+        let mut effects = vec![Effect::Notify(Event::FileProgress {
             file_id: file.file_id,
             received: file.chunk_total,
             total: file.chunk_total,
-        })])
+        })];
+        // **Собрали — объявили** (§9.1). Теперь у файла есть второй
+        // источник, и читатель, которому до автора не дотянуться,
+        // возьмёт куски у нас.
+        effects.extend(self.announce_file(now_ms, file)?);
+        Ok(effects)
     }
 
     /// Срок молчания вышел — спрашиваем заново.

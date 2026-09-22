@@ -1828,7 +1828,7 @@ impl<S: Store> Engine<S> {
                     vec![Effect::Notify(Event::MessageReceived { chat, msg_id: envelope.msg_id })];
                 for record in records {
                     if record.complete {
-                        effects.extend(self.finish_file(&record)?);
+                        effects.extend(self.finish_file(now_ms, &record)?);
                     } else if record.accepted {
                         // Просьба уедет **отправителю предложения**, а не
                         // «собеседнику чата»: чанки есть только у него.

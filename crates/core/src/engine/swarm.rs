@@ -843,7 +843,11 @@ impl<S: Store> Engine<S> {
     /// те, кто привязался к нам сам (§7.5.1). Третьего источника нет:
     /// читатель, к которому мы не подключены и который не подключился
     /// к нам, для нас не существует.
-    fn push_candidates(&self, chat: ChatId, own: bool) -> Result<Vec<[u8; 32]>, EngineError> {
+    pub(super) fn push_candidates(
+        &self,
+        chat: ChatId,
+        own: bool,
+    ) -> Result<Vec<[u8; 32]>, EngineError> {
         let me = self.identity.public().ik;
         if self.channel_owner(chat).is_some_and(|owner| owner == me) {
             // **Состав и привязавшиеся, а не одно только состав.**

@@ -888,6 +888,7 @@ impl<S: Store> Engine<S> {
             PayloadType::FileOffer => self.on_file_offer(now_ms, via, peer_ik, &envelope),
             PayloadType::FileChunk => self.on_file_chunk(now_ms, via, peer_ik, &envelope),
             PayloadType::FileRequest => self.on_file_request(now_ms, peer_ik, &envelope),
+            PayloadType::FileHave => self.on_file_have(now_ms, via, peer_ik, &envelope),
             PayloadType::ContactShare => self.on_contact_share(now_ms, via, peer_ik, &envelope),
             // Заявка на подписку (фаза 2, §10.4). Один на один, потому что
             // в канале заявитель ещё никто: ни состава, ни цепочки у него

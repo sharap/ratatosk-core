@@ -2527,6 +2527,252 @@ fn a_grant_issued_before_the_key_travelled_heals_itself() {
 }
 
 #[test]
+fn an_avatar_set_later_in_an_open_channel_reaches_the_readers() {
+    // Тот же стык, что у выдачи права, и в том же открытом канале:
+    // картинка едет отдельным действием (§11.2), а рассылалась веером
+    // по составу — которого у открытого канала нет (§10.4).
+    //
+    // Проверка отдельная от `a_channel_avatar_reaches_its_readers`
+    // нарочно: та про канал **по приглашению**, где состав есть, и она
+    // была зелёной всё это время.
+    let mut stand = Stand::strangers(0x0_A7A3, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    let picture = {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.resize(24 * 1024, 5);
+        bytes
+    };
+    let sent = picture.clone();
+    stand.sim.act(NodeId(0), |node, ctx| {
+        node.command(ctx, Command::SetGroupAvatar { chat, bytes: sent.clone() });
+    });
+    stand.settle();
+
+    let got = stand
+        .sim
+        .node(NodeId(1))
+        .engine()
+        .store()
+        .group_avatar(&chat)
+        .expect("чтение")
+        .map(|it| it.bytes);
+    assert_eq!(
+        got.as_deref(),
+        Some(picture.as_slice()),
+        "картинка открытого канала обязана доехать до подписчика; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn the_catalogue_of_an_open_channel_reaches_the_readers() {
+    // Третий случай того же стыка — и самый обидный: каталог (§7.5)
+    // это то, **чем** открытый канал держится. Запись раздающего
+    // уезжала владельцу, а тот рассылал её веером по составу, которого
+    // у открытого канала нет: читатели не узнавали о раздающих никогда
+    // и висели на одном владельце.
+    //
+    // Отсюда и «часть получает всё быстро, часть немного, часть
+    // вообще ничего» из живого прогона.
+    let mut stand = Stand::strangers(0x0_CA7A, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Сперва владелец: он собирает каталог и он же его развозит.
+    // Без этого утверждения провал ниже читался бы как «не доехало
+    // до читателя», а дело было в том, что запись отвергал владелец.
+    assert!(
+        stand.facts(NodeId(0), chat).seeds_known > 0,
+        "владелец обязан принять запись раздающего; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        stand.facts(NodeId(2), chat).seeds_known > 0,
+        "второй читатель обязан узнать о раздающем; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn the_catalogue_of_an_open_channel_has_a_ceiling() {
+    // Обратная сторона предыдущей проверки. Открытый канал берёт запись
+    // раздающего **у всякого**, кто её пришлёт: состава, которым
+    // отбирали раньше, у него нет (§10.4), а читать §7.6 разрешает
+    // каждому, у кого есть идентификатор. Значит единственное, что
+    // держит каталог конечным, — предел.
+    //
+    // Каталог набивается прямо в хранилище, а не тридцатью тремя
+    // живыми узлами: затишье после каждого из них стоило бы дороже,
+    // чем весь остальной набор вместе взятый, а проверяется здесь
+    // правило владельца, а не дорога к нему. Дорогу стережёт
+    // `the_catalogue_of_an_open_channel_reaches_the_readers` рядом.
+    let mut stand = Stand::strangers(0x0_CE11, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // Тридцать два чужих места — столько, сколько обещано. Число
+    // повторено здесь **само**, а не взято из крейта: возьми его
+    // проверка оттуда, поднятие предела подняло бы и её, и она смолчала
+    // бы о том, что каталог стал вчетверо тяжелее.
+    let far = stand.sim.now_ms() + 30 * 24 * 60 * 60 * 1000;
+    stand.sim.act(NodeId(0), |node, ctx| {
+        let now = ctx.now_ms();
+        for seat in 0..32u16 {
+            let mut ik = [0u8; 32];
+            ik[0..2].copy_from_slice(&seat.to_be_bytes());
+            ik[2] = 0xAA;
+            node.engine_mut()
+                .store_mut()
+                .put_seed(
+                    &chat,
+                    &ratatosk_store::StoredSeed {
+                        ik,
+                        record_bytes: Vec::new(),
+                        signature: [0u8; 64],
+                        valid_until_ms: far,
+                        received_ms: now,
+                    },
+                )
+                .expect("место в каталоге");
+        }
+    });
+
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    let newcomer = stand.ik(NodeId(1));
+    let taken = stand
+        .sim
+        .node(NodeId(0))
+        .engine()
+        .store()
+        .seeds(&chat)
+        .expect("каталог")
+        .iter()
+        .any(|seed| seed.ik == newcomer);
+    assert!(!taken, "полный каталог не берёт нового раздающего; сид {:#x}", stand.sim.seed());
+
+    // **А известному место есть всегда.** Запрети мы продление
+    // на полном каталоге — список застыл бы навсегда и протух
+    // бы целиком и разом.
+    stand.sim.act(NodeId(0), |node, ctx| {
+        let now = ctx.now_ms();
+        node.engine_mut()
+            .store_mut()
+            .put_seed(
+                &chat,
+                &ratatosk_store::StoredSeed {
+                    ik: newcomer,
+                    record_bytes: Vec::new(),
+                    signature: [0u8; 64],
+                    valid_until_ms: now + 1000,
+                    received_ms: now,
+                },
+            )
+            .expect("место в каталоге");
+    });
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+    let renewed = stand
+        .sim
+        .node(NodeId(0))
+        .engine()
+        .store()
+        .seeds(&chat)
+        .expect("каталог")
+        .into_iter()
+        .find(|seed| seed.ik == newcomer)
+        .expect("запись известного осталась");
+    assert!(
+        !renewed.record_bytes.is_empty(),
+        "продление известного обязано пройти и на полном каталоге; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Чего проверка не стережёт.** Того, кто займёт места первым.
+    // Отказ новому оставляет флудеру первый ход, и §7.7 отвечает
+    // на это остыванием, а не отбором: место в списке ничего не стоит,
+    // если по нему не отвечают. Вытеснение давних было бы хуже — им же
+    // флудер и пользовался бы.
+}
+
+#[test]
+fn a_right_granted_in_an_open_channel_reaches_the_readers() {
+    // **Разбор живого случая.** «В открытом канале трое, все с правом
+    // писать. Двое были друг у друга в контактах — между ними сообщения
+    // ходили; третий не получал ничего. Удалил контакты у двух других
+    // и перезапустил — сообщения перестали ходить вовсе.»
+    //
+    // Из последней фразы и видно, где дыра: переписка держалась
+    // на **личном знакомстве**, а не на канале. Слово проверяется
+    // ключом из выдачи (§6.2), выдача живёт в представлении, а новое
+    // представление до подписчиков открытого канала не доезжало:
+    // рассылалось оно по составу, а состава у открытого канала
+    // нет вовсе (§10.4). Знакомые проверяли друг друга карточкой
+    // контакта — и это единственное, что работало.
+    let mut stand = Stand::strangers(0x0_09E7, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    // Сперва документ: версия у читателей обязана сойтись с владельцем.
+    // Без этого утверждения провал ниже читался бы как «слово не доехало»,
+    // а дело в том, что не доехала **выдача**.
+    let owner_version = stand.facts(NodeId(0), chat).version;
+    for reader in [NodeId(1), NodeId(2)] {
+        assert_eq!(
+            stand.facts(reader, chat).version,
+            owner_version,
+            "новое представление обязано доехать до {reader:?}; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+
+    stand.say(NodeId(1), chat, "говорю не владелец");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"говорю не владелец".to_owned()),
+            "слово держателя права обязано дойти до {who:?} без всякого знакомства; \
+             видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+
+    // **Никто никому не контакт** — это и проверяется. `strangers`
+    // заводит узлы незнакомыми, и если проверка однажды начнёт
+    // знакомить их по дороге, она перестанет стеречь тот самый случай.
+    for who in [NodeId(1), NodeId(2)] {
+        let ik = stand.ik(NodeId(0));
+        assert!(
+            !stand.sim.node(who).engine().contacts().contains_key(&ik),
+            "читатель не должен знать владельца контактом; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn an_open_channel_with_nobody_serving_it_says_so() {
     // §15 велит показывать признак «никто из достижимых не отдаёт этот
     // канал». Живой прогон объяснил, зачем: «часть людей получает всё

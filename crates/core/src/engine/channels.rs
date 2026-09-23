@@ -1712,7 +1712,11 @@ impl<S: Store> Engine<S> {
                 .map_err(|_| EngineError::TooManyGrants)?,
         };
         let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &action)?;
-        let mut effects = self.fan_out_group(now_ms, chat, msg_id, &bytes)?;
+        // **Дорогой документа, а не веером по составу** (см.
+        // `push_document`): у открытого канала состава нет вовсе
+        // (§10.4), и веер означал там «никому» — новая версия
+        // не уезжала никуда, а выдачи прав не узнавал никто.
+        let mut effects = self.push_document(now_ms, chat, msg_id, &bytes)?;
         effects.push(Effect::Notify(Event::ChannelChanged {
             chat,
             version: next.version,

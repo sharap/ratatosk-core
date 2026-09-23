@@ -986,7 +986,11 @@ impl<S: Store> Engine<S> {
         let (msg_id, hlc, frame) = self.seal_group_action(now_ms, chat, &action)?;
 
         self.apply_group_avatar(chat, bytes, hlc)?;
-        let mut effects = self.fan_out_group(now_ms, chat, msg_id, &frame)?;
+        // **Дорогой документа** (`push_document`), а не веером: у канала
+        // получателей знает рой, и у открытого канала веер означал
+        // «никому» — состава у него нет вовсе (§10.4). В группе эта же
+        // строка остаётся веером: там состав и есть список получателей.
+        let mut effects = self.push_document(now_ms, chat, msg_id, &frame)?;
         effects.push(Effect::Notify(Event::GroupAvatarChanged { chat }));
         Ok(effects)
     }

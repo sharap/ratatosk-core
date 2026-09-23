@@ -847,11 +847,59 @@ impl<S: Store> Engine<S> {
         // контакта нет ни строки в списке, ни имени. Повышай мы после —
         // первое сообщение легло бы в чат, которого человек не видит.
         let mut effects = Vec::new();
-        if envelope.payload_type.starts_a_personal_chat() && !self.contacts.contains_key(&peer_ik) {
+        if envelope.payload_type.starts_a_personal_chat()
+            && !self.about_a_shared_chat(&envelope)
+            && !self.contacts.contains_key(&peer_ik)
+        {
             effects.extend(self.promote_peer_to_contact(now_ms, peer_ik)?);
         }
         effects.extend(self.deliver_payload(now_ms, via, peer_ik, envelope)?);
         Ok(effects)
+    }
+
+    /// Кадр про **общий** чат, хотя вид его — личный (§8.3).
+    ///
+    /// # Зачем это понадобилось
+    ///
+    /// Вид кадра отвечает на вопрос «разговор ли это» почти всегда —
+    /// но не у файлов. Кусок файла (`FileChunk`) и просьба о нём
+    /// (`FileRequest`) едут **одними и теми же кадрами** и в личном
+    /// чате, и в канале: файловый рой §9.1 берёт куски у любого
+    /// держателя, а держатель читателю не собеседник (§3.2).
+    ///
+    /// Пока это не спрашивалось, всякая выкачка файла из канала заводила
+    /// контакт с обеих сторон. Живой прогон описал это так: «постоянно
+    /// вычищаю контакты от каналов, а они добавляются обратно».
+    /// Вычищать их и правда приходилось: они заводились снова
+    /// при следующем же файле.
+    ///
+    /// # Почему спрашивается файл, а не чат кадра
+    ///
+    /// Чата в кадре нет: куски файла адресные, и `file_id` — всё, что
+    /// в них есть. Чат достаётся оттуда — через сообщение, к которому
+    /// файл приложен.
+    ///
+    /// Файла не знаем — отвечаем «личный»: так выглядит первое
+    /// предложение файла от незнакомца, и это настоящий разговор.
+    /// Ошибиться здесь в сторону «личный» безопаснее: лишний контакт
+    /// человек уберёт руками, а неучтённый разговор не покажется нигде.
+    fn about_a_shared_chat(&self, envelope: &Envelope) -> bool {
+        use ratatosk_proto::files;
+
+        let file_id = match envelope.payload_type {
+            PayloadType::FileChunk => files::chunk_from_payload(&envelope.payload).map(|it| it.0),
+            PayloadType::FileRequest => {
+                files::request_from_payload(&envelope.payload).map(|it| it.0)
+            }
+            // Предложение файла в канал не ездит: там его объявляет
+            // `FileHave` (§9.1), и разговором он не считается уже
+            // по виду кадра.
+            _ => return false,
+        };
+        let Ok(file_id) = file_id else { return false };
+        let Ok(Some(file)) = self.store.file(&file_id) else { return false };
+        let Ok(Some(message)) = self.store.message(&file.msg_id) else { return false };
+        self.groups.contains_key(&message.chat_id)
     }
 
     /// Пришёл пакет блоков асинхронной ступени (§8.4).

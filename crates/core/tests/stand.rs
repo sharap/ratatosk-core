@@ -121,8 +121,8 @@ struct Peer {
     /// Заведена ли у узла почта. Перезапуск обязан поднять его таким же:
     /// узел, у которого ящика не было, после перезапуска его не заводит.
     mail: bool,
-    /// Единственная ступень узла, если она одна: онион-адреса у такого
-    /// узла нет вовсе.
+    /// Ступени **этого** узла. Онион-адрес заводится, только если он
+    /// в списке: узел, у которого ониона нет, обязан ехать тем, что есть.
     ///
     /// Стенд с самого начала давал онион всем, и это скрывало целую
     /// ступень: каналы ни разу не ездили ни по мешу, ни по реле —
@@ -131,7 +131,7 @@ struct Peer {
     ///
     /// Переживает перезапуск вместе с почтой и по той же причине: узел
     /// обязан подняться тем же, каким лёг.
-    sole: Option<Transport>,
+    rungs: Vec<Transport>,
     /// Повторяет ли эфир объявления. Ложь у всех, кроме эфирных сценариев.
     beacons: bool,
     /// Сколько кадров узел отдал сети за прогон — им меряется рой (§7.1).
@@ -193,9 +193,10 @@ fn db_key() -> Zeroizing<[u8; 32]> {
 }
 
 impl Peer {
-    fn new(seed: u8, run: u64, mail: bool, sole: Option<Transport>) -> Peer {
+    fn new(seed: u8, run: u64, mail: bool, rungs: &[Transport]) -> Peer {
         let home = Home::new(run, u16::from(seed));
-        let engine = Peer::open(seed, &home, mail, sole);
+        let rungs = rungs.to_vec();
+        let engine = Peer::open(seed, &home, mail, &rungs);
         Peer {
             engine: Some(engine),
             peers: BTreeMap::new(),
@@ -204,7 +205,7 @@ impl Peer {
             home,
             mail,
             beacons: false,
-            sole: None,
+            rungs: rungs.clone(),
             beacon_at_ms: 0,
             by_address: false,
             no_address: 0,
@@ -217,7 +218,7 @@ impl Peer {
     /// Одно место на оба случая нарочно: перезапуск обязан открывать базу
     /// **тем же** способом, что и первый запуск. Разойдись они, стенд
     /// проверял бы не перезапуск, а свою вторую редакцию его.
-    fn open(seed: u8, home: &Home, mail: bool, sole: Option<Transport>) -> Node {
+    fn open(seed: u8, home: &Home, mail: bool, rungs: &[Transport]) -> Node {
         let mut store = SqliteStore::open(&home.db(), db_key()).expect("база открывается");
         store.migrate().expect("миграции");
         let name = format!("узел{seed}");
@@ -233,10 +234,10 @@ impl Peer {
                 // Пусто у меш-узла: у него онион-адреса нет вовсе, и §5.4
                 // обязан выбрать меш — а не выбрать его молча по ониону,
                 // которого на устройстве не поднято.
-                onion: if sole.is_some() {
-                    String::new()
-                } else {
+                onion: if rungs.contains(&Transport::Onion) {
                     ratatosk_crypto::OnionKey::from_seed([seed; 32]).address()
+                } else {
+                    String::new()
                 },
                 // Почта бывает и не заведена, и это не редкость: ящик
                 // заводит человек сам, а до тех пор последней ступени §5.4
@@ -504,7 +505,7 @@ impl Stand {
     /// `without_mail`: с ней всякое письмо доезжает спулом, и ожидание
     /// §5.4 не проверяется вовсе.
     fn strangers(seed: u64, count: u16) -> Stand {
-        Stand::assemble(seed, count, false, false, None)
+        Stand::assemble(seed, count, false, false, &Stand::same_rungs(count, &[Transport::Onion]))
     }
 
     /// Незнакомцы **в адресной сети**: кадр уезжает, только если у нас
@@ -520,7 +521,13 @@ impl Stand {
     /// Заведено по живому прогону: «двое были друг у друга в контактах —
     /// между ними ходило, третий не получал ничего».
     fn strangers_by_address(seed: u64, count: u16) -> Stand {
-        let mut stand = Stand::assemble(seed, count, false, false, None);
+        let mut stand = Stand::assemble(
+            seed,
+            count,
+            false,
+            false,
+            &Stand::same_rungs(count, &[Transport::Onion]),
+        );
         for i in 0..count {
             stand.sim.node_mut(NodeId(i)).by_address = true;
         }
@@ -536,7 +543,13 @@ impl Stand {
     /// Целая ступень оставалась непроверенной, и вместе с ней — всё,
     /// что решается **по адресу**, а не по ключу.
     fn strangers_in_the_mesh(seed: u64, count: u16) -> Stand {
-        let mut stand = Stand::assemble(seed, count, false, false, Some(Transport::Ygg));
+        let mut stand = Stand::assemble(
+            seed,
+            count,
+            false,
+            false,
+            &Stand::same_rungs(count, &[Transport::Ygg]),
+        );
         for i in 0..count {
             stand.sim.node_mut(NodeId(i)).by_address = true;
         }
@@ -549,8 +562,43 @@ impl Stand {
     /// Вторая из двух ступеней, включённых на живых устройствах, —
     /// и вторая, которой стенд не видел ни разу.
     fn strangers_on_relays(seed: u64, count: u16) -> Stand {
-        let mut stand = Stand::assemble(seed, count, false, false, Some(Transport::Nostr));
+        let mut stand = Stand::assemble(
+            seed,
+            count,
+            false,
+            false,
+            &Stand::same_rungs(count, &[Transport::Nostr]),
+        );
         for i in 0..count {
+            stand.sim.node_mut(NodeId(i)).by_address = true;
+        }
+        stand
+    }
+
+    /// Одни и те же ступени у всех узлов.
+    fn same_rungs(count: u16, rungs: &[Transport]) -> Vec<Vec<Transport>> {
+        vec![rungs.to_vec(); usize::from(count)]
+    }
+
+    /// Три незнакомца, у которых ступени **разные**: владелец достаёт
+    /// обоих, а читатели друг друга — нет.
+    ///
+    /// Заведено по живому прогону: «на двух устройствах обычно всё
+    /// отлично работает, поломки начинаются, когда появляется ещё одно».
+    /// Двое — это всегда прямая дорога; трое — это первый раз, когда
+    /// кто-то обязан **передать дальше**. А если у третьего ступень
+    /// не та, передать ему может не всякий.
+    ///
+    /// Раскладка: владелец в меше и на реле, первый читатель только
+    /// в меше, второй только на реле.
+    fn strangers_on_split_rungs(seed: u64) -> Stand {
+        let rungs = vec![
+            vec![Transport::Ygg, Transport::Nostr],
+            vec![Transport::Ygg],
+            vec![Transport::Nostr],
+        ];
+        let mut stand = Stand::assemble(seed, 3, false, false, &rungs);
+        for i in 0..3u16 {
             stand.sim.node_mut(NodeId(i)).by_address = true;
         }
         stand
@@ -569,11 +617,11 @@ impl Stand {
     /// и увидеть это можно лишь там, где почта — настоящая дорога,
     /// а не пустая строка в карточке.
     fn strangers_with_mail(seed: u64, count: u16) -> Stand {
-        Stand::assemble(seed, count, true, false, None)
+        Stand::assemble(seed, count, true, false, &Stand::same_rungs(count, &[Transport::Onion]))
     }
 
     fn build(seed: u64, count: u16, mail: bool) -> Stand {
-        Stand::assemble(seed, count, mail, true, None)
+        Stand::assemble(seed, count, mail, true, &Stand::same_rungs(count, &[Transport::Onion]))
     }
 
     fn assemble(
@@ -581,10 +629,17 @@ impl Stand {
         count: u16,
         mail: bool,
         introduce_everyone: bool,
-        sole: Option<Transport>,
+        rungs: &[Vec<Transport>],
     ) -> Stand {
         let mut nodes: Vec<Peer> = (0..count)
-            .map(|i| Peer::new(u8::try_from(i + 1).expect("узлов не больше 254"), seed, mail, sole))
+            .map(|i| {
+                Peer::new(
+                    u8::try_from(i + 1).expect("узлов не больше 254"),
+                    seed,
+                    mail,
+                    &rungs[usize::from(i)],
+                )
+            })
             .collect();
 
         let cards: Vec<(NodeId, [u8; 32], Vec<u8>)> = nodes
@@ -604,9 +659,6 @@ impl Stand {
             }
         }
 
-        for node in &mut nodes {
-            node.sole = sole;
-        }
         let mut sim = Sim::new(seed, nodes);
 
         // Потери на почте убраны, на прямых каналах — оставлены, и это
@@ -624,8 +676,12 @@ impl Stand {
         // пока человек его не включил. Стенд включает его вместе с узлами:
         // иначе кадры уходили бы в сеть, которой нет, и это выглядело бы
         // ровно как поломка протокола.
-        if let Some(rung) = sole {
-            sim.net_mut().set_enabled(to_sim(rung), true);
+        // **Ступень в симуляции включается отдельно**, как и на
+        // устройстве: меш и реле выключены по умолчанию, и кадры уходили
+        // бы в сеть, которой нет, — снаружи это выглядит ровно как
+        // поломка протокола.
+        for kind in rungs.iter().flatten().map(|rung| to_sim(*rung)) {
+            sim.net_mut().set_enabled(kind, true);
         }
 
         sim.start();
@@ -653,18 +709,19 @@ impl Stand {
         // **Меш-узлу называется ключ меша, и только он.** Онион-адреса
         // у него нет вовсе (`Peer::open`), так что §5.4 обязан выбрать
         // меш — а не выбрать его молча по ониону, которого нет.
-        if let Some(rung) = sole {
-            for i in 0..count {
-                let key = vec![u8::try_from(i + 1).expect("узлов не больше 254"); 32];
-                sim.act(NodeId(i), |node, ctx| {
-                    // **Включает ступень человек**, и без этого §5.4 честно
-                    // отвечает «ехать некуда»: готовность транспорта
-                    // (`TransportReady`) и разрешение на него — разные
-                    // вещи. Стенд их не различал, потому что онион был
-                    // разрешён с самого начала.
+        for i in 0..count {
+            let key = vec![u8::try_from(i + 1).expect("узлов не больше 254"); 32];
+            let mine = rungs[usize::from(i)].clone();
+            sim.act(NodeId(i), |node, ctx| {
+                for rung in &mine {
+                    // **Включает ступень человек**, и без этого §5.4
+                    // честно отвечает «ехать некуда»: готовность
+                    // транспорта (`TransportReady`) и разрешение на него —
+                    // разные вещи. Стенд их не различал, потому что онион
+                    // был разрешён с самого начала.
                     node.command(
                         ctx,
-                        Command::SetTransportEnabled { transport: rung, enabled: true },
+                        Command::SetTransportEnabled { transport: *rung, enabled: true },
                     );
                     match rung {
                         // Адрес в меше выводится из ключа, и называет его
@@ -688,19 +745,15 @@ impl Stand {
                         }
                         _ => {}
                     }
-                });
-            }
+                }
+            });
         }
-        let ready: Vec<Transport> = match (sole, mail) {
-            (Some(rung), true) => vec![rung, Transport::Mail],
-            (Some(rung), false) => vec![rung],
-            (None, true) => vec![Transport::Onion, Transport::Mail],
-            (None, false) => vec![Transport::Onion],
-        };
-        let ready: &[Transport] = &ready;
         for i in 0..count {
+            let mut ready = rungs[usize::from(i)].clone();
+            if mail {
+                ready.push(Transport::Mail);
+            }
             for transport in ready {
-                let transport = *transport;
                 sim.act(NodeId(i), |node, ctx| {
                     let effects = node
                         .engine_mut()
@@ -1222,11 +1275,11 @@ impl Stand {
             // к одному файлу — это не перезапуск, а два устройства.
             let seed = node.seed;
             let mail = node.mail;
-            let sole = node.sole;
+            let rungs = node.rungs.clone();
             // Порядок здесь и есть смысл: старое ядро закрывает базу,
             // и только потом открывается новое.
             drop(node.engine.take());
-            let fresh = Peer::open(seed, &node.home, mail, sole);
+            let fresh = Peer::open(seed, &node.home, mail, &rungs);
             node.engine = Some(fresh);
 
             // И то, ради чего перезапуск вообще проверяется: поднятое
@@ -1238,11 +1291,9 @@ impl Stand {
             // Меш-узлу поднимается меш: онион у него не заведён вовсе,
             // и объявлять его готовым значило бы вернуть ему дорогу,
             // которой на устройстве нет.
-            let rungs: Vec<Transport> = match sole {
-                Some(rung) => vec![rung, Transport::Mail],
-                None => vec![Transport::Onion, Transport::Mail],
-            };
-            for transport in rungs.iter().copied() {
+            let mut again = rungs.clone();
+            again.push(Transport::Mail);
+            for transport in again {
                 let effects = node
                     .engine_mut()
                     .step(ctx.now_ms(), Input::TransportReady { transport })
@@ -2799,6 +2850,134 @@ fn the_catalogue_of_an_open_channel_reaches_the_readers() {
     assert!(
         stand.facts(NodeId(2), chat).seeds_known > 0,
         "второй читатель обязан узнать о раздающем; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_third_reader_on_another_rung_still_hears_the_channel() {
+    // **Живой прогон назвал границу прямо:** «на двух устройствах обычно
+    // всё отлично работает, поломки начинаются, когда появляется ещё
+    // одно». Двое — это всегда прямая дорога. Трое — первый раз, когда
+    // кто-то обязан передать дальше; а если у третьего ступень не та,
+    // передать ему может не всякий.
+    //
+    // Раскладка: владелец в меше и на реле, первый читатель только
+    // в меше, второй только на реле. Друг до друга читателям **не
+    // дотянуться вовсе** — ни адреса, ни общей ступени, — и дерево §7.1
+    // обязано это пережить, а не рассыпаться на том, что подрезало ребро
+    // к недостижимому.
+    let mut stand = Stand::strangers_on_split_rungs(0x0_3_1FF);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    for reader in 1..3u16 {
+        stand.grant(
+            NodeId(0),
+            chat,
+            NodeId(reader),
+            ratatosk_proto::channel::Rights::WRITE.bits(),
+            year,
+        );
+    }
+    stand.settle();
+
+    // **И вот теперь третий зависит от второго.** Первый читатель
+    // вызвался раздавать (§7.5.1), и его запись уехала в каталог всем —
+    // включая того, кому до него не дотянуться ни одной общей ступенью.
+    // Именно здесь двое превращаются в трёх: пока их двое, дорога всегда
+    // прямая, и выбирать не из чего.
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "слово владельца");
+    stand.say(NodeId(1), chat, "слово из меша");
+    stand.say(NodeId(2), chat, "слово с реле");
+    stand.settle();
+
+    for who in [NodeId(0), NodeId(1), NodeId(2)] {
+        for what in ["слово владельца", "слово из меша", "слово с реле"]
+        {
+            assert!(
+                stand.sim.node(who).seen(chat).contains(&what.to_owned()),
+                "{who:?} не услышал «{what}»; видно {:?}; кадров без адреса {}; сид {:#x}",
+                stand.sim.node(who).seen(chat),
+                stand.frames_without_address(),
+                stand.sim.seed()
+            );
+        }
+    }
+
+    // **И недостижимая пара обязана остаться недостижимой** — иначе
+    // проверка стережёт не то, что обещает её имя. Спрашивается это
+    // у самих карточек: общей ступени у читателей нет ни одной, сколько
+    // бы каталог их друг другу ни называл.
+    let first = stand.sim.node(NodeId(1)).engine().own_card();
+    let second = stand.sim.node(NodeId(2)).engine().own_card();
+    assert!(
+        first.nostr.is_empty() && first.onion.is_empty(),
+        "первый читатель обязан оставаться только в меше; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        second.ygg.is_empty() && second.onion.is_empty(),
+        "второй читатель обязан оставаться только на реле; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Чего проверка не стережёт.** Того, что второй читатель
+    // не потратил попыток на недостижимого сида: §5.4 отказывается
+    // ещё до отправки («ехать некуда»), кадра не возникает вовсе,
+    // и счётчику `frames_without_address` считать нечего. Это хорошо,
+    // но проверяется здесь не это.
+}
+
+#[test]
+fn a_reader_who_cannot_reach_the_seed_falls_back_to_the_owner() {
+    // Продолжение предыдущей проверки, и самое опасное её место.
+    //
+    // Привязка живёт в памяти (§7.5.1). Пока она цела, второй читатель
+    // получает слово от владельца, к которому привязался при подписке.
+    // Но стоит ему перезапуститься — привязку он строит заново,
+    // **по каталогу**, а в каталоге к тому времени стоит сид, до которого
+    // ему нечем дозвониться. Выбери он только сида — и замолчит навсегда:
+    // владелец о нём больше не знает, а сид недостижим.
+    //
+    // Снаружи это ровно то, что описал живой прогон: «часть получает всё,
+    // часть немного, часть вообще ничего», и начинается это **с третьего
+    // устройства** — пока их двое, выбирать не из чего.
+    let mut stand = Stand::strangers_on_split_rungs(0x0_FA11);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    // Перезапуск **обоих**: привязка живёт в памяти у каждой стороны,
+    // и пока владелец помнит читателя, тот получает слово, даже никуда
+    // не привязавшись. Забыли оба — и остаётся только то, что читатель
+    // построит заново по каталогу.
+    stand.restart(NodeId(0));
+    stand.restart(NodeId(2));
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "после перезапуска");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"после перезапуска".to_owned()),
+        "читатель, которому до сида не дотянуться, обязан вернуться к владельцу; \
+         видно {:?}; источников {:?}; сид {:#x}",
+        stand.sim.node(NodeId(2)).seen(chat),
+        stand.facts(NodeId(2), chat).sources_now,
         stand.sim.seed()
     );
 }

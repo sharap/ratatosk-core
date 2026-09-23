@@ -2660,6 +2660,117 @@ fn a_file_in_an_open_channel_reaches_the_subscriber() {
 }
 
 #[test]
+fn deleting_a_contact_does_not_take_away_the_channel_he_owns() {
+    // **Разбор живого случая.** «При удалении всех контактов, связанных
+    // с каналом, последующий запрос истории отвечает „контакт
+    // неизвестен“».
+    //
+    // Владелец канала лежит **пиром** (§8.3) — так его кладёт подписка
+    // по ссылке. Стань он ещё и контактом — удаление контакта не вправе
+    // уносить с собой дорогу к каналу: §10.6 знает разницу, забыть
+    // человека и отписаться от его канала — разные действия, и второго
+    // человек не просил.
+    let mut stand = Stand::strangers(0x0_DE1E7, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // Человек добавил автора в знакомые — обычное дело. А запись пира
+    // при этом **исчезает**: ровно так поступает повышение до контакта
+    // (`promote_peer_to_contact`), когда собеседник заговорил лично.
+    // Здесь она убирается руками, потому что повышение проверкой
+    // не воспроизвести: личное слово незнакомцу ядро и так не пустит.
+    let owner_ik = stand.ik(NodeId(0));
+    let card = stand.sim.node(NodeId(0)).engine().own_card().encode().expect("карточка");
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::AddContact { card_bytes: card.clone(), met_in_person: false });
+    });
+    stand.settle();
+    stand.sim.act(NodeId(1), |node, _| {
+        node.engine_mut().store_mut().delete_peer(&owner_ik).expect("запись пира убрана");
+    });
+    stand.restart(NodeId(1));
+    assert!(
+        !stand.sim.node(NodeId(1)).engine().peers().contains_key(&owner_ik),
+        "опора: записи пира больше нет, иначе восстанавливать нечего; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::DeleteContact { peer_ik: owner_ik, purge_history: false });
+    });
+    stand.settle();
+
+    // **Дорога к владельцу канала обязана уцелеть.** Знакомство убрали,
+    // канал остался — и читать его не через кого, кроме него.
+    assert!(
+        stand.sim.node(NodeId(1)).engine().peers().contains_key(&owner_ik),
+        "удаление контакта не вправе уносить владельца канала; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // И слово владельца по-прежнему доезжает. Обход даёт читателю
+    // повод назваться заново: удаление унесло сессии, и привязку надо
+    // повторить — ровно как после перезапуска (§7.5.1).
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+    stand.say(NodeId(0), chat, "после удаления");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"после удаления".to_owned()),
+        "канал обязан читаться и после того, как автора убрали из знакомых; \
+         видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(1)).seen(chat),
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_channel_with_no_one_to_ask_says_so_instead_of_refusing() {
+    // Вторая половина того же случая — и та, что чинит **уже
+    // испорченные** базы. Пира могли и потерять: до этой поставки всякая
+    // выкачка файла из канала повышала собеседника до контакта, а
+    // повышение **удаляет** запись пира. Удалили потом контакт — и
+    // не осталось ничего: ни знакомства, ни адреса.
+    //
+    // Дороги в такой канал больше нет, и вернуть её ядру нечем. Но
+    // «спросить некого» — это состояние, а не отказ: человек просил
+    // прокрутить историю, а получал «контакт неизвестен» и читал это
+    // как внутреннюю ошибку.
+    let mut stand = Stand::strangers(0x0_A5C, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // Так выглядит база, из которой запись пира уже потеряна.
+    let owner_ik = stand.ik(NodeId(0));
+    stand.sim.act(NodeId(1), |node, _| {
+        node.engine_mut().store_mut().delete_peer(&owner_ik).expect("запись пира убрана");
+    });
+    stand.restart(NodeId(1));
+
+    let asked = stand.sim.act(NodeId(1), |node, ctx| {
+        node.engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::PullOlderHistory { chat }))
+            .map(|effects| {
+                let end = effects.iter().any(|effect| {
+                    matches!(effect, Effect::Notify(Event::ChannelHistoryEnd { .. }))
+                });
+                node.events.clear();
+                end
+            })
+    });
+    assert!(
+        matches!(asked, Ok(true)),
+        "прокрутка без единого адресата обязана честно сказать «дальше некуда», \
+         а не отказать: {asked:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_file_pulled_from_a_channel_does_not_make_anyone_a_contact() {
     // **Разбор живого случая.** «Постоянно вычищаю контакты от каналов,
     // а они добавляются обратно».

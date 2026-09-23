@@ -549,7 +549,14 @@ impl<S: Store> Engine<S> {
         let seeds = self.attach_targets(now_ms, chat)?;
         let mut effects = Vec::new();
         for seed in seeds {
-            effects.extend(self.attach_one(now_ms, chat, seed)?);
+            // Отказ по одному не обрывает остальных, и обход тем более:
+            // он идёт по **всем** каналам, и один потерянный адрес унёс
+            // бы с собой и поворот ключа, и каталог, и привязки
+            // ко всему прочему.
+            match self.attach_one(now_ms, chat, seed) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "до сида не дотянуться"),
+            }
         }
         Ok(effects)
     }
@@ -1891,7 +1898,21 @@ impl<S: Store> Engine<S> {
         let targets = self.attach_targets(now_ms, chat)?;
         let mut effects = Vec::new();
         for peer in targets {
-            effects.extend(self.attach_one(now_ms, chat, peer)?);
+            // **Отказ по одному адресату не обрывает остальных** — то же
+            // правило, что у веера и у дерева. И не выходит наружу
+            // отказом команды: «до этого не дотянуться» — состояние,
+            // а не ошибка человека.
+            //
+            // Живой прогон описал цену этой разницы: «удалил все контакты,
+            // связанные с каналом, — и запрос истории отвечает „контакт
+            // неизвестен“». Записи пира к тому времени не было (её съело
+            // повышение до контакта), дороги в канал не осталось вовсе —
+            // и прокрутка вверх падала отказом вместо честного «дальше
+            // некуда».
+            match self.attach_one(now_ms, chat, peer) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "до сида не дотянуться"),
+            }
         }
         // Спросить некого — говорим об этом сразу, а не молчим: у канала
         // без сидов и без владельца под рукой прокрутка просто не даст

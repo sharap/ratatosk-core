@@ -2582,7 +2582,7 @@ impl<S: Store> Engine<S> {
             }
             Command::SetLocalName { peer_ik, name } => self.on_set_local_name(peer_ik, name),
             Command::DeleteContact { peer_ik, purge_history } => {
-                self.on_delete_contact(peer_ik, purge_history)
+                self.on_delete_contact(now_ms, peer_ik, purge_history)
             }
             Command::DeleteMessages { chat, msg_ids } => {
                 Ok(self.forget_messages(now_ms, chat, &msg_ids))

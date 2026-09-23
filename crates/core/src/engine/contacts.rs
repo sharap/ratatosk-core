@@ -203,6 +203,38 @@ impl<S: Store> Engine<S> {
     /// # Errors
     ///
     /// Отказ хранилища либо неразбираемая карточка.
+    /// Нужен ли нам этот человек **каналом**, а не знакомством (§10.6).
+    ///
+    /// # Зачем спрашивается
+    ///
+    /// Запись пира — это дорога (§8.3), запись контакта — знакомство.
+    /// Повышение до контакта дорогу **съедает**: пир удаляется, потому
+    /// что в нём больше нет нужды. Удалили потом контакт — и не осталось
+    /// ничего, а канал никуда не делся.
+    ///
+    /// # Владелец и сид, и больше никто
+    ///
+    /// Владелец — единственный источник канала по приглашению (§3.2)
+    /// и первый у открытого (§7.5.2); сид — тот, у кого мы спрашиваем
+    /// блоки (§7.5.1). Остальных удаление вправе уносить целиком:
+    /// участник группы приедет карточкой заново (§11.5), а незнакомец,
+    /// однажды пожавший руку, дорогой нам не является.
+    fn needed_by_a_channel(&self, who: &[u8; 32]) -> bool {
+        let channels: Vec<ChatId> = self
+            .groups
+            .iter()
+            .filter(|(_, state)| !state.profile.everyone_writes())
+            .map(|(chat, _)| *chat)
+            .collect();
+        channels.iter().any(|chat| {
+            self.groups.get(chat).is_some_and(|state| state.group.owner == *who)
+                || self
+                    .store
+                    .seeds(chat)
+                    .is_ok_and(|seeds| seeds.iter().any(|seed| seed.ik == *who))
+        })
+    }
+
     pub(super) fn promote_peer_to_contact(
         &mut self,
         now_ms: u64,
@@ -1039,6 +1071,7 @@ impl<S: Store> Engine<S> {
     /// лежит в [`crate::honest::DELETION_NOTICE`].
     pub(super) fn on_delete_contact(
         &mut self,
+        now_ms: u64,
         peer_ik: [u8; 32],
         purge_history: bool,
     ) -> Result<Vec<Effect>, EngineError> {
@@ -1046,6 +1079,19 @@ impl<S: Store> Engine<S> {
             return Err(EngineError::UnknownPeer);
         }
         let chat = Self::chat_id_for(&peer_ik);
+
+        // **Канал переживает удаление знакомства** (§10.6). Забыть
+        // человека и отписаться от его канала — разные действия, и второго
+        // человек не просил. Карточка снимается **до** удаления: после
+        // него взять её будет неоткуда, а без неё канал остаётся
+        // без единого адреса и всякая его просьба упирается
+        // в `UnknownPeer`. Живой прогон описал это так: «удалил все
+        // контакты, связанные с каналом, — и запрос истории отвечает
+        // „контакт неизвестен“».
+        let keep = self
+            .needed_by_a_channel(&peer_ik)
+            .then(|| self.contacts.get(&peer_ik).and_then(|it| it.card.encode().ok()))
+            .flatten();
 
         // Сессии — первыми и из обоих мест сразу: из реестра в памяти и
         // с диска. Пережившая удаление запись в реестре продолжала бы
@@ -1092,6 +1138,13 @@ impl<S: Store> Engine<S> {
                 self.forget_file(&file_id);
             }
             self.store.delete_chat(&chat)?;
+        }
+
+        // Запись пира возвращается **после** удаления контакта: пока
+        // контакт на месте, `remember_card_as` положил бы рядом вторую
+        // запись об одном человеке, и наблюдаемым он стал бы дважды.
+        if let Some(card_bytes) = keep {
+            self.remember_card_from_channel(now_ms, &card_bytes)?;
         }
 
         let mut effects = vec![Effect::Notify(Event::ContactRemoved { peer_ik })];

@@ -121,12 +121,45 @@ struct Peer {
     /// Заведена ли у узла почта. Перезапуск обязан поднять его таким же:
     /// узел, у которого ящика не было, после перезапуска его не заводит.
     mail: bool,
+    /// Единственная ступень узла, если она одна: онион-адреса у такого
+    /// узла нет вовсе.
+    ///
+    /// Стенд с самого начала давал онион всем, и это скрывало целую
+    /// ступень: каналы ни разу не ездили ни по мешу, ни по реле —
+    /// только по ониону. А на живых устройствах включены как раз меш
+    /// и реле, и §5.4 выбирает их.
+    ///
+    /// Переживает перезапуск вместе с почтой и по той же причине: узел
+    /// обязан подняться тем же, каким лёг.
+    sole: Option<Transport>,
     /// Повторяет ли эфир объявления. Ложь у всех, кроме эфирных сценариев.
     beacons: bool,
     /// Сколько кадров узел отдал сети за прогон — им меряется рой (§7.1).
     sent: usize,
     /// Когда последний раз объявлялись. Чаще срока маяку незачем.
     beacon_at_ms: u64,
+    /// Спрашивать ли адрес перед отправкой (**адресная сеть**).
+    ///
+    /// Обычная сеть стенда доставляет кадр всякому узлу **по ключу**:
+    /// отправитель называет `IK`, симуляция находит узел. Живая сеть так
+    /// не умеет — раннеру нужен адрес, и не найдя его, он отвечает
+    /// `NoAddress`, а кадр не уезжает вовсе.
+    ///
+    /// Разница эта не мелочь: между контактами адреса есть всегда
+    /// (карточками обменялись при знакомстве), а между владельцем канала
+    /// и подписчиком — только те, что приехали ссылкой и рукопожатием.
+    /// Целый класс поломок — «работает только между контактами» — стенд
+    /// по ключу не увидит **никогда**.
+    ///
+    /// Заводится это отдельным режимом, а не по умолчанию, потому что
+    /// проверка, из-под которой убрали дорогу, падает не там, где
+    /// поломка: сперва надо увидеть, что именно перестаёт ездить.
+    by_address: bool,
+    /// Сколько кадров стенд **не отпустил**: адреса не нашлось.
+    ///
+    /// Считается всегда, а роняет только адресная сеть: по этому числу
+    /// видно, что сценарий упирается в адрес, а не в протокол.
+    no_address: usize,
 }
 
 /// Как часто эфир повторяет объявление.
@@ -160,9 +193,9 @@ fn db_key() -> Zeroizing<[u8; 32]> {
 }
 
 impl Peer {
-    fn new(seed: u8, run: u64, mail: bool) -> Peer {
+    fn new(seed: u8, run: u64, mail: bool, sole: Option<Transport>) -> Peer {
         let home = Home::new(run, u16::from(seed));
-        let engine = Peer::open(seed, &home, mail);
+        let engine = Peer::open(seed, &home, mail, sole);
         Peer {
             engine: Some(engine),
             peers: BTreeMap::new(),
@@ -171,7 +204,10 @@ impl Peer {
             home,
             mail,
             beacons: false,
+            sole: None,
             beacon_at_ms: 0,
+            by_address: false,
+            no_address: 0,
             sent: 0,
         }
     }
@@ -181,7 +217,7 @@ impl Peer {
     /// Одно место на оба случая нарочно: перезапуск обязан открывать базу
     /// **тем же** способом, что и первый запуск. Разойдись они, стенд
     /// проверял бы не перезапуск, а свою вторую редакцию его.
-    fn open(seed: u8, home: &Home, mail: bool) -> Node {
+    fn open(seed: u8, home: &Home, mail: bool, sole: Option<Transport>) -> Node {
         let mut store = SqliteStore::open(&home.db(), db_key()).expect("база открывается");
         store.migrate().expect("миграции");
         let name = format!("узел{seed}");
@@ -194,7 +230,14 @@ impl Peer {
                 // Онион у всех есть: без адреса §5.4 честно отвечает «ехать
                 // некуда», и половина сценариев проверяла бы это вместо
                 // того, что в них написано.
-                onion: ratatosk_crypto::OnionKey::from_seed([seed; 32]).address(),
+                // Пусто у меш-узла: у него онион-адреса нет вовсе, и §5.4
+                // обязан выбрать меш — а не выбрать его молча по ониону,
+                // которого на устройстве не поднято.
+                onion: if sole.is_some() {
+                    String::new()
+                } else {
+                    ratatosk_crypto::OnionKey::from_seed([seed; 32]).address()
+                },
                 // Почта бывает и не заведена, и это не редкость: ящик
                 // заводит человек сам, а до тех пор последней ступени §5.4
                 // у него нет вовсе. Пустой адрес — ровно это и означает:
@@ -234,6 +277,16 @@ impl Peer {
                     let Some(&to) = self.peers.get(&peer_ik) else {
                         panic!("некуда слать: узел с таким IK в стенде не заведён");
                     };
+                    // **Адресная сеть спрашивает то же, что живой раннер.**
+                    // Правило одно на обоих (`Engine::address_of`): иначе
+                    // стенд зеленел бы там, где раннер отвечает
+                    // `NoAddress`, и тишину нечем было бы объяснить.
+                    if !addressable_at(self.engine(), &peer_ik, via) {
+                        self.no_address += 1;
+                        if self.by_address {
+                            continue;
+                        }
+                    }
                     // Счёт кадров — то, чем меряется рой (§7.1). Шагов сети
                     // для этого мало: в них входят и квитанции, и таймеры,
                     // и «почему слово стоит восьми блоков вместо пяти»
@@ -354,6 +407,26 @@ fn to_proto(kind: TransportKind) -> Transport {
     }
 }
 
+/// Есть ли у нас адрес этого ключа на этой ступени (§5.4).
+///
+/// Спрашивается у ядра, а не считается здесь: правило «контакт, иначе
+/// пир, иначе устройство» живёт в `Engine::address_of`, и вторая его
+/// копия разошлась бы с первой молча.
+///
+/// Эфир и локальная сеть отвечают `true` всегда: их адрес — не запись
+/// в карточке, а объявление рядом (§5.1), и знает о нём обнаружение,
+/// а не мы.
+fn addressable_at(engine: &Node, peer_ik: &[u8; 32], via: Transport) -> bool {
+    let address = engine.address_of(peer_ik);
+    match via {
+        Transport::Lan | Transport::Bt => true,
+        Transport::Onion => address.onion.is_some(),
+        Transport::Ygg => address.ygg.is_some(),
+        Transport::Nostr => address.nostr.is_some(),
+        Transport::Mail => address.chatmail.is_some(),
+    }
+}
+
 fn to_sim(transport: Transport) -> TransportKind {
     match transport {
         Transport::Lan => TransportKind::Lan,
@@ -431,7 +504,63 @@ impl Stand {
     /// `without_mail`: с ней всякое письмо доезжает спулом, и ожидание
     /// §5.4 не проверяется вовсе.
     fn strangers(seed: u64, count: u16) -> Stand {
-        Stand::assemble(seed, count, false, false)
+        Stand::assemble(seed, count, false, false, None)
+    }
+
+    /// Незнакомцы **в адресной сети**: кадр уезжает, только если у нас
+    /// есть адрес получателя на этой ступени (§5.4).
+    ///
+    /// Обычный стенд доставляет по ключу: назвал `IK` — симуляция нашла
+    /// узел. Живая сеть так не умеет, и разница эта закрывала целый
+    /// класс поломок: «работает только между контактами». Между
+    /// контактами адреса есть всегда — карточками обменялись
+    /// при знакомстве; между владельцем канала и подписчиком есть лишь
+    /// те, что приехали ссылкой (§10.1) и рукопожатием (§8.2).
+    ///
+    /// Заведено по живому прогону: «двое были друг у друга в контактах —
+    /// между ними ходило, третий не получал ничего».
+    fn strangers_by_address(seed: u64, count: u16) -> Stand {
+        let mut stand = Stand::assemble(seed, count, false, false, None);
+        for i in 0..count {
+            stand.sim.node_mut(NodeId(i)).by_address = true;
+        }
+        stand
+    }
+
+    /// Незнакомцы **в меше и в адресной сети**: ни у кого нет ониона,
+    /// единственная дорога — Yggdrasil (0.2), и кадр уезжает, только
+    /// если адрес нашёлся.
+    ///
+    /// Заведено по живому прогону: на устройствах включены меш и реле,
+    /// а стенд с первого дня давал всем онион и им же всё и возил.
+    /// Целая ступень оставалась непроверенной, и вместе с ней — всё,
+    /// что решается **по адресу**, а не по ключу.
+    fn strangers_in_the_mesh(seed: u64, count: u16) -> Stand {
+        let mut stand = Stand::assemble(seed, count, false, false, Some(Transport::Ygg));
+        for i in 0..count {
+            stand.sim.node_mut(NodeId(i)).by_address = true;
+        }
+        stand
+    }
+
+    /// Незнакомцы, у которых из ступеней **только реле** (0.3),
+    /// и адресная сеть.
+    ///
+    /// Вторая из двух ступеней, включённых на живых устройствах, —
+    /// и вторая, которой стенд не видел ни разу.
+    fn strangers_on_relays(seed: u64, count: u16) -> Stand {
+        let mut stand = Stand::assemble(seed, count, false, false, Some(Transport::Nostr));
+        for i in 0..count {
+            stand.sim.node_mut(NodeId(i)).by_address = true;
+        }
+        stand
+    }
+
+    /// Сколько кадров стенд не отпустил за весь прогон: адреса не нашлось.
+    fn frames_without_address(&self) -> usize {
+        (0..u16::try_from(self.sim.len()).expect("узлов не больше 65535"))
+            .map(|i| self.sim.node(NodeId(i)).no_address)
+            .sum()
     }
 
     /// Незнакомцы, у каждого из которых есть почтовый адрес (§5.3).
@@ -440,16 +569,22 @@ impl Stand {
     /// и увидеть это можно лишь там, где почта — настоящая дорога,
     /// а не пустая строка в карточке.
     fn strangers_with_mail(seed: u64, count: u16) -> Stand {
-        Stand::assemble(seed, count, true, false)
+        Stand::assemble(seed, count, true, false, None)
     }
 
     fn build(seed: u64, count: u16, mail: bool) -> Stand {
-        Stand::assemble(seed, count, mail, true)
+        Stand::assemble(seed, count, mail, true, None)
     }
 
-    fn assemble(seed: u64, count: u16, mail: bool, introduce_everyone: bool) -> Stand {
+    fn assemble(
+        seed: u64,
+        count: u16,
+        mail: bool,
+        introduce_everyone: bool,
+        sole: Option<Transport>,
+    ) -> Stand {
         let mut nodes: Vec<Peer> = (0..count)
-            .map(|i| Peer::new(u8::try_from(i + 1).expect("узлов не больше 254"), seed, mail))
+            .map(|i| Peer::new(u8::try_from(i + 1).expect("узлов не больше 254"), seed, mail, sole))
             .collect();
 
         let cards: Vec<(NodeId, [u8; 32], Vec<u8>)> = nodes
@@ -469,6 +604,9 @@ impl Stand {
             }
         }
 
+        for node in &mut nodes {
+            node.sole = sole;
+        }
         let mut sim = Sim::new(seed, nodes);
 
         // Потери на почте убраны, на прямых каналах — оставлены, и это
@@ -482,6 +620,13 @@ impl Stand {
             TransportKind::Mail,
             LinkProfile { loss_permille: 0, ..LinkProfile::MAIL },
         );
+        // **Меш в симуляции выключен по умолчанию** — как и на устройстве,
+        // пока человек его не включил. Стенд включает его вместе с узлами:
+        // иначе кадры уходили бы в сеть, которой нет, и это выглядело бы
+        // ровно как поломка протокола.
+        if let Some(rung) = sole {
+            sim.net_mut().set_enabled(to_sim(rung), true);
+        }
 
         sim.start();
 
@@ -505,8 +650,54 @@ impl Stand {
         // Onion объявляется работающим сразу: стенд проверяет протокол,
         // а не подъём Tor. Почта — тоже, иначе последняя ступень §5.4
         // не выбиралась бы вовсе и осталась непроверенной молча.
-        let ready: &[Transport] =
-            if mail { &[Transport::Onion, Transport::Mail] } else { &[Transport::Onion] };
+        // **Меш-узлу называется ключ меша, и только он.** Онион-адреса
+        // у него нет вовсе (`Peer::open`), так что §5.4 обязан выбрать
+        // меш — а не выбрать его молча по ониону, которого нет.
+        if let Some(rung) = sole {
+            for i in 0..count {
+                let key = vec![u8::try_from(i + 1).expect("узлов не больше 254"); 32];
+                sim.act(NodeId(i), |node, ctx| {
+                    // **Включает ступень человек**, и без этого §5.4 честно
+                    // отвечает «ехать некуда»: готовность транспорта
+                    // (`TransportReady`) и разрешение на него — разные
+                    // вещи. Стенд их не различал, потому что онион был
+                    // разрешён с самого начала.
+                    node.command(
+                        ctx,
+                        Command::SetTransportEnabled { transport: rung, enabled: true },
+                    );
+                    match rung {
+                        // Адрес в меше выводится из ключа, и называет его
+                        // человек (0.2): без ключа карточка не везёт
+                        // ступень, и §5.4 её не выбирает.
+                        Transport::Ygg => {
+                            node.command(
+                                ctx,
+                                Command::SetYggMode(ratatosk_proto::ygg::YggMode::External),
+                            );
+                            node.command(ctx, Command::SetYggKey(key.clone()));
+                        }
+                        // У реле адрес получателя — его ключ (0.3), а реле
+                        // это наша дорога. Ключ ядро заводит само
+                        // при включении ступени; реле называет человек.
+                        Transport::Nostr => {
+                            node.command(
+                                ctx,
+                                Command::SetNostrRelays(vec!["wss://relay.example".to_owned()]),
+                            );
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        }
+        let ready: Vec<Transport> = match (sole, mail) {
+            (Some(rung), true) => vec![rung, Transport::Mail],
+            (Some(rung), false) => vec![rung],
+            (None, true) => vec![Transport::Onion, Transport::Mail],
+            (None, false) => vec![Transport::Onion],
+        };
+        let ready: &[Transport] = &ready;
         for i in 0..count {
             for transport in ready {
                 let transport = *transport;
@@ -1031,10 +1222,11 @@ impl Stand {
             // к одному файлу — это не перезапуск, а два устройства.
             let seed = node.seed;
             let mail = node.mail;
+            let sole = node.sole;
             // Порядок здесь и есть смысл: старое ядро закрывает базу,
             // и только потом открывается новое.
             drop(node.engine.take());
-            let fresh = Peer::open(seed, &node.home, mail);
+            let fresh = Peer::open(seed, &node.home, mail, sole);
             node.engine = Some(fresh);
 
             // И то, ради чего перезапуск вообще проверяется: поднятое
@@ -1042,8 +1234,15 @@ impl Stand {
             let effects = node.engine_mut().startup_effects();
             node.apply(ctx, effects);
 
-            // Onion после перезапуска поднимается заново — как и в жизни.
-            for transport in [Transport::Onion, Transport::Mail] {
+            // Ступени после перезапуска поднимаются заново — как в жизни.
+            // Меш-узлу поднимается меш: онион у него не заведён вовсе,
+            // и объявлять его готовым значило бы вернуть ему дорогу,
+            // которой на устройстве нет.
+            let rungs: Vec<Transport> = match sole {
+                Some(rung) => vec![rung, Transport::Mail],
+                None => vec![Transport::Onion, Transport::Mail],
+            };
+            for transport in rungs.iter().copied() {
                 let effects = node
                     .engine_mut()
                     .step(ctx.now_ms(), Input::TransportReady { transport })
@@ -2602,6 +2801,169 @@ fn the_catalogue_of_an_open_channel_reaches_the_readers() {
         "второй читатель обязан узнать о раздающем; сид {:#x}",
         stand.sim.seed()
     );
+}
+
+#[test]
+fn an_open_channel_works_over_the_mesh_alone() {
+    // **Ступень, которой стенд не видел ни разу.** С первого дня он давал
+    // всем узлам онион и им же всё и возил; на живых устройствах включены
+    // меш и реле, и §5.4 выбирает их. Здесь онион не заведён вовсе,
+    // и дорога одна — Yggdrasil.
+    //
+    // Вместе с адресной сетью это и есть проверка того класса поломок,
+    // который живой прогон описывал как «работает только между
+    // контактами»: между ними адреса есть всегда, а у владельца канала
+    // и подписчика — только те, что приехали ссылкой и рукопожатием.
+    let mut stand = Stand::strangers_in_the_mesh(0x0_9E5F, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    // **Знакомство ни у кого ни с кем**, и до выдачи права проверяется
+    // именно это: читатель узнал владельца из ссылки, владелец узнал
+    // читателя рукопожатием (§8.3), и оба остались друг другу
+    // не контактами. Без этой пары утверждений провал ниже читался бы
+    // как «протокол не работает», а дело было бы в том, что стенд
+    // не довёз до собеседника вообще ничего.
+    assert!(
+        stand.sim.node(NodeId(1)).engine().peers().contains_key(&stand.ik(NodeId(0))),
+        "читатель обязан знать владельца пиром; кадров без адреса {}; сид {:#x}",
+        stand.frames_without_address(),
+        stand.sim.seed()
+    );
+    assert!(
+        stand.sim.node(NodeId(0)).engine().peers().contains_key(&stand.ik(NodeId(1))),
+        "владелец обязан узнать читателя рукопожатием; кадров без адреса {}; сид {:#x}",
+        stand.frames_without_address(),
+        stand.sim.seed()
+    );
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "слово владельца");
+    stand.say(NodeId(1), chat, "слово второго автора");
+    stand.settle();
+
+    for (who, what) in [
+        (NodeId(1), "слово владельца"),
+        (NodeId(2), "слово владельца"),
+        (NodeId(0), "слово второго автора"),
+        (NodeId(2), "слово второго автора"),
+    ] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&what.to_owned()),
+            "в меше {who:?} не получил «{what}»; кадров без адреса {}; сид {:#x}",
+            stand.frames_without_address(),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn an_open_channel_works_over_relays_alone() {
+    // Вторая из двух ступеней, включённых на живых устройствах, и вторая,
+    // которой стенд не видел ни разу. Онион не заведён вовсе, дорога
+    // одна — реле nostr (0.3), и адрес получателя там его собственный
+    // ключ, а не запись в карточке-адресе.
+    //
+    // Вместе с адресной сетью это и есть проверка того класса поломок,
+    // который живой прогон описывал как «работает только между
+    // контактами»: между ними адреса есть всегда, а у владельца канала
+    // и подписчика — только те, что приехали ссылкой и рукопожатием.
+    let mut stand = Stand::strangers_on_relays(0x0_9E17, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    // **Знакомство ни у кого ни с кем**, и до выдачи права проверяется
+    // именно это: читатель узнал владельца из ссылки, владелец узнал
+    // читателя рукопожатием (§8.3), и оба остались друг другу
+    // не контактами. Без этой пары утверждений провал ниже читался бы
+    // как «протокол не работает», а дело было бы в том, что стенд
+    // не довёз до собеседника вообще ничего.
+    assert!(
+        stand.sim.node(NodeId(1)).engine().peers().contains_key(&stand.ik(NodeId(0))),
+        "читатель обязан знать владельца пиром; кадров без адреса {}; сид {:#x}",
+        stand.frames_without_address(),
+        stand.sim.seed()
+    );
+    assert!(
+        stand.sim.node(NodeId(0)).engine().peers().contains_key(&stand.ik(NodeId(1))),
+        "владелец обязан узнать читателя рукопожатием; кадров без адреса {}; сид {:#x}",
+        stand.frames_without_address(),
+        stand.sim.seed()
+    );
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "слово владельца");
+    stand.say(NodeId(1), chat, "слово второго автора");
+    stand.settle();
+
+    for (who, what) in [
+        (NodeId(1), "слово владельца"),
+        (NodeId(2), "слово владельца"),
+        (NodeId(0), "слово второго автора"),
+        (NodeId(2), "слово второго автора"),
+    ] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&what.to_owned()),
+            "на реле {who:?} не получил «{what}»; кадров без адреса {}; сид {:#x}",
+            stand.frames_without_address(),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn an_open_channel_works_in_a_network_that_needs_addresses() {
+    // **Стенд, ищущий именно этот класс поломок.** Обычная сеть стенда
+    // доставляет кадр по ключу: назвал `IK` — симуляция нашла узел.
+    // Живая сеть так не умеет: раннеру нужен адрес, и не найдя его,
+    // он отвечает `NoAddress`, а кадр не уезжает вовсе.
+    //
+    // Между контактами адреса есть всегда — карточками обменялись
+    // при знакомстве. Между владельцем канала и подписчиком есть только
+    // те, что приехали ссылкой (§10.1) и рукопожатием (§8.2). Живой
+    // прогон описал разницу прямо: «двое были друг у друга в контактах —
+    // между ними ходило, третий не получал ничего».
+    let mut stand = Stand::strangers_by_address(0x0_ADD2, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "слово владельца");
+    stand.say(NodeId(1), chat, "слово второго автора");
+    stand.settle();
+
+    for (who, what) in [
+        (NodeId(1), "слово владельца"),
+        (NodeId(2), "слово владельца"),
+        (NodeId(0), "слово второго автора"),
+        (NodeId(2), "слово второго автора"),
+    ] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&what.to_owned()),
+            "в адресной сети {who:?} не получил «{what}»; кадров без адреса {}; сид {:#x}",
+            stand.frames_without_address(),
+            stand.sim.seed()
+        );
+    }
 }
 
 #[test]

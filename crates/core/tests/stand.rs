@@ -2835,6 +2835,148 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn a_message_the_owner_never_got_is_marked_as_such() {
+    // **Разбор живого случая.** «Стоит владельцу уйти из сети, начинается
+    // хаос; со временем чинится, но некоторые сообщения всё равно
+    // остаются у пользователей, хотя в дереве канала их уже нет, надо
+    // их как-то помечать».
+    //
+    // Пометить есть чем: владелец присылает свой have-вектор (§7.2),
+    // и сообщение, лежащее **в дыре** между двумя его строками, до него
+    // не доехало. Завтрашний читатель канала его не увидит.
+    //
+    // # Вектор здесь кладётся руками, и это не обход проверки
+    //
+    // Дыру посередине стенд не удержит: анти-энтропия §7.2 её заживляет,
+    // и это правильно — соседние проверки на том и стоят. Проверяется
+    // поэтому **правило**, а не путь: владелец сказал «вот что у меня
+    // есть», и по сказанному надо судить. Путь, которым это приезжает,
+    // стережёт `a_reader_who_was_away_catches_up_when_he_comes_back`.
+    let mut stand = Stand::strangers(0x0_D14A, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    for word in ["первое", "второе", "третье"] {
+        stand.say(NodeId(1), chat, word);
+        stand.settle();
+    }
+
+    // Номера автора в архиве читателя — по ним и строится вектор.
+    let author = stand.ik(NodeId(1));
+    let seq_of = |stand: &Stand, text: &str| -> u64 {
+        let node = stand.sim.node(NodeId(2));
+        let found = node
+            .engine()
+            .store()
+            .messages(&chat, usize::MAX, None)
+            .expect("история")
+            .into_iter()
+            .find(|m| String::from_utf8_lossy(&m.body) == text)
+            .expect("сообщение в истории");
+        node.engine()
+            .store()
+            .archived(&chat, &found.msg_id)
+            .expect("архив")
+            .expect("блок в архиве")
+            .seq
+    };
+    let (first, middle, last) =
+        (seq_of(&stand, "первое"), seq_of(&stand, "второе"), seq_of(&stand, "третье"));
+    assert!(
+        first < middle && middle < last,
+        "номера обязаны идти подряд; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Опора: вектор владельца у читателя уже есть.** Он приезжает
+    // ответом на привязку (§7.2), и без этой строки проверка ниже
+    // стерегла бы только счёт, а не дорогу: вектор она кладёт сама.
+    let mut key = String::from("channel_owner_have:");
+    for byte in chat {
+        key.push_str(&format!("{byte:02x}"));
+    }
+    let stored =
+        stand.sim.node(NodeId(2)).engine().store().meta(&key).expect("чтение").unwrap_or_default();
+    assert!(
+        !stored.is_empty(),
+        "вектор владельца обязан приехать сам; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Владелец сказал: «есть первое и третье, второго нет».
+    let mut vector = Vec::new();
+    for (from, to) in [(first, first), (last, last)] {
+        vector.extend_from_slice(&author);
+        vector.extend_from_slice(&from.to_be_bytes());
+        vector.extend_from_slice(&to.to_be_bytes());
+    }
+    stand.sim.act(NodeId(2), |node, _| {
+        node.engine_mut().store_mut().put_meta(&key, &vector).expect("вектор владельца");
+    });
+
+    let mark = |stand: &Stand, who: NodeId, text: &str| -> Option<bool> {
+        let node = stand.sim.node(who);
+        let found = node
+            .engine()
+            .store()
+            .messages(&chat, usize::MAX, None)
+            .expect("история")
+            .into_iter()
+            .find(|m| String::from_utf8_lossy(&m.body) == text)
+            .expect("сообщение в истории");
+        node.engine().message_in_the_channel(&chat, &found.msg_id)
+    };
+
+    assert_eq!(
+        mark(&stand, NodeId(2), "второе"),
+        Some(false),
+        "сообщение в дыре вектора владельца обязано быть помечено; сид {:#x}",
+        stand.sim.seed()
+    );
+    // **И соседние — не помечены.** Без этой половины метка была бы
+    // «помечаю всё подряд», и человек перестал бы её читать.
+    for text in ["первое", "третье"] {
+        assert_eq!(
+            mark(&stand, NodeId(2), text),
+            Some(true),
+            "«{text}» владелец держит — метки быть не должно; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+    // У самого владельца судить не по чему: свой канал он и есть.
+    assert_eq!(
+        mark(&stand, NodeId(0), "первое"),
+        None,
+        "в своём канале метки не бывает; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Свежее последнего — «не знаем», а не «нет».** Владелец мог
+    // просто не успеть сказать. Пометь мы такое — метка висела бы
+    // на каждом новом сообщении.
+    let mut short = Vec::new();
+    short.extend_from_slice(&author);
+    short.extend_from_slice(&first.to_be_bytes());
+    short.extend_from_slice(&first.to_be_bytes());
+    stand.sim.act(NodeId(2), |node, _| {
+        node.engine_mut().store_mut().put_meta(&key, &short).expect("вектор владельца");
+    });
+    assert_eq!(
+        mark(&stand, NodeId(2), "третье"),
+        None,
+        "о том, что новее сказанного владельцем, судить нечем; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn an_owner_off_the_screen_still_serves_his_channel() {
     // **Что проверяется.** §12 гасит раздачу у аккаунта, ушедшего
     // с экрана: «активен ровно один аккаунт… его сидирование

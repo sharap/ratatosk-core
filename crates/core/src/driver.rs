@@ -150,6 +150,23 @@ pub struct MessageView {
     /// не доехала, подписывается началом отпечатка. Правило одно и живёт
     /// в одном месте.
     pub author: Option<String>,
+    /// Есть ли это сообщение у владельца канала (§7.2, §7.3).
+    ///
+    /// `None` — судить не по чему: это не канал, канал наш собственный,
+    /// вектор от владельца ещё не приезжал, либо номер лежит **вне**
+    /// того, что владелец о себе сказал (архив обрезается окном §9.3,
+    /// и о старом он молчит не потому, что его нет).
+    ///
+    /// `Some(false)` означает ровно одно: **до владельца это не
+    /// доехало**, и пришедший в канал завтра этого не увидит. Не
+    /// «удалили» — удаления §11.4 у канала нет вовсе — и не
+    /// «подделка»: подпись проверена, иначе сообщение не показалось бы.
+    ///
+    /// Заведено по живому прогону: «стоит владельцу уйти из сети,
+    /// начинается хаос; со временем чинится, но некоторые сообщения
+    /// остаются у пользователей, хотя в дереве канала их уже нет,
+    /// надо их как-то помечать».
+    pub in_the_channel: Option<bool>,
 }
 
 /// Присланная карточка контакта вместе с тем, что о ней уже известно.
@@ -1653,6 +1670,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
                     let shared_contact = self.shared_contact_view(&message.msg_id);
                     MessageView {
                         author: self.engine.message_author(&message.chat_id, &message.sender_ik),
+                        in_the_channel: self
+                            .engine
+                            .message_in_the_channel(&message.chat_id, &message.msg_id),
                         message,
                         reactions,
                         files,
@@ -1715,6 +1735,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
                             author: self
                                 .engine
                                 .message_author(&message.chat_id, &message.sender_ik),
+                            in_the_channel: self
+                                .engine
+                                .message_in_the_channel(&message.chat_id, &message.msg_id),
                             message,
                             reactions,
                             files,
@@ -1952,6 +1975,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 let shared_contact = self.shared_contact_view(&message.msg_id);
                 MessageView {
                     author: self.engine.message_author(&message.chat_id, &message.sender_ik),
+                    in_the_channel: self
+                        .engine
+                        .message_in_the_channel(&message.chat_id, &message.msg_id),
                     message,
                     reactions,
                     files,

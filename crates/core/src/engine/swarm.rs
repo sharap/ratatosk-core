@@ -1629,6 +1629,16 @@ impl<S: Store> Engine<S> {
                 // замыкается на одном ответе.
                 let me = self.identity.public().ik;
                 let mine = self.channel_owner(chat).is_some_and(|owner| owner == me);
+                // **Вектор владельца запоминается**, и не ради роя:
+                // по нему видно, чего в канале **нет**. Живой прогон
+                // назвал это так: «некоторые сообщения остаются
+                // у пользователей, хотя в дереве канала их уже нет,
+                // надо их как-то помечать».
+                if !mine && self.channel_owner(chat) == Some(peer_ik) {
+                    if let Err(error) = self.remember_owner_have(chat, &ranges) {
+                        tracing::warn!(?error, "вектор владельца не записался");
+                    }
+                }
                 let mut effects = self.on_have(now_ms, chat, peer_ik, &ranges)?;
                 if mine {
                     match self.send_have(now_ms, chat, peer_ik) {
@@ -1688,6 +1698,119 @@ impl<S: Store> Engine<S> {
         // нечего, а сам он нам нужен.
         let tell = swarm::Control::Have { group: chat, ranges };
         self.send_swarm_control(now_ms, peer_ik, &tell)
+    }
+
+    /// Ключ, под которым лежит последний вектор владельца этого канала.
+    fn owner_have_key(chat: ChatId) -> String {
+        // Шестнадцатеричный вид, а не байты: ключ у `meta` — строка,
+        // и класть в неё сырой идентификатор значило бы полагаться
+        // на то, что он окажется годным UTF-8.
+        let mut key = String::from("channel_owner_have:");
+        for byte in chat {
+            key.push_str(&format!("{byte:02x}"));
+        }
+        key
+    }
+
+    /// Запоминает have-вектор владельца канала (§7.2, §7.3).
+    ///
+    /// # Зачем его хранить
+    ///
+    /// Рою он не нужен: `on_have` разбирает его на месте и тут же
+    /// просит недостающее. Нужен он **человеку**. Сообщение, которое
+    /// есть у нас и которого нет у владельца, выглядит на экране точно
+    /// так же, как всякое другое, — а это разные вещи, и разницу видно
+    /// только по его вектору.
+    ///
+    /// Живой прогон описал случай прямо: «стоит владельцу уйти из сети,
+    /// начинается хаос; со временем чинится, но некоторые сообщения
+    /// остаются у пользователей, хотя в дереве канала их уже нет».
+    ///
+    /// # Свой вид записи, а не канонический CBOR
+    ///
+    /// Запись **не пересекает провод** и живёт только на нашем диске,
+    /// поэтому у неё нет ни версии, ни совместимости: сорок восемь байт
+    /// на строку, ключ автора и два номера. Испорченная или чужая
+    /// по длине читается как «вектора нет» — судить по половине строки
+    /// хуже, чем не судить вовсе.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    fn remember_owner_have(
+        &mut self,
+        chat: ChatId,
+        ranges: &[swarm::Range],
+    ) -> Result<(), EngineError> {
+        let mut bytes = Vec::with_capacity(ranges.len() * 48);
+        for range in ranges.iter().take(swarm::MAX_HAVE_RANGES) {
+            bytes.extend_from_slice(&range.author);
+            bytes.extend_from_slice(&range.first_seq.to_be_bytes());
+            bytes.extend_from_slice(&range.last_seq.to_be_bytes());
+        }
+        self.store.put_meta(&Self::owner_have_key(chat), &bytes)?;
+        Ok(())
+    }
+
+    /// Есть ли это сообщение у владельца канала — как он сам сказал.
+    ///
+    /// # Три ответа, и третий важнее прочих
+    ///
+    /// `None` — **судить не по чему**, и это самый частый случай:
+    /// чат не канал, канал наш собственный, вектор от владельца ещё
+    /// не приезжал, блока нет в архиве, либо номер лежит **вне**
+    /// того, что владелец о себе сказал. Последнее не мелочь: архив
+    /// обрезается окном §9.3, и о старом владелец молчит не потому,
+    /// что его нет, а потому, что он его больше не держит. Сказать
+    /// про такое «в канале этого нет» значило бы соврать.
+    ///
+    /// `Some(true)` — держит. `Some(false)` — **не держит, хотя эту
+    /// часть цепочки автора покрывает**: между двумя его строками
+    /// зияет дыра ровно на нашем номере.
+    ///
+    /// # Чего этот ответ не значит
+    ///
+    /// Не «сообщение удалили»: удаления §11.4 у канала нет вовсе.
+    /// И не «оно поддельное»: подпись мы проверили, иначе не показали
+    /// бы. Значит он ровно одно — **до владельца это не доехало**,
+    /// и тот, кто придёт в канал завтра, этого не увидит.
+    #[must_use]
+    pub fn message_in_the_channel(&self, chat: &ChatId, msg_id: &MsgId) -> Option<bool> {
+        let me = self.identity.public().ik;
+        let state = self.groups.get(chat)?;
+        if state.profile.everyone_writes() || state.group.owner == me {
+            return None;
+        }
+        let block = self.store.archived(chat, msg_id).ok()??;
+        let bytes = self.store.meta(&Self::owner_have_key(*chat)).ok()??;
+        if bytes.is_empty() || bytes.len() % 48 != 0 {
+            return None;
+        }
+        let mut covers = false;
+        for row in bytes.chunks_exact(48) {
+            let author: [u8; 32] = row[..32].try_into().ok()?;
+            if author != block.author_ik {
+                continue;
+            }
+            let first = u64::from_be_bytes(row[32..40].try_into().ok()?);
+            let last = u64::from_be_bytes(row[40..48].try_into().ok()?);
+            if block.seq >= first && block.seq <= last {
+                return Some(true);
+            }
+            // Покрытие считается по **всем** строкам этого автора:
+            // вектор разбит на непрерывные куски, и наш номер может
+            // лежать в дыре между двумя из них. Дыра — это и есть
+            // «не доехало», а всё, что ниже первого куска или выше
+            // последнего, — «не знаем».
+            covers |= block.seq >= first;
+        }
+        let above_last = bytes
+            .chunks_exact(48)
+            .filter(|row| row[..32] == block.author_ik)
+            .map(|row| u64::from_be_bytes(row[40..48].try_into().unwrap_or([0u8; 8])))
+            .max()
+            .is_some_and(|last| block.seq > last);
+        (covers && !above_last).then_some(false)
     }
 
     /// Пришёл чужой have-вектор: просим то, чего нет у нас (§7.2).

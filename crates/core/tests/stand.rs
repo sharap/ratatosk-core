@@ -2727,6 +2727,72 @@ fn deleting_a_contact_does_not_take_away_the_channel_he_owns() {
 }
 
 #[test]
+fn the_link_brings_back_a_channel_that_lost_its_road() {
+    // **Продолжение того же разбора, доведённое до конца.** Если запись
+    // пира уже потеряна — а на базах прошлых сборок она потеряна, —
+    // адресов владельца не осталось нигде: подписка хранит его ключ,
+    // но не адреса (§10.3), а каталог у обычного канала пуст, потому что
+    // раздача по умолчанию тихая (§7.5.1).
+    //
+    // Единственное место, где адреса ещё есть, — сама ссылка, и она
+    // у человека в руках. Ядро отвечало ему «вы уже подписаны» и
+    // не брало из неё ничего.
+    let mut stand = Stand::strangers(0x0_11_5C, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // Так выглядит база, потерявшая дорогу.
+    let owner_ik = stand.ik(NodeId(0));
+    stand.sim.act(NodeId(1), |node, _| {
+        node.engine_mut().store_mut().delete_peer(&owner_ik).expect("запись пира убрана");
+    });
+    stand.restart(NodeId(1));
+    assert!(
+        !stand.sim.node(NodeId(1)).engine().peers().contains_key(&owner_ik),
+        "опора: дороги нет, иначе возвращать нечего; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек вставляет ту же ссылку снова.
+    let again = stand.sim.act(NodeId(1), |node, ctx| {
+        node.engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::SubscribeToChannel { uri: link.clone() }))
+            .map(|_| ())
+    });
+    // **Отказ остаётся отказом**: заводить канал заново нельзя, это
+    // стёрло бы принятое представление. Человеку так и говорят.
+    assert!(
+        matches!(again, Err(ratatosk_core::EngineError::AlreadySubscribed)),
+        "повторная ссылка обязана честно сказать «вы уже подписаны»: {again:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    // А дорога при этом взята.
+    assert!(
+        stand.sim.node(NodeId(1)).engine().peers().contains_key(&owner_ik),
+        "повторная ссылка обязана вернуть путь к владельцу; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // И канал снова читается.
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+    stand.say(NodeId(0), chat, "канал вернулся");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"канал вернулся".to_owned()),
+        "после возврата дороги канал обязан читаться; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(1)).seen(chat),
+        stand.sim.seed()
+    );
+
+    // **Чего это не чинит.** Ссылки, в которой адресов не было вовсе
+    // (§10.2 такую разрешает): взять из неё нечего, и канал останется
+    // без дороги — но скажет об этом признаком §15, а не отказом.
+}
+
+#[test]
 fn a_channel_with_no_one_to_ask_says_so_instead_of_refusing() {
     // Вторая половина того же случая — и та, что чинит **уже
     // испорченные** базы. Пира могли и потерять: до этой поставки всякая

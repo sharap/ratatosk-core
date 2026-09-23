@@ -329,9 +329,34 @@ impl<S: Store> Engine<S> {
             channel::Invitation::from_uri(uri).map_err(|_| EngineError::BadChannelLink)?;
         let chat = invitation.group;
         if self.groups.contains_key(&chat) {
-            // Уже знаем этот канал: своей же ссылкой или второй копией
-            // чужой. Заводить его заново значило бы стереть принятое
-            // представление и состав.
+            // **Но адреса из ссылки берём** — и это единственное, чем
+            // можно вернуть канал, потерявший дорогу.
+            //
+            // Живой прогон дошёл до этого случая своим ходом: «удалили
+            // все контакты, связанные с каналом, перезапустили — канал
+            // недоступен». Записи пира к тому времени нет (её съело
+            // повышение до контакта), адресов владельца нет больше нигде:
+            // подписка хранит его ключ, но не адреса, а каталог у обычного
+            // канала пуст — раздача по умолчанию тихая (§7.5.1).
+            //
+            // Ссылка — единственное место, где адреса ещё есть, и человек
+            // держит её в руках. Отвечать ему «вы уже подписаны», не взяв
+            // из неё ничего, значит отказать в том единственном, что могло
+            // помочь.
+            //
+            // Заводить канал заново по-прежнему нельзя: это стёрло бы
+            // принятое представление и состав. Поэтому берётся ровно
+            // одно — путь к владельцу, и ровно тем же способом, каким
+            // он берётся при первой подписке.
+            let me = self.identity.public().ik;
+            if invitation.owner != me && !self.contacts.contains_key(&invitation.owner) {
+                self.remember_peer(
+                    now_ms,
+                    invitation.owner,
+                    &invitation.endpoints,
+                    ratatosk_store::PEER_CHANNEL_OWNER,
+                )?;
+            }
             return Err(EngineError::AlreadySubscribed);
         }
 
@@ -628,6 +653,32 @@ impl<S: Store> Engine<S> {
         peer_ik: [u8; 32],
     ) -> Result<Vec<Effect>, EngineError> {
         let Some(stored) = self.store.channel(&chat)? else { return Ok(Vec::new()) };
+
+        // **Сперва карточка, и это не щедрость.** Читатель проверяет
+        // наши блоки нашим ключом подписи, а берёт он его из карточки
+        // (§11.5). Нет карточки — всякий наш блок откладывается навсегда,
+        // и снаружи это неотличимо от «ничего не приходит».
+        //
+        // Потерять её читателю есть отчего: запись пира удаляется
+        // повышением до контакта, а удаление контакта возвращает
+        // из ссылки только **адреса** — подписи в ссылке нет (§10.2).
+        // Живой прогон дошёл до этого случая своим ходом: «удалили все
+        // контакты, связанные с каналом, перезапустили — канал
+        // недоступен».
+        //
+        // Цена — карточка на привязку, то есть на новую сессию
+        // с читателем. Она мала и подписана; проверка `accept` на той
+        // стороне отвергнет её как устаревшую, если у него уже есть
+        // свежая (§4.3).
+        let card = self.own_card().encode()?;
+        let signature = self.identity.sign(&card);
+        let (_, mut effects) = self.enqueue_request(
+            now_ms,
+            peer_ik,
+            PayloadType::CardUpdate,
+            ratatosk_proto::card_update::payload(&card, &signature),
+        )?;
+
         let document = ratatosk_proto::group_action::Action::Representation {
             bytes: ratatosk_codec::canonical::encode(&channel::wire_value(
                 stored.block_bytes,
@@ -635,7 +686,7 @@ impl<S: Store> Engine<S> {
             ))?,
         };
         let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &document)?;
-        let mut effects = self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?;
+        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
 
         // И каталог — тем же, чем он едет впущенному (§7.4, шаг 1).
         for seed in self.store.seeds(&chat)? {

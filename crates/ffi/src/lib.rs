@@ -786,6 +786,30 @@ pub enum FfiEvent {
         /// Ждём ли впуска владельцем. `false` — открытый канал.
         awaiting: bool,
     },
+    /// Канал показан по ссылке — **до** подписки (фаза 2, §10.3, шаг 5).
+    ///
+    /// Приходит в ответ на [`RatatoskClient::preview_channel`]: документ
+    /// приехал, подпись сошлась ключом из ссылки, версия не ниже
+    /// обещанной. В базе при этом не завелось ничего — человек ещё
+    /// не согласился, и согласие это [`RatatoskClient::subscribe_to_channel`]
+    /// с той же ссылкой.
+    ///
+    /// **Неудача события не имеет.** Не достучались — §10.5 обещает
+    /// ждать и не считать это тупиком; подделанная подпись и версия
+    /// ниже обещанной выглядят на экране так же, и объяснить разницу
+    /// человеку нечем. Клиенту рисовать ожидание, а не ошибку.
+    ChannelPreviewed {
+        /// Чат.
+        chat_id: Vec<u8>,
+        /// Как канал называется.
+        title: String,
+        /// Порода (§6.1): `true` — открытый.
+        open: bool,
+        /// Версия документа.
+        version: u64,
+        /// Цена слова в битах работы (§11). Ноль — не требуется.
+        pow_bits: u32,
+    },
     /// У канала новая версия представления (фаза 2, §6.1).
     ///
     /// Отдельно от [`FfiEvent::GroupRenamed`]: у группы переименование —
@@ -1593,6 +1617,16 @@ pub enum FfiChannelSignal {
     Waiting,
     /// Владельцу: поворот ключа просрочен (§6.4).
     RotationOverdue,
+}
+
+/// Что стоит предпросмотр канала (§15, §10.3).
+///
+/// Показывается **до** [`RatatoskClient::preview_channel`] — это
+/// единственный момент, когда человек ещё может отказаться бесплатно.
+#[uniffi::export]
+#[must_use]
+pub fn channel_preview_notice() -> String {
+    ratatosk_proto::channel::PreviewConsequences::ui_text().to_owned()
 }
 
 /// Слова к сообщению, которого нет у владельца канала (§14, §7.3).
@@ -3639,6 +3673,36 @@ impl RatatoskClient {
         self.command(Command::SubscribeToChannel { uri })
     }
 
+    /// Показывает канал по ссылке **до** подписки (фаза 2, §10.3, шаг 5).
+    ///
+    /// # Что она делает
+    ///
+    /// Спрашивает документ у владельца по адресам из ссылки и, проверив
+    /// подпись его ключом **из ссылки** и версию, отдаёт название,
+    /// породу и цену слова событием [`FfiEvent::ChannelPreviewed`].
+    /// В базе не заводится ничего, кроме пути к владельцу: согласие —
+    /// это [`RatatoskClient::subscribe_to_channel`] с той же ссылкой.
+    ///
+    /// # Цену надо показать **до** вызова
+    ///
+    /// [`channel_preview_notice`] (§15): владелец узнает, что кто-то
+    /// интересуется каналом, — даже если человек потом откажется.
+    /// Отменить это задним числом нечем.
+    ///
+    /// # Ответа может и не быть
+    ///
+    /// И это не ошибка: §10.5 велит ждать и не считать молчание тупиком.
+    /// Рисовать надо ожидание, а не отказ.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiChannelRefusal::BadLink`] — ссылка не разобралась;
+    /// [`FfiChannelRefusal::AlreadySubscribed`] — канал уже наш,
+    /// и показывать нечего: документ у нас свежее обещанного ссылкой.
+    pub fn preview_channel(&self, uri: String) -> Result<(), RatatoskError> {
+        self.command(Command::PreviewChannel { uri })
+    }
+
     /// Отписывается от канала (фаза 2, §10.6).
     ///
     /// **Отписка стирает ключи чтения, а с ними и архив.** Вернувшись
@@ -5258,6 +5322,9 @@ fn translate(event: Event) -> Option<FfiEvent> {
         }
         Event::ChannelChanged { chat, version, title } => {
             FfiEvent::ChannelChanged { chat_id: chat.to_vec(), version, title }
+        }
+        Event::ChannelPreviewed { chat, title, open, version, pow_bits } => {
+            FfiEvent::ChannelPreviewed { chat_id: chat.to_vec(), title, open, version, pow_bits }
         }
         Event::ChannelSubscribed { chat, awaiting } => {
             FfiEvent::ChannelSubscribed { chat_id: chat.to_vec(), awaiting }

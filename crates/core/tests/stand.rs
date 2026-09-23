@@ -2835,6 +2835,200 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn a_preview_shows_the_channel_without_joining_it() {
+    // §10.3 расставляет переход по ссылке шагами, и показ стоит пятым —
+    // после того, как представление достали и проверили, и **до**
+    // подтверждения. До этой поставки шага не было вовсе: подписка
+    // делала всё разом, и человек соглашался, не видя даже названия.
+    //
+    // Проверяется оба конца обещания: канал показан — и в базе ничего
+    // не завелось.
+    let mut stand = Stand::strangers(0x0_9_2E7, 2);
+    let chat = stand.create_channel(NodeId(0), "вечерняя лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    let uri = link.clone();
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::PreviewChannel { uri: uri.clone() });
+    });
+    stand.settle();
+
+    let shown = stand.sim.node(NodeId(1)).events.iter().find_map(|event| match event {
+        Event::ChannelPreviewed { chat: shown, title, open, version, pow_bits } => {
+            Some((*shown, title.clone(), *open, *version, *pow_bits))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        shown,
+        Some((chat, "вечерняя лента".to_owned(), false, 1, 0)),
+        "предпросмотр обязан показать канал; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **И ничего не завелось.** §10.3: «шаги 2–4 идут до любого показа
+    // содержимого и до заведения чего-либо в базе». Путь к владельцу —
+    // исключение: без него спрашивать некого.
+    let node = stand.sim.node(NodeId(1));
+    assert!(
+        node.engine().groups().get(&chat).is_none(),
+        "чат до согласия не заводится; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        node.engine().store().channel(&chat).expect("чтение").is_none(),
+        "документ до согласия не ложится; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        node.engine().store().archive_keys(&chat).expect("чтение").is_empty(),
+        "ключа чтения до согласия не бывает; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        node.engine().peers().contains_key(&stand.ik(NodeId(0))),
+        "путь к владельцу — единственное, что заводится; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Шаг 6: согласие.** Та же ссылка — и теперь канал заводится.
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).engine().groups().get(&chat).is_some(),
+        "после согласия канал обязан завестись; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_preview_from_anyone_but_the_owner_is_ignored() {
+    // §10.3 (шаг 3) называет ключ поимённо: подпись судится `owner_ik`
+    // **из ссылки**. Значит и отвечать вправе только он: ответ
+    // от постороннего — кадр не по адресу, и показать его значило бы
+    // показать человеку канал, которого тот, чей адрес в ссылке,
+    // не подписывал.
+    let mut stand = Stand::strangers(0x0_9_2E9, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    // Посторонний заводит **свой** канал с тем же названием и шлёт его
+    // документ тому, кто ждёт предпросмотра.
+    let theirs = stand.create_channel(NodeId(2), "лента", false);
+    let their_link = stand.channel_link(NodeId(2), theirs);
+    // Сперва честный предпросмотр чужого канала: он и знакомит эти двоих,
+    // иначе подложный ответ просто некуда слать.
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::PreviewChannel { uri: their_link.clone() });
+    });
+    stand.settle();
+
+    let uri = link.clone();
+    stand.offline(NodeId(0));
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::PreviewChannel { uri: uri.clone() });
+    });
+    stand.settle();
+
+    let stranger = stand.ik(NodeId(1));
+    // **Подделка на тот же канал.** Посторонний подписывает документ
+    // с идентификатором чужого канала: без проверки ключом из ссылки
+    // такой ответ прошёл бы — от настоящего его не отличить ничем,
+    // кроме подписи.
+    let forger = ratatosk_crypto::Identity::from_seed([stand.sim.node(NodeId(2)).seed; 32]);
+    let forged = ratatosk_proto::channel::Representation {
+        group: chat,
+        owner: forger.public().ik,
+        version: 9,
+        kind: ratatosk_proto::channel::Kind::Open,
+        title: "подделка".to_owned(),
+        pow_bits: 0,
+        seed_days: 0,
+        seed_bytes: 0,
+        grants: Vec::new(),
+    };
+    let (block_bytes, signature) =
+        ratatosk_proto::channel::sign_representation(&forger, &forged).expect("подпись");
+    let document = ratatosk_store::StoredChannel {
+        chat_id: chat,
+        version: 9,
+        owner_ik: forger.public().ik,
+        kind: 1,
+        title: "подделка".to_owned(),
+        pow_bits: 0,
+        seed_days: 0,
+        seed_bytes: 0,
+        block_bytes,
+        signature,
+        received_ms: 0,
+        grants: Vec::new(),
+    };
+    stand.sim.act(NodeId(2), |node, ctx| {
+        let now = ctx.now_ms();
+        let effects = node
+            .engine_mut()
+            .preview_answer_unasked(
+                now,
+                stranger,
+                &chat,
+                document.block_bytes.clone(),
+                &document.signature,
+            )
+            .expect("ответ собрался");
+        node.apply(ctx, effects);
+    });
+    stand.settle();
+
+    // Опора: честный предпросмотр чужого канала **показан** — значит
+    // дорога и событие работают, и молчание ниже про подлог, а не
+    // про сломанный путь.
+    let shown: Vec<[u8; 16]> = stand
+        .sim
+        .node(NodeId(1))
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ChannelPreviewed { chat, .. } => Some(*chat),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shown.contains(&theirs),
+        "честный предпросмотр обязан показаться; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        !shown.contains(&chat),
+        "ответ постороннего показывать нельзя; показано {shown:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_preview_of_a_channel_we_already_read_is_refused() {
+    // Показывать нечего: канал уже открыт, и документ у нас свежее
+    // того, что обещает ссылка (§10.7). Отказ тот же, что у повторной
+    // подписки, — и человеку он понятен.
+    let mut stand = Stand::strangers(0x0_9_2E8, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    let refused = stand.sim.act(NodeId(1), |node, ctx| {
+        node.engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::PreviewChannel { uri: link.clone() }))
+            .map(|_| ())
+    });
+    assert!(
+        matches!(refused, Err(ratatosk_core::EngineError::AlreadySubscribed)),
+        "предпросмотр уже читаемого канала — отказ: {refused:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_message_the_owner_never_got_is_marked_as_such() {
     // **Разбор живого случая.** «Стоит владельцу уйти из сети, начинается
     // хаос; со временем чинится, но некоторые сообщения всё равно

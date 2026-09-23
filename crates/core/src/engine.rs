@@ -1583,6 +1583,14 @@ pub struct Engine<S: Store> {
     /// раздач. Сохрани мы его, узел проснулся бы с eager-пиром, которого
     /// давно нет, и ждал бы от него блоков.
     tree: BTreeMap<ChatId, swarm::Tree>,
+    /// Ссылки, по которым сейчас просим предпросмотр (§10.3, шаг 5).
+    ///
+    /// **В памяти, и это решение.** Предпросмотр — живое намерение
+    /// человека: он открыл ссылку и смотрит на экран ожидания. Переживи
+    /// он перезапуск, ядро проверяло бы подписи для окна, которого
+    /// давно нет, а человек всё равно начал бы заново. Ссылка при этом
+    /// никуда не девается — она у него в руках.
+    previews: BTreeMap<ChatId, ratatosk_proto::channel::Invitation>,
     /// Блоки, о которых позвали `IHAVE`, и кто позвал.
     awaited_blocks: BTreeMap<(ChatId, MsgId), swarm::Awaited>,
     /// Метки сроков `T_graft`: какая метка какой блок ждёт.
@@ -2166,6 +2174,7 @@ impl<S: Store> Engine<S> {
             file_holders: BTreeMap::new(),
             history_pull: BTreeSet::new(),
             tree: BTreeMap::new(),
+            previews: BTreeMap::new(),
             awaited_blocks: BTreeMap::new(),
             graft_timers: BTreeMap::new(),
             swarm_budget: BTreeMap::new(),
@@ -2645,6 +2654,7 @@ impl<S: Store> Engine<S> {
             Command::RevokePairing { device_id } => self.on_revoke_pairing(now_ms, &device_id),
             Command::CreateGroup { title } => self.on_create_group(now_ms, &title),
             Command::CreateChannel { title, open } => self.on_create_channel(now_ms, &title, open),
+            Command::PreviewChannel { uri } => self.on_preview_channel(now_ms, &uri),
             Command::SubscribeToChannel { uri } => self.on_subscribe_to_channel(now_ms, &uri),
             Command::UnsubscribeFromChannel { chat } => {
                 self.on_unsubscribe_from_channel(now_ms, chat)

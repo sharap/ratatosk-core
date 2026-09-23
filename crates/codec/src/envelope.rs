@@ -249,6 +249,8 @@ pub enum PayloadType {
     ///
     /// Повторы съедает дедупликация §9.2 — та же, что у всякого кадра.
     SwarmBundle,
+    /// Ответ предпросмотра: подписанное представление канала (§10.3).
+    ChannelPreview,
     /// «Этот файл у меня есть целиком» (фаза 2, §9.1).
     ///
     /// Объявление доступности вложения. Едет тем, кто читает этот канал
@@ -379,6 +381,9 @@ impl PayloadType {
             | PayloadType::FileHave
             // Пакет блоков — та же раздача, только пачкой.
             | PayloadType::SwarmBundle
+            // Предпросмотр — про канал, а не про разговор: спрашивающий
+            // ещё даже не подписчик (§10.3, шаг 5).
+            | PayloadType::ChannelPreview
             // Запись каталога — про раздачу, а не про разговор: сид
             // сообщает владельцу адрес, а не пишет ему.
             | PayloadType::SwarmPeer
@@ -438,6 +443,7 @@ impl PayloadType {
             PayloadType::ChannelIntroWanted => 29,
             PayloadType::FileHave => 30,
             PayloadType::SwarmBundle => 31,
+            PayloadType::ChannelPreview => 32,
             PayloadType::Unknown(code) => code,
         }
     }
@@ -477,6 +483,7 @@ impl PayloadType {
             29 => PayloadType::ChannelIntroWanted,
             30 => PayloadType::FileHave,
             31 => PayloadType::SwarmBundle,
+            32 => PayloadType::ChannelPreview,
             other => PayloadType::Unknown(other),
         }
     }
@@ -686,7 +693,7 @@ mod tests {
         // в `from_code` сборку не ломает — она превращает известный тип
         // в `Unknown`, и кадр молча перестаёт пониматься на приёме.
         // Заметить это можно только на двух устройствах разных версий.
-        const HIGHEST: u64 = 31;
+        const HIGHEST: u64 = 32;
         for code in 1..=HIGHEST {
             let parsed = PayloadType::from_code(code);
             assert!(

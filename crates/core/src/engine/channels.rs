@@ -483,7 +483,7 @@ impl<S: Store> Engine<S> {
                 now_ms,
                 invitation.owner,
                 PayloadType::ChannelIntroWanted,
-                channel::request_value(&chat),
+                channel::request_value(&chat, false),
             )?;
             effects.extend(sent);
             // **И сразу «шли мне блоки»** (§7.5.1). Ждать обхода нельзя:
@@ -504,7 +504,7 @@ impl<S: Store> Engine<S> {
                 now_ms,
                 invitation.owner,
                 PayloadType::ChannelRequest,
-                channel::request_value(&chat),
+                channel::request_value(&chat, false),
             )?;
             effects.extend(sent);
         }
@@ -556,6 +556,166 @@ impl<S: Store> Engine<S> {
     /// # Errors
     ///
     /// Отказ хранилища или сборки блока.
+    /// Показывает канал по ссылке до подписки (§10.3, шаги 2–5).
+    ///
+    /// # Порядок шагов — тот, что в спеке, и он значим
+    ///
+    /// Разобрать (шаг 1), достать по адресам (шаг 2), проверить подпись
+    /// и версию (шаги 3–4), показать (шаг 5). Первый шаг делается здесь,
+    /// второй уезжает просьбой, а третий и четвёртый ждут ответа
+    /// (`on_channel_preview`): раньше него судить не о чем.
+    ///
+    /// # В базе не заводится ничего, кроме пути
+    ///
+    /// §10.3 говорит: «шаги 2–4 идут до любого показа содержимого и до
+    /// заведения чего-либо в базе». Путь к владельцу — исключение,
+    /// и не по недосмотру: без него спрашивать некого, а адреса эти
+    /// и так лежат в ссылке, которую человек держит в руках (§10.2).
+    /// Всё прочее — чат, ключ, подписка — заводит согласие (§10.4).
+    ///
+    /// # Уже подписаны — не предпросмотр
+    ///
+    /// Показывать нечего: канал уже открыт, и документ у нас свежее
+    /// того, что обещает ссылка. Отказ тот же, что у повторной подписки.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::BadChannelLink`] — ссылка не разобралась (шаг 1);
+    /// [`EngineError::AlreadySubscribed`] — канал уже наш;
+    /// отказ хранилища.
+    pub(super) fn on_preview_channel(
+        &mut self,
+        now_ms: u64,
+        uri: &str,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let invitation =
+            channel::Invitation::from_uri(uri).map_err(|_| EngineError::BadChannelLink)?;
+        let chat = invitation.group;
+        if self.groups.contains_key(&chat) {
+            return Err(EngineError::AlreadySubscribed);
+        }
+        let me = self.identity.public().ik;
+        if invitation.owner == me {
+            // Свой собственный канал, которого у нас почему-то нет.
+            // Показывать нечего, и спрашивать себя — тем более.
+            return Err(EngineError::AlreadySubscribed);
+        }
+        self.remember_peer(
+            now_ms,
+            invitation.owner,
+            &invitation.endpoints,
+            ratatosk_store::PEER_CHANNEL_OWNER,
+        )?;
+        let owner = invitation.owner;
+        self.previews.insert(chat, invitation);
+        let (_, effects) = self.enqueue_request(
+            now_ms,
+            owner,
+            PayloadType::ChannelIntroWanted,
+            channel::request_value(&chat, true),
+        )?;
+        Ok(effects)
+    }
+
+    /// Собирает ответ предпросмотра **не по просьбе** — ради разбора.
+    ///
+    /// Наружу по той же причине, что `swarm_tree`: правило «отвечать
+    /// вправе только владелец» проверяется **подложным ответом**,
+    /// а собрать такой обычными командами нельзя по построению — его
+    /// шлёт владелец, и только в ответ на просьбу.
+    ///
+    /// Границу UniFFI это не пересекает (§13.3): клиенту такой кадр
+    /// слать незачем.
+    ///
+    /// # Errors
+    ///
+    /// Отказ сборки кадра.
+    pub fn preview_answer_unasked(
+        &mut self,
+        now_ms: u64,
+        to: [u8; 32],
+        chat: &ChatId,
+        block_bytes: Vec<u8>,
+        signature: &[u8; 64],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let (_, effects) = self.enqueue_request(
+            now_ms,
+            to,
+            PayloadType::ChannelPreview,
+            channel::preview_value(chat, block_bytes, signature),
+        )?;
+        Ok(effects)
+    }
+
+    /// Пришёл ответ предпросмотра (§10.3, шаги 3–5).
+    ///
+    /// # Судим ключом из ссылки, а не приехавшим рядом
+    ///
+    /// §10.3 (шаг 3) называет ключ поимённо: `owner_ik` **из ссылки**.
+    /// Возьми мы ключ из ответа, подпись проверяла бы сама себя,
+    /// и подделать документ смог бы всякий, до кого дошла просьба.
+    ///
+    /// # Молчим на всякую неудачу, и это не лень
+    ///
+    /// Версия ниже обещанной (шаг 4), чужая подпись, не тот канал —
+    /// всё это на экране выглядит одинаково: ожидание, которое §10.5
+    /// и так обещает не считать тупиком. Сказать человеку «подпись
+    /// не сошлась» значит сказать то, чего он не проверит и с чем
+    /// ничего не сделает.
+    ///
+    /// # Errors
+    ///
+    /// Отказ сборки квитанции.
+    pub(super) fn on_channel_preview(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: &Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let effects =
+            self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
+
+        let Ok((chat, unchecked)) = channel::preview_from_value(&envelope.payload) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        let Some(invitation) = self.previews.get(&chat) else { return Ok(effects) };
+        // Отвечать обязан тот, чьим ключом мы будем судить: ответ
+        // от постороннего — кадр не по адресу.
+        if invitation.owner != peer_ik {
+            return Ok(effects);
+        }
+        // **Ключ — того, кого назвала ссылка** (§10.3, шаг 3), а не
+        // того, кто прислал ответ. Возьми мы ключ отвечающего, подпись
+        // проверяла бы сама себя, и подделать документ смог бы всякий,
+        // до кого дошла просьба.
+        //
+        // Сама карточка приезжает тем же ответом первой (§11.5): нет
+        // её — судить нечем, и молчим. Человек повторит, а §10.5 и так
+        // обещает ждать.
+        let min_version = invitation.min_version;
+        let expected = invitation.owner;
+        let Some(owner) = self.public_identity_of(&expected)? else { return Ok(effects) };
+        let Ok(representation) = unchecked.verify(&owner) else {
+            self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
+            return Ok(effects);
+        };
+        if representation.group != chat || representation.version < min_version {
+            return Ok(effects);
+        }
+        self.previews.remove(&chat);
+        let mut effects = effects;
+        effects.push(Effect::Notify(Event::ChannelPreviewed {
+            chat,
+            title: representation.title.clone(),
+            open: representation.kind == channel::Kind::Open,
+            version: representation.version,
+            pow_bits: representation.pow_bits,
+        }));
+        Ok(effects)
+    }
+
     pub(super) fn on_channel_intro_wanted(
         &mut self,
         now_ms: u64,
@@ -568,7 +728,7 @@ impl<S: Store> Engine<S> {
         let mut effects =
             self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
 
-        let Ok(chat) = channel::request_from_value(&envelope.payload) else {
+        let Ok((chat, preview)) = channel::request_from_value(&envelope.payload) else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(effects);
         };
@@ -578,6 +738,36 @@ impl<S: Store> Engine<S> {
             return Ok(effects);
         }
         let Some(stored) = self.store.channel(&chat)? else { return Ok(effects) };
+
+        // **Предпросмотр отвечается открытым документом** (§10.3, шаг 5),
+        // и порода тут ни при чём: спрашивающий ещё никто, запечатанного
+        // он не откроет, а §10.3 обещает показать канал всякому, кто
+        // перешёл по ссылке, — и по приглашению в первую очередь: иначе
+        // человек просился бы в канал, не зная даже его названия.
+        if preview {
+            // **Сперва карточка, потом документ** — то же правило, что
+            // у впуска (§11.5) и у обычной просьбы ниже: без ключа
+            // подписи документ не проверить, и спрашивающий отложил бы
+            // его навсегда. Порядок держит очередь §5.4: кадры одному
+            // собеседнику уходят в том порядке, в каком поставлены.
+            let card = self.own_card().encode()?;
+            let signature = self.identity.sign(&card);
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                peer_ik,
+                PayloadType::CardUpdate,
+                ratatosk_proto::card_update::payload(&card, &signature),
+            )?;
+            effects.extend(sent);
+            let (_, sent) = self.enqueue_request(
+                now_ms,
+                peer_ik,
+                PayloadType::ChannelPreview,
+                channel::preview_value(&chat, stored.block_bytes, &stored.signature),
+            )?;
+            effects.extend(sent);
+            return Ok(effects);
+        }
         if channel::Kind::from_code(u64::from(stored.kind)) != Some(channel::Kind::Open) {
             return Ok(effects);
         }
@@ -724,7 +914,9 @@ impl<S: Store> Engine<S> {
         let mut effects =
             self.send_receipt(now_ms, peer_ik, via, Receipt::Delivered, &[envelope.msg_id])?;
 
-        let Ok(chat) = channel::request_from_value(&envelope.payload) else {
+        // Заявку §10.4 признак предпросмотра не касается: она про
+        // подписку, а не про показ.
+        let Ok((chat, _)) = channel::request_from_value(&envelope.payload) else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(effects);
         };

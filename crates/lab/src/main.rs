@@ -3129,6 +3129,7 @@ async fn console(
                     | Event::ChannelCreated { .. }
                     | Event::ChannelChanged { .. }
                     | Event::ChannelSubscribed { .. }
+                    | Event::ChannelPreviewed { .. }
                     | Event::ChannelRequested { .. }
                     | Event::ChannelUnsubscribed { .. }
                     | Event::ChannelKeyRotated { .. }
@@ -5112,6 +5113,14 @@ fn report(event: &Event) {
             // ничего не поворачивалось, он только что получил первое.
             // Читать «повернулся: поколение 0» человеку неоткуда.
             println!("< ключ чтения канала {}: поколение {generation}", short(chat));
+        }
+        Event::ChannelPreviewed { chat, title, open, version, pow_bits } => {
+            println!(
+                "< канал показан: {} «{title}», {}, версия {version}, цена {pow_bits} бит\n    \
+                 подписаться: /sub <та же ссылка>",
+                data_encoding::HEXLOWER.encode(chat),
+                if *open { "открытый" } else { "по приглашению" }
+            );
         }
         Event::ChannelSubscribed { chat, awaiting } => {
             // Названия здесь нет: оно внутри представления, а его ещё

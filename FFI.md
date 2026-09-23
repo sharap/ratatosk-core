@@ -1376,6 +1376,7 @@ title }` — и на своё переименование тоже, чтобы 
 ```rust
 fn create_channel(title: String, open: bool) -> Result<(), RatatoskError>
 fn channel_link(chat_id: Vec<u8>) -> Result<String, RatatoskError>
+fn preview_channel(uri: String) -> Result<(), RatatoskError>
 fn subscribe_to_channel(uri: String) -> Result<(), RatatoskError>
 fn unsubscribe_from_channel(chat_id: Vec<u8>) -> Result<(), RatatoskError>
 fn admit_to_channel(chat_id: Vec<u8>, peer_ik: Vec<u8>) -> Result<(), RatatoskError>
@@ -1405,6 +1406,7 @@ seeding_notice() -> String          // **до** объявления себя р
 sharing_level_notice() -> String    // **до** сужения круга отдачи (§12) — не путать с `sharing_notice`
 channel_refusal_text(reason) -> String  // слова к отказу канала
 channel_signal_text(signal) -> String   // слова к признаку «почему тихо» (§15)
+channel_preview_notice() -> String      // **до** предпросмотра (§10.3, шаг 2)
 ```
 
 **Канал — это группа со вторым профилем, а не третий вид чата (§3.2).**
@@ -1510,12 +1512,18 @@ struct FfiChannelRights { write: bool, admit: bool, evict: bool, edit: bool }
 «впустить», а не пару «принять/отклонить»: вторая обещала бы просящему
 ответ, которого он не получит.
 
-**Чего у каналов нет.** Предпросмотра (§10.3, шаги 2 и 5) и расписания
-ожидания (§10.5): достать представление по адресам нечем — это
-запрос-ответ, которого в ядре нет ни одного. И **заявитель становится
-несверенным контактом владельца**: приёмная сторона «сессии без
-контакта» (§8.3) ещё не сделана, так что у канала с сотней просящих
-список знакомых вырастет на сотню.
+**Предпросмотр есть** (§10.3, шаги 2–5): `preview_channel(uri)`
+спрашивает документ у владельца и отдаёт название, породу и цену слова
+событием `ChannelPreviewed`, **ничего не заводя в базе** кроме пути
+к владельцу. Согласие — `subscribe_to_channel` с той же ссылкой.
+Показать `channel_preview_notice()` надо **до** вызова: владелец узнает
+об интересе, даже если человек потом откажется.
+
+Неудача предпросмотра события не имеет: §10.5 велит ждать и не считать
+молчание тупиком. Рисовать надо ожидание, а не ошибку.
+
+**Чего у каналов нет.** Расписания ожидания §10.5 наружу: состояния
+«дольше обычного» и «медленный путь, это часы» в ядре не выражены.
 
 ```rust
 enum FfiChannelRefusal {

@@ -1005,6 +1005,7 @@ impl<S: Store> Engine<S> {
             PayloadType::ChannelIntroWanted => {
                 self.on_channel_intro_wanted(now_ms, via, peer_ik, &envelope)
             }
+            PayloadType::ChannelPreview => self.on_channel_preview(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmPeer => self.on_seed_record(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmAttach => self.on_swarm_attach(now_ms, via, peer_ik, &envelope),
             PayloadType::SwarmControl => self.on_swarm_control(now_ms, via, peer_ik, &envelope),

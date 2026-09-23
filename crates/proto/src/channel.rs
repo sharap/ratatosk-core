@@ -560,9 +560,23 @@ pub fn wire_value(block_bytes: Vec<u8>, signature: &[u8; 64]) -> Value {
 /// рукопожатием. Подпись доказывала бы то же самое второй раз — и
 /// вдобавок делала бы заявку **пересылаемой**, то есть позволяла бы
 /// третьему предъявить владельцу чужую просьбу.
+///
+/// # Признак предпросмотра — необязательное поле
+///
+/// §10.3 (шаг 5) велит показать канал **до** подписки, и спрашивающий
+/// тогда ещё ничей: чата у него нет, ключа цепочки нет, и запечатанный
+/// документ он не откроет. Поле говорит владельцу, каким ответом
+/// отвечать.
+///
+/// Необязательное нарочно: отсутствие означает «обычная просьба»,
+/// и сборка, не знающая о предпросмотре, читает такую карту как читала.
 #[must_use]
-pub fn request_value(group: &GroupId) -> Value {
-    Value::Map(vec![(Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec()))])
+pub fn request_value(group: &GroupId, preview: bool) -> Value {
+    let mut map = vec![(Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec()))];
+    if preview {
+        map.push((Value::Integer(KEY_PREVIEW.into()), Value::Integer(1u64.into())));
+    }
+    Value::Map(map)
 }
 
 /// Читает заявку с провода.
@@ -571,10 +585,70 @@ pub fn request_value(group: &GroupId) -> Value {
 ///
 /// [`ChannelError::Malformed`] — карта не той формы или идентификатор
 /// не шестнадцати байт.
-pub fn request_from_value(value: &Value) -> Result<GroupId, ChannelError> {
+pub fn request_from_value(value: &Value) -> Result<(GroupId, bool), ChannelError> {
     let map = canonical::as_map(value).map_err(|_| ChannelError::Malformed)?;
     let group = canonical::require(map, KEY_GROUP).map_err(|_| ChannelError::Malformed)?;
-    canonical::as_array::<16>(group).map_err(|_| ChannelError::Malformed)
+    let group = canonical::as_array::<16>(group).map_err(|_| ChannelError::Malformed)?;
+    // Неизвестное значение читается как «не предпросмотр»: поле
+    // необязательное, и строгость здесь означала бы отказ в обычной
+    // просьбе из-за мусора в поле, которого могло и не быть.
+    let preview = canonical::get(map, KEY_PREVIEW)
+        .and_then(|value| canonical::as_u64(value).ok())
+        .is_some_and(|flag| flag == 1);
+    Ok((group, preview))
+}
+
+/// Ответ на предпросмотр: подписанное представление **как есть** (§10.3).
+///
+/// # Почему не запечатано
+///
+/// Спрашивающий ещё никто: чата у него нет, ключа цепочки нет, а ключ
+/// чтения есть только у открытого канала (§6.1). Запечатай мы ответ —
+/// предпросмотр канала по приглашению не работал бы вовсе, то есть
+/// §10.3 (шаг 5) остался бы словами.
+///
+/// # Что этим раскрывается, и почему это не утечка
+///
+/// Название, порода, цена слова и список выдач — то самое, что §10.3
+/// обещает показать всякому, кто перешёл по ссылке. Ссылку владелец
+/// раздаёт сам (§10.2), и она уже несёт его адрес и идентификатор
+/// канала; §7.6 вдобавок разрешает **всякому** с идентификатором
+/// вытянуть шифротекст. Документ подписан, подделать его нельзя,
+/// а содержимого канала в нём нет.
+#[must_use]
+pub fn preview_value(group: &GroupId, block_bytes: Vec<u8>, signature: &[u8; 64]) -> Value {
+    Value::Map(vec![
+        (Value::Integer(KEY_GROUP.into()), Value::Bytes(group.to_vec())),
+        (Value::Integer(KEY_BLOCK.into()), Value::Bytes(block_bytes)),
+        (Value::Integer(KEY_SIGNATURE.into()), Value::Bytes(signature.to_vec())),
+    ])
+}
+
+/// Читает ответ предпросмотра: канал и **непроверенное** представление.
+///
+/// Непроверенное — по тому же правилу, что у всякого документа
+/// (§10.3, шаг 3): подпись сверяется ключом из **ссылки**, а не тем,
+/// что приехал рядом, и сверять её умеет только тот, у кого ссылка
+/// есть.
+///
+/// # Errors
+///
+/// [`ChannelError::Malformed`] — карта не той формы.
+pub fn preview_from_value(
+    value: &Value,
+) -> Result<(GroupId, UncheckedRepresentation), ChannelError> {
+    let map = canonical::as_map(value).map_err(|_| ChannelError::Malformed)?;
+    let group = canonical::require(map, KEY_GROUP).map_err(|_| ChannelError::Malformed)?;
+    let group = canonical::as_array::<16>(group).map_err(|_| ChannelError::Malformed)?;
+    let block = canonical::require(map, KEY_BLOCK).map_err(|_| ChannelError::Malformed)?;
+    let block = canonical::as_bytes(block).map_err(|_| ChannelError::Malformed)?;
+    let signature = canonical::require(map, KEY_SIGNATURE).map_err(|_| ChannelError::Malformed)?;
+    let signature = canonical::as_bytes(signature).map_err(|_| ChannelError::Malformed)?;
+    let wire = wire_value(
+        block.to_vec(),
+        &<[u8; 64]>::try_from(signature).map_err(|_| ChannelError::Malformed)?,
+    );
+    Ok((group, parse_representation(&wire)?))
 }
 
 /// Подписывает представление и отдаёт **пару** «байты и подпись».
@@ -1013,6 +1087,7 @@ mod tests {
             AdmitterGrantConsequences::ui_text(),
             KeyRotationConsequences::ui_text(),
             SharingConsequences::ui_text(),
+            PreviewConsequences::ui_text(),
         ]
         .into_iter()
         .chain(signals)
@@ -1510,6 +1585,8 @@ const KEY_ENDPOINT_KIND: u64 = 18;
 const KEY_ENDPOINT_VALUE: u64 = 19;
 const KEY_ADMITTED_BY: u64 = 20;
 const KEY_GENERATION: u64 = 21;
+/// Признак предпросмотра в просьбе (§10.3, шаг 5).
+const KEY_PREVIEW: u64 = 22;
 
 /// Куда стучаться за представлением канала.
 ///
@@ -1769,13 +1846,9 @@ fn endpoint_from_value(value: &Value) -> Result<Endpoint, ChannelError> {
 //
 // # Чего здесь нет, и это не забывчивость
 //
-// §15 перечисляет одиннадцать текстов. Пять из них описывают то, чего
+// §15 перечисляет одиннадцать текстов. Четыре из них описывают то, чего
 // ядро **не делает**:
 //
-// * `channel_preview_notice` — предпросмотр соединяется с владельцем
-//   или сидом (§10.3, шаг 2). Достать представление по адресам нечем;
-//   показать этот текст сегодня значило бы предупредить о соединении,
-//   которого не будет;
 // * `channel_history_none_notice` — глубина истории (§5.4) не собрана:
 //   `archive_wrap` не пишется, и «прежние записи не передаются» верно
 //   для **всех** каналов, а не «так настроен этот»;
@@ -1913,6 +1986,35 @@ impl Signal {
                  кто в списке, ничего не заметят."
             }
         }
+    }
+}
+
+/// Что стоит предпросмотр канала (§10.3, шаг 2).
+///
+/// Показывается **до** того, как мы полезем за представлением, —
+/// и это единственный момент, когда человек ещё может отказаться
+/// бесплатно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewConsequences;
+
+impl PreviewConsequences {
+    /// Узнает ли владелец о нашем интересе.
+    ///
+    /// Да: за представлением мы соединяемся с ним или с сидом,
+    /// и рукопожатие §8.2 называет нас по имени.
+    pub const OWNER_LEARNS_OF_THE_INTEREST: bool = true;
+    /// Останется ли это знание, если человек передумает.
+    ///
+    /// Да. Отменить соединение задним числом нечем, и §10.3 велит
+    /// сказать об этом заранее.
+    pub const REFUSING_LATER_DOES_NOT_UNDO_IT: bool = true;
+
+    /// Точная формулировка для UI (§15).
+    #[must_use]
+    pub const fn ui_text() -> &'static str {
+        "Чтобы показать канал, нужно к нему подключиться. Тот, чей адрес \
+         в ссылке, увидит, что кто-то интересуется этим каналом, — даже \
+         если вы потом откажетесь."
     }
 }
 

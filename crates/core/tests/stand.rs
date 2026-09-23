@@ -2835,6 +2835,150 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn an_owner_off_the_screen_still_serves_his_channel() {
+    // **Что проверяется.** §12 гасит раздачу у аккаунта, ушедшего
+    // с экрана: «активен ровно один аккаунт… его сидирование
+    // прекращается». Правило про **второй аккаунт** на том же
+    // устройстве — но `may_serve` спрашивает `foreground` первым,
+    // до всего остального, и владелец канала попадает под него тоже.
+    //
+    // Если клиент понимает `set_foreground(false)` как «приложение
+    // свернули» — а свёрнуто оно почти всегда, — то владелец перестаёт
+    // отвечать на просьбы, принимать привязки и чинить дерево. Снаружи
+    // это «канал работает, только когда автор смотрит в экран».
+    let mut stand = Stand::strangers(0x0_F09, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+
+    // Владелец ушёл с экрана, и все перезапустились: привязок больше нет,
+    // читателям надо назваться заново.
+    stand.foreground(NodeId(0), false);
+    for node in 0..3u16 {
+        stand.restart(NodeId(node));
+    }
+    stand.foreground(NodeId(0), false);
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "с погашенного экрана");
+    stand.settle();
+    for reader in [NodeId(1), NodeId(2)] {
+        assert!(
+            stand.sim.node(reader).seen(chat).contains(&"с погашенного экрана".to_owned()),
+            "{reader:?} не услышал владельца, ушедшего с экрана; видно {:?}; сид {:#x}",
+            stand.sim.node(reader).seen(chat),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn a_quiet_writer_is_heard_by_everyone_after_a_restart() {
+    // **Разбор живого случая.** «Обмен сообщениями в каналах работает,
+    // но при одном условии: если пишущий — объявленный сид».
+    //
+    // Объявленность (§7.5.1) обещает совсем другое: она про то, у кого
+    // **спрашивать блоки**. Право писать (§6.2) от неё не зависит
+    // и зависеть не должно: умолчание — тихая раздача, и человек её
+    // не трогает.
+    //
+    // Проверяется тихий автор после перезапуска **всех** — так живут
+    // телефоны, и так теряются привязки (§7.5.1), которые только
+    // и держали дорогу.
+    let mut stand = Stand::strangers(0x0_9_1E7, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    // Опора: до перезапуска тихий автор слышен всем.
+    stand.say(NodeId(1), chat, "до перезапуска");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"до перезапуска".to_owned()),
+            "опора: тихий автор слышен до перезапуска; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+
+    // Перезапускаются все — привязки не переживают его ни у кого.
+    for node in 0..3u16 {
+        stand.restart(NodeId(node));
+    }
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    stand.say(NodeId(1), chat, "после перезапуска");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"после перезапуска".to_owned()),
+            "{who:?} не услышал тихого автора; видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn a_quiet_writer_is_heard_in_a_channel_by_invite_over_the_mesh() {
+    // Та же проверка в раскладке живого прогона: канал **по
+    // приглашению**, ступень одна — меш, и сеть требует адрес. Читатель
+    // канала по приглашению не привязывается ни к кому (§7.5.2), так
+    // что здесь всё держится на одном владельце.
+    let mut stand = Stand::strangers_in_the_mesh(0x0_9_1E8, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    // Опора: до перезапуска тихий автор слышен всем.
+    stand.say(NodeId(1), chat, "до перезапуска");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"до перезапуска".to_owned()),
+            "опора: тихий автор слышен до перезапуска; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+
+    // Перезапускаются все — привязки не переживают его ни у кого.
+    for node in 0..3u16 {
+        stand.restart(NodeId(node));
+    }
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    stand.say(NodeId(1), chat, "после перезапуска");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"после перезапуска".to_owned()),
+            "{who:?} не услышал тихого автора; видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn a_reader_who_was_away_catches_up_when_he_comes_back() {
     // **Разбор живого случая.** «Создал канал на А, добавил Б и В
     // по ссылке, выдал Б право писать — всё ходило. Выключил В, написал

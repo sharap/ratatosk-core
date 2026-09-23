@@ -2793,6 +2793,132 @@ fn the_link_brings_back_a_channel_that_lost_its_road() {
 }
 
 #[test]
+fn unsubscribing_works_even_when_the_owner_is_unreachable() {
+    // Маленькая находка живого прогона: «отписывался от канала —
+    // появилось „контакт неизвестен“».
+    //
+    // Уход из канала — действие **местное**: состав правится у нас, чат
+    // стирается у нас, и единственное сетевое в нём — вежливость (§10.6),
+    // блок ухода владельцу. Не дотянулись — так и не дотянемся: канала
+    // у нас больше нет, повторять будет некому. Отказывать человеку
+    // в отписке из-за этого нельзя.
+    let mut stand = Stand::strangers(0x0_0FF_5C, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+
+    // Дороги к владельцу не осталось — так выглядит база, потерявшая
+    // запись пира. Опора: без неё отписка прошла бы и без правки.
+    let owner_ik = stand.ik(NodeId(0));
+    stand.sim.act(NodeId(1), |node, _| {
+        node.engine_mut().store_mut().delete_peer(&owner_ik).expect("запись пира убрана");
+    });
+    stand.restart(NodeId(1));
+
+    let gone = stand.sim.act(NodeId(1), |node, ctx| {
+        node.engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::UnsubscribeFromChannel { chat }))
+            .map(|_| ())
+    });
+    assert!(
+        gone.is_ok(),
+        "отписка обязана пройти и без дороги к владельцу: {gone:?}; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        stand.sim.node(NodeId(1)).engine().groups().get(&chat).is_none(),
+        "канала после отписки быть не должно; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn a_reader_who_was_away_catches_up_when_he_comes_back() {
+    // **Разбор живого случая.** «Создал канал на А, добавил Б и В
+    // по ссылке, выдал Б право писать — всё ходило. Выключил В, написал
+    // несколько сообщений, включил В снова — он не прогрузил свежую
+    // историю, хотя Б был сидом. У В при этом не было ни одного сида,
+    // и аватарка тоже не доехала. Отписался и подписался заново — канал
+    // открылся и заработал».
+    //
+    // Всё, что уехало, пока В спал, уехало **мимо него**: владелец
+    // развозит по составу, а состав — это очередь §5.4, и она не ждёт
+    // вечно. Спросить потом В нечем: он о пропуске не знает, а §7.2
+    // возит пропущенное только тому, кто прислал свой вектор — и только
+    // в ответ на чужой.
+    let mut stand = Stand::strangers(0x0_A_3A7, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+
+    stand.say(NodeId(0), chat, "при всех");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(2)).seen(chat).contains(&"при всех".to_owned()),
+        "опора: пока В в сети, слово доходит; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // В выключился — и всё это время владелец продолжал писать.
+    stand.offline(NodeId(2));
+    // Сид объявился, **пока В спал**: его запись до В не доехала, и
+    // каталог у В остался пустым — ровно то, что описал прогон
+    // («у В отображалось отсутствие сидов»). Спрашивать ему теперь
+    // не у кого: к владельцу канал по приглашению не привязывается
+    // (§7.5.2), а других он не знает.
+    stand.announce_seeding(NodeId(1), chat);
+    for word in ["пока В спал — раз", "пока В спал — два"] {
+        stand.say(NodeId(0), chat, word);
+        stand.settle();
+    }
+    // **Очередь владельца сдалась.** Пока она цела, доставка случится
+    // сама, и проверка стерегла бы очередь §5.4, а не рой. В жизни
+    // сдаться ей есть отчего: по реле «отправлено» значит «реле приняло»
+    // (§9.4), и повторять такую доставку никто не будет — а спавший
+    // читатель её не увидит никогда.
+    //
+    // Здесь очередь снимается руками: так выглядит любой из этих
+    // случаев, а проверяется то, что читатель догоняет **сам**.
+    let away = stand.ik(NodeId(2));
+    stand.sim.act(NodeId(0), |node, _| {
+        let doomed: Vec<_> = node
+            .engine()
+            .store()
+            .outbox()
+            .expect("очередь")
+            .into_iter()
+            .filter(|row| row.recipient_ik == away)
+            .map(|row| row.msg_id)
+            .collect();
+        for msg_id in doomed {
+            node.engine_mut().store_mut().delete_outbox(&msg_id, &away).expect("снято");
+        }
+    });
+    stand.restart(NodeId(0));
+
+    // В вернулся. Обход даёт ему повод назваться; дальше он обязан
+    // догнать сам.
+    stand.online(NodeId(2));
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    for word in ["пока В спал — раз", "пока В спал — два"] {
+        assert!(
+            stand.sim.node(NodeId(2)).seen(chat).contains(&word.to_owned()),
+            "вернувшийся читатель обязан догнать «{word}»; видно {:?}; сид {:#x}",
+            stand.sim.node(NodeId(2)).seen(chat),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn a_channel_with_no_one_to_ask_says_so_instead_of_refusing() {
     // Вторая половина того же случая — и та, что чинит **уже
     // испорченные** базы. Пира могли и потерять: до этой поставки всякая

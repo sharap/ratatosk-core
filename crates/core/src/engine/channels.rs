@@ -945,7 +945,21 @@ impl<S: Store> Engine<S> {
             if let Some(state) = self.groups.get_mut(&chat) {
                 state.group.apply(op);
             }
-            effects.extend(self.tell_member(now_ms, owner, PayloadType::GroupMembership, block)?);
+            // **Отказ сказать владельцу отписку не отменяет.** Уход
+            // из канала — действие местное: состав правится у нас, чат
+            // стирается у нас, и единственное, что в нём сетевого, —
+            // вежливость (§10.6). Не дотянулись — так и не дотянемся:
+            // канала у нас больше нет, и повторять будет некому.
+            //
+            // Живой прогон описал цену этой строки: «отписывался
+            // от канала — получил „контакт неизвестен“». Записи
+            // владельца к тому времени не было, `tell_member` упирался
+            // в `UnknownPeer`, и отписка падала отказом — при том что
+            // сделать её было **нечем помешать**.
+            match self.tell_member(now_ms, owner, PayloadType::GroupMembership, block) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "владельцу об уходе не сказать"),
+            }
         }
 
         // Порядок как в `on_clear_chat`: сперва снять с очередей то, что

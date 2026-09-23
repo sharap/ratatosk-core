@@ -513,8 +513,47 @@ impl<S: Store> Engine<S> {
             .filter(|(_, state)| !state.profile.everyone_writes())
             .map(|(chat, _)| *chat)
             .collect();
+        let me = self.identity.public().ik;
         for chat in channels {
             effects.extend(self.attach_to_seeds(now_ms, chat)?);
+            // **И свой вектор владельцу — обходом** (§7.2). Привязка
+            // к владельцу в канале по приглашению не заводится (§7.5.2:
+            // он развозит по составу), и до этой строки читатель,
+            // проспавший день, не имел **ни одного** повода заговорить:
+            // сидов он мог не знать вовсе, а владелец сам о пропуске
+            // не заговаривает.
+            //
+            // Это не «шли мне блоки»: состав раздачи не меняется, дерево
+            // не трогается. Это «вот что у меня есть» — и ответный вектор
+            // владельца показывает дыры.
+            let Some(owner) = self.channel_owner(chat).filter(|owner| *owner != me) else {
+                continue;
+            };
+            if self.dialed.get(&chat).is_some_and(|dialed| dialed.contains(&owner)) {
+                // Уже привязаны к нему — вектор уехал вместе с привязкой.
+                continue;
+            }
+            // **Спрашиваем, только когда есть о чём беспокоиться** —
+            // когда за последний обход в канале не было слышно ничего.
+            //
+            // Без этого условия владелец платил бы вектором **за каждого
+            // читателя каждый час**, и замер поймал это в ту же минуту
+            // (`admitting_a_reader_costs_the_same_however_many_are_already_there`):
+            // впуск подорожал с числом уже впущенных. §7.5.2 заводит сидов
+            // ровно затем, чтобы снять нагрузку с владельца, — глупо
+            // возвращать её обходом.
+            //
+            // Живой канал этим не платит ничего: в нём слышно, и условие
+            // не срабатывает. Платит только тот, у кого тихо, — и платит
+            // один раз за обход.
+            let heard = self.store.last_heard_in_chat(&chat, &owner)?;
+            if heard.is_some_and(|at| now_ms.saturating_sub(at) < KEY_ROTATION_SCAN_MS) {
+                continue;
+            }
+            match self.send_have(now_ms, chat, owner) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "вектор владельцу не уехал"),
+            }
         }
         Ok(effects)
     }
@@ -859,8 +898,12 @@ impl<S: Store> Engine<S> {
             if !self.attach_targets(now_ms, chat)?.contains(&peer_ik) {
                 continue;
             }
-            effects.extend(self.attach_one(now_ms, chat, peer_ik)?);
+            match self.attach_one(now_ms, chat, peer_ik) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "до сида не дотянуться"),
+            }
         }
+
         Ok(effects)
     }
 
@@ -1554,7 +1597,35 @@ impl<S: Store> Engine<S> {
                 let (block, bytes) = (block.msg_id, block.frame);
                 self.send_group_copy(now_ms, block, peer_ik, &bytes)
             }
-            swarm::Control::Have { ranges, .. } => self.on_have(now_ms, chat, peer_ik, &ranges),
+            swarm::Control::Have { ranges, .. } => {
+                // **Обмен, а не рассказ** (§7.2: «при установлении
+                // соединения — обмен have-векторами»). Свой вектор
+                // отвечает **владелец**, и только он: читатель о своём
+                // пропуске не знает, а увидеть его можно лишь сверив
+                // с чужим.
+                //
+                // Живой прогон описал цену молчания: «выключил В, написал
+                // несколько сообщений, включил снова — он не прогрузил
+                // свежую историю». Спросить ему было нечем: сидов он
+                // не знал, а владелец о его пропуске не заговаривал.
+                //
+                // **Отвечает только владелец**, и это не произвол:
+                // ответь вектором всякий, кто вправе обслуживать, — два
+                // сида качали бы векторы друг другу без конца. Владелец
+                // же в своём канале ни у кого не спрашивает
+                // (`attach_targets` отдаёт ему пустой список), и круг
+                // замыкается на одном ответе.
+                let me = self.identity.public().ik;
+                let mine = self.channel_owner(chat).is_some_and(|owner| owner == me);
+                let mut effects = self.on_have(now_ms, chat, peer_ik, &ranges)?;
+                if mine {
+                    match self.send_have(now_ms, chat, peer_ik) {
+                        Ok(produced) => effects.extend(produced),
+                        Err(error) => tracing::debug!(?error, "вектор в ответ не уехал"),
+                    }
+                }
+                Ok(effects)
+            }
             swarm::Control::Want { author, from_seq, to_seq, .. } => {
                 self.on_want(now_ms, chat, peer_ik, &author, from_seq, to_seq)
             }

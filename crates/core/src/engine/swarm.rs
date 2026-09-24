@@ -1630,7 +1630,28 @@ impl<S: Store> Engine<S> {
                 // Срок берётся у ступени, которой приехал зов (§7.7).
                 // У почты и реле его нет вовсе — там `GRAFT` значил бы
                 // «попроси ещё раз то, что и так в пути».
-                let Some(wait) = swarm::graft_wait_ms(via) else { return Ok(Vec::new()) };
+                // **Зов, который некому превратить в просьбу, —
+                // не повод молчать, а повод спросить сразу.**
+                //
+                // §8.4 велит асинхронным ступеням быть всегда eager,
+                // и сторона, шлющая зов, это соблюдает
+                // (`split_tree`). Но решает она по той ступени, которую
+                // ждёт, а уезжает кадр по той, которая нашлась: лестница
+                // §5.4 вправе спуститься на реле, когда прямая не удалась.
+                // Тогда зов приезжает туда, где срока у него нет,
+                // и прежняя строка выбрасывала его молча — а дерево
+                // держало нас ленивым дальше. Канал замолкал **навсегда
+                // и только этот**: у остальных дерево своё.
+                //
+                // Здесь мы знаем ступень **настоящую**, а не ожидаемую,
+                // и правильный ответ на «у меня есть блок» по медленной
+                // дороге — «пришли». Срок не заводится: считать по нему
+                // вину (§7.7) не с чего, ответа по такой ступени ждут
+                // часами.
+                let Some(wait) = swarm::graft_wait_ms(via) else {
+                    let ask = swarm::Control::Graft { group: chat, block };
+                    return self.send_swarm_control(now_ms, peer_ik, &ask);
+                };
                 let token = self.allocate_timer();
                 let awaited = Awaited { who: peer_ik, wait_ms: wait, asked: false };
                 self.awaited_blocks.insert((chat, block), awaited);
@@ -2545,6 +2566,35 @@ impl<S: Store> Engine<S> {
         if budget.misses >= swarm::MISSES_BEFORE_COOLING {
             self.cool_down(now_ms, peer_ik, "звал, а блока нет");
         }
+    }
+
+    /// Шлёт зов `IHAVE` **почтой** — ради разбора.
+    ///
+    /// Наружу по той же причине, что `swarm_tree`: правило «зов
+    /// по ступени без срока обращается просьбой сразу» проверяется
+    /// зовом, приехавшим именно такой ступенью, а выбрать её обычной
+    /// командой нельзя — лестница §5.4 выбирает сама.
+    ///
+    /// Границу UniFFI это не пересекает (§13.3).
+    ///
+    /// # Errors
+    ///
+    /// Отказ сборки кадра.
+    pub fn call_by_mail_for_a_check(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+        block: MsgId,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let call = swarm::Control::IHave { group: chat, block };
+        let (_, effects) = self.enqueue_request(
+            now_ms,
+            peer_ik,
+            PayloadType::SwarmControl,
+            call.value(),
+        )?;
+        Ok(effects)
     }
 
     /// Форма дерева раздачи: кому целиком, кому зовом (§7.1).

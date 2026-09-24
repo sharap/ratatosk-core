@@ -2588,12 +2588,8 @@ impl<S: Store> Engine<S> {
         block: MsgId,
     ) -> Result<Vec<Effect>, EngineError> {
         let call = swarm::Control::IHave { group: chat, block };
-        let (_, effects) = self.enqueue_request(
-            now_ms,
-            peer_ik,
-            PayloadType::SwarmControl,
-            call.value(),
-        )?;
+        let (_, effects) =
+            self.enqueue_request(now_ms, peer_ik, PayloadType::SwarmControl, call.value())?;
         Ok(effects)
     }
 

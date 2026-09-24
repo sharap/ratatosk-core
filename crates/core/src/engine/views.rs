@@ -280,6 +280,55 @@ impl<S: Store> Engine<S> {
         }
     }
 
+    /// Настройка уведомлений чата, как её записал человек (§14).
+    ///
+    /// Отдаётся **как есть**, без счёта срока: «что я выбрал» и «молчим
+    /// ли сейчас» — разные вопросы, и на экране настроек нужен первый.
+    /// На второй отвечает [`Engine::chat_speaks_at`].
+    ///
+    /// Отказ хранилища читается как умолчание: показать «говорить» там,
+    /// где не прочлось, честнее, чем уронить список чатов из-за строки
+    /// настройки.
+    #[must_use]
+    pub fn chat_notify(&self, chat: &ChatId) -> ratatosk_proto::notify::Notify {
+        use ratatosk_proto::notify::{Mode, Notify};
+
+        self.store.chat_notify(chat).ok().flatten().map_or_else(Notify::default, |stored| Notify {
+            mode: Mode::from_code(stored.mode),
+            until_ms: stored.until_ms,
+        })
+    }
+
+    /// Говорить ли об этом чате **сейчас** (§14).
+    ///
+    /// Один вопрос — один ответ, и считает его ядро: срок молчания
+    /// истекает сам, и клиент, считающий это у себя, разошёлся бы
+    /// с ядром на границе суток.
+    #[must_use]
+    pub fn chat_speaks_at(&self, chat: &ChatId, now_ms: u64) -> bool {
+        self.chat_notify(chat).speaks_at(now_ms)
+    }
+
+    /// Все настройки разом — чтобы нарисовать список одним чтением.
+    ///
+    /// Чатов, которые человек трогал, немного: молчат обычно единицы
+    /// из десятков. Поэтому отдаётся **только тронутое**, а остальное
+    /// клиент читает умолчанием — иначе список рос бы вместе с числом
+    /// чатов, ничего к нему не добавляя.
+    #[must_use]
+    pub fn all_chat_notify(&self) -> Vec<(ChatId, ratatosk_proto::notify::Notify)> {
+        use ratatosk_proto::notify::{Mode, Notify};
+
+        self.store
+            .all_chat_notify()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(chat, stored)| {
+                (chat, Notify { mode: Mode::from_code(stored.mode), until_ms: stored.until_ms })
+            })
+            .collect()
+    }
+
     /// Состав группы в том виде, в каком его рисуют.
     ///
     /// Отдаётся списком записей, а не ключей, и это то же решение, что

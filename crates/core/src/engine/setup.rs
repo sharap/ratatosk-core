@@ -31,6 +31,42 @@ impl<S: Store> Engine<S> {
     /// своим чередом и честно скажет об этом (§14). Отменять обещание
     /// доставки из-за переключателя нельзя: человек выключил транспорт,
     /// а не отказался от переписки.
+    /// Кладёт настройку уведомлений чата (§14).
+    ///
+    /// # Ничего не уезжает по сети, и это решение
+    ///
+    /// Молчание — дело **этого** устройства. Разошли мы его по своим
+    /// же устройствам (§13.4), телефон замолчал бы там, где человек
+    /// гасил уведомления на ноутбуке; а разошли собеседнику — он узнал
+    /// бы, что его приглушили, чего §14 никому не обещал.
+    ///
+    /// # Срок читается только у молчания
+    ///
+    /// У «говорить» его нет: запиши мы остаток срока — снятое молчание
+    /// однажды включилось бы само.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn on_set_chat_notify(
+        &mut self,
+        chat: ChatId,
+        silent: bool,
+        until_ms: u64,
+    ) -> Result<Vec<Effect>, EngineError> {
+        use ratatosk_proto::notify::Mode;
+
+        let mode = if silent { Mode::Silent } else { Mode::Speak };
+        self.store.set_chat_notify(
+            &chat,
+            &ratatosk_store::StoredNotify {
+                mode: mode.code(),
+                until_ms: if silent { until_ms } else { 0 },
+            },
+        )?;
+        Ok(vec![Effect::Notify(Event::ChatNotifyChanged { chat })])
+    }
+
     pub(super) fn on_set_transport_enabled(
         &mut self,
         now_ms: u64,

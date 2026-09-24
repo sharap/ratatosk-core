@@ -2835,6 +2835,111 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn a_chat_kept_quiet_stays_quiet_after_a_restart() {
+    // Настройка уведомлений живёт **в ядре**, а не в клиенте: телефон
+    // убивают, приложение переустанавливают, а «этот чат молчит» — выбор
+    // человека, и он обязан пережить и то, и другое.
+    //
+    // Проверяется на настоящем хранилище и настоящим перезапуском:
+    // на заглушке в памяти этого не увидеть, и ровно такие проверки
+    // однажды зеленели на пустом месте.
+    let mut stand = Stand::strangers(0x0_9_1E7_C, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+
+    // Умолчание — говорить, и его человек не выбирал.
+    assert!(
+        stand.sim.node(NodeId(0)).engine().chat_speaks_at(&chat, stand.sim.now_ms()),
+        "умолчание — говорить; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    let until = stand.sim.now_ms() + 3_600_000;
+    stand.sim.act(NodeId(0), |node, ctx| {
+        node.command(ctx, Command::SetChatNotify { chat, silent: true, until_ms: until });
+    });
+    assert!(
+        !stand.sim.node(NodeId(0)).engine().chat_speaks_at(&chat, stand.sim.now_ms()),
+        "замолчавший чат обязан молчать; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.restart(NodeId(0));
+    let kept = stand.sim.node(NodeId(0)).engine().chat_notify(&chat);
+    assert_eq!(
+        kept,
+        ratatosk_proto::notify::Notify {
+            mode: ratatosk_proto::notify::Mode::Silent,
+            until_ms: until
+        },
+        "настройка обязана пережить перезапуск; сид {:#x}",
+        stand.sim.seed()
+    );
+    assert!(
+        !stand.sim.node(NodeId(0)).engine().chat_speaks_at(&chat, stand.sim.now_ms()),
+        "и молчание после перезапуска не снимается само; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Срок кончается сам.** Снимать настройку руками человек забудет,
+    // и §14 не вправе на это рассчитывать.
+    stand.sim.run_for(3_600_001);
+    assert!(
+        stand.sim.node(NodeId(0)).engine().chat_speaks_at(&chat, stand.sim.now_ms()),
+        "срок вышел — чат снова говорит; сид {:#x}",
+        stand.sim.seed()
+    );
+    // А **выбор** при этом остался записанным: «молчал до такого-то»
+    // и «не трогал» — разные вещи, и экран настроек показывает первое.
+    assert_eq!(
+        stand.sim.node(NodeId(0)).engine().chat_notify(&chat).mode,
+        ratatosk_proto::notify::Mode::Silent,
+        "истёкший срок не стирает выбор; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Сняли — говорим, и остаток срока не воскрешает молчание.
+    stand.sim.act(NodeId(0), |node, ctx| {
+        node.command(ctx, Command::SetChatNotify { chat, silent: false, until_ms: until });
+    });
+    assert_eq!(
+        stand.sim.node(NodeId(0)).engine().chat_notify(&chat),
+        ratatosk_proto::notify::Notify::default(),
+        "снятое молчание не хранит срока; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn the_quiet_of_a_chat_goes_away_with_the_chat() {
+    // Внешнего ключа у настройки нет нарочно — замолчать можно до
+    // первого сообщения, — и потому убирать её при удалении чата надо
+    // руками. Забудь мы это, следующий чат с тем же идентификатором
+    // достался бы человеку молчащим, и он бы не понял, почему.
+    let mut stand = Stand::strangers(0x0_9_1E7_D, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::SetChatNotify { chat, silent: true, until_ms: 0 });
+    });
+    assert!(
+        !stand.sim.node(NodeId(1)).engine().chat_speaks_at(&chat, stand.sim.now_ms()),
+        "опора: чат замолчал, иначе убирать нечего; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.unsubscribe(NodeId(1), chat);
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).engine().store().chat_notify(&chat).expect("чтение").is_none(),
+        "настройка обязана уйти вместе с чатом; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_call_that_arrives_by_relay_is_asked_about_at_once() {
     // **Разбор живого случая.** «Проблема даже не в уходе и возврате
     // подписчика, а в потере соединения с **этим** каналом — другие

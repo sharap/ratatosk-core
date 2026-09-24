@@ -297,6 +297,9 @@ enum Query {
     ChannelSeeds { chat: ChatId, reply: oneshot::Sender<Vec<SeedView>> },
     /// Наше участие в раздаче этого канала (фаза 2, §7.5.1).
     Seeding { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Seeding> },
+    /// Настройка уведомлений чата (§14) — вместе с готовым ответом
+    /// «говорить ли сейчас»: срок считает ядро.
+    ChatNotify { chat: ChatId, reply: oneshot::Sender<(ratatosk_proto::notify::Notify, bool)> },
     /// Кому мы отдаём блоки этого канала (§12) — **действующий** уровень,
     /// то есть с учётом умолчания аккаунта.
     Sharing { chat: ChatId, reply: oneshot::Sender<ratatosk_proto::swarm::Sharing> },
@@ -1255,6 +1258,19 @@ impl DriverHandle {
     }
 
     /// Читает наше участие в раздаче (§7.5.1), блокируя вызывающий поток.
+    /// Настройка уведомлений чата и готовый ответ «говорить ли сейчас».
+    #[must_use]
+    pub fn chat_notify_blocking(
+        &self,
+        chat: ChatId,
+    ) -> Option<(ratatosk_proto::notify::Notify, bool)> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::ChatNotify { chat, reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
+    /// Участие в раздаче этого канала (§7.5.1) — блокирующе.
+    #[must_use]
     pub fn seeding_blocking(&self, chat: ChatId) -> Option<ratatosk_proto::swarm::Seeding> {
         let (reply, answer) = oneshot::channel();
         self.requests.blocking_send(Request::Query(Query::Seeding { chat, reply })).ok()?;
@@ -1933,6 +1949,11 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 // Часы спрашиваются здесь, а не в ядре: протухшие записи
                 // отсекаются по времени, а времени у ядра своего нет.
                 let _ = reply.send(self.engine.seeds(chat, now_ms()).unwrap_or_default());
+            }
+            Query::ChatNotify { chat, reply } => {
+                let now = now_ms();
+                let _ = reply
+                    .send((self.engine.chat_notify(&chat), self.engine.chat_speaks_at(&chat, now)));
             }
             Query::Seeding { chat, reply } => {
                 let _ = reply.send(

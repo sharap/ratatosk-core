@@ -800,6 +800,16 @@ pub enum FfiEvent {
         /// Ждём ли впуска владельцем. `false` — открытый канал.
         awaiting: bool,
     },
+    /// Настройка уведомлений чата изменилась (§14).
+    ///
+    /// Приходит в ответ на [`RatatoskClient::set_chat_notify`] и ни
+    /// от чего другого: по сети настройка не ездит — молчание дело
+    /// **этого** устройства, и ни собеседник, ни свой же десктоп
+    /// о нём не узнают.
+    ChatNotifyChanged {
+        /// Чат.
+        chat_id: Vec<u8>,
+    },
     /// Канал показан по ссылке — **до** подписки (фаза 2, §10.3, шаг 5).
     ///
     /// Приходит в ответ на [`RatatoskClient::preview_channel`]: документ
@@ -1590,6 +1600,7 @@ pub struct FfiChannel {
     ///
     /// У остальных `false`: чужой ключ повернуть нечем.
     pub rotation_overdue: bool,
+
     /// Что показывать, пока канал не открылся (§10.5).
     ///
     /// `null` — ждать нечего: канал открыт, либо это не канал.
@@ -1605,6 +1616,28 @@ pub struct FfiChannel {
     /// из шести — то самое правило, которое в каждом клиенте написали бы
     /// по-своему.
     pub signal: FfiChannelSignal,
+}
+
+/// Настройка уведомлений чата (§14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiNotify {
+    /// Молчать ли по выбору человека.
+    pub silent: bool,
+    /// До какого момента, мс. `0` — бессрочно.
+    ///
+    /// Показывать стоит: «молчу» и «молчу до утра» — разные вещи,
+    /// и вторая сама кончится.
+    pub until_ms: u64,
+    /// Говорить ли об этом чате **сейчас**.
+    ///
+    /// Считает ядро, а не клиент: срок истекает сам, и вычитание дат
+    /// на этой стороне границы означало бы второе место, где живёт
+    /// одно правило (§13.3).
+    ///
+    /// Отличается от `!silent` ровно истёкшим сроком — и это самый
+    /// частый случай: «замолчать до утра» человек ставит чаще всего,
+    /// а снять забывает.
+    pub speaks_now: bool,
 }
 
 /// Что показывать, пока канал не открылся (§10.5).
@@ -3764,6 +3797,60 @@ impl RatatoskClient {
         self.command(Command::SubscribeToChannel { uri })
     }
 
+    /// Настраивает уведомления чата (§14).
+    ///
+    /// # Что решает ядро, а что клиент
+    ///
+    /// Ядро держит выбор человека и отвечает на один вопрос: говорить
+    /// об этом чате или молчать **сейчас**. Звук, вибрация и вид
+    /// шторки — показ, и решает их клиент (§13.3).
+    ///
+    /// # Срок
+    ///
+    /// `until_ms` — момент, когда молчание кончается само; ноль значит
+    /// «пока не передумаю». У `silent = false` срок не читается: снятое
+    /// молчание не должно включаться обратно.
+    ///
+    /// # Чат годится любой
+    ///
+    /// В том числе тот, в котором ещё нет ни сообщения: замолчать
+    /// вправе и до первого слова.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn set_chat_notify(
+        &self,
+        chat_id: Vec<u8>,
+        silent: bool,
+        until_ms: u64,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::SetChatNotify { chat: to_chat(&chat_id)?, silent, until_ms })
+    }
+
+    /// Что человек выбрал для этого чата (§14).
+    ///
+    /// **Выбор, а не «молчим ли сейчас»**: на экране настроек нужен
+    /// именно он — с выключателем и сроком, каким его поставили.
+    /// Ответ на «молчать ли сейчас» даёт [`FfiNotify::speaks_now`]
+    /// в этой же записи, и считает его ядро.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub fn chat_notify(&self, chat_id: Vec<u8>) -> Result<FfiNotify, RatatoskError> {
+        let (notify, speaks_now) = self
+            .opened
+            .handle
+            .chat_notify_blocking(to_chat(&chat_id)?)
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))?;
+        Ok(FfiNotify {
+            silent: notify.mode == ratatosk_proto::notify::Mode::Silent,
+            until_ms: notify.until_ms,
+            speaks_now,
+        })
+    }
+
     /// Показывает канал по ссылке **до** подписки (фаза 2, §10.3, шаг 5).
     ///
     /// # Что она делает
@@ -5415,6 +5502,7 @@ fn translate(event: Event) -> Option<FfiEvent> {
         Event::ChannelChanged { chat, version, title } => {
             FfiEvent::ChannelChanged { chat_id: chat.to_vec(), version, title }
         }
+        Event::ChatNotifyChanged { chat } => FfiEvent::ChatNotifyChanged { chat_id: chat.to_vec() },
         Event::ChannelPreviewed { chat, title, open, version, pow_bits } => {
             FfiEvent::ChannelPreviewed { chat_id: chat.to_vec(), title, open, version, pow_bits }
         }

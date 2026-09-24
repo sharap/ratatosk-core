@@ -20,7 +20,7 @@ use crate::{
     ArchivedBlock, FileId, HaveRange, Result, StagedUpload, Store, StoreError, StoredAdmit,
     StoredArchiveKey, StoredAvatar, StoredChannel, StoredContact, StoredContactShare, StoredFile,
     StoredGrant, StoredGroup, StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp,
-    StoredMessage, StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup,
+    StoredMessage, StoredNotify, StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup,
     StoredReaction, StoredSeed, StoredSenderChain, StoredSession, StoredSubscription,
 };
 
@@ -3328,6 +3328,59 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn chat_notify(&self, chat_id: &[u8; 16]) -> Result<Option<StoredNotify>> {
+        // Отсутствие строки — не отказ: человек её просто не трогал.
+        let found = match self.conn.query_row(
+            "SELECT mode, until_ms FROM chat_notify WHERE chat_id = ?1",
+            [&chat_id[..]],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ) {
+            Ok(found) => Some(found),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(found.map(|(mode, until_ms)| StoredNotify {
+            mode: u32::try_from(sql_types::from_sql(mode)).unwrap_or_default(),
+            until_ms: sql_types::from_sql(until_ms),
+        }))
+    }
+
+    fn set_chat_notify(&mut self, chat_id: &[u8; 16], notify: &StoredNotify) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO chat_notify (chat_id, mode, until_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET mode = excluded.mode,
+                                                until_ms = excluded.until_ms",
+            rusqlite::params![
+                &chat_id[..],
+                sql_types::to_sql(u64::from(notify.mode)),
+                sql_types::to_sql(notify.until_ms)
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn all_chat_notify(&self) -> Result<Vec<([u8; 16], StoredNotify)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT chat_id, mode, until_ms FROM chat_notify ORDER BY chat_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (chat, mode, until_ms) = row?;
+            let Ok(chat) = <[u8; 16]>::try_from(chat.as_slice()) else { continue };
+            out.push((
+                chat,
+                StoredNotify {
+                    mode: u32::try_from(sql_types::from_sql(mode)).unwrap_or_default(),
+                    until_ms: sql_types::from_sql(until_ms),
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     fn delete_chat(&mut self, chat_id: &[u8; 16]) -> Result<()> {
         let tx = self.conn.transaction()?;
         // Сообщения — явно, хотя внешний ключ и каскадный: порядок здесь
@@ -3350,6 +3403,10 @@ impl Store for SqliteStore {
             [&chat_id[..]],
         )?;
         tx.execute("DELETE FROM messages WHERE chat_id = ?1", [&chat_id[..]])?;
+        // Настройка уведомлений — явно: внешнего ключа у неё нет
+        // нарочно (замолчать можно до первого сообщения), и каскад
+        // её не унесёт.
+        tx.execute("DELETE FROM chat_notify WHERE chat_id = ?1", [&chat_id[..]])?;
         tx.execute("DELETE FROM chats WHERE chat_id = ?1", [&chat_id[..]])?;
         tx.commit()?;
         Ok(())

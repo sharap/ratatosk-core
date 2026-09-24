@@ -18,8 +18,8 @@ use crate::{
     ArchivedBlock, FileId, HaveRange, Result, StagedUpload, Store, StoreError, StoredAdmit,
     StoredArchiveKey, StoredAvatar, StoredChannel, StoredContact, StoredContactShare, StoredFile,
     StoredGroup, StoredGroupAvatar, StoredMembershipBlock, StoredMembershipOp, StoredMessage,
-    StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction, StoredSeed,
-    StoredSenderChain, StoredSession, StoredSubscription,
+    StoredNotify, StoredOutbox, StoredPairedDevice, StoredPeer, StoredPendingGroup, StoredReaction,
+    StoredSeed, StoredSenderChain, StoredSession, StoredSubscription,
 };
 
 /// Хранилище в оперативной памяти.
@@ -30,6 +30,10 @@ pub struct MemoryStore {
     /// чат, затем HLC, затем `msg_id` — то есть порядок §9.1.
     messages: BTreeMap<([u8; 16], Hlc, MsgId), StoredMessage>,
     seen: HashMap<MsgId, u64>,
+    /// Настройка уведомлений чата (§14). `BTreeMap` по той же причине,
+    /// что у контактов: порядок чтения обязан быть одним от запуска
+    /// к запуску (§16).
+    chat_notify: BTreeMap<[u8; 16], StoredNotify>,
     /// Когда сообщение удалили. Надгробие держит идентификатор, а не текст:
     /// тело стирается в тот же момент (§12).
     tombstones: HashMap<MsgId, u64>,
@@ -246,6 +250,19 @@ impl Store for MemoryStore {
         // всего: ключевой материал пережил бы контакт.
         self.sessions.retain(|_, session| session.peer_ik != *ik);
         Ok(())
+    }
+
+    fn chat_notify(&self, chat_id: &[u8; 16]) -> Result<Option<StoredNotify>> {
+        Ok(self.chat_notify.get(chat_id).copied())
+    }
+
+    fn set_chat_notify(&mut self, chat_id: &[u8; 16], notify: &StoredNotify) -> Result<()> {
+        self.chat_notify.insert(*chat_id, *notify);
+        Ok(())
+    }
+
+    fn all_chat_notify(&self) -> Result<Vec<([u8; 16], StoredNotify)>> {
+        Ok(self.chat_notify.iter().map(|(chat, notify)| (*chat, *notify)).collect())
     }
 
     fn delete_chat(&mut self, chat_id: &[u8; 16]) -> Result<()> {

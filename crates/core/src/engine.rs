@@ -2706,6 +2706,9 @@ impl<S: Store> Engine<S> {
             Command::RevokePairing { device_id } => self.on_revoke_pairing(now_ms, &device_id),
             Command::CreateGroup { title } => self.on_create_group(now_ms, &title),
             Command::CreateChannel { title, open } => self.on_create_channel(now_ms, &title, open),
+            Command::SetChatNotify { chat, silent, until_ms } => {
+                self.on_set_chat_notify(chat, silent, until_ms)
+            }
             Command::PreviewChannel { uri } => self.on_preview_channel(now_ms, &uri),
             Command::SubscribeToChannel { uri } => self.on_subscribe_to_channel(now_ms, &uri),
             Command::UnsubscribeFromChannel { chat } => {

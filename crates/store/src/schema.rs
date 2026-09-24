@@ -10,7 +10,7 @@
 //! но места, которые они чистят, заданы уже здесь.
 
 /// Версия схемы. Увеличивается на каждую миграцию.
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// Прагмы, выставляемые при каждом открытии соединения.
 pub const PRAGMAS: &str = "\
@@ -1505,6 +1505,26 @@ pub const MIGRATION_0039: &str = r#"
 ALTER TABLE channel_archive ADD COLUMN addressee BLOB;
 "#;
 
+/// Настройка уведомлений чата (фаза 2, §14).
+///
+/// # Своя таблица, а не столбец в `chats`
+///
+/// Строка чата заводится **первым сообщением**, а замолчать человек
+/// вправе раньше — и по контакту, которому ещё ни разу не написал.
+/// Столбец в `chats` потребовал бы завести чат ради настройки, то есть
+/// показать в списке пустую строку.
+///
+/// Внешнего ключа по той же причине нет. Убирается запись вместе
+/// с чатом — явно, в `delete_chat`: каскада, которого не на что
+/// повесить, здесь не бывает.
+pub const MIGRATION_0040: &str = r#"
+CREATE TABLE chat_notify (
+    chat_id         BLOB PRIMARY KEY NOT NULL,
+    mode            INTEGER NOT NULL,            -- 0 говорить, 1 молчать
+    until_ms        INTEGER NOT NULL             -- 0 — бессрочно
+) STRICT;
+"#;
+
 /// Все таблицы базы — поимённо.
 ///
 /// Список нужен вывозу «социального графа» (§12): он оставляет
@@ -1514,7 +1534,7 @@ ALTER TABLE channel_archive ADD COLUMN addressee BLOB;
 ///
 /// Сверяется тестом с тем, что на самом деле создают миграции, — чтобы
 /// «список отстал от схемы» было падением сборки, а не тихой утечкой.
-pub const ALL_TABLES: [&str; 39] = [
+pub const ALL_TABLES: [&str; 40] = [
     "avatars",
     "causal_refs",
     "channel_admits",
@@ -1527,6 +1547,7 @@ pub const ALL_TABLES: [&str; 39] = [
     "swarm_seeding",
     "channel_archive",
     "channel_subscriptions",
+    "chat_notify",
     "chats",
     "contact_shares",
     "contacts",
@@ -1583,7 +1604,7 @@ pub const GRAPH_META_KEYS: [&str; 5] =
     ["identity_seed", "onion_key", "db_salt", "self_card", "mail_account"];
 
 /// Все миграции по порядку.
-pub const MIGRATIONS: [&str; 39] = [
+pub const MIGRATIONS: [&str; 40] = [
     MIGRATION_0001,
     MIGRATION_0002,
     MIGRATION_0003,
@@ -1623,6 +1644,7 @@ pub const MIGRATIONS: [&str; 39] = [
     MIGRATION_0037,
     MIGRATION_0038,
     MIGRATION_0039,
+    MIGRATION_0040,
 ];
 
 #[cfg(test)]
@@ -1703,7 +1725,7 @@ mod tests {
     /// **Что делать, если тест упал.** Почти наверняка вы правите выпущенную
     /// миграцию — верните её как было и заведите следующий номер. Число здесь
     /// меняют только вместе с добавлением новой миграции в конец списка.
-    const FROZEN: [u64; 39] = [
+    const FROZEN: [u64; 40] = [
         0xa3f5_d87f_eeaa_0e3c,
         0x7996_4d61_828d_b650,
         0x67d3_78d4_c2cc_c4f1,
@@ -1743,6 +1765,7 @@ mod tests {
         0x486a_7674_7421_471d,
         0x0427_c222_cdfc_6950,
         0xe15c_44d0_425c_7858,
+        0xac34_55e6_c022_0a28,
     ];
 
     #[test]

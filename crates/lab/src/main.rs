@@ -1779,7 +1779,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off|quiet>   /seeds <id канала>   /pull <id канала>   /sharing <id|-> <all|contacts|verified|default>   /limits [<на пира> <общий>]   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off|quiet>   /quiet <id чата> <on|off> [часов]   /seeds <id канала>   /pull <id канала>   /sharing <id|-> <all|contacts|verified|default>   /limits [<на пира> <общий>]   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -2281,6 +2281,37 @@ async fn console(
                             }
                         }
                         _ => println!("< /limits [<на пира> <общий>]"),
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("/quiet ") {
+                    // «Молчать» и «говорить» одной командой: срок
+                    // в часах, ноль — бессрочно.
+                    let (chat, tail) = split_group(rest, "/quiet <id чата> <on|off> [часов]");
+                    if let Some(chat) = chat {
+                        let mut words = tail.split_whitespace();
+                        match words.next() {
+                            Some("on") => {
+                                let hours: u64 = words.next().and_then(|it| it.parse().ok()).unwrap_or(0);
+                                let until_ms =
+                                    if hours == 0 { 0 } else { wall_ms() + hours * 3_600_000 };
+                                handle
+                                    .send(Command::SetChatNotify { chat, silent: true, until_ms })
+                                    .await
+                                    .ok();
+                            }
+                            Some("off") => {
+                                handle
+                                    .send(Command::SetChatNotify {
+                                        chat,
+                                        silent: false,
+                                        until_ms: 0,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            _ => println!("< /quiet <id чата> <on|off> [часов]"),
+                        }
                     }
                     continue;
                 }
@@ -3130,6 +3161,7 @@ async fn console(
                     | Event::ChannelChanged { .. }
                     | Event::ChannelSubscribed { .. }
                     | Event::ChannelPreviewed { .. }
+                    | Event::ChatNotifyChanged { .. }
                     | Event::ChannelRequested { .. }
                     | Event::ChannelUnsubscribed { .. }
                     | Event::ChannelKeyRotated { .. }
@@ -5122,6 +5154,9 @@ fn report(event: &Event) {
             // ничего не поворачивалось, он только что получил первое.
             // Читать «повернулся: поколение 0» человеку неоткуда.
             println!("< ключ чтения канала {}: поколение {generation}", short(chat));
+        }
+        Event::ChatNotifyChanged { chat } => {
+            println!("< уведомления чата {} изменены", short(chat));
         }
         Event::ChannelPreviewed { chat, title, open, version, pow_bits } => {
             println!(

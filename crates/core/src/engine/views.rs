@@ -359,6 +359,7 @@ impl<S: Store> Engine<S> {
             .max()
             .unwrap_or(0);
 
+        let subscription = self.store.subscription(chat).ok().flatten();
         let kind = stored.as_ref().and_then(|it| channel::Kind::from_code(u64::from(it.kind)));
         let keys = self.store.archive_keys(chat).unwrap_or_default();
         // Те же три правила, что в `on_rotate_channel_key`, и спрошены
@@ -396,12 +397,14 @@ impl<S: Store> Engine<S> {
             rights: rights.bits(),
             rights_until_ms,
             pow_bits: stored.as_ref().map_or(0, |it| it.pow_bits),
-            awaiting: self
-                .store
-                .subscription(chat)
-                .ok()
-                .flatten()
-                .is_some_and(|it| it.state == SUBSCRIPTION_REQUESTED),
+            awaiting: subscription.as_ref().is_some_and(|it| it.state == SUBSCRIPTION_REQUESTED),
+            // Ожидание считается от `joined_ms` — мига, когда человек
+            // нажал. Повтор его не двигает: §10.5 меряет ожидание
+            // от первой просьбы, а не от последнего стука.
+            waiting: subscription
+                .as_ref()
+                .filter(|it| it.state == SUBSCRIPTION_REQUESTED)
+                .map(|it| channel::Waiting::at(now_ms.saturating_sub(it.joined_ms))),
             readable: !keys.is_empty(),
             generation: keys.iter().map(|key| key.generation).max().unwrap_or(0),
             may_rotate,

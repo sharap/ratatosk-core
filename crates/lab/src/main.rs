@@ -3522,6 +3522,15 @@ async fn show_groups(handle: &DriverHandle) {
                     channel.awaiting_blocks,
                 );
             }
+            // **Экран ожидания §10.5.** Пока канал не открылся, человеку
+            // нужна не пустота, а надпись — и она меняется по времени,
+            // раньше механизма.
+            if let Some(waiting) = channel.waiting {
+                println!("    {}", waiting.ui_text());
+                if waiting.offer_a_notification() {
+                    println!("    можно закрыть: сообщим, когда откроется");
+                }
+            }
             // §6.3: факт, а не вывод. «От владельца ничего не приходило»
             // — это про наш приём, а не про то, где владелец.
             if channel.owner_unseen {

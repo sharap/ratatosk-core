@@ -1576,6 +1576,14 @@ pub struct FfiChannel {
     ///
     /// У остальных `false`: чужой ключ повернуть нечем.
     pub rotation_overdue: bool,
+    /// Что показывать, пока канал не открылся (§10.5).
+    ///
+    /// `null` — ждать нечего: канал открыт, либо это не канал.
+    /// Отсчёт идёт от **первой** просьбы и повтором не двигается.
+    ///
+    /// Слова — [`channel_waiting_text`], кнопка «сообщить, когда
+    /// откроется» — [`channel_waiting_offers_a_notification`].
+    pub waiting: Option<FfiWaiting>,
     /// Чем объяснить тишину — один признак на экран (§15).
     ///
     /// Складывается из полей выше и ничего к ним не добавляет: клиенту
@@ -1583,6 +1591,75 @@ pub struct FfiChannel {
     /// из шести — то самое правило, которое в каждом клиенте написали бы
     /// по-своему.
     pub signal: FfiChannelSignal,
+}
+
+/// Что показывать, пока канал не открылся (§10.5).
+///
+/// Зеркало `channel::Waiting`. **Экран переключается раньше механизма**:
+/// §10.5 говорит это прямым текстом — «отметка 0:30 меняет только
+/// надпись». Расписание повторов живёт своей жизнью, и связывать их
+/// клиенту не нужно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWaiting {
+    /// До полуминуты: «открываем канал».
+    Opening,
+    /// От полуминуты до пяти минут: «дольше обычного».
+    Longer,
+    /// От пяти минут до суток: «медленный путь, это часы».
+    SlowPath,
+    /// Сутки прошли: «не отвечает», и ядро перестало стучать.
+    NoAnswer,
+}
+
+/// Слова к состоянию ожидания (§15, §10.5).
+#[uniffi::export]
+#[must_use]
+pub fn channel_waiting_text(waiting: FfiWaiting) -> String {
+    core_waiting(waiting).ui_text().to_owned()
+}
+
+/// Показывать ли кнопку «сообщить, когда откроется» (§10.5).
+///
+/// Появляется вместе с медленным путём: ждать часами, глядя в экран,
+/// никто не станет.
+#[uniffi::export]
+#[must_use]
+pub fn channel_waiting_offers_a_notification(waiting: FfiWaiting) -> bool {
+    core_waiting(waiting).offer_a_notification()
+}
+
+/// Текст §15 про медленный путь — он же [`FfiWaiting::SlowPath`].
+///
+/// Отдельным именем, потому что §15 называет его отдельно; строка
+/// берётся оттуда же, где живёт состояние, и второй её копии нет.
+#[uniffi::export]
+#[must_use]
+pub fn channel_slow_path_notice() -> String {
+    ratatosk_proto::channel::Waiting::SlowPath.ui_text().to_owned()
+}
+
+/// Ожидание наружу.
+fn waiting_of(waiting: ratatosk_proto::channel::Waiting) -> FfiWaiting {
+    use ratatosk_proto::channel::Waiting;
+
+    match waiting {
+        Waiting::Opening => FfiWaiting::Opening,
+        Waiting::Longer => FfiWaiting::Longer,
+        Waiting::SlowPath => FfiWaiting::SlowPath,
+        Waiting::NoAnswer => FfiWaiting::NoAnswer,
+    }
+}
+
+/// Ожидание обратно — ради слов к нему.
+fn core_waiting(waiting: FfiWaiting) -> ratatosk_proto::channel::Waiting {
+    use ratatosk_proto::channel::Waiting;
+
+    match waiting {
+        FfiWaiting::Opening => Waiting::Opening,
+        FfiWaiting::Longer => Waiting::Longer,
+        FfiWaiting::SlowPath => Waiting::SlowPath,
+        FfiWaiting::NoAnswer => Waiting::NoAnswer,
+    }
 }
 
 /// Почему канал молчит — признак интерфейса (§15).
@@ -4576,6 +4653,7 @@ fn channel_of(facts: &ratatosk_core::engine::ChannelFacts) -> FfiChannel {
         seeds_known: facts.seeds_known,
         awaiting_blocks: facts.awaiting_blocks,
         rotation_overdue: facts.rotation_overdue,
+        waiting: facts.waiting.map(waiting_of),
         signal: signal_of(facts.signal()),
     }
 }
@@ -6265,6 +6343,7 @@ mod tests {
             owner_quiet_ms: None,
             owner_unseen: false,
             grants_expiring: 0,
+            waiting: None,
             sources_now: Some(1),
             seeds_known: 1,
             awaiting_blocks: 0,

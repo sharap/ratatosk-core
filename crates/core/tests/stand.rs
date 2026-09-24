@@ -2835,6 +2835,76 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn the_waiting_screen_changes_before_the_machinery_does() {
+    // §10.5 расписывает экран ожидания по времени: до полуминуты
+    // «открываем канал», дальше «дольше обычного», с пяти минут
+    // «медленный путь, это часы», через сутки «не отвечает».
+    //
+    // И говорит прямым текстом: «экран переключается раньше механизма —
+    // отметка 0:30 меняет только надпись». Поэтому считается **время
+    // от первой просьбы**, а не шаги очереди §5.4.
+    let mut stand = Stand::strangers(0x0_9A17, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    // Владелец не на связи: заявка ушла и ждёт (§10.4).
+    stand.offline(NodeId(0));
+    // **Без `settle` нарочно.** Затишье сети жжёт модельное время
+    // горстями, и первая же отметка §10.5 проскочила бы до того, как
+    // проверка успела на неё посмотреть.
+    let uri = link.clone();
+    stand.sim.act(NodeId(1), |node, ctx| {
+        node.command(ctx, Command::SubscribeToChannel { uri: uri.clone() });
+    });
+
+    let waiting = |stand: &Stand| stand.facts(NodeId(1), chat).waiting;
+    assert_eq!(
+        waiting(&stand),
+        Some(ratatosk_proto::channel::Waiting::Opening),
+        "сразу после нажатия — «открываем канал»; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Числа здесь повторены **сами**, а не взяты из крейта: возьми их
+    // проверка оттуда, сдвиг отметки сдвинул бы и её, и она смолчала бы
+    // о том, что «дольше обычного» стало появляться через час.
+    stand.sim.run_for(31_000);
+    assert_eq!(
+        waiting(&stand),
+        Some(ratatosk_proto::channel::Waiting::Longer),
+        "через полминуты — «дольше обычного»; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.sim.run_for(5 * 60_000);
+    assert_eq!(
+        waiting(&stand),
+        Some(ratatosk_proto::channel::Waiting::SlowPath),
+        "через пять минут — медленный путь; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Суточная отметка «не отвечает» сюда не входит нарочно: к ней
+    // расписание §10.5 уже кончилось, заявка до владельца не доедет,
+    // и проверка мерила бы не экран, а мёртвую очередь. Границу
+    // стережёт `the_waiting_screen_follows_the_clock_of_the_spec`
+    // в `proto::channel` — она про чистый счёт времени.
+
+    // **Впустили — ждать больше нечего.** Иначе экран ожидания висел бы
+    // над открытым каналом, и метка «не отвечает» — над работающим.
+    stand.online(NodeId(0));
+    stand.settle();
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    assert_eq!(
+        waiting(&stand),
+        None,
+        "у открытого канала ожидания не бывает; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_preview_shows_the_channel_without_joining_it() {
     // §10.3 расставляет переход по ссылке шагами, и показ стоит пятым —
     // после того, как представление достали и проверили, и **до**

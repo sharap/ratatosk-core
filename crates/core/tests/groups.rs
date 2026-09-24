@@ -1385,7 +1385,14 @@ fn a_chat_with_an_unknown_profile_does_not_rise() {
 /// Заводит канал и отдаёт его идентификатор.
 fn create_channel(engine: &mut Node, now_ms: u64, title: &str, open: bool) -> [u8; 16] {
     let effects = engine
-        .step(now_ms, Input::Command(Command::CreateChannel { title: title.to_owned(), open }))
+        .step(
+            now_ms,
+            Input::Command(Command::CreateChannel {
+                title: title.to_owned(),
+                open,
+                history_all: true,
+            }),
+        )
         .expect("канал заводится");
     let mut found = None;
     for effect in effects {
@@ -1496,13 +1503,21 @@ fn a_channel_title_obeys_the_same_two_limits_as_a_group() {
     let mut me = node(1);
 
     assert!(matches!(
-        me.step(100, Input::Command(Command::CreateChannel { title: "  ".to_owned(), open: true })),
+        me.step(
+            100,
+            Input::Command(Command::CreateChannel {
+                title: "  ".to_owned(),
+                open: true,
+                history_all: true
+            })
+        ),
         Err(EngineError::GroupTitleEmpty)
     ));
     assert!(matches!(
         me.step(
             200,
             Input::Command(Command::CreateChannel {
+                history_all: true,
                 title: "я".repeat(MAX_GROUP_TITLE_CHARS + 1),
                 open: true,
             })

@@ -7379,7 +7379,11 @@ fn shared_channel(alice: &mut Node, bob: &mut Node, now_ms: u64, open: bool) -> 
     let effects = alice
         .step(
             now_ms + 1_000,
-            Input::Command(Command::CreateChannel { title: "лента".into(), open }),
+            Input::Command(Command::CreateChannel {
+                title: "лента".into(),
+                open,
+                history_all: true,
+            }),
         )
         .expect("канал заводится");
     let chat = effects
@@ -7705,14 +7709,17 @@ fn a_link_to_an_open_channel_carries_the_read_key_and_a_link_to_a_closed_one_doe
 
 /// Заводит канал у одного узла и отдаёт его идентификатор.
 fn create_channel_for(node: &mut Node, now_ms: u64, title: &str, open: bool) -> [u8; 16] {
-    node.step(now_ms, Input::Command(Command::CreateChannel { title: title.into(), open }))
-        .expect("канал заводится")
-        .iter()
-        .find_map(|e| match e {
-            Effect::Notify(Event::ChannelCreated { chat, .. }) => Some(*chat),
-            _ => None,
-        })
-        .expect("событие о заведении")
+    node.step(
+        now_ms,
+        Input::Command(Command::CreateChannel { title: title.into(), open, history_all: true }),
+    )
+    .expect("канал заводится")
+    .iter()
+    .find_map(|e| match e {
+        Effect::Notify(Event::ChannelCreated { chat, .. }) => Some(*chat),
+        _ => None,
+    })
+    .expect("событие о заведении")
 }
 
 #[test]

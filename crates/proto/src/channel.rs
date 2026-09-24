@@ -298,6 +298,34 @@ pub struct Representation {
     pub seed_days: u32,
     /// Окно сидирования: сколько байт хранить (§9.3).
     pub seed_bytes: u64,
+    /// Отдаётся ли новичку **вся** история канала (§5.4).
+    ///
+    /// §5.4 делает настройку двоичной — «всё» или «ничего»:
+    /// промежуточное окно требовало бы хранить прошлое состояние
+    /// цепочки, то есть отменять прямую секретность писателя на ширину
+    /// окна.
+    ///
+    /// # Что этим решается у канала
+    ///
+    /// Слово канала запечатано ключом чтения того поколения, которое
+    /// было текущим (§6.1, §10.4). Значит вопрос «видит ли новичок
+    /// прошлое» — это вопрос **какие поколения ему отдать**: все
+    /// (`true`) или одно текущее (`false`).
+    ///
+    /// # Открытый канал подразумевает «всё»
+    ///
+    /// §5.4 говорит это прямо: ключ чтения лежит в ссылке и статичен,
+    /// «ничего» там не выражается вовсе. Настройкой это не делается —
+    /// у открытого канала поле всегда `true`, и приём такой документ
+    /// проверяет.
+    ///
+    /// # Чем платим
+    ///
+    /// §5.4: «`AK` — долгоживущий симметричный ключ у каждого читателя.
+    /// Изъятие базы любого из них раскрывает весь архив». Новой потери
+    /// в этом нет — в режиме «всё» каждый и так вправе прочесть всё, —
+    /// но одного изъятия довольно.
+    pub history_all: bool,
     /// Кому что выдано. Владельца здесь нет: у него всё и всегда.
     pub grants: Vec<Grant>,
 }
@@ -522,6 +550,10 @@ fn representation_value(representation: &Representation) -> Value {
         (Value::Integer(KEY_POW.into()), Value::Integer(representation.pow_bits.into())),
         (Value::Integer(KEY_SEED_DAYS.into()), Value::Integer(representation.seed_days.into())),
         (Value::Integer(KEY_SEED_BYTES.into()), Value::Integer(representation.seed_bytes.into())),
+        (
+            Value::Integer(KEY_HISTORY.into()),
+            Value::Integer(u64::from(representation.history_all).into()),
+        ),
         (
             Value::Integer(KEY_GRANTS.into()),
             // Без обрезки: длину стережёт `signed_representation`, и обрезка
@@ -773,6 +805,21 @@ pub fn parse_representation(value: &Value) -> Result<UncheckedRepresentation, Ch
         pow_bits: u32::try_from(number(KEY_POW)?).map_err(|_| ChannelError::Malformed)?,
         seed_days: u32::try_from(number(KEY_SEED_DAYS)?).map_err(|_| ChannelError::Malformed)?,
         seed_bytes: stored_number(number(KEY_SEED_BYTES)?)?,
+        // **Поля может не быть**, и это законно: документы, подписанные
+        // до появления глубины, читаются как «ничего» — ровно то, что
+        // ядро делало до неё. Обратное — прочесть их как «всё» — раздало
+        // бы архив тем, кому владелец его не обещал.
+        //
+        // У открытого канала поле не спрашивается вовсе: §5.4 говорит
+        // «подразумевает „всё“», и настройкой это не делается. Соври
+        // документ здесь `false`, мы всё равно отдадим всё — ключ
+        // из ссылки разворачивает все обёртки, и «ничего» у открытого
+        // не выражается ничем.
+        history_all: kind == Kind::Open
+            || map.iter().any(|(key, value)| {
+                canonical::as_u64(key).is_ok_and(|key| key == KEY_HISTORY)
+                    && canonical::as_u64(value).is_ok_and(|flag| flag == 1)
+            }),
         grants: grants.iter().map(grant_from_value).collect::<Result<Vec<_>, _>>()?,
     };
     Ok(UncheckedRepresentation { representation, signature, signed: signed.clone() })
@@ -788,6 +835,7 @@ mod tests {
 
     fn sample(version: u64) -> Representation {
         Representation {
+            history_all: false,
             group: [7u8; 16],
             owner: owner().public().ik,
             version,
@@ -1144,6 +1192,7 @@ mod tests {
             KeyRotationConsequences::ui_text(),
             SharingConsequences::ui_text(),
             PreviewConsequences::ui_text(),
+            HistoryDepthConsequences::ui_text(),
             // Из ожидания §10.5 сюда идут только объясняющие: «медленный
             // путь» и «не отвечает». Первые два — **надписи на экране**
             // («открываем канал»), и требовать от них восьмидесяти байт
@@ -1688,6 +1737,8 @@ const KEY_ADMITTED_BY: u64 = 20;
 const KEY_GENERATION: u64 = 21;
 /// Признак предпросмотра в просьбе (§10.3, шаг 5).
 const KEY_PREVIEW: u64 = 22;
+/// Глубина истории для новичка (§5.4): 1 — «всё», иначе «ничего».
+const KEY_HISTORY: u64 = 23;
 
 /// Куда стучаться за представлением канала.
 ///
@@ -1948,18 +1999,13 @@ fn endpoint_from_value(value: &Value) -> Result<Endpoint, ChannelError> {
 //
 // # Чего здесь нет, и это не забывчивость
 //
-// §15 перечисляет одиннадцать текстов. Один из них описывает то, чего
-// ядро **не делает**:
-//
-// * `channel_history_none_notice` — глубина истории (§5.4) не собрана:
-//   `archive_wrap` не пишется, и «прежние записи не передаются» верно
-//   для **всех** каналов, а не «так настроен этот».
-//
-// Список тает по мере того, как появляется поведение. Ушли из него:
+// §15 перечисляет одиннадцать текстов, и **все они написаны**:
+// поведение есть у каждого. Список ненаписанных был, и ушли из него:
 // `relay_policy_notice` (уровни раздачи §12 — `swarm::SharingLevelConsequences`),
 // `channel_preview_notice` (предпросмотр §10.3 — `PreviewConsequences`),
-// `channel_slow_path_notice` (экран ожидания §10.5 — `Waiting::SlowPath`)
-// и оба про аккаунты (§12 сделан — `core::honest`).
+// `channel_slow_path_notice` (экран ожидания §10.5 — `Waiting::SlowPath`),
+// оба про аккаунты (§12 сделан — `core::honest`) и, последним,
+// `channel_history_none_notice` (глубина §5.4 — `HistoryDepthConsequences`).
 //
 // Текст, описывающий несуществующее поведение, хуже отсутствующего:
 // отсутствующий человек не прочтёт, а ложный он прочтёт и поверит.
@@ -2172,6 +2218,38 @@ impl Waiting {
                  когда будет повод думать, что владелец вернулся."
             }
         }
+    }
+}
+
+/// Что значит канал без истории для новичка (§5.4).
+///
+/// Настройка двоичная и ставится при заведении: «всё» или «ничего».
+/// Промежуточных окон §5.4 не знает — окно требовало бы хранить
+/// прошлое состояние цепочки, то есть отменять прямую секретность
+/// писателя на его ширину.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryDepthConsequences;
+
+impl HistoryDepthConsequences {
+    /// Передаются ли прежние записи новичку в режиме «ничего».
+    ///
+    /// Нет: ему отдаётся одно текущее поколение ключа чтения, и всё,
+    /// что запечатано прежними, он не откроет — сколько бы ни вытянул
+    /// из роя.
+    pub const OLD_RECORDS_REACH_THE_NEWCOMER: bool = false;
+    /// Можно ли передумать и отдать историю потом.
+    ///
+    /// Нет, и это решение, а не недоделка: §5.4 закрывает направление
+    /// «ничего» → «всё» механически. У канала оно выразилось бы выдачей
+    /// прежних поколений задним числом — то есть «настройка, которая
+    /// ничего не обещает». Обещание §5.4 стоит дороже удобства.
+    pub const IT_CAN_BE_TURNED_ON_LATER: bool = false;
+
+    /// Точная формулировка для UI (§15).
+    #[must_use]
+    pub const fn ui_text() -> &'static str {
+        "Канал ведётся не с сегодняшнего дня, но прежние записи \
+         не передаются новым читателям — так настроен этот канал."
     }
 }
 

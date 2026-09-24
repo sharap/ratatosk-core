@@ -1312,8 +1312,8 @@ impl Store for SqliteStore {
         tx.execute(
             "INSERT INTO channel_representations
                (chat_id, version, owner_ik, kind, title_enc, pow_bits,
-                seed_days, seed_bytes, block_bytes, signature, received_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                seed_days, seed_bytes, block_bytes, signature, received_ms, history_all)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(chat_id) DO UPDATE SET
                version = excluded.version,
                owner_ik = excluded.owner_ik,
@@ -1324,7 +1324,8 @@ impl Store for SqliteStore {
                seed_bytes = excluded.seed_bytes,
                block_bytes = excluded.block_bytes,
                signature = excluded.signature,
-               received_ms = excluded.received_ms",
+               received_ms = excluded.received_ms,
+               history_all = excluded.history_all",
             rusqlite::params![
                 &channel.chat_id[..],
                 sql_types::to_sql(channel.version),
@@ -1336,7 +1337,8 @@ impl Store for SqliteStore {
                 sql_types::to_sql(channel.seed_bytes),
                 &channel.block_bytes[..],
                 &channel.signature[..],
-                sql_types::to_sql(channel.received_ms)
+                sql_types::to_sql(channel.received_ms),
+                sql_types::to_sql(u64::from(channel.history_all))
             ],
         )?;
         // **Стирается целиком, а не дополняется.** Список в новой версии —
@@ -1366,7 +1368,7 @@ impl Store for SqliteStore {
             .conn
             .query_row(
                 "SELECT version, owner_ik, kind, title_enc, pow_bits, seed_days,
-                        seed_bytes, block_bytes, signature, received_ms
+                        seed_bytes, block_bytes, signature, received_ms, history_all
                    FROM channel_representations WHERE chat_id = ?1",
                 [&chat_id[..]],
                 |row| {
@@ -1381,6 +1383,7 @@ impl Store for SqliteStore {
                         row.get::<_, Vec<u8>>(7)?,
                         row.get::<_, Vec<u8>>(8)?,
                         row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
                     ))
                 },
             )
@@ -1400,6 +1403,7 @@ impl Store for SqliteStore {
             block_bytes,
             signature,
             received_ms,
+            history_all,
         )) = found
         else {
             return Ok(None);
@@ -1462,6 +1466,7 @@ impl Store for SqliteStore {
             block_bytes,
             signature,
             received_ms: sql_types::from_sql(received_ms),
+            history_all: sql_types::from_sql(history_all) == 1,
             grants,
         }))
     }

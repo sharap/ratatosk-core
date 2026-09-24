@@ -1600,6 +1600,16 @@ pub struct FfiChannel {
     ///
     /// У остальных `false`: чужой ключ повернуть нечем.
     pub rotation_overdue: bool,
+    /// Отдаётся ли новичку вся история канала (§5.4).
+    ///
+    /// `false` — «ничего»: пришедший завтра не увидит сказанного
+    /// сегодня. Это настройка владельца, а не поломка, и рядом
+    /// с пустой лентой её надо объяснить —
+    /// [`channel_history_none_notice`].
+    ///
+    /// У открытого канала всегда `true`: ключ чтения лежит в ссылке
+    /// и статичен, «ничего» там не выражается ничем.
+    pub history_all: bool,
 
     /// Что показывать, пока канал не открылся (§10.5).
     ///
@@ -3739,8 +3749,22 @@ impl RatatoskClient {
     ///
     /// Идентификатор придёт событием [`FfiEvent::ChannelCreated`] —
     /// и только им: он случаен.
-    pub fn create_channel(&self, title: String, open: bool) -> Result<(), RatatoskError> {
-        self.command(Command::CreateChannel { title, open })
+    /// `history_all` — глубина истории для новичка (§5.4): «всё»
+    /// или «ничего», и третьего нет. У **открытого** канала поле
+    /// не читается: §5.4 говорит «подразумевает „всё“».
+    ///
+    /// Цена «всего» названа в §5.4 и её стоит показать: ключ чтения —
+    /// долгоживущий симметричный ключ у каждого читателя, и изъятие
+    /// базы любого из них раскрывает весь архив. Цена «ничего» —
+    /// [`channel_history_none_notice`]: пришедший завтра не увидит
+    /// ничего из сказанного сегодня, и **передумать нельзя**.
+    pub fn create_channel(
+        &self,
+        title: String,
+        open: bool,
+        history_all: bool,
+    ) -> Result<(), RatatoskError> {
+        self.command(Command::CreateChannel { title, open, history_all })
     }
 
     /// Ссылка на канал — для QR и пересылки (фаза 2, §10.1, §10.2).
@@ -4750,6 +4774,7 @@ fn channel_of(facts: &ratatosk_core::engine::ChannelFacts) -> FfiChannel {
         owner_quiet_ms: facts.owner_quiet_ms,
         owner_unseen: facts.owner_unseen,
         grants_expiring: facts.grants_expiring,
+        history_all: facts.history_all,
         sources_now: facts.sources_now,
         seeds_known: facts.seeds_known,
         awaiting_blocks: facts.awaiting_blocks,
@@ -5929,6 +5954,18 @@ pub fn file_waiting_text(reason: FfiFileWaitReason) -> String {
     wait_reason_back(reason).text().to_string()
 }
 
+/// Что значит канал без истории для новичка (§5.4, §15).
+///
+/// Показать **до** подписки на такой канал и рядом с его пустой лентой:
+/// человек видит канал, который ведётся давно, и ни одной записи —
+/// а это настройка владельца, а не поломка. Признак —
+/// [`FfiChannel::history_all`].
+#[uniffi::export]
+#[must_use]
+pub fn channel_history_none_notice() -> String {
+    ratatosk_proto::channel::HistoryDepthConsequences::ui_text().to_owned()
+}
+
 /// Что значит завести второй аккаунт (§12, §15).
 ///
 /// Показать **до** заведения: после будет поздно, а человек, заводящий
@@ -6469,6 +6506,7 @@ mod tests {
             owner_unseen: false,
             grants_expiring: 0,
             waiting: None,
+            history_all: true,
             sources_now: Some(1),
             seeds_known: 1,
             awaiting_blocks: 0,

@@ -924,6 +924,15 @@ pub struct ChannelFacts {
     /// Экран здесь переключается раньше механизма — так велит §10.5
     /// прямым текстом: «отметка 0:30 меняет только надпись».
     pub waiting: Option<channel::Waiting>,
+    /// Отдаётся ли новичку вся история канала (§5.4).
+    ///
+    /// `false` — «ничего»: пришедший завтра не увидит сказанного
+    /// сегодня, и это настройка владельца, а не поломка. Текст
+    /// к ней — `channel::HistoryDepthConsequences::ui_text`.
+    ///
+    /// У открытого канала всегда `true`: ключ чтения лежит в ссылке
+    /// и статичен, «ничего» там не выражается ничем (§5.4).
+    pub history_all: bool,
     /// Владельцу: ключу чтения больше месяца (§6.4).
     ///
     /// Расписание §6.4 — обещание владельца читателям, и нарушает его
@@ -1013,6 +1022,7 @@ mod signal_tests {
             owner_quiet_ms: None,
             owner_unseen: false,
             grants_expiring: 0,
+            history_all: true,
             sources_now: Some(1),
             seeds_known: 1,
             awaiting_blocks: 0,
@@ -2705,7 +2715,9 @@ impl<S: Store> Engine<S> {
             Command::PairDevice { label } => self.on_pair_device(now_ms, &label),
             Command::RevokePairing { device_id } => self.on_revoke_pairing(now_ms, &device_id),
             Command::CreateGroup { title } => self.on_create_group(now_ms, &title),
-            Command::CreateChannel { title, open } => self.on_create_channel(now_ms, &title, open),
+            Command::CreateChannel { title, open, history_all } => {
+                self.on_create_channel(now_ms, &title, open, history_all)
+            }
             Command::SetChatNotify { chat, silent, until_ms } => {
                 self.on_set_chat_notify(chat, silent, until_ms)
             }

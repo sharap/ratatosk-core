@@ -1986,6 +1986,7 @@ fn a_repeated_put_renames_the_group_but_keeps_its_owner() {
 
 fn channel(version: u64, grants: Vec<StoredGrant>) -> StoredChannel {
     StoredChannel {
+        history_all: false,
         chat_id: [7u8; 16],
         version,
         owner_ik: [107u8; 32],

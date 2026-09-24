@@ -215,7 +215,12 @@ impl<S: Store> Engine<S> {
         now_ms: u64,
         title: &str,
         open: bool,
+        history_all: bool,
     ) -> Result<Vec<Effect>, EngineError> {
+        // §5.4: «открытый канал подразумевает „всё“». Ключ чтения лежит
+        // в ссылке и статичен, значит разворачивает все обёртки;
+        // «ничего» там не выражается ничем, и настройкой это не делается.
+        let history_all = history_all || open;
         let title = title.trim();
         if title.is_empty() {
             return Err(EngineError::GroupTitleEmpty);
@@ -252,6 +257,7 @@ impl<S: Store> Engine<S> {
 
         let kind = if open { channel::Kind::Open } else { channel::Kind::ByInvite };
         let representation = channel::Representation {
+            history_all,
             group: chat,
             owner: me,
             // Единица, а не ноль: ссылка называет **минимальную** версию
@@ -272,6 +278,7 @@ impl<S: Store> Engine<S> {
             channel::sign_representation(&self.identity, &representation)
                 .map_err(|_| EngineError::GroupTitleTooLong)?;
         self.store.put_channel(&StoredChannel {
+            history_all,
             chat_id: chat,
             version: representation.version,
             owner_ik: me,
@@ -1520,18 +1527,38 @@ impl<S: Store> Engine<S> {
         let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &document)?;
         effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
 
+        // **Сколько поколений ключа отдать — это и есть глубина истории**
+        // (§5.4). Слово канала запечатано ключом того поколения, которое
+        // было текущим; значит «видит ли новичок прошлое» — вопрос
+        // о поколениях, а не о блоках.
+        //
+        // «Всё» — все, что у нас есть; «ничего» — одно текущее. Третьего
+        // §5.4 не знает: промежуточное окно требовало бы хранить прошлое
+        // состояние цепочки, то есть отменять прямую секретность
+        // писателя на его ширину.
+        //
+        // Открытый канал сюда не попадает вовсе (впуска там нет), и это
+        // не оговорка, а §5.4: ключ из ссылки статичен и разворачивает
+        // всё.
+        let keys = if stored.history_all {
+            self.store.archive_keys(&chat)?
+        } else {
+            vec![current.clone()]
+        };
         // Ключ — **запечатанным**, тем же блоком, что и при повороте
         // (§5.3): у нас с ним есть сессия, но форма одна на оба случая,
         // и второй дороги ключу заводить незачем.
-        let sealed = ratatosk_crypto::seal::seal_to_static(&peer_ik, &current.key)
-            .map_err(|_| EngineError::UnknownPeer)?;
-        let key_action = ratatosk_proto::group_action::Action::ArchiveKey {
-            generation: current.generation,
-            recipient_ik: peer_ik,
-            sealed,
-        };
-        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &key_action)?;
-        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+        for key in keys {
+            let sealed = ratatosk_crypto::seal::seal_to_static(&peer_ik, &key.key)
+                .map_err(|_| EngineError::UnknownPeer)?;
+            let key_action = ratatosk_proto::group_action::Action::ArchiveKey {
+                generation: key.generation,
+                recipient_ik: peer_ik,
+                sealed,
+            };
+            let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &key_action)?;
+            effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+        }
 
         // **Каталог — вместе с впуском** (§7.5, §7.4 шаг 1: «представление
         // и `PeerRecord`ы — чтобы было у кого спрашивать»).
@@ -2171,6 +2198,7 @@ impl<S: Store> Engine<S> {
             .ok_or(EngineError::NotAllowedInChannel)?;
 
         let mut next = channel::Representation {
+            history_all: stored.history_all,
             group: chat,
             owner: me,
             version: stored.version + 1,
@@ -2198,6 +2226,7 @@ impl<S: Store> Engine<S> {
         let (block_bytes, signature) = channel::sign_representation(&self.identity, &next)
             .map_err(|_| EngineError::TooManyGrants)?;
         self.store.put_channel(&StoredChannel {
+            history_all: next.history_all,
             chat_id: chat,
             version: next.version,
             owner_ik: me,
@@ -2369,6 +2398,7 @@ impl<S: Store> Engine<S> {
                 pow_bits: known.pow_bits,
                 seed_days: known.seed_days,
                 seed_bytes: known.seed_bytes,
+                history_all: known.history_all,
                 grants: known
                     .grants
                     .iter()
@@ -2434,6 +2464,7 @@ impl<S: Store> Engine<S> {
             owner_ik: next.owner,
             kind: u32::try_from(next.kind.code()).unwrap_or(u32::MAX),
             title: next.title.clone(),
+            history_all: next.history_all,
             pow_bits: next.pow_bits,
             seed_days: next.seed_days,
             seed_bytes: next.seed_bytes,

@@ -506,6 +506,7 @@ impl<S: Store> Engine<S> {
             // (`rotate_channels_if_due`). Нулевое поколение — рождение
             // канала (§6.5), и месяц идёт от него так же, как от
             // поворота: §6.4 обещает возраст ключа, а не частоту кнопки.
+            history_all: stored.as_ref().is_some_and(|it| it.history_all),
             rotation_overdue: owner == me
                 && kind == Some(channel::Kind::ByInvite)
                 && keys

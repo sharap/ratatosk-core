@@ -2019,6 +2019,10 @@ async fn console(
                                 .send(Command::CreateChannel {
                                     title: title.trim().to_owned(),
                                     open,
+                                    // Стенд заводит каналы с историей:
+                                    // «ничего» проверяется отдельно,
+                                    // а руками нужен обычный канал.
+                                    history_all: true,
                                 })
                                 .await
                                 .ok();

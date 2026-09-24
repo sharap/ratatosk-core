@@ -842,10 +842,21 @@ impl Stand {
     /// и не меняется никогда, а умолчание в заготовке стенда означало бы,
     /// что половина сценариев проверяет не ту породу, о которой написана.
     fn create_channel(&mut self, owner: NodeId, title: &str, open: bool) -> [u8; 16] {
+        self.create_channel_with_history(owner, title, open, true)
+    }
+
+    /// Заводит канал с названной глубиной истории (§5.4).
+    fn create_channel_with_history(
+        &mut self,
+        owner: NodeId,
+        title: &str,
+        open: bool,
+        history_all: bool,
+    ) -> [u8; 16] {
         let title = title.to_owned();
         let events = self.sim.act(owner, |node, ctx| {
             let before = node.events.len();
-            node.command(ctx, Command::CreateChannel { title, open });
+            node.command(ctx, Command::CreateChannel { title, open, history_all });
             node.events[before..].to_vec()
         });
         events
@@ -2835,6 +2846,100 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn history_depth_decides_what_the_newcomer_sees() {
+    // §5.4: глубина истории для новичка двоична — «всё» или «ничего».
+    // Промежуточных окон нет: окно требовало бы хранить прошлое
+    // состояние цепочки, то есть отменять прямую секретность писателя
+    // на его ширину.
+    //
+    // У канала это решается **поколениями ключа чтения**: слово
+    // запечатано ключом того поколения, которое было текущим, и вопрос
+    // «видит ли новичок прошлое» — это вопрос, сколько поколений ему
+    // отдали.
+    for (history_all, must_see) in [(true, true), (false, false)] {
+        let seed = if history_all { 0x0_415_7 } else { 0x0_415_8 };
+        let mut stand = Stand::strangers(seed, 3);
+        let chat = stand.create_channel_with_history(NodeId(0), "лента", false, history_all);
+        let link = stand.channel_link(NodeId(0), chat);
+
+        // Первый читатель — при первом поколении ключа.
+        stand.subscribe(NodeId(1), &link);
+        stand.admit(NodeId(0), chat, NodeId(1));
+        stand.settle();
+        stand.say(NodeId(0), chat, "сказано при первом поколении");
+        stand.settle();
+        assert!(
+            stand
+                .sim
+                .node(NodeId(1))
+                .seen(chat)
+                .contains(&"сказано при первом поколении".to_owned()),
+            "опора: при своём поколении слышно всегда; сид {:#x}",
+            stand.sim.seed()
+        );
+
+        // Ключ повернули: прошлое запечатано прежним поколением (§6.4).
+        stand.sleep_for(8 * 24 * 60 * 60 * 1000);
+        stand.sim.act(NodeId(0), |node, ctx| {
+            node.command(ctx, Command::RotateChannelKey { chat });
+        });
+        stand.settle();
+        stand.say(NodeId(0), chat, "сказано после поворота");
+        stand.settle();
+
+        // И пришёл второй — ему решает настройка.
+        stand.subscribe(NodeId(2), &link);
+        stand.admit(NodeId(0), chat, NodeId(2));
+        stand.settle();
+
+        // **Прошлое тянет человек, а не обход** (§7.4, шаг 3):
+        // «вступление не оплачивает историю, которую никто не открыл».
+        // Прокрутка вверх опускает границу на страницу — и вот тут-то
+        // и решается, чем он её откроет.
+        stand.pull_older(NodeId(2), chat);
+        stand.settle();
+
+        let seen = stand.sim.node(NodeId(2)).seen(chat);
+        assert!(
+            seen.contains(&"сказано после поворота".to_owned()),
+            "слово своего поколения слышно при любой глубине; видно {seen:?}; сид {:#x}",
+            stand.sim.seed()
+        );
+        assert_eq!(
+            seen.contains(&"сказано при первом поколении".to_owned()),
+            must_see,
+            "глубина «{}» обязана решать судьбу прошлого; видно {seen:?}; сид {:#x}",
+            if history_all { "всё" } else { "ничего" },
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
+fn an_open_channel_always_means_all_of_the_history() {
+    // §5.4 говорит это прямо: «открытый канал подразумевает „всё“.
+    // Так и записать, а не делать настройкой». Ключ чтения лежит
+    // в ссылке и статичен — «ничего» там не выражается ничем, и просьба
+    // человека завести открытый канал без истории обязана кончиться
+    // каналом **с** историей, а не каналом, который врёт.
+    let mut stand = Stand::strangers(0x0_09E_415, 2);
+    let chat = stand.create_channel_with_history(NodeId(0), "лента", true, false);
+    let document = stand
+        .sim
+        .node(NodeId(0))
+        .engine()
+        .store()
+        .channel(&chat)
+        .expect("чтение")
+        .expect("документ");
+    assert!(
+        document.history_all,
+        "у открытого канала глубина всегда «всё»; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn a_chat_kept_quiet_stays_quiet_after_a_restart() {
     // Настройка уведомлений живёт **в ядре**, а не в клиенте: телефон
     // убивают, приложение переустанавливают, а «этот чат молчит» — выбор
@@ -3475,6 +3580,7 @@ fn a_preview_from_anyone_but_the_owner_is_ignored() {
     // кроме подписи.
     let forger = ratatosk_crypto::Identity::from_seed([stand.sim.node(NodeId(2)).seed; 32]);
     let forged = ratatosk_proto::channel::Representation {
+        history_all: true,
         group: chat,
         owner: forger.public().ik,
         version: 9,
@@ -3488,6 +3594,7 @@ fn a_preview_from_anyone_but_the_owner_is_ignored() {
     let (block_bytes, signature) =
         ratatosk_proto::channel::sign_representation(&forger, &forged).expect("подпись");
     let document = ratatosk_store::StoredChannel {
+        history_all: true,
         chat_id: chat,
         version: 9,
         owner_ik: forger.public().ik,

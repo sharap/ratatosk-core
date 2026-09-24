@@ -2835,6 +2835,48 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn a_seed_that_left_the_channel_falls_out_of_the_catalogue() {
+    // Запись раздающего живёт **сроком**, а не отзывом (§7.5): «перестал
+    // продлевать — выпал», и срок этот неделя. Всё это время читатели
+    // привязываются к тому, кто из канала ушёл и обслуживать их больше
+    // не станет: канала у него нет, `may_serve` отвечает «нет».
+    //
+    // Снаружи это «часть подписчиков замолчала», и чинит само остывание
+    // §7.7 — четверть часа спустя. Владелец же узнаёт об уходе первым
+    // (§10.6) и вправе не раздавать мёртвую запись дальше.
+    let mut stand = Stand::strangers(0x0_5EED_60, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    stand.announce_seeding(NodeId(1), chat);
+    stand.settle();
+
+    let seed_ik = stand.ik(NodeId(1));
+    assert!(
+        stand.seeds(NodeId(0), chat).contains(&seed_ik),
+        "опора: владелец знал его раздающим; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.unsubscribe(NodeId(1), chat);
+    stand.settle();
+
+    assert!(
+        !stand.seeds(NodeId(0), chat).contains(&seed_ik),
+        "ушедший обязан выпасть из каталога владельца; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Чего проверка не стережёт.** Чужих копий записи: отзыва §7.5
+    // не знает, и у тех, кто её уже получил, она доживёт свой срок.
+    // Их чинит остывание §7.7, а не эта строка.
+}
+
+#[test]
 fn a_returned_reader_is_heard_by_the_others() {
     // **Разбор живого случая.** «После возвращения сообщения
     // не доходят до остальных — не до всех».
@@ -2897,6 +2939,34 @@ fn a_returned_reader_is_heard_by_the_others() {
         assert!(
             stand.sim.node(who).seen(chat).contains(&"после возвращения".to_owned()),
             "{who:?} не услышал вернувшегося; видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+
+    // **И тот, кто никуда не уходил, не должен выпасть** — ни из слуха,
+    // ни из речи. Живой прогон описал именно это: «сообщения перестали
+    // доходить до второго подписчика и от него тоже».
+    stand.say(NodeId(0), chat, "владелец после всего");
+    stand.settle();
+    for who in [NodeId(1), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"владелец после всего".to_owned()),
+            "{who:?} не услышал владельца; видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(2), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+    stand.say(NodeId(2), chat, "слово не уходившего");
+    stand.settle();
+    for who in [NodeId(0), NodeId(1)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"слово не уходившего".to_owned()),
+            "{who:?} не услышал не уходившего; видно {:?}; сид {:#x}",
             stand.sim.node(who).seen(chat),
             stand.sim.seed()
         );

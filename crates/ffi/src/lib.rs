@@ -5929,6 +5929,29 @@ pub fn file_waiting_text(reason: FfiFileWaitReason) -> String {
     wait_reason_back(reason).text().to_string()
 }
 
+/// Что значит завести второй аккаунт (§12, §15).
+///
+/// Показать **до** заведения: после будет поздно, а человек, заводящий
+/// второй аккаунт ради «второго номера», ждёт от него обратного —
+/// напрямую тот недостижим, пока открыт первый.
+#[uniffi::export]
+#[must_use]
+pub fn account_second_notice() -> String {
+    ratatosk_core::honest::ACCOUNT_SECOND_NOTICE.to_string()
+}
+
+/// Что видно со стороны при переключении аккаунтов (§12, §15).
+///
+/// Показать **до** переключения: один адрес гаснет, другой встаёт
+/// в тот же миг и по тому же подключению, и связать их между собой
+/// сможет всякий, кто смотрит на сеть. Скрыть это протоколу нечем,
+/// и §14 велит сказать прямо.
+#[uniffi::export]
+#[must_use]
+pub fn account_switch_notice() -> String {
+    ratatosk_core::honest::ACCOUNT_SWITCH_NOTICE.to_string()
+}
+
 /// Предупреждение при включении LAN (§5.1).
 #[uniffi::export]
 #[must_use]

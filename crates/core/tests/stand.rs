@@ -2835,6 +2835,75 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn a_returned_reader_is_heard_by_the_others() {
+    // **Разбор живого случая.** «После возвращения сообщения
+    // не доходят до остальных — не до всех».
+    //
+    // Вернувшийся — это автор, у которого всё своё заведено заново:
+    // цепочка, номера, привязки. Остальные помнят его прежним. Проверка
+    // требует, чтобы слово вернувшегося услышали **все**, включая того,
+    // кто из канала не уходил.
+    let mut stand = Stand::strangers(0x0_6A_C4, 3);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+    for reader in 1..3u16 {
+        stand.subscribe(NodeId(reader), &link);
+        stand.admit(NodeId(0), chat, NodeId(reader));
+    }
+    stand.settle();
+    let year = stand.sim.now_ms() + 365 * 24 * 60 * 60 * 1000;
+    stand.grant(NodeId(0), chat, NodeId(1), ratatosk_proto::channel::Rights::WRITE.bits(), year);
+    stand.settle();
+
+    stand.say(NodeId(1), chat, "до ухода");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"до ухода".to_owned()),
+            "опора: до ухода его слышали все; сид {:#x}",
+            stand.sim.seed()
+        );
+    }
+
+    // **Уход, о котором владелец не узнал** — ровно тот случай, который
+    // чинится заявкой от «уже состоящего». После него вернувшийся
+    // получает канал, но впуска не было, и состав у владельца прежний.
+    stand.offline(NodeId(0));
+    stand.unsubscribe(NodeId(1), chat);
+    stand.settle();
+    let owner_ik = stand.ik(NodeId(0));
+    stand.sim.act(NodeId(1), |node, _| {
+        let doomed: Vec<_> = node
+            .engine()
+            .store()
+            .outbox()
+            .expect("очередь")
+            .into_iter()
+            .filter(|row| row.recipient_ik == owner_ik)
+            .map(|row| row.msg_id)
+            .collect();
+        for msg_id in doomed {
+            node.engine_mut().store_mut().delete_outbox(&msg_id, &owner_ik).expect("снято");
+        }
+    });
+    stand.online(NodeId(0));
+    stand.settle();
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    stand.say(NodeId(1), chat, "после возвращения");
+    stand.settle();
+    for who in [NodeId(0), NodeId(2)] {
+        assert!(
+            stand.sim.node(who).seen(chat).contains(&"после возвращения".to_owned()),
+            "{who:?} не услышал вернувшегося; видно {:?}; сид {:#x}",
+            stand.sim.node(who).seen(chat),
+            stand.sim.seed()
+        );
+    }
+}
+
+#[test]
 fn coming_back_when_the_owner_never_heard_the_leaving_works() {
     // **Разбор живого случая, и ответ на «через раз».** «Подписался,
     // отписался, снова подписался — тишина: владельцу не приходит

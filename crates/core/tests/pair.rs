@@ -9077,7 +9077,12 @@ fn a_reader_without_the_evict_right_cannot_rotate() {
         "право писать не даёт поворачивать ключ"
     );
 
-    // А с правом «исключать» — даёт.
+    // **А с правом «исключать» — тоже нет, и отказ другой.** §6.4
+    // отдаёт поворот делегату, §3.2 делает это невозможным: новое
+    // поколение уезжает по составу, а состав у делегата — он сам.
+    // Стенд показал поворот делегатом дословно — поколение `1` у него
+    // одного и `0` у всех остальных (`a_delegate_cannot_rotate_the_key`).
+    // Отказ по имени: «нет права» посоветовал бы просить то, что дали.
     let effects = alice
         .step(
             10_000,
@@ -9090,8 +9095,17 @@ fn a_reader_without_the_evict_right_cannot_rotate() {
         )
         .expect("право исключать");
     pump(&mut alice, &mut bob, 10_000, effects);
-    bob.step(WEEK_MS, Input::Command(Command::RotateChannelKey { chat }))
-        .expect("держатель права «исключать» поворачивает");
+    assert!(
+        matches!(
+            bob.step(WEEK_MS, Input::Command(Command::RotateChannelKey { chat })),
+            Err(EngineError::OnlyOwnerRotates)
+        ),
+        "делегат не поворачивает: развезти поколение ему некому"
+    );
+    // А владелец — поворачивает: иначе отказ выше ничего не значил бы.
+    alice
+        .step(WEEK_MS, Input::Command(Command::RotateChannelKey { chat }))
+        .expect("владелец поворачивает");
 }
 
 // --- Учёт впусков (фаза 2, §6.5) ------------------------------------------
@@ -9272,20 +9286,37 @@ fn those_admitted_stay_after_the_right_is_taken_away() {
 }
 
 #[test]
-fn the_link_carries_our_own_address_and_the_text_says_so() {
-    // §10.2: адреса в ссылку кладёт тот, кто делится. Отсюда обещание
-    // `channel_share_notice`: получивший ссылку узнаёт наш адрес и то,
-    // что мы этот канал читаем, — и без всякого соединения.
-    let mut alice = node(1, "alice");
-    let chat = create_channel_for(&mut alice, 1_000, "лента", true);
-    let link = alice.channel_link(chat).expect("ссылка");
+fn the_link_carries_the_owners_address_and_the_text_says_so() {
+    // §10.2: «адрес владельца — всегда, последним рубежом». Ссылка везёт
+    // один ключ — владельца — и подписчик стучится по её адресам к нему
+    // (`remember_peer`). Отсюда обещание `channel_share_notice`: в ссылке
+    // адрес владельца, а не того, кто ею делится.
+    //
+    // **Стояло наоборот**, и третий узел на стенде записывал владельцу
+    // onion читателя: рукопожатие §8.2 к ключу владельца по чужой двери
+    // не доходит никогда. Стенд по ключу этого не видел — он доставляет
+    // по `IK`, а не по адресу; проверка здесь смотрит на саму ссылку.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    let chat = shared_channel(&mut alice, &mut bob, 1_000, true);
+    let hers = alice.channel_link(chat).expect("ссылка владельца");
+    let his = bob.channel_link(chat).expect("ссылка читателя");
 
-    let parsed = ratatosk_proto::channel::Invitation::from_uri(&link).expect("разбирается");
-    assert!(
-        parsed.endpoints.iter().any(|e| matches!(e, ratatosk_proto::channel::Endpoint::Onion(_))),
-        "свой onion обязан попасть в ссылку — по нему и стучатся"
-    );
-    assert!(ratatosk_proto::channel::SharingConsequences::THE_LINK_CARRIES_OUR_ADDRESS);
+    let onion_in = |link: &str| -> String {
+        let parsed = ratatosk_proto::channel::Invitation::from_uri(link).expect("разбирается");
+        parsed
+            .endpoints
+            .iter()
+            .find_map(|e| match e {
+                ratatosk_proto::channel::Endpoint::Onion(address) => Some(address.clone()),
+                _ => None,
+            })
+            .expect("onion в ссылке")
+    };
+    assert_eq!(onion_in(&hers), alice.own_card().onion, "владелец кладёт свой адрес");
+    assert_eq!(onion_in(&his), alice.own_card().onion, "читатель кладёт адрес владельца");
+    assert_ne!(onion_in(&his), bob.own_card().onion, "и не свой");
+    assert!(ratatosk_proto::channel::SharingConsequences::THE_LINK_CARRIES_THE_OWNERS_ADDRESS);
+    assert!(!ratatosk_proto::channel::SharingConsequences::THE_LINK_CARRIES_THE_SHARERS_ADDRESS);
     assert!(ratatosk_proto::channel::SharingConsequences::IT_REVEALS_THAT_WE_READ_IT);
 }
 
@@ -9541,4 +9572,117 @@ fn snapshot_after_skipping(skipped: usize) -> usize {
     }
     pump(&mut alice, &mut bob, 9_000, last);
     snapshot_bytes(&bob)
+}
+
+// --- Аудит доставки: сбор из кусков и очередь ожидания -------------------
+
+#[test]
+fn a_message_reassembled_from_pieces_is_shown_once_however_many_times_it_comes() {
+    // **Собранный из кусков конверт шёл мимо окна дедупликации §9.2.**
+    // Кусок проходил окно по своему номеру, а собранное из кусков — сразу
+    // в разбор; куски же режет каждый отправитель заново и своими
+    // номерами. Одно и то же сообщение, приехавшее дважды (повтор после
+    // потерянной квитанции, второй курьер в канале), показывалось дважды,
+    // а в канале ещё и дважды уезжало дальше по дереву.
+    //
+    // Повтор здесь настоящий: квитанция до Алисы не доходит, срок выходит,
+    // и она шлёт то же сообщение заново — новыми кусками по новой сессии.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    air_only(&mut bob, alice.own_card().ik);
+    let mut opening = air_only(&mut alice, bob.own_card().ik);
+    opening.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, opening);
+    assert_eq!(alice.session_count(), 1, "сессия обязана сойтись до замера");
+
+    let long = "ё".repeat(20_000);
+    let outgoing = send_text(&mut alice, &bob, 2_000, &long);
+    let pieces = air_sends(&outgoing);
+    assert!(pieces.len() > 2, "длинный текст обязан уехать кусками");
+
+    // Первый приезд: куски доходят, квитанция Боба **теряется**.
+    let mut shown = 0usize;
+    for frame in pieces {
+        let effects = bob
+            .step(2_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame })
+            .expect("кусок принят");
+        shown += effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Notify(Event::MessageReceived { .. })))
+            .count();
+    }
+    assert_eq!(shown, 1, "собранное показывается один раз");
+    assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned(), long.clone()]);
+
+    // Срок вышел — Алиса считает, что не дошло, и шлёт заново.
+    let retry = fire_timers(&mut alice, 2_000 + 10 * 60_000, &outgoing);
+    assert!(!air_sends(&retry).is_empty(), "повтор обязан уехать эфиром: {retry:?}");
+    let events = pump(&mut alice, &mut bob, 2_000 + 10 * 60_000, retry);
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::MessageReceived { .. })),
+        "второй приезд того же сообщения — повтор, а не новость: {events:?}"
+    );
+    assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned(), long], "и в истории оно одно");
+}
+
+#[test]
+fn a_personal_message_is_not_evicted_from_the_waiting_queue_by_silent_copies() {
+    // **Очередь ожидания одна на всё, и рой заполнял её первым.** Сид
+    // с сотней привязанных читателей, ушедших в офлайн, за один блок
+    // канала вытеснял из очереди личное письмо другу — а копию канала
+    // вернёт анти-энтропия §7.2, личное не вернёт никто. Теперь
+    // вытесняются сперва молчаливые копии, потом остальное.
+    //
+    // Очередь здесь набивается копиями **группы** — они молчаливы так же
+    // (§11.3), а собрать двести читателей канала на паре узлов нечем.
+    // Число двести — своё: проверка стережёт «личное переживает
+    // переполнение», а не длину очереди.
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    // Личное — первым, чтобы оно было самым старым в очереди.
+    let effects = alice
+        .step(1_000, Input::Command(Command::SendText { chat, text: "личное".into() }))
+        .expect("отправка текста");
+    let msg_id = alice.store().messages(&chat, 10, None).unwrap()[0].msg_id;
+    // Пауза на обнаружение вышла: соседа нет, сообщение ложится ждать.
+    let waited = fire_timers(&mut alice, 60_000, &effects);
+    assert!(
+        waited.iter().any(|e| matches!(
+            e,
+            Effect::Notify(Event::StatusChanged {
+                status: ratatosk_proto::DeliveryStatus::Waiting,
+                ..
+            })
+        )),
+        "личное обязано лечь в ожидание: {waited:?}"
+    );
+
+    // Группа с тем же соседом — и двести слов в неё: двести молчаливых копий.
+    let group = create_group(&mut alice, 61_000, "у костра");
+    alice
+        .step(62_000, Input::Command(Command::InviteToGroup { chat: group, peer_ik }))
+        .expect("приглашение ложится ждать вместе со всем");
+    for n in 0..200u64 {
+        alice
+            .step(
+                70_000 + n,
+                Input::Command(Command::SendText { chat: group, text: format!("слово {n}") }),
+            )
+            .expect("слово в группу");
+    }
+
+    let status = alice
+        .store()
+        .message(&msg_id)
+        .unwrap()
+        .unwrap()
+        .status
+        .and_then(ratatosk_proto::DeliveryStatus::from_code);
+    assert_eq!(
+        status,
+        Some(ratatosk_proto::DeliveryStatus::Waiting),
+        "личное письмо пережило двести молчаливых копий"
+    );
 }

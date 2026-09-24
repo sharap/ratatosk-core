@@ -842,6 +842,9 @@ impl<S: Store> Engine<S> {
         stalled: bool,
     ) -> Result<Vec<Effect>, EngineError> {
         let Some(peer_ik) = self.source_for(file)? else { return Ok(Vec::new()) };
+        // Кого спросили — помним: замолчит, и держателем он числиться
+        // перестанет (`on_file_stall`).
+        self.file_asked.insert(file.file_id, peer_ik);
         if peer_ik == self.identity.public().ik {
             // Своё же вложение. Сюда не приходят — просят только за
             // входящим, — но правило дешевле привычки: просьба к самому
@@ -2121,6 +2124,19 @@ impl<S: Store> Engine<S> {
         if file.complete || !file.incoming || !file.accepted {
             return Ok(Vec::new());
         }
+        // **Замолчавший держатель вычёркивается** (§9.1). Список
+        // держателей живёт в памяти и не чистился никогда: ушедший
+        // из канала оставался кандидатом, просьба уходила в никуда,
+        // и срок молчания удваивался вокруг пустого места. Объявится
+        // снова — снова попадёт в список. Первоисточник не вычёркивается:
+        // у него байты есть по построению.
+        if let Some(asked) = self.file_asked.remove(&file_id) {
+            if self.offerer_of(&file)? != Some(asked) {
+                if let Some(holders) = self.file_holders.get_mut(&file_id) {
+                    holders.remove(&asked);
+                }
+            }
+        }
         // **Заминка — повод объявить, что у нас уже есть** (§9.1).
         // Мы застряли, но часть кусков держим, и соседу они могут быть
         // нужны: объявление стоит одного кадра и делает из застрявшего
@@ -2207,7 +2223,10 @@ impl<S: Store> Engine<S> {
     /// и надо: поломка проявляется только если перезапустить приложение
     /// посреди почтовой передачи, то есть через час после её начала.
     pub(super) fn resume_all_files(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
-        let peers: Vec<[u8; 32]> = self.contacts.keys().copied().collect();
+        // **И пиры** (§8.3): файл из канала предлагает владелец, а он
+        // читателю не контакт. Пока здесь были одни контакты, приём файла
+        // канала почтой после перезапуска не возобновлялся никогда.
+        let peers: Vec<[u8; 32]> = self.contacts.keys().chain(self.peers.keys()).copied().collect();
         let mut effects = Vec::new();
         for peer_ik in peers {
             effects.extend(self.resume_files(now_ms, peer_ik)?);

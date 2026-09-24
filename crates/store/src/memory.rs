@@ -195,6 +195,14 @@ impl MemoryStore {
     }
 }
 
+/// Виден ли блок спрашивающему: всем либо ровно ему (`ArchivedBlock::addressee`).
+fn visible_to(block: &ArchivedBlock, viewer: Option<&[u8; 32]>) -> bool {
+    match (block.addressee, viewer) {
+        (None, _) | (_, None) => true,
+        (Some(to), Some(who)) => to == *who,
+    }
+}
+
 impl Store for MemoryStore {
     fn migrate(&mut self) -> Result<()> {
         self.migrated = true;
@@ -605,6 +613,11 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn delete_archive_keys(&mut self, chat_id: &[u8; 16]) -> Result<()> {
+        self.archive_keys.retain(|(chat, _), _| chat != chat_id);
+        Ok(())
+    }
+
     fn archive_keys(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredArchiveKey>> {
         Ok(self
             .archive_keys
@@ -848,6 +861,7 @@ impl Store for MemoryStore {
         author_ik: &[u8; 32],
         from_seq: u64,
         limit: usize,
+        viewer: Option<&[u8; 32]>,
     ) -> Result<Vec<ArchivedBlock>> {
         // Ключ карты — «чат, автор, номер», и обход по нему уже
         // отсортирован: то же, что `ORDER BY seq` в файловой базе.
@@ -857,19 +871,24 @@ impl Store for MemoryStore {
             .filter(|((chat, author, seq), _)| {
                 chat == chat_id && author == author_ik && *seq >= from_seq
             })
+            .filter(|(_, block)| visible_to(block, viewer))
             .take(limit)
             .map(|(_, block)| block.clone())
             .collect())
     }
 
-    fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+    fn archive_have(
+        &self,
+        chat_id: &[u8; 16],
+        viewer: Option<&[u8; 32]>,
+    ) -> Result<Vec<HaveRange>> {
         // Склейка подряд идущих, а не `MIN..MAX` по автору: провал
         // в журнале — не порча, а то, что §7.3 велит видеть по номеру.
         // Ключ карты уже упорядочен (чат, автор, номер), и обход идёт
         // в том же порядке, в каком строки едут на провод.
         let mut found: Vec<HaveRange> = Vec::new();
-        for ((chat, author, seq), _) in &self.archive {
-            if chat != chat_id {
+        for ((chat, author, seq), block) in &self.archive {
+            if chat != chat_id || !visible_to(block, viewer) {
                 continue;
             }
             match found.last_mut() {
@@ -882,11 +901,16 @@ impl Store for MemoryStore {
         Ok(found)
     }
 
-    fn archive_recent(&self, chat_id: &[u8; 16], limit: usize) -> Result<Vec<ArchivedBlock>> {
+    fn archive_recent(
+        &self,
+        chat_id: &[u8; 16],
+        limit: usize,
+        viewer: Option<&[u8; 32]>,
+    ) -> Result<Vec<ArchivedBlock>> {
         let mut found: Vec<ArchivedBlock> = self
             .archive
             .iter()
-            .filter(|((chat, _, _), _)| chat == chat_id)
+            .filter(|((chat, _, _), block)| chat == chat_id && visible_to(block, viewer))
             .map(|(_, block)| block.clone())
             .collect();
         // Свежие первыми — тем же правилом, что в файловой базе:
@@ -908,11 +932,43 @@ impl Store for MemoryStore {
         let day_ms = 24 * 60 * 60 * 1000u64;
         let edge = now_ms.saturating_sub(u64::from(max_days).saturating_mul(day_ms));
         let before = self.archive.len();
-        self.archive.retain(|(chat, _, _), block| chat != chat_id || block.received_ms >= edge);
-
-        // Снимается **префикс**: самое раннее по времени и номеру, пока
-        // канал не влезет в окно. Так же, как в файловой базе, — иначе
+        // По сроку — **столько младших номеров автора, сколько у него
+        // строк старше срока**: какие снимать, решает номер, а не время
+        // приёма. Тем же правилом, что в файловой базе, — иначе
         // have-вектор разошёлся бы у двух хранилищ.
+        let authors: std::collections::BTreeSet<[u8; 32]> = self
+            .archive
+            .keys()
+            .filter(|(chat, _, _)| chat == chat_id)
+            .map(|(_, author, _)| *author)
+            .collect();
+        for author in authors {
+            let stale = self
+                .archive
+                .iter()
+                .filter(|((chat, who, _), block)| {
+                    chat == chat_id
+                        && *who == author
+                        && block.addressee.is_none()
+                        && block.received_ms < edge
+                })
+                .count();
+            let doomed: Vec<([u8; 16], [u8; 32], u64)> = self
+                .archive
+                .iter()
+                .filter(|((chat, who, _), block)| {
+                    chat == chat_id && *who == author && block.addressee.is_none()
+                })
+                .map(|(key, _)| *key)
+                .take(stale)
+                .collect();
+            for key in doomed {
+                self.archive.remove(&key);
+            }
+        }
+
+        // Сверх размера — по одной с младшего номера у того автора, чья
+        // самая ранняя строка старее всех. Адресные не трогаются.
         loop {
             let total: u64 = self
                 .archive
@@ -923,16 +979,26 @@ impl Store for MemoryStore {
             if total <= max_bytes {
                 break;
             }
-            let Some(oldest) = self
+            let Some(author) = self
                 .archive
                 .iter()
-                .filter(|((chat, _, _), _)| chat == chat_id)
+                .filter(|((chat, _, _), block)| chat == chat_id && block.addressee.is_none())
                 .min_by_key(|(&(_, _, seq), block)| (block.received_ms, seq))
+                .map(|((_, author, _), _)| *author)
+            else {
+                break;
+            };
+            let Some(youngest) = self
+                .archive
+                .iter()
+                .find(|((chat, who, _), block)| {
+                    chat == chat_id && *who == author && block.addressee.is_none()
+                })
                 .map(|(key, _)| *key)
             else {
                 break;
             };
-            self.archive.remove(&oldest);
+            self.archive.remove(&youngest);
         }
         Ok(before - self.archive.len())
     }
@@ -1334,6 +1400,11 @@ impl Store for MemoryStore {
 
     fn note_seen(&mut self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
         Ok(self.seen.insert(*msg_id, now_ms).is_none())
+    }
+
+    fn forget_seen(&mut self, msg_id: &MsgId) -> Result<()> {
+        self.seen.remove(msg_id);
+        Ok(())
     }
 
     fn seen(&self, msg_id: &MsgId) -> Result<bool> {

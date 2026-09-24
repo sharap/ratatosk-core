@@ -1646,16 +1646,14 @@ fn the_write_right_does_not_let_you_rename_the_channel() {
 }
 
 #[test]
-fn even_with_the_edit_right_a_delegate_does_not_publish_in_a_star() {
-    // **Пара к правилу звезды, и она про `fans_out`.** Переименование
-    // и картинка расходятся по каналу веером — значит и они упираются
-    // в то же, что слово: состав знает владелец (§3.2), и развозить
-    // делегату некому.
-    //
-    // Проверяется на **праве, которое есть**: с `EDIT` отказ обязан
-    // быть про доставку, а не про право. Иначе объяви кто-нибудь
-    // переименование адресным — и оно прошло бы у делегата молча,
-    // не доехав ни до кого.
+fn with_the_edit_right_a_delegate_renames_the_channel_by_an_action() {
+    // **Право «менять представление» было мёртвым.** Команда отказывала
+    // «не владелец» ещё до вопроса о праве: выдать `EDIT` было можно,
+    // а воспользоваться — нет. Теперь держатель правит название
+    // действием (§6.2), оно едет владельцу и сидам той же дорогой, что
+    // слово, а владелец подписывает названное новой версией документа
+    // (`a_rename_by_the_edit_holder_reaches_everyone_and_survives_the_next_document`
+    // на стенде).
     let mut me = node(1);
     let chat = create_channel(&mut me, 100, "лента", false);
     let mine = Identity::from_seed([1u8; 32]).public().ik;
@@ -1665,14 +1663,11 @@ fn even_with_the_edit_right_a_delegate_does_not_publish_in_a_star() {
     me.store_mut().put_channel(&stored).unwrap();
     grant_in_channel(&mut me, &chat, mine, channel::Rights::EDIT.bits(), u64::MAX);
 
-    assert!(
-        matches!(
-            me.step(200, Input::Command(Command::RenameGroup { chat, title: "моё".to_owned() })),
-            Err(EngineError::OnlyOwnerPublishesYet)
-        ),
-        "право менять представление есть — мешает доставка, и сказать надо это"
-    );
-    assert_eq!(me.groups().get(&chat).expect("канал").title, "лента", "и название не сменилось");
+    me.step(200, Input::Command(Command::RenameGroup { chat, title: "моё".to_owned() }))
+        .expect("держатель права «менять представление» переименовывает");
+    assert_eq!(me.groups().get(&chat).expect("канал").title, "моё", "название сменилось у себя");
+    // Документ при этом не тронут: подписать его может только владелец.
+    assert_eq!(me.store().channel(&chat).unwrap().unwrap().title, "лента");
 }
 
 #[test]

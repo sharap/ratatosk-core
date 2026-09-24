@@ -366,8 +366,11 @@ impl<S: Store> Engine<S> {
         // они здесь затем, чтобы человек не узнавал о них из отказа.
         // Порода неизвестна — кнопки нет: обещать поворот, не зная,
         // бывает ли он в этом канале, хуже, чем не обещать.
+        // Поворачивает только владелец (`OnlyOwnerRotates`): у делегата
+        // нет состава, которому новое поколение развезти (§3.2).
         let may_rotate =
             kind == Some(channel::Kind::ByInvite)
+                && owner == me
                 && rights.has(channel::Rights::EVICT)
                 && keys.iter().rev().find(|key| key.generation > 0).is_none_or(|last| {
                     now_ms.saturating_sub(last.created_ms) >= MIN_KEY_ROTATION_MS

@@ -52,8 +52,29 @@ const KEY_GRANTS: u64 = 9;
 const KEY_WHO: u64 = 10;
 const KEY_RIGHTS: u64 = 11;
 const KEY_UNTIL: u64 = 12;
+/// Ключ подписи в выдаче — **внутри карты выдачи**, и только там.
+///
+/// Число то же, что у `KEY_BLOCK`, и это не ошибка, а ловушка, названная
+/// вслух: карты разные (выдача лежит внутри подписанных байт, блок —
+/// снаружи), и менять номер задним числом нельзя — он в подписанных
+/// документах на чужих дисках.
 const KEY_GRANT_SK: u64 = 13;
 const KEY_BLOCK: u64 = 13;
+
+/// Наибольшая величина, которую примет хранилище (знаковый столбец).
+///
+/// Версия документа, окно в байтах, срок выдачи и порог ссылки идут
+/// в базу как есть; больше этого — не число, а порча или чужая сборка,
+/// и разбор отказывает словами, а не роняет процесс на записи.
+const MAX_STORED_NUMBER: u64 = i64::MAX as u64;
+
+/// Число, которому предстоит лечь в хранилище.
+fn stored_number(value: u64) -> Result<u64, ChannelError> {
+    if value > MAX_STORED_NUMBER {
+        return Err(ChannelError::Malformed);
+    }
+    Ok(value)
+}
 const KEY_SIGNATURE: u64 = 14;
 
 /// Наибольшая длина названия канала в байтах.
@@ -695,10 +716,12 @@ fn grant_from_value(value: &Value) -> Result<Grant, ChannelError> {
         )
         .map_err(|_| ChannelError::Malformed)?,
         rights: Rights::from_bits(u32::try_from(rights).map_err(|_| ChannelError::Malformed)?),
-        until_ms: canonical::as_u64(
-            canonical::require(map, KEY_UNTIL).map_err(|_| ChannelError::Malformed)?,
-        )
-        .map_err(|_| ChannelError::Malformed)?,
+        until_ms: stored_number(
+            canonical::as_u64(
+                canonical::require(map, KEY_UNTIL).map_err(|_| ChannelError::Malformed)?,
+            )
+            .map_err(|_| ChannelError::Malformed)?,
+        )?,
     })
 }
 
@@ -744,12 +767,12 @@ pub fn parse_representation(value: &Value) -> Result<UncheckedRepresentation, Ch
     let representation = Representation {
         group: canonical::as_array::<16>(field(KEY_GROUP)?).map_err(|_| ChannelError::Malformed)?,
         owner: canonical::as_array::<32>(field(KEY_OWNER)?).map_err(|_| ChannelError::Malformed)?,
-        version: number(KEY_VERSION)?,
+        version: stored_number(number(KEY_VERSION)?)?,
         kind,
         title: title.to_owned(),
         pow_bits: u32::try_from(number(KEY_POW)?).map_err(|_| ChannelError::Malformed)?,
         seed_days: u32::try_from(number(KEY_SEED_DAYS)?).map_err(|_| ChannelError::Malformed)?,
-        seed_bytes: number(KEY_SEED_BYTES)?,
+        seed_bytes: stored_number(number(KEY_SEED_BYTES)?)?,
         grants: grants.iter().map(grant_from_value).collect::<Result<Vec<_>, _>>()?,
     };
     Ok(UncheckedRepresentation { representation, signature, signed: signed.clone() })
@@ -830,7 +853,9 @@ mod tests {
         let mut granted = original.clone();
         granted.grants[0].rights = Rights::all();
         let mut prolonged = original.clone();
-        prolonged.grants[0].until_ms = u64::MAX;
+        // Не `u64::MAX`: такое число разбор отвергает раньше подписи
+        // (`stored_number`), и проверка стерегла бы не подпись, а предел.
+        prolonged.grants[0].until_ms = i64::MAX as u64;
 
         for (what, tampered) in [
             ("версия", bumped),
@@ -1033,9 +1058,11 @@ mod tests {
         assert!(text.contains("потеряют доступ"), "кнопка называется последствием (§6.4)");
         assert!(text.contains("останется"), "и тем, что прочитанное не забрать");
 
-        assert!(SharingConsequences::THE_LINK_CARRIES_OUR_ADDRESS);
+        assert!(SharingConsequences::THE_LINK_CARRIES_THE_OWNERS_ADDRESS);
+        assert!(!SharingConsequences::THE_LINK_CARRIES_THE_SHARERS_ADDRESS);
         assert!(SharingConsequences::IT_REVEALS_THAT_WE_READ_IT);
-        assert!(SharingConsequences::ui_text().contains("ваш адрес"));
+        assert!(SharingConsequences::ui_text().contains("адрес владельца"));
+        assert!(SharingConsequences::ui_text().contains("вашего адреса в ней нет"));
     }
 
     #[test]
@@ -1556,6 +1583,44 @@ mod tests {
     }
 
     #[test]
+    fn a_number_too_big_for_the_store_is_refused_on_parse() {
+        // Версия, окно в байтах и срок выдачи ложатся в знаковый столбец
+        // хранилища. Подписанный документ с числом за его пределом ронял
+        // отладочную сборку читателя на записи (`sql_types::to_sql`)
+        // и молча насыщался в релизе; отказ обязан быть здесь, словами.
+        let owner = owner();
+        for (what, tamper) in [
+            (
+                "версия",
+                Box::new(|r: &mut Representation| r.version = u64::MAX)
+                    as Box<dyn Fn(&mut Representation)>,
+            ),
+            ("окно в байтах", Box::new(|r: &mut Representation| r.seed_bytes = u64::MAX)),
+            ("срок выдачи", Box::new(|r: &mut Representation| r.grants[0].until_ms = u64::MAX)),
+        ] {
+            let mut representation = sample(3);
+            tamper(&mut representation);
+            let bytes = canonical::encode(&representation_value(&representation)).unwrap();
+            let signature = owner.sign(&bytes);
+            let forged = wire_value(bytes, &signature);
+            assert!(
+                matches!(parse_representation(&forged), Err(ChannelError::Malformed)),
+                "{what} за пределом хранилища обязано отказать разбором"
+            );
+        }
+        // И порог в ссылке — тем же правилом.
+        let mut link = open_link();
+        link.min_version = u64::MAX;
+        let uri = link.to_uri().unwrap();
+        assert!(matches!(Invitation::from_uri(&uri), Err(ChannelError::Malformed)));
+        // А самое большое из допустимых — проходит: иначе отказ выше
+        // мог бы отказывать всему подряд.
+        let mut fine = sample(3);
+        fine.grants[0].until_ms = i64::MAX as u64;
+        assert!(signed_representation(&owner, &fine).is_ok());
+    }
+
+    #[test]
     fn a_kind_we_do_not_know_is_refused() {
         // Порода решает, отбирается ли доступ обратно. Прочитать незнакомую
         // как одну из известных значило бы пообещать не то.
@@ -1836,8 +1901,9 @@ impl Invitation {
                 .map_err(|_| ChannelError::Malformed)?,
             owner: canonical::as_array::<32>(field(KEY_OWNER)?)
                 .map_err(|_| ChannelError::Malformed)?,
-            min_version: canonical::as_u64(field(KEY_MIN_VERSION)?)
-                .map_err(|_| ChannelError::Malformed)?,
+            min_version: stored_number(
+                canonical::as_u64(field(KEY_MIN_VERSION)?).map_err(|_| ChannelError::Malformed)?,
+            )?,
             key,
             endpoints,
         })
@@ -2261,22 +2327,30 @@ impl KeyRotationConsequences {
 pub struct SharingConsequences;
 
 impl SharingConsequences {
-    /// Попадает ли в ссылку наш собственный адрес.
+    /// Попадает ли в ссылку адрес **владельца**.
     ///
-    /// Да: `Engine::channel_link` кладёт свои onion и почту — по ним
+    /// Да: `Engine::channel_link` кладёт адреса владельца — свои, если
+    /// делится он, и известные нам его, если делится читатель. По ним
     /// и стучатся за представлением (§10.2).
-    pub const THE_LINK_CARRIES_OUR_ADDRESS: bool = true;
+    pub const THE_LINK_CARRIES_THE_OWNERS_ADDRESS: bool = true;
+    /// Попадает ли в ссылку адрес читателя, который ею делится.
+    ///
+    /// **Нет.** Ссылка везёт один ключ — владельца — и подписчик стучится
+    /// по её адресам к нему; адрес читателя под ключом владельца был бы
+    /// дверью, за которой никого нет. Здесь стояло «да», и третий узел
+    /// на стенде записывал владельцу onion читателя.
+    pub const THE_LINK_CARRIES_THE_SHARERS_ADDRESS: bool = false;
     /// Узнаёт ли получивший ссылку, что мы этот канал читаем.
     ///
-    /// Да: адрес в ссылке стоит рядом с идентификатором канала, и одно
-    /// связывается с другим без всякого соединения.
+    /// Да — не по адресу, а по самому факту: ссылку на канал даёт тот,
+    /// у кого она есть, то есть читатель или владелец.
     pub const IT_REVEALS_THAT_WE_READ_IT: bool = true;
 
     /// Точная формулировка для UI (§15).
     #[must_use]
     pub const fn ui_text() -> &'static str {
-        "В ссылку попадёт ваш адрес — вы раздаёте этот канал. Любой, \
-         к кому она попадёт дальше, узнает его и то, что вы этот канал \
+        "В ссылке — адрес владельца канала и его ключ; вашего адреса в ней \
+         нет. Любой, к кому она попадёт дальше, поймёт, что вы этот канал \
          читаете, даже если сам подписываться не станет."
     }
 }

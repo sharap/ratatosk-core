@@ -135,6 +135,9 @@ fn engine_err(error: ratatosk_core::EngineError) -> RatatoskError {
         EngineError::OnlyOwnerPublishesYet => {
             RatatoskError::Channel { reason: FfiChannelRefusal::OnlyOwnerPublishesYet }
         }
+        EngineError::OnlyOwnerRotates => {
+            RatatoskError::Channel { reason: FfiChannelRefusal::OnlyOwnerRotates }
+        }
         EngineError::NotAChannel | EngineError::NotAGroup => {
             RatatoskError::Channel { reason: FfiChannelRefusal::WrongProfile }
         }
@@ -233,6 +236,13 @@ pub enum FfiChannelRefusal {
     /// (`FfiChannel::owner_ik` против своего ключа), а не по
     /// `rights.write` — право может быть, а доставка нет.
     OnlyOwnerPublishesYet,
+    /// Ключ чтения поворачивает только владелец (§6.4, §3.2).
+    ///
+    /// Право «исключать» у делегата остаётся правом выдать ключ при
+    /// впуске; развезти новое поколение ему некому — состав канала знает
+    /// владелец. Клиенту: кнопку поворота показывать по
+    /// `FfiChannel::may_rotate`, а не по `rights.evict`.
+    OnlyOwnerRotates,
     /// Права выдают кому угодно, кроме владельца (§6.2).
     ///
     /// **Отдельно от [`FfiChannelRefusal::NoRight`], и разница
@@ -281,6 +291,10 @@ pub fn channel_refusal_text(reason: FfiChannelRefusal) -> String {
         FfiChannelRefusal::OwnerNeedsNoGrant => {
             "Это владелец канала: у него и так все права, и отнять их \
              нельзя. Выдавать их нужно другим."
+        }
+        FfiChannelRefusal::OnlyOwnerRotates => {
+            "Ключ чтения поворачивает только владелец канала: новое \
+             поколение развозится по составу, а состав знает он один."
         }
         FfiChannelRefusal::WrongProfile => {
             "Это действие не для этого чата: у канала и у группы разные \
@@ -6545,6 +6559,7 @@ mod tests {
             (EngineError::NotAllowedInChannel, FfiChannelRefusal::NoRight),
             (EngineError::OwnerNeedsNoGrant, FfiChannelRefusal::OwnerNeedsNoGrant),
             (EngineError::OnlyOwnerPublishesYet, FfiChannelRefusal::OnlyOwnerPublishesYet),
+            (EngineError::OnlyOwnerRotates, FfiChannelRefusal::OnlyOwnerRotates),
             (EngineError::NotAChannel, FfiChannelRefusal::WrongProfile),
             (EngineError::NotAGroup, FfiChannelRefusal::WrongProfile),
             (EngineError::OpenChannelHasNoRotation, FfiChannelRefusal::OpenHasNoRotation),

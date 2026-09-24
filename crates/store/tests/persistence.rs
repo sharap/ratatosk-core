@@ -2219,7 +2219,183 @@ fn arch_block(author: u8, seq: u64, size: usize) -> ratatosk_store::ArchivedBloc
         msg_id: [u8::try_from(seq).unwrap_or(0); 16],
         frame: vec![7u8; size],
         received_ms: 1_000 + seq * 1_000,
+        addressee: None,
     }
+}
+
+/// Тот же блок, но адресованный одному (§5.3, §6.5).
+fn addressed(author: u8, seq: u64, to: u8) -> ratatosk_store::ArchivedBlock {
+    ratatosk_store::ArchivedBlock { addressee: Some([to; 32]), ..arch_block(author, seq, 10) }
+}
+
+#[test]
+fn an_addressed_block_is_shown_and_given_only_to_its_addressee() {
+    // **Заведено по утечке состава (§3.2).** Ключ чтения впущенному
+    // и запись о впуске владельцу занимают позиции в цепочке наравне
+    // со словами (§7.3), а читать их вправе один адресат. Пока архив
+    // отдавал их всякому, читатель, догнавший канал после сна, узнавал,
+    // кого ещё впустили, — из чужих записей о впуске в своей же базе.
+    //
+    // Проверяются все три окна, которыми архив смотрит наружу: вектор,
+    // диапазон и «последние». Пропусти одно — и утечка вернулась бы им.
+    let db = TempDb::new("archive-addressee");
+    let chat = [3u8; 16];
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    sqlite.put_group(&group(3, "канал", 1_000)).unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        store.put_archived(&chat, &arch_block(9, 1, 10)).unwrap();
+        store.put_archived(&chat, &addressed(9, 2, 5)).unwrap();
+        store.put_archived(&chat, &arch_block(9, 3, 10)).unwrap();
+    }
+    for store in [&sqlite as &dyn Store, &memory] {
+        // Свой взгляд — целиком: по нему считаются собственные дыры.
+        let mine = store.archive_have(&chat, None).unwrap();
+        assert_eq!((mine[0].first_seq, mine[0].last_seq), (1, 3), "себе — всё");
+
+        // Чужому второй номер не значится: он видит дыру, как видит
+        // её на всяком адресном блоке (§7.2), и просить его не станет.
+        let theirs = store.archive_have(&chat, Some(&[7u8; 32])).unwrap();
+        let seqs: Vec<(u64, u64)> = theirs.iter().map(|r| (r.first_seq, r.last_seq)).collect();
+        assert_eq!(seqs, vec![(1, 1), (3, 3)], "чужому адресный блок не объявляется");
+        // А адресату — значится.
+        let his = store.archive_have(&chat, Some(&[5u8; 32])).unwrap();
+        assert_eq!((his[0].first_seq, his[0].last_seq), (1, 3), "адресату — вместе со своим");
+
+        let given: Vec<u64> = store
+            .archived_range(&chat, &[9u8; 32], 0, 10, Some(&[7u8; 32]))
+            .unwrap()
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+        assert_eq!(given, vec![1, 3], "на просьбу чужого адресный блок не отдаётся");
+        let given: Vec<u64> = store
+            .archived_range(&chat, &[9u8; 32], 0, 10, Some(&[5u8; 32]))
+            .unwrap()
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+        assert_eq!(given, vec![1, 2, 3], "адресату — отдаётся");
+
+        let recent: Vec<u64> = store
+            .archive_recent(&chat, 10, Some(&[7u8; 32]))
+            .unwrap()
+            .iter()
+            .map(|b| b.seq)
+            .collect();
+        assert!(!recent.contains(&2), "и в пакет §8.4 чужому не кладётся");
+    }
+    // Адресат переживает перезапуск: иначе после подъёма с диска блок
+    // стал бы «для всех», и утечка вернулась бы через сутки.
+    drop(sqlite);
+    let store = SqliteStore::open(&db.0, key(1)).unwrap();
+    let back = store.archived(&chat, &[2u8; 16]).unwrap().expect("кадр на месте");
+    assert_eq!(back.addressee, Some([5u8; 32]));
+}
+
+#[test]
+fn the_window_cuts_by_number_even_when_the_old_block_came_last() {
+    // **Обрезка по времени приёма делала дыру в середине.** Блок,
+    // притянутый анти-энтропией позже соседей (§7.2), по `received_ms`
+    // моложе их, а по номеру старше; обрезка по времени снимала соседей
+    // и оставляла его торчать за вырезанной серединой — а §9.3 обещает
+    // префикс без дыр, и на этом стоит §7.3.
+    //
+    // Числа свои: проверка стережёт обещание «префикс», а не окно.
+    let db = TempDb::new("archive-late-old");
+    let chat = [3u8; 16];
+    let mut sqlite = SqliteStore::open(&db.0, key(1)).unwrap();
+    sqlite.migrate().unwrap();
+    sqlite.put_group(&group(3, "канал", 1_000)).unwrap();
+    let mut memory = MemoryStore::new();
+    memory.migrate().unwrap();
+
+    for store in [&mut sqlite as &mut dyn Store, &mut memory] {
+        // Номера 2, 3, 4 приняты живьём в секунды 2, 3, 4; номер 1
+        // приехал анти-энтропией много позже.
+        for seq in [2u64, 3, 4] {
+            store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
+        }
+        store
+            .put_archived(
+                &chat,
+                &ratatosk_store::ArchivedBlock { received_ms: 900_000, ..arch_block(9, 1, 10) },
+            )
+            .unwrap();
+        // Окно в сутки, а сейчас — на полсекунды позже четвёртого
+        // блока: старше срока ровно два (2 и 3). Снимаются два **младших
+        // номера** — 1 и 2, — а не 2 и 3.
+        let day = 24 * 60 * 60 * 1000u64;
+        let gone = store.prune_archive(&chat, 1, u64::MAX, day + 4_500).unwrap();
+        assert_eq!(gone, 2, "снимается столько, сколько старше срока");
+        let have = store.archive_have(&chat, None).unwrap();
+        assert_eq!(have.len(), 1, "дыры в середине не бывает");
+        assert_eq!((have[0].first_seq, have[0].last_seq), (3, 4), "снят префикс по номеру");
+    }
+}
+
+#[test]
+fn the_window_leaves_addressed_blocks_alone() {
+    // §6.5: «записи о впуске не обрезаются окном сидирования». Ключ
+    // чтения впущенному — тем же правилом: без него впущенный
+    // не прочтёт ничего, а весит он восемьдесят байт.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    store.put_archived(&chat, &addressed(9, 1, 5)).unwrap();
+    for seq in 2..=5u64 {
+        store.put_archived(&chat, &arch_block(9, seq, 100)).unwrap();
+    }
+    // По размеру: влезают два кадра, три уходят — адресный не в счёт.
+    let gone = store.prune_archive(&chat, 30, 250, 10_000).unwrap();
+    assert_eq!(gone, 2, "адресный блок не снимается");
+    let seqs: Vec<u64> = store
+        .archived_range(&chat, &[9u8; 32], 0, 10, None)
+        .unwrap()
+        .iter()
+        .map(|b| b.seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 4, 5], "первый остался, префикс слов снят");
+    // И по сроку — тоже не снимается.
+    assert_eq!(store.prune_archive(&chat, 0, u64::MAX, 3_600_000).unwrap(), 2);
+    assert_eq!(store.archived(&chat, &[1u8; 16]).unwrap().map(|b| b.seq), Some(1));
+}
+
+#[test]
+fn a_forgotten_mark_lets_the_frame_be_seen_again() {
+    // Отметка «видено» ставится до разбора, а отложенный кадр могут
+    // вытеснить из очереди. Снятая отметка возвращает ему право приехать
+    // анти-энтропией — иначе он пропадал на тридцать суток.
+    let db = TempDb::new("dedup-forget");
+    let mut store = SqliteStore::open(&db.0, key(1)).unwrap();
+    store.migrate().unwrap();
+    assert!(store.note_seen(&[4u8; 16], 1_000).unwrap(), "первый раз — свежий");
+    assert!(!store.note_seen(&[4u8; 16], 1_001).unwrap(), "второй — повтор");
+    store.forget_seen(&[4u8; 16]).unwrap();
+    assert!(!store.seen(&[4u8; 16]).unwrap());
+    assert!(store.note_seen(&[4u8; 16], 1_002).unwrap(), "после снятия отметки — снова свежий");
+}
+
+#[test]
+fn deleting_the_read_keys_leaves_the_channel_unreadable() {
+    // Ссылка обещала открытый канал и несла ключ, а документ назвал
+    // канал по приглашению (§6.1): ключ из ссылки не открывает ничего,
+    // и держать его значит показывать «читаемо» там, где читать нечем.
+    let mut store = MemoryStore::new();
+    store.migrate().unwrap();
+    let chat = [3u8; 16];
+    store
+        .put_archive_key(
+            &chat,
+            &ratatosk_store::StoredArchiveKey { generation: 0, key: [1u8; 32], created_ms: 1 },
+        )
+        .unwrap();
+    assert_eq!(store.archive_keys(&chat).unwrap().len(), 1);
+    store.delete_archive_keys(&chat).unwrap();
+    assert!(store.archive_keys(&chat).unwrap().is_empty());
 }
 
 #[test]
@@ -2253,7 +2429,7 @@ fn a_have_vector_says_the_first_and_the_last() {
     }
     store.put_archived(&chat, &arch_block(1, 42, 10)).unwrap();
 
-    let have = store.archive_have(&chat).unwrap();
+    let have = store.archive_have(&chat, None).unwrap();
     assert_eq!(have.len(), 2, "по строке на автора");
     let mine = have.iter().find(|r| r.author_ik == [9u8; 32]).expect("автор на месте");
     assert_eq!((mine.first_seq, mine.last_seq), (3, 6));
@@ -2321,7 +2497,7 @@ fn a_gap_in_the_middle_breaks_the_have_vector_in_two() {
         store.put_archived(&chat, &arch_block(9, seq, 10)).unwrap();
     }
 
-    let have = store.archive_have(&chat).unwrap();
+    let have = store.archive_have(&chat, None).unwrap();
     assert_eq!(have.len(), 2, "провал разрывает строку надвое; вектор: {have:?}");
     assert_eq!((have[0].first_seq, have[0].last_seq), (10, 10));
     assert_eq!((have[1].first_seq, have[1].last_seq), (51, 53));
@@ -2339,7 +2515,7 @@ fn two_authors_with_gaps_do_not_glue_into_one_run() {
     store.put_archived(&chat, &arch_block(1, 7, 10)).unwrap();
     store.put_archived(&chat, &arch_block(9, 8, 10)).unwrap();
 
-    let have = store.archive_have(&chat).unwrap();
+    let have = store.archive_have(&chat, None).unwrap();
     assert_eq!(have.len(), 2, "разные авторы — разные строки; вектор: {have:?}");
     assert!(have.iter().all(|run| run.first_seq == run.last_seq));
 }
@@ -2363,8 +2539,8 @@ fn both_backends_see_the_same_gap() {
         }
         store.put_archived(&chat, &arch_block(1, 3, 10)).unwrap();
     }
-    let have = sqlite.archive_have(&chat).unwrap();
-    assert_eq!(have, memory.archive_have(&chat).unwrap(), "хранилища обязаны видеть одно");
+    let have = sqlite.archive_have(&chat, None).unwrap();
+    assert_eq!(have, memory.archive_have(&chat, None).unwrap(), "хранилища обязаны видеть одно");
     assert_eq!(have.len(), 4, "три куска у одного автора и один у другого; вектор: {have:?}");
 }
 
@@ -2386,9 +2562,9 @@ fn the_window_cuts_the_prefix_and_never_the_middle() {
     // остальные четыре — префикс — уходят.
     let gone = store.prune_archive(&chat, 30, 250, 10_000).unwrap();
     assert_eq!(gone, 4, "снимается ровно столько, сколько не влезает");
-    let have = store.archive_have(&chat).unwrap();
+    let have = store.archive_have(&chat, None).unwrap();
     assert_eq!((have[0].first_seq, have[0].last_seq), (5, 6), "снят префикс, хвост цел");
-    let left = store.archived_range(&chat, &[9u8; 32], 0, 100).unwrap();
+    let left = store.archived_range(&chat, &[9u8; 32], 0, 100, None).unwrap();
     let seqs: Vec<u64> = left.iter().map(|b| b.seq).collect();
     assert_eq!(seqs, vec![5, 6], "дыр в середине не бывает");
 }
@@ -2407,7 +2583,7 @@ fn the_window_also_cuts_by_age() {
     // не уходит ничего, а при окне «ноль суток» уходит всё.
     assert_eq!(store.prune_archive(&chat, 1, u64::MAX, 3_600_000).unwrap(), 0);
     assert_eq!(store.prune_archive(&chat, 0, u64::MAX, 3_600_000).unwrap(), 4);
-    assert!(store.archive_have(&chat).unwrap().is_empty());
+    assert!(store.archive_have(&chat, None).unwrap().is_empty());
 }
 
 #[test]
@@ -2428,10 +2604,13 @@ fn both_backends_cut_the_window_the_same_way() {
         }
         store.prune_archive(&chat, 30, 250, 10_000).unwrap();
     }
-    assert_eq!(sqlite.archive_have(&chat).unwrap(), memory.archive_have(&chat).unwrap());
     assert_eq!(
-        sqlite.archived_range(&chat, &[9u8; 32], 0, 10).unwrap(),
-        memory.archived_range(&chat, &[9u8; 32], 0, 10).unwrap()
+        sqlite.archive_have(&chat, None).unwrap(),
+        memory.archive_have(&chat, None).unwrap()
+    );
+    assert_eq!(
+        sqlite.archived_range(&chat, &[9u8; 32], 0, 10, None).unwrap(),
+        memory.archived_range(&chat, &[9u8; 32], 0, 10, None).unwrap()
     );
 }
 

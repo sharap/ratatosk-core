@@ -122,6 +122,14 @@ impl<S: Store> Engine<S> {
             return self.on_group_intro(now_ms, peer_ik, &envelope.payload);
         }
         if !self.groups.contains_key(&chat) {
+            // **Канал, от которого отписались, не ждёт.** Владелец и сиды
+            // слать блоки не перестанут (привязка у них в памяти, §7.5.1),
+            // и каждый такой кадр занимал бы место в очереди отложенного
+            // — у чата, которого не будет. Стенд показал два таких кадра
+            // у ушедшего читателя после трёх слов владельца.
+            if self.left_channels.contains(&chat) {
+                return Ok(Vec::new());
+            }
             self.park_group_frame(PendingGroup { chat, envelope, peer_ik });
             return Ok(Vec::new());
         }
@@ -148,7 +156,34 @@ impl<S: Store> Engine<S> {
     /// Возраст здесь — это **место в очереди**, и времени прихода кадр
     /// не носит. Носил бы — у одного и того же возраста стало бы два
     /// представления, читаемых порознь, и разошлись бы они молча.
+    ///
+    /// # Отметка «видено» снимается, и это разбор живой поломки
+    ///
+    /// Окно §9.2 отмечает номер кадра **до** разбора (`on_data`), а разбор
+    /// вправе отложить кадр сюда и потом вытеснить его переполнением.
+    /// Вытесненный оставался «виденным» тридцать суток: анти-энтропия §7.2
+    /// честно привозила его снова, окно выбрасывало как повтор — и слово
+    /// пропадало навсегда, а курьеру за него уходил ещё и `PRUNE`.
+    /// Стенд показал это числом: читатель, пропустивший поворот ключа,
+    /// из семидесяти слов получал шестьдесят четыре — ровно длину очереди.
+    ///
+    /// Отметка возвращается при разборе (`drain_pending_group`): кадр,
+    /// который применился, снова считается виденным, а тот, что снова
+    /// отложился, снова забывается. Один и тот же кадр, приехавший
+    /// вторым путём, пока лежит здесь, заменяет свою запись, а не встаёт
+    /// рядом с ней.
     pub(super) fn park_group_frame(&mut self, frame: PendingGroup) {
+        // Канал, от которого отписались, не ждёт (см. `dispatch_group_frame`):
+        // сюда попадают и слова, открытые не там, а в `open_group_frame`.
+        if self.left_channels.contains(&frame.chat) {
+            return;
+        }
+        let msg_id = frame.envelope.msg_id;
+        self.dedup.forget(&msg_id);
+        if let Err(error) = self.store.forget_seen(&msg_id) {
+            tracing::warn!(?error, "отметка «видено» у отложенного кадра не снялась");
+        }
+        self.pending_group.retain(|parked| parked.envelope.msg_id != msg_id);
         if self.pending_group.len() >= MAX_PENDING_GROUP {
             self.pending_group.remove(0);
         }
@@ -225,6 +260,12 @@ impl<S: Store> Engine<S> {
             // на неё там, где можно просто не порождать дубль, незачем.
             self.persist_pending_group();
             for frame in ready {
+                // Отметка «видено» возвращается перед разбором: пока кадр
+                // лежал, её не было (см. `park_group_frame`). Отложится
+                // снова — снова снимется.
+                let msg_id = frame.envelope.msg_id;
+                self.dedup.check(msg_id, now_ms);
+                self.store.note_seen(&msg_id, now_ms)?;
                 effects.extend(self.dispatch_group_frame(
                     now_ms,
                     frame.peer_ik,
@@ -276,7 +317,19 @@ impl<S: Store> Engine<S> {
         // а в канале владелец состоит по определению (`counts_as_member`):
         // блоков про него у читателя нет и не будет (§3.2), и требуй мы
         // их, цепочка владельца откладывалась бы навсегда.
-        if !self.counts_as_member(chat, &peer_ik) || !self.counts_as_member(chat, &block.member) {
+        //
+        // **В канале свою цепочку вправе назвать всякий сам.** Впускающий
+        // делегат отдаёт впущенному свою цепочку до того, как впущенный
+        // узнает о его праве (документ едет под ключом чтения, а ключ —
+        // под этой же цепочкой); блок запечатан нам и говорит только
+        // «вот чем проверять мои блоки». Чужая цепочка без права ничего
+        // не открывает: слово судится правом (§6.2), а не цепочкой.
+        let self_named = self.groups.get(&chat).is_some_and(|s| !s.profile.everyone_writes())
+            && peer_ik == block.member;
+        if !self_named
+            && (!self.counts_as_member(chat, &peer_ik)
+                || !self.counts_as_member(chat, &block.member))
+        {
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
             return Ok(Vec::new());
         }
@@ -806,9 +859,12 @@ impl<S: Store> Engine<S> {
         // А документ канала по-прежнему возит владелец, и дело тут
         // не в доставке: представление судится **его подписью** (§10.3,
         // шаг 3), и подписанного делегатом не примет никто.
+        // Название и картинка держателя `EDIT` — тоже «о слове» в этом
+        // смысле: у них та же дорога, что у слова, а не веер владельца.
         let word = matches!(
             action.gate(),
-            ratatosk_proto::group_action::Gate::Right(right) if right == channel::Rights::WRITE
+            ratatosk_proto::group_action::Gate::Right(right)
+                if right == channel::Rights::WRITE || right == channel::Rights::EDIT
         );
         if action.fans_out() && !word {
             self.check_may_publish(chat)?;
@@ -885,7 +941,8 @@ impl<S: Store> Engine<S> {
         // §7.6 разрешает вытянуть шифротекст всякому, а открыть его
         // сможет только тот, кому он запечатан.
         if self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes()) {
-            self.archive_channel_frame(now_ms, chat, msg_id, &bytes)?;
+            let addressee = self.addressee_of(chat, action);
+            self.archive_channel_frame(now_ms, chat, msg_id, &bytes, addressee)?;
         }
         Ok((msg_id, hlc, bytes))
     }
@@ -1222,9 +1279,16 @@ impl<S: Store> Engine<S> {
             // Пока здесь стоял только состав, слово второго автора
             // откладывалось у всех, кроме владельца, — а он один и видел,
             // что оно вообще было.
-            self.groups[&chat].group.owner == sender
-                || self.groups[&chat].group.contains(&sender)
-                || self.right_holds(now_ms, chat, &sender, channel::Rights::WRITE)?
+            //
+            // **Любое право, а не только «писать», и ещё впустивший нас.**
+            // Делегат с правом «впускать» отдаёт впущенному ключ чтения
+            // и документ своими кадрами, и слово тут ни при чём;
+            // а документ, по которому его право видно, лежит в одном
+            // из этих кадров. Впустивший узнаётся по своему блоку
+            // (`counts_as_member`), и без этого впуск делегатом стоял
+            // на месте.
+            self.counts_as_member(chat, &sender)
+                || self.any_right_holds(now_ms, chat, &sender, channel::Rights::all())?
         };
         if !sender_may_speak {
             self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
@@ -1541,8 +1605,35 @@ impl<S: Store> Engine<S> {
         };
         match ratatosk_proto::group_action::from_payload(&value) {
             Ok(action) => {
-                let mut effects =
-                    self.apply_group_action(now_ms, chat, sender, envelope, &action)?;
+                let mut effects = match self
+                    .apply_group_action(now_ms, chat, sender, envelope, &action)?
+                {
+                    ActionOutcome::Applied(effects) => effects,
+                    // **Цель ещё не приехала — ждём её, а не забываем.**
+                    // Отзыв, правка и реакция законно обгоняют своё слово
+                    // (§9.2), а в канале это ещё и обычный путь: слово
+                    // приедет анти-энтропией §7.2 часы спустя. Выбросив
+                    // действие, мы получили бы у одного читателя слово,
+                    // которое все остальные уже удалили, — стенд показал
+                    // ровно это.
+                    //
+                    // Откладывается **кадр**, и это возможно только
+                    // в канале: там содержимое открывается ключом чтения,
+                    // и второй заход откроет его снова. В группе ключ
+                    // позиции цепочки уже израсходован, и отложенный кадр
+                    // не открылся бы никогда — там действие без цели
+                    // по-прежнему пропадает, и это названо в `TESTING.md`.
+                    ActionOutcome::TargetUnknown => {
+                        if self.groups.get(&chat).is_some_and(|s| !s.profile.everyone_writes()) {
+                            self.park_group_frame(PendingGroup {
+                                chat,
+                                envelope: envelope.clone(),
+                                peer_ik,
+                            });
+                        }
+                        return Ok(Vec::new());
+                    }
+                };
                 // **Принятое действие — тоже позиция цепочки** (§7.3),
                 // и в архиве ей место наравне со словом: спросивший
                 // историю обязан получить подряд всё, что было.
@@ -1560,10 +1651,13 @@ impl<S: Store> Engine<S> {
                 // владелец сам, и курьер им не нужен.
                 if self.groups.get(&chat).is_some_and(|s| !s.profile.everyone_writes()) {
                     let bytes = envelope.encode()?;
+                    // Название и картинка от держателя права «менять
+                    // представление» едут той же дорогой: у него, как
+                    // у всякого делегата, состава нет (§3.2).
                     let about_a_word = matches!(
                         action.gate(),
                         ratatosk_proto::group_action::Gate::Right(right)
-                            if right == channel::Rights::WRITE
+                            if right == channel::Rights::WRITE || right == channel::Rights::EDIT
                     );
                     if about_a_word {
                         effects.extend(self.push_block(
@@ -1574,7 +1668,14 @@ impl<S: Store> Engine<S> {
                             &bytes,
                         )?);
                     } else {
-                        self.archive_channel_frame(now_ms, chat, envelope.msg_id, &bytes)?;
+                        let addressee = self.addressee_of(chat, &action);
+                        self.archive_channel_frame(
+                            now_ms,
+                            chat,
+                            envelope.msg_id,
+                            &bytes,
+                            addressee,
+                        )?;
                     }
                 }
                 Ok(effects)
@@ -1604,6 +1705,24 @@ impl<S: Store> Engine<S> {
         sender: ActorId,
         envelope: &Envelope,
         action: &ratatosk_proto::group_action::Action,
+    ) -> Result<ActionOutcome, EngineError> {
+        let mut waiting = false;
+        let effects =
+            self.apply_group_action_inner(now_ms, chat, sender, envelope, action, &mut waiting)?;
+        Ok(if waiting { ActionOutcome::TargetUnknown } else { ActionOutcome::Applied(effects) })
+    }
+
+    /// Тело [`Engine::apply_group_action`]. `waiting` поднимается там,
+    /// где действие ссылается на сообщение, которого у нас ещё нет:
+    /// это ответ, а не ошибка, и наружу он выходит исходом.
+    fn apply_group_action_inner(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        sender: ActorId,
+        envelope: &Envelope,
+        action: &ratatosk_proto::group_action::Action,
+        waiting: &mut bool,
     ) -> Result<Vec<Effect>, EngineError> {
         use ratatosk_proto::group_action::Action;
 
@@ -1621,7 +1740,14 @@ impl<S: Store> Engine<S> {
                 }
             }
             ratatosk_proto::group_action::Gate::AnyOf(rights) => {
-                if !self.any_right_holds(now_ms, chat, &sender, rights)? {
+                // Ключ чтения от **впустившего нас** принимается и без
+                // документа: документ приедет под этим же ключом (§10.4),
+                // и требуй мы права раньше ключа — впуск делегатом
+                // не открывался бы никогда. Кто нас впустил, доказывает
+                // его подписанный блок, а не слова.
+                if !self.any_right_holds(now_ms, chat, &sender, rights)?
+                    && !self.admitted_me(chat, &sender)
+                {
                     return Ok(Vec::new());
                 }
             }
@@ -1660,11 +1786,19 @@ impl<S: Store> Engine<S> {
                 self.attach_to_seeds(now_ms, chat)
             }
             Action::Rename { title } => {
-                // **Только создатель** (§11.2, расширенное по смыслу).
-                // Проверка на приёме, а не только у отправителя: иначе
-                // достаточно собрать кадр чужой сборкой — ровно тот же
-                // довод, что у `group::removal_allowed`.
-                if sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner) {
+                // **В группе — только создатель** (§11.2, расширенное
+                // по смыслу). Проверка на приёме, а не только
+                // у отправителя: иначе достаточно собрать кадр чужой
+                // сборкой — ровно тот же довод, что у `group::removal_allowed`.
+                //
+                // **В канале — держатель права «менять представление»**
+                // (§6.2): право уже спрошено гейтом выше, а владельцу
+                // оно принадлежит всегда.
+                let in_a_group =
+                    self.groups.get(&chat).is_some_and(|s| s.profile.everyone_writes());
+                if in_a_group
+                    && sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner)
+                {
                     self.sessions.note_anomaly(sender, |c| c.malformed += 1);
                     return Ok(Vec::new());
                 }
@@ -1673,13 +1807,36 @@ impl<S: Store> Engine<S> {
                 if !self.apply_rename(chat, title, envelope.hlc)? {
                     return Ok(Vec::new());
                 }
-                Ok(vec![Effect::Notify(Event::GroupRenamed { chat, title: title.clone() })])
+                let mut effects =
+                    vec![Effect::Notify(Event::GroupRenamed { chat, title: title.clone() })];
+                // **Владелец подписывает названное делегатом.** У канала
+                // имя живёт в документе (§6.1), и всякая следующая версия
+                // везёт его читателям; не впиши владелец новое имя —
+                // первая же правка прав откатила бы название у всех.
+                let me = self.identity.public().ik;
+                if !in_a_group && sender != me && self.channel_owner(chat) == Some(me) {
+                    let named = title.clone();
+                    match self.publish_representation(now_ms, chat, move |next| next.title = named)
+                    {
+                        Ok(produced) => effects.extend(produced),
+                        Err(error) => {
+                            tracing::warn!(?error, "название делегата не легло в документ")
+                        }
+                    }
+                }
+                Ok(effects)
             }
             Action::Avatar { bytes } => {
-                // **Только создатель**, и проверка та же и там же, что
-                // у переименования: собрать кадр чужой сборкой ничто
-                // не мешает, а картинка в группе видна всем.
-                if sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner) {
+                // **В группе — только создатель**, и проверка та же и там
+                // же, что у переименования: собрать кадр чужой сборкой
+                // ничто не мешает, а картинка в группе видна всем.
+                // В канале — держатель права «менять представление»,
+                // и его спросил гейт выше.
+                let in_a_group =
+                    self.groups.get(&chat).is_some_and(|s| s.profile.everyone_writes());
+                if in_a_group
+                    && sender != self.groups.get(&chat).map_or(sender, |state| state.group.owner)
+                {
                     self.sessions.note_anomaly(sender, |c| c.malformed += 1);
                     return Ok(Vec::new());
                 }
@@ -1799,7 +1956,18 @@ impl<S: Store> Engine<S> {
                     admitted_by: admission.admitted_by,
                 })])
             }
-            Action::Representation { bytes } => self.apply_representation(now_ms, chat, bytes),
+            Action::Representation { bytes } => {
+                // **Документ едет в кадре владельца, и только в нём.**
+                // Судится он подписью (`Gate::OwnSignature`), и без этой
+                // строки любой участник мог бы слать кадр с чужим
+                // документом — а несошедшаяся подпись записывалась бы
+                // в аномалии **владельцу**, чьим ключом её проверяли.
+                if self.channel_owner(chat).is_some_and(|owner| owner != sender) {
+                    self.sessions.note_anomaly(sender, |c| c.malformed += 1);
+                    return Ok(Vec::new());
+                }
+                self.apply_representation(now_ms, chat, sender, bytes)
+            }
             Action::Files { caption, offers, forwarded } => {
                 // Сообщение с вложениями — и оно же строка в истории,
                 // под номером конверта: у всех участников это одна и та же
@@ -1908,8 +2076,12 @@ impl<S: Store> Engine<S> {
             }
             Action::Edit { target, text } => {
                 // Правка про сообщение, которого нет, — не ошибка: копия
-                // могла быть удалена раньше или не дойти вовсе.
-                let Some(message) = self.store.message(target)? else { return Ok(Vec::new()) };
+                // могла быть удалена раньше или не дойти вовсе. В канале
+                // такой кадр ждёт своё слово (см. `on_group_action`).
+                let Some(message) = self.store.message(target)? else {
+                    *waiting = true;
+                    return Ok(Vec::new());
+                };
                 if message.sender_ik != sender || message.chat_id != chat {
                     self.sessions.note_anomaly(sender, |c| c.malformed += 1);
                     return Ok(Vec::new());
@@ -1931,7 +2103,15 @@ impl<S: Store> Engine<S> {
             Action::Retract { targets } => {
                 let mut gone = Vec::new();
                 for target in targets {
-                    let Some(message) = self.store.message(target)? else { continue };
+                    let Some(message) = self.store.message(target)? else {
+                        // Цели ещё нет — в канале кадр подождёт её.
+                        // Надгробие §9.2 здесь не помогает: оно ставится
+                        // на **известное** сообщение, а неизвестное
+                        // приедет анти-энтропией позже и легло бы как
+                        // живое.
+                        *waiting = true;
+                        continue;
+                    };
                     if message.sender_ik != sender || message.chat_id != chat {
                         // Попытка распорядиться не своим — аномалия сессии,
                         // а не «формат не тот».
@@ -1952,7 +2132,10 @@ impl<S: Store> Engine<S> {
                 // и на своё, и на чужое. Реакция на сообщение из другого чата
                 // означала бы, что нам прислали идентификатор, которого знать
                 // не должны.
-                let Some(message) = self.store.message(target)? else { return Ok(Vec::new()) };
+                let Some(message) = self.store.message(target)? else {
+                    *waiting = true;
+                    return Ok(Vec::new());
+                };
                 if message.chat_id != chat {
                     self.sessions.note_anomaly(sender, |c| c.malformed += 1);
                     return Ok(Vec::new());

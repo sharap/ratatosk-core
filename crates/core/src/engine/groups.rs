@@ -844,7 +844,10 @@ impl<S: Store> Engine<S> {
 
         let me = self.identity.public().ik;
         let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
-        if state.group.owner != me {
+        // «Только создатель» (§11.2) — правило группы. В канале название
+        // правит и держатель права «менять представление» (§6.2), поэтому
+        // владелец спрашивается ниже, внутри канальной ветки.
+        if state.profile.everyone_writes() && state.group.owner != me {
             return Err(group::GroupError::NotOwner.into());
         }
         // **У канала имя живёт в подписанном представлении (§6.1), а не
@@ -860,24 +863,43 @@ impl<S: Store> Engine<S> {
             if title.len() > channel::MAX_TITLE_BYTES {
                 return Err(EngineError::GroupTitleTooLong);
             }
-            // **Право, потом доставка, и порядок тут тот же, что у слова.**
-            // `publish_representation` пускает одного владельца и отказывает
-            // всем словами «нет права» — а у держателя `EDIT` право как раз
-            // есть, мешает ему доставка: состав канала знает владелец
-            // (§3.2), и развозить веером делегату некому. Сказать ему
-            // «нет права» значило бы посоветовать просить то, что у него
-            // уже есть (`even_with_the_edit_right_a_delegate_does_not_publish_in_a_star`).
+            // **Право — первым.** У держателя `EDIT` оно есть, и отказ
+            // «нет права» посоветовал бы просить то, что уже дали.
             self.check_may_put(now_ms, chat, channel::Rights::EDIT)?;
-            self.check_may_publish(chat)?;
-            let named = title.to_owned();
-            let mut effects =
-                self.publish_representation(now_ms, chat, move |next| next.title = named)?;
-            // Своя строка чата — тем же шагом: `publish_representation`
-            // трогает документ, а список чатов живёт в `chats`.
-            let at = self.clock.now(now_ms)?;
-            if self.apply_rename(chat, title, at)? {
-                effects.push(Effect::Notify(Event::GroupRenamed { chat, title: title.to_owned() }));
+            // Владелец — по документу (`channel_owner`): им подписывается
+            // новая версия, и строка чата тут не судья.
+            if self.channel_owner(chat) == Some(me) {
+                let named = title.to_owned();
+                let mut effects =
+                    self.publish_representation(now_ms, chat, move |next| next.title = named)?;
+                // Своя строка чата — тем же шагом: `publish_representation`
+                // трогает документ, а список чатов живёт в `chats`.
+                let at = self.clock.now(now_ms)?;
+                if self.apply_rename(chat, title, at)? {
+                    effects.push(Effect::Notify(Event::GroupRenamed {
+                        chat,
+                        title: title.to_owned(),
+                    }));
+                }
+                return Ok(effects);
             }
+            // **Держатель права «менять представление» правит название
+            // действием** (§6.2): подписать документ он не может — подпись
+            // одна, владельца, — и потому действие едет той же дорогой,
+            // что слово: владельцу и своим сидам (`push_candidates`).
+            // Владелец, приняв его, подписывает новую версию документа
+            // с этим названием (`apply_group_action`), и у читателей
+            // название сходится к подписанному, а не к тому, чей кадр
+            // приехал последним.
+            //
+            // До этой поставки право `EDIT` было мёртвым: команда отказывала
+            // «не владелец» ещё до вопроса о праве, и выдать его было
+            // можно, а воспользоваться — нет.
+            let action = ratatosk_proto::group_action::Action::Rename { title: title.to_owned() };
+            let (msg_id, hlc, bytes) = self.seal_group_action(now_ms, chat, &action)?;
+            self.apply_rename(chat, title, hlc)?;
+            let mut effects = self.spread_in_chat(now_ms, chat, msg_id, &bytes)?;
+            effects.push(Effect::Notify(Event::GroupRenamed { chat, title: title.to_owned() }));
             return Ok(effects);
         }
         // Состоим ли — не спрашиваем: спросит сборка кадра, и её отказ
@@ -977,7 +999,12 @@ impl<S: Store> Engine<S> {
 
         let me = self.identity.public().ik;
         let state = self.groups.get(&chat).ok_or(EngineError::UnknownGroup)?;
-        if state.group.owner != me {
+        // В группе — только создатель (§11.2). В канале картинку правит
+        // и держатель права «менять представление» (§6.2): право спросит
+        // сборка кадра (`Gate::Right(EDIT)`), а дорогу ему даёт рой —
+        // тем же путём, что и переименование.
+        let (in_a_group, i_own) = (state.profile.everyone_writes(), state.group.owner == me);
+        if in_a_group && !i_own {
             return Err(group::GroupError::NotOwner.into());
         }
         // Состоим ли — спросит сборка кадра, и её отказ (`NotInGroup`)
@@ -986,6 +1013,11 @@ impl<S: Store> Engine<S> {
         let (msg_id, hlc, frame) = self.seal_group_action(now_ms, chat, &action)?;
 
         self.apply_group_avatar(chat, bytes, hlc)?;
+        if !in_a_group && !i_own {
+            let mut effects = self.spread_in_chat(now_ms, chat, msg_id, &frame)?;
+            effects.push(Effect::Notify(Event::GroupAvatarChanged { chat }));
+            return Ok(effects);
+        }
         // **Дорогой документа** (`push_document`), а не веером: у канала
         // получателей знает рой, и у открытого канала веер означал
         // «никому» — состава у него нет вовсе (§10.4). В группе эта же
@@ -1242,15 +1274,6 @@ impl<S: Store> Engine<S> {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(Vec::new());
         };
-        // Отправитель ещё не значится участником — и это, скорее всего,
-        // не самозванец, а порядок: блоки состава могли отстать от списка
-        // (§9.2). Кадр откладывается, а не отбрасывается; чужой так и
-        // пролежит до вытеснения, потому что участником не станет.
-        if !self.counts_as_member(chat, &peer_ik) {
-            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
-            return Ok(Vec::new());
-        }
-
         let me = self.identity.public().ik;
         // **В канале список карточек заводит пиров, а не контактов**
         // (§8.3, приёмная сторона). Читателю при впуске приезжают двое —
@@ -1262,6 +1285,22 @@ impl<S: Store> Engine<S> {
         // У группы правило обратное и остаётся: §11.5 прямо обещает, что
         // участники увидят адреса друг друга.
         let as_peers = self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes());
+        // Отправитель ещё не значится участником — и это, скорее всего,
+        // не самозванец, а порядок: блоки состава могли отстать от списка
+        // (§9.2). Кадр откладывается, а не отбрасывается; чужой так и
+        // пролежит до вытеснения, потому что участником не станет.
+        //
+        // **В канале список берётся от любого**, и это разбор впуска
+        // делегатом. Список от впустившего приезжает **раньше** блока,
+        // которым он нас впустил, а тот блок проверяется карточкой из этого
+        // же списка: требуй мы здесь участия — список ждал бы блока, блок
+        // ждал бы списка, и впущенный делегатом не читал бы ничего.
+        // Цена малая: в канале список заводит пиров, а не контактов,
+        // и карточка в нём подписана своим же ключом.
+        if !as_peers && !self.counts_as_member(chat, &peer_ik) {
+            self.park_group_frame(PendingGroup { chat, envelope: envelope.clone(), peer_ik });
+            return Ok(Vec::new());
+        }
         let mut effects = Vec::new();
         for card_bytes in roster.cards {
             // Карточка чужой сборки может не разобраться — это не повод
@@ -1545,12 +1584,63 @@ impl<S: Store> Engine<S> {
     /// [`Engine::open_group_frame`]: его подпись и есть канал. Здесь оно
     /// названо вслух и лежит в одном месте на оба приёма — ключа
     /// отправителя и списка карточек.
+    ///
+    /// # И тот, кто нас впустил, — тоже
+    ///
+    /// Впустить в канал вправе делегат с правом «впускать» (§6.2), а состав
+    /// у читателя — он сам да владелец: блока «владелец добавил делегата»
+    /// у него нет и не будет (§3.2). Пока здесь спрашивался один состав,
+    /// всё, что делегат присылал впущенному — карточки, цепочку, ключ
+    /// чтения, документ, — откладывалось навсегда, и впущенный делегатом
+    /// не читал ничего. Стенд показал это дословно: ноль ключей, состав
+    /// из себя одного, пять кадров в отложенном.
+    ///
+    /// Впустивший узнаётся по **его подписанному блоку**, которым он нас
+    /// и добавил: он лежит у нас, потому что мы его приняли. Держатель
+    /// права по принятому документу считается участником по той же
+    /// причине, что владелец: его слова канал и есть.
     pub(super) fn counts_as_member(&self, chat: ChatId, who: &[u8; 32]) -> bool {
         let Some(state) = self.groups.get(&chat) else { return false };
         if state.group.contains(who) {
             return true;
         }
-        !state.profile.everyone_writes() && state.group.owner == *who
+        if state.profile.everyone_writes() {
+            return false;
+        }
+        state.group.owner == *who
+            || self.holds_any_right_now(chat, who)
+            || self.admitted_me(chat, who)
+    }
+
+    /// Есть ли у него хоть одно живое право по принятому документу.
+    ///
+    /// Без времени — по последней метке часов: сюда спрашивают из мест,
+    /// где времени нет (`counts_as_member`), а выдача живёт месяцами,
+    /// и минута ошибки часов здесь ничего не решает.
+    fn holds_any_right_now(&self, chat: ChatId, who: &[u8; 32]) -> bool {
+        let now_ms = self.clock.last().wall_ms;
+        self.any_right_holds(now_ms, chat, who, channel::Rights::all()).unwrap_or(false)
+    }
+
+    /// Впустил ли нас в этот канал именно он — по его подписанному блоку.
+    ///
+    /// Читается с диска и проверяется подписью каждый раз: блоков у читателя
+    /// единицы, а держать второй ответ на «кто меня впустил» в памяти
+    /// значило бы завести ещё одно место, которое после перезапуска
+    /// поднимать. Отказ хранилища здесь — «нет»: это вопрос, а не действие.
+    pub(super) fn admitted_me(&self, chat: ChatId, who: &[u8; 32]) -> bool {
+        let me = self.identity.public().ik;
+        let Ok(blocks) = self.store.membership_blocks(&chat) else { return false };
+        let Ok(Some(known)) = self.public_identity_of(who) else { return false };
+        for stored in blocks.iter().filter(|block| block.author_ik == *who) {
+            let Ok(value) = ratatosk_codec::canonical::decode(&stored.bytes) else { continue };
+            let Ok(unchecked) = group::parse_membership(&value) else { continue };
+            let Ok(block) = unchecked.verify(&known) else { continue };
+            if block.ops.iter().any(|op| matches!(op, OrSetOp::Add { elem, .. } if *elem == me)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Есть ли у этого человека это право в этом чате **сейчас**.

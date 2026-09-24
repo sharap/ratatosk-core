@@ -577,18 +577,42 @@ fn archived_from_row(row: &rusqlite::Row<'_>) -> Result<Option<ArchivedBlock>> {
     let msg: Vec<u8> = row.get(2)?;
     let frame: Vec<u8> = row.get(3)?;
     let received: i64 = row.get(4)?;
+    let addressee: Option<Vec<u8>> = row.get(5)?;
     let (Ok(author_ik), Ok(msg_id)) =
         (<[u8; 32]>::try_from(author.as_slice()), <[u8; 16]>::try_from(msg.as_slice()))
     else {
         return Ok(None);
     };
+    // Адресат не той длины — «для всех», а не пропуск строки: строка
+    // легла до этой поставки либо испорчена, и потерять слово хуже,
+    // чем отдать его на один блок шире.
+    let addressee = addressee.and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok());
     Ok(Some(ArchivedBlock {
         author_ik,
         seq: sql_types::from_sql(seq),
         msg_id,
         frame,
         received_ms: sql_types::from_sql(received),
+        addressee,
     }))
+}
+
+/// Условие «этот блок виден спрашивающему» — для `WHERE`.
+///
+/// `?N` — номер параметра, под который вызывающий кладёт ключ; при
+/// `viewer = None` условие пустое, и параметр не читается.
+///
+/// Число параметров у запроса постоянное: при `viewer = None` под
+/// параметр кладётся `NULL`, и первое сравнение делает условие
+/// тождественно истинным. Собирать запрос с разным числом параметров
+/// значило бы считать их в двух местах.
+fn visible_to(param: &str) -> String {
+    format!(" AND ({param} IS NULL OR addressee IS NULL OR addressee = {param})")
+}
+
+/// Параметр «кто спрашивает»: ключ либо `NULL`.
+fn asker_param(viewer: Option<&[u8; 32]>) -> Option<Vec<u8>> {
+    viewer.map(|who| who.to_vec())
 }
 
 fn sql_limit(limit: usize) -> i64 {
@@ -1522,6 +1546,11 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn delete_archive_keys(&mut self, chat_id: &[u8; 16]) -> Result<()> {
+        self.conn.execute("DELETE FROM channel_archive_keys WHERE chat_id = ?1", [&chat_id[..]])?;
+        Ok(())
+    }
+
     fn archive_keys(&self, chat_id: &[u8; 16]) -> Result<Vec<StoredArchiveKey>> {
         let mut stmt = self.conn.prepare(
             "SELECT generation, key_enc, created_ms FROM channel_archive_keys
@@ -2148,8 +2177,8 @@ impl Store for SqliteStore {
         // кадр под тем же номером — это ретрансляция того же самого.
         self.conn.execute(
             "INSERT OR IGNORE INTO channel_archive
-                 (chat_id, author_ik, seq, msg_id, frame, received_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (chat_id, author_ik, seq, msg_id, frame, received_ms, addressee)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 &chat_id[..],
                 &block.author_ik[..],
@@ -2157,6 +2186,7 @@ impl Store for SqliteStore {
                 &block.msg_id[..],
                 block.frame,
                 sql_types::to_sql(block.received_ms),
+                block.addressee.as_ref().map(|who| who.to_vec()),
             ],
         )?;
         Ok(())
@@ -2164,7 +2194,7 @@ impl Store for SqliteStore {
 
     fn archived(&self, chat_id: &[u8; 16], msg_id: &[u8; 16]) -> Result<Option<ArchivedBlock>> {
         let mut statement = self.conn.prepare(
-            "SELECT author_ik, seq, msg_id, frame, received_ms
+            "SELECT author_ik, seq, msg_id, frame, received_ms, addressee
              FROM channel_archive WHERE chat_id = ?1 AND msg_id = ?2",
         )?;
         let mut rows = statement.query(rusqlite::params![&chat_id[..], &msg_id[..]])?;
@@ -2178,18 +2208,23 @@ impl Store for SqliteStore {
         author_ik: &[u8; 32],
         from_seq: u64,
         limit: usize,
+        viewer: Option<&[u8; 32]>,
     ) -> Result<Vec<ArchivedBlock>> {
-        let mut statement = self.conn.prepare(
-            "SELECT author_ik, seq, msg_id, frame, received_ms
+        let sql = format!(
+            "SELECT author_ik, seq, msg_id, frame, received_ms, addressee
              FROM channel_archive
-             WHERE chat_id = ?1 AND author_ik = ?2 AND seq >= ?3
+             WHERE chat_id = ?1 AND author_ik = ?2 AND seq >= ?3{}
              ORDER BY seq LIMIT ?4",
-        )?;
+            visible_to("?5")
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let asker = asker_param(viewer);
         let mut rows = statement.query(rusqlite::params![
             &chat_id[..],
             &author_ik[..],
             sql_types::to_sql(from_seq),
             sql_limit(limit),
+            asker,
         ])?;
         let mut found = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2200,16 +2235,23 @@ impl Store for SqliteStore {
         Ok(found)
     }
 
-    fn archive_have(&self, chat_id: &[u8; 16]) -> Result<Vec<HaveRange>> {
+    fn archive_have(
+        &self,
+        chat_id: &[u8; 16],
+        viewer: Option<&[u8; 32]>,
+    ) -> Result<Vec<HaveRange>> {
         // **`MIN`/`MAX` по автору здесь не годятся**, и это разбор живой
         // лжи: читатель, имеющий 10 и 51, объявил бы диапазон 10..51 —
         // то есть и те сорок номеров, которых у него нет. Склейка идёт
         // по подряд идущим номерам, а провал начинает новую строку.
-        let mut statement = self.conn.prepare(
+        let sql = format!(
             "SELECT author_ik, seq FROM channel_archive
-             WHERE chat_id = ?1 ORDER BY author_ik, seq",
-        )?;
-        let rows = statement.query_map([&chat_id[..]], |row| {
+             WHERE chat_id = ?1{} ORDER BY author_ik, seq",
+            visible_to("?2")
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let asker = asker_param(viewer);
+        let rows = statement.query_map(rusqlite::params![&chat_id[..], asker], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
         })?;
         let mut found: Vec<HaveRange> = Vec::new();
@@ -2229,38 +2271,25 @@ impl Store for SqliteStore {
         Ok(found)
     }
 
-    fn archive_recent(&self, chat_id: &[u8; 16], limit: usize) -> Result<Vec<ArchivedBlock>> {
-        let mut statement = self.conn.prepare(
-            "SELECT author_ik, seq, msg_id, frame, received_ms FROM channel_archive
-              WHERE chat_id = ?1 ORDER BY received_ms DESC, seq DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![&chat_id[..], sql_types::to_sql(limit as u64)],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )?;
+    fn archive_recent(
+        &self,
+        chat_id: &[u8; 16],
+        limit: usize,
+        viewer: Option<&[u8; 32]>,
+    ) -> Result<Vec<ArchivedBlock>> {
+        let sql = format!(
+            "SELECT author_ik, seq, msg_id, frame, received_ms, addressee FROM channel_archive
+              WHERE chat_id = ?1{} ORDER BY received_ms DESC, seq DESC LIMIT ?2",
+            visible_to("?3")
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let asker = asker_param(viewer);
+        let mut rows = statement.query(rusqlite::params![&chat_id[..], sql_limit(limit), asker])?;
         let mut found = Vec::new();
-        for row in rows {
-            let (author, seq, msg_id, frame, received) = row?;
-            let (Ok(author_ik), Ok(msg_id)) =
-                (<[u8; 32]>::try_from(author.as_slice()), <[u8; 16]>::try_from(msg_id.as_slice()))
-            else {
-                continue;
-            };
-            found.push(ArchivedBlock {
-                author_ik,
-                seq: sql_types::from_sql(seq),
-                msg_id,
-                frame,
-                received_ms: sql_types::from_sql(received),
-            });
+        while let Some(row) = rows.next()? {
+            if let Some(block) = archived_from_row(row)? {
+                found.push(block);
+            }
         }
         Ok(found)
     }
@@ -2274,14 +2303,50 @@ impl Store for SqliteStore {
     ) -> Result<usize> {
         let day_ms = 24 * 60 * 60 * 1000u64;
         let edge = now_ms.saturating_sub(u64::from(max_days).saturating_mul(day_ms));
-        let mut gone = self.conn.execute(
-            "DELETE FROM channel_archive WHERE chat_id = ?1 AND received_ms < ?2",
-            rusqlite::params![&chat_id[..], sql_types::to_sql(edge)],
-        )?;
+        // **По сроку — столько младших номеров автора, сколько у него
+        // строк старше срока.** Не «строки старше срока»: блок,
+        // притянутый анти-энтропией позже соседей, по времени приёма
+        // моложе, а по номеру старше — и обрезка по времени оставила бы
+        // его торчать за вырезанной серединой. Число снимаемых берётся
+        // по времени, а **какие** снимать — по номеру, с младших.
+        //
+        // Адресные блоки в счёт не идут и не снимаются (§6.5).
+        let mut gone = 0usize;
+        let authors: Vec<Vec<u8>> = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DISTINCT author_ik FROM channel_archive WHERE chat_id = ?1")?;
+            let rows = statement.query_map([&chat_id[..]], |row| row.get::<_, Vec<u8>>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for author in &authors {
+            let stale: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM channel_archive
+                  WHERE chat_id = ?1 AND author_ik = ?2 AND addressee IS NULL
+                    AND received_ms < ?3",
+                rusqlite::params![&chat_id[..], author, sql_types::to_sql(edge)],
+                |row| row.get(0),
+            )?;
+            if stale <= 0 {
+                continue;
+            }
+            gone += self.conn.execute(
+                "DELETE FROM channel_archive
+                  WHERE rowid IN (
+                      SELECT rowid FROM channel_archive
+                       WHERE chat_id = ?1 AND author_ik = ?2 AND addressee IS NULL
+                       ORDER BY seq LIMIT ?3
+                  )",
+                rusqlite::params![&chat_id[..], author, stale],
+            )?;
+        }
 
         // Размер считается **по всему каналу**, а обрезается **префикс
         // каждой цепочки**: §9.3 обещает, что дыр в середине не бывает,
-        // и снимать надо самое раннее, а не самое большое.
+        // и снимать надо самое раннее, а не самое большое. «Самое
+        // раннее» — младший номер у того автора, чья самая ранняя
+        // строка старее всех: так очередь на вынос идёт по времени,
+        // а вырез у каждого автора остаётся префиксом.
         loop {
             let total: i64 = self.conn.query_row(
                 "SELECT COALESCE(SUM(LENGTH(frame)), 0) FROM channel_archive WHERE chat_id = ?1",
@@ -2295,7 +2360,13 @@ impl Store for SqliteStore {
                 "DELETE FROM channel_archive
                  WHERE rowid IN (
                      SELECT rowid FROM channel_archive
-                     WHERE chat_id = ?1 ORDER BY received_ms, seq LIMIT 1
+                      WHERE chat_id = ?1 AND addressee IS NULL
+                        AND author_ik = (
+                            SELECT author_ik FROM channel_archive
+                             WHERE chat_id = ?1 AND addressee IS NULL
+                             ORDER BY received_ms, seq LIMIT 1
+                        )
+                      ORDER BY seq LIMIT 1
                  )",
                 [&chat_id[..]],
             )?;
@@ -3192,6 +3263,11 @@ impl Store for SqliteStore {
             rusqlite::params![&msg_id[..], sql_types::to_sql(now_ms)],
         )?;
         Ok(inserted == 1)
+    }
+
+    fn forget_seen(&mut self, msg_id: &MsgId) -> Result<()> {
+        self.conn.execute("DELETE FROM dedup WHERE msg_id = ?1", [&msg_id[..]])?;
+        Ok(())
     }
 
     fn seen(&self, msg_id: &MsgId) -> Result<bool> {

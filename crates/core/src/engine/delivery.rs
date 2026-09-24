@@ -1032,7 +1032,15 @@ impl<S: Store> Engine<S> {
             // обещание «отправим позже» снимается вместе с очередью, и UI
             // об этом узнаёт. Молча оставить «ждём» у сообщения, к которому
             // никто больше не вернётся, значит соврать на экране.
-            let evicted = self.deferred.remove(0);
+            //
+            // **Сперва молчаливые копии, потом личное.** Очередь одна
+            // на всё, а рой заполняет её быстрее всех: сид с сотней
+            // привязанных читателей, ушедших в офлайн, за один блок
+            // вытеснил бы всё личное. Копию канала вернёт анти-энтропия
+            // §7.2, копию группы — следующий блок состава; личное письмо
+            // не вернёт никто.
+            let at = self.deferred.iter().position(|waiting| waiting.silent).unwrap_or(0);
+            let evicted = self.deferred.remove(at);
             self.store.delete_outbox(&evicted.msg_id, &evicted.peer_ik)?;
             effects.extend(self.note_status_of(&evicted, DeliveryStatus::Undeliverable)?);
         }

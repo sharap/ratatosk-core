@@ -574,7 +574,7 @@ open_channel_notice() -> String   // **до** заведения открыто�
 private_channel_notice() -> String // **до** заведения канала по приглашению
 admitter_grant_notice() -> String // при **выдаче** права «впускать»: впущенные остаются впущенными (§6.5)
 key_rotation_notice() -> String   // **до** поворота ключа чтения: кто вне состава, теряет будущее (§6.4)
-sharing_notice() -> String        // **до** показа ссылки на канал: в ней едет наш адрес (§10.2)
+sharing_notice() -> String        // **до** показа ссылки на канал: в ней адрес владельца, не наш (§10.2)
 channel_refusal_text(reason) -> String  // слова к отказу канала
 max_group_title_chars() -> u32    // предел названия, в символах; считать клиенту самому
 deletion_notice() -> String       // перед удалением контакта
@@ -1537,9 +1537,9 @@ struct FfiChannelRights { write: bool, admit: bool, evict: bool, edit: bool }
 
 ```rust
 enum FfiChannelRefusal {
-    NoRight, OwnerNeedsNoGrant, OnlyOwnerPublishesYet, WrongProfile,
-    OpenHasNoRotation, RotatedTooRecently, NoReadKeyYet, PowTooHard,
-    BadLink, AlreadySubscribed, OwnChannel, TooManyGrants,
+    NoRight, OwnerNeedsNoGrant, OnlyOwnerPublishesYet, OnlyOwnerRotates,
+    WrongProfile, OpenHasNoRotation, RotatedTooRecently, NoReadKeyYet,
+    PowTooHard, BadLink, AlreadySubscribed, OwnChannel, TooManyGrants,
 }
 ```
 
@@ -1553,13 +1553,18 @@ enum FfiChannelRefusal {
 по `FfiChannel::rights.write`, как и было обещано, — совет «гасить всем,
 кроме владельца» устарел вместе с отказом.
 
-Отказ остался там, где дороги по-прежнему нет: действия, которые
-развозятся **веером по составу** (`Action::fans_out`) — смена названия,
-картинки и прочее описательное, — у не-владельца канала отвергаются
-им же. Состав канала §3.2 оставляет владельцу, и развозить их некому.
+**Название и картинку правит и держатель права «менять представление»**
+(§6.2). Его правка едет действием той же дорогой, что слово, а владелец
+вписывает названное в следующую версию документа. До этого право было
+мёртвым: команда отказывала «не владелец» раньше вопроса о праве.
+Кнопки переименования и картинки в канале — по `rights.edit`.
 
-Впускать, выдавать ключ чтения и поворачивать его делегат может
-по-прежнему: те блоки едут адресатам и ничьего состава не требуют.
+**Поворот ключа — только владелец: `OnlyOwnerRotates`.** §6.4 отдаёт
+его и держателю «исключать», но состав канала знает владелец (§3.2),
+и делегату развезти новое поколение некому — на стенде поворот делегатом
+уходил в никуда. Кнопку поворота показывать по `may_rotate`; у делегата
+он ложь и при `rights.evict`. Впускать и выдавать ключ чтения при впуске
+делегат может по-прежнему.
 
 **`NoRight` и `OwnerNeedsNoGrant` различать обязательно.** Первое — права
 нет; второе — право есть, и потому выдача бессмысленна: у владельца все

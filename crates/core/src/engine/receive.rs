@@ -672,6 +672,33 @@ impl<S: Store> Engine<S> {
             return Ok(woken);
         }
 
+        woken.extend(self.admit(now_ms, via, peer_ik, envelope)?);
+        Ok(woken)
+    }
+
+    /// Окно дедупликации и часы §9.1 — и только потом разбор.
+    ///
+    /// # Одно место на целый конверт и на собранный из кусков
+    ///
+    /// Конверт, приехавший кусками (§9.3), проходил мимо окна: кусок
+    /// по своему номеру, а собранное из них — сразу в разбор. Куски
+    /// же режет **каждый курьер сам** и своими номерами, и один блок,
+    /// доехавший двумя путями, применялся дважды и дважды уезжал дальше
+    /// по дереву — а подрезки за дубль (§7.1, шаг 3) не случалось.
+    /// Крупные блоки канала (файлы с превью) режутся и по onion, так
+    /// что это не эфирный случай, а обычный.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки квитанции.
+    fn admit(
+        &mut self,
+        now_ms: u64,
+        via: Transport,
+        peer_ik: [u8; 32],
+        envelope: Envelope,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let mut woken = Vec::new();
         let fresh = self.dedup.check(envelope.msg_id, now_ms).is_fresh()
             && self.store.note_seen(&envelope.msg_id, now_ms)?;
         if !fresh {
@@ -826,7 +853,12 @@ impl<S: Store> Engine<S> {
         let Some(whole) = self.reassemble(now_ms, via, peer_ik, envelope)? else {
             return Ok(Vec::new());
         };
-        self.deliver(now_ms, via, peer_ik, whole)
+        // Кусок файла в окно не кладётся и целым (см. `on_data`); всё
+        // прочее проходит окно и часы — как приехавшее целым.
+        if whole.payload_type == PayloadType::FileChunk {
+            return self.deliver(now_ms, via, peer_ik, whole);
+        }
+        self.admit(now_ms, via, peer_ik, whole)
     }
 
     pub(super) fn deliver(

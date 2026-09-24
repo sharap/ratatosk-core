@@ -59,7 +59,20 @@ impl<S: Store> Engine<S> {
             channel::Kind::ByInvite => None,
         };
 
-        let endpoints = self.own_endpoints();
+        // **Адреса — владельца, если делится не он.** Ссылка везёт один
+        // ключ, `owner_ik`, и подписчик стучится по её адресам **к нему**
+        // (`remember_peer`): рукопожатие §8.2 идёт к статическому ключу,
+        // и наш адрес под ключом владельца — это дверь, за которой
+        // никого нет. Стенд показал у третьего узла onion читателя,
+        // записанный владельцу. §10.2 велит класть «адрес владельца —
+        // всегда, последним рубежом»; свои читатель положить не может,
+        // пока в ссылке нет места под чужой ключ.
+        let me = self.identity.public().ik;
+        let endpoints = if stored.owner_ik == me {
+            self.own_endpoints()
+        } else {
+            self.endpoints_of(&stored.owner_ik)
+        };
 
         channel::Invitation {
             group: chat,
@@ -112,6 +125,53 @@ impl<S: Store> Engine<S> {
         if let Ok(key) = <[u8; 32]>::try_from(self.nostr.as_slice()) {
             endpoints.push(channel::Endpoint::Nostr(key));
             for relay in self.nostr_card_relays() {
+                if endpoints.len() == channel::MAX_ENDPOINTS {
+                    break;
+                }
+                endpoints.push(channel::Endpoint::NostrRelay(relay));
+            }
+        }
+        endpoints
+    }
+
+    /// Адреса чужого узла, какими мы их знаем, — для ссылки (§10.2).
+    ///
+    /// Из карточки контакта либо записи пира: те же виды, что кладёт
+    /// в свою ссылку владелец. Не знаем никого — список пуст, и это
+    /// законно: остаются почта и реле (§10.5).
+    pub(super) fn endpoints_of(&self, who: &[u8; 32]) -> Vec<channel::Endpoint> {
+        let (onion, chatmail, ygg, nostr, relays) = if let Some(contact) = self.contacts.get(who) {
+            (
+                contact.card.onion.clone(),
+                contact.card.chatmail.clone(),
+                contact.card.ygg.clone(),
+                contact.card.nostr.clone(),
+                contact.card.nostr_relays.clone(),
+            )
+        } else if let Some(peer) = self.peers.get(who) {
+            (
+                peer.onion.clone(),
+                peer.chatmail.clone(),
+                peer.ygg.clone(),
+                peer.nostr.clone(),
+                peer.relays.clone(),
+            )
+        } else {
+            return Vec::new();
+        };
+        let mut endpoints = Vec::new();
+        if !onion.is_empty() {
+            endpoints.push(channel::Endpoint::Onion(onion));
+        }
+        if !chatmail.is_empty() {
+            endpoints.push(channel::Endpoint::Chatmail(chatmail));
+        }
+        if let Ok(key) = <[u8; 32]>::try_from(ygg.as_slice()) {
+            endpoints.push(channel::Endpoint::Ygg(key));
+        }
+        if let Ok(key) = <[u8; 32]>::try_from(nostr.as_slice()) {
+            endpoints.push(channel::Endpoint::Nostr(key));
+            for relay in relays {
                 if endpoints.len() == channel::MAX_ENDPOINTS {
                     break;
                 }
@@ -310,16 +370,23 @@ impl<S: Store> Engine<S> {
     /// Принять такую значило бы завести чат, который никогда ничего
     /// не покажет, и человеку об этом не сказать.
     ///
-    /// # Чего здесь нет
+    /// # Заявка и предпросмотр
     ///
-    /// **Заявки владельцу** (§10.4): блок с нашей карточкой. Для неё
-    /// нужен путь к владельцу, а адреса из ссылки мы не храним — они
-    /// недоверенные и живут неделями. Подписка на канал по приглашению
-    /// поэтому ложится состоянием «заявка», и перевести её в «участвуем»
-    /// пока может только впуск приглашением.
+    /// Заявка владельцу (§10.4) уезжает отсюда же у канала по приглашению:
+    /// владелец лежит пиром с адресами из ссылки (§8.3). Предпросмотр
+    /// (§10.3, шаги 2–5) — отдельная команда, `on_preview_channel`.
     ///
-    /// **Предпросмотра** (§10.3, шаги 2 и 5): достать представление
-    /// по адресам нечем, это работа транспорта.
+    /// # Номер цепочки начинается с часов, а не с нуля
+    ///
+    /// Отписка стирает чат вместе с нашей цепочкой, а повторная подписка
+    /// заводила её заново с нуля: слова писателя, вернувшегося в канал,
+    /// шли под прежними номерами, архив (`INSERT OR IGNORE` по позиции)
+    /// молча терял их, и §7.3 у этого автора переставал держаться.
+    /// Спека называет это открытым вопросом (§18.11); здесь номер
+    /// начинается с текущего времени в миллисекундах — оно больше любого
+    /// номера прежней подписки, и цепочка остаётся монотонной без
+    /// памяти о прошлом. Дыра ниже первого номера законна: «`first_seq`
+    /// не равен нулю» (§9.3).
     pub(super) fn on_subscribe_to_channel(
         &mut self,
         now_ms: u64,
@@ -423,7 +490,7 @@ impl<S: Store> Engine<S> {
         // нам нечем будет сказать ни слова, даже получив право.
         let mut chain = [0u8; 32];
         self.entropy.fill(&mut chain);
-        let chain = SenderChain::new(zeroize::Zeroizing::new(chain));
+        let chain = SenderChain::resume(zeroize::Zeroizing::new(chain), now_ms);
         self.store.put_sender_chain(
             &chat,
             &StoredSenderChain {
@@ -436,6 +503,9 @@ impl<S: Store> Engine<S> {
             },
         )?;
         self.record_own_ops(now_ms, chat, &[OrSet::prepare_add(me, at)])?;
+        // Подписка заново снимает канал со списка отписанных: его блоки
+        // снова наши.
+        self.forget_left(chat)?;
 
         let mut group = Group::restore(chat, invitation.owner);
         group.apply(OrSet::prepare_add(me, at));
@@ -511,51 +581,6 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
-    /// Принимает заявку на подписку (фаза 2, §10.4).
-    ///
-    /// # Что здесь проверяется и чего не проверяется
-    ///
-    /// Канал обязан быть нашим и быть каналом: заявка в чужой чат —
-    /// это кадр не по адресу, и молчать на него нечего. А вот право
-    /// или порода заявителя не спрашиваются вовсе: просить вправе кто
-    /// угодно, на то она и просьба. Решает владелец, и решает руками.
-    ///
-    /// # Открытый канал заявок не принимает
-    ///
-    /// §10.4: у открытого владелец «не участвует и не узнаёт». Заявка
-    /// туда — либо чужая ошибка, либо попытка узнать, жив ли владелец;
-    /// ни на что из этого отвечать не надо.
-    ///
-    /// # Повтор не двигает время
-    ///
-    /// Заявка, посланная второй раз, — это та же просьба, на которую
-    /// ещё не ответили. Время в строке остаётся временем первой:
-    /// §10.5 меряет ожидание от неё, и обновляй мы его, ожидание
-    /// начиналось бы заново при каждом повторе.
-    /// Пришла просьба показать представление (фаза 2, §10.3, шаг 2).
-    ///
-    /// # Отвечаем только по открытому каналу
-    ///
-    /// У открытого ключ чтения лежит в ссылке (§6.1), значит документ
-    /// спросивший всё равно прочтёт — и §7.6 говорит то же самое про
-    /// любой блок канала: «вытянуть вправе любой». Отказывать здесь
-    /// значило бы держать закрытой дверь, ключ от которой роздан.
-    ///
-    /// У канала **по приглашению** ответа нет: там путь другой — заявка
-    /// §10.4 и впуск, и документ едет впуском. Молчим, а не отказываем:
-    /// «такого канала у меня нет» и «есть, но не покажу» для чужого
-    /// выглядят одинаково, и второе рассказало бы больше первого.
-    ///
-    /// # Что едет в ответ
-    ///
-    /// Представление — тем же действием, каким едут новые версии, чтобы
-    /// приём был один на все случаи. И записи каталога (§7.5): без них
-    /// подписчику не к кому привязаться, а §7.4 ставит их первым шагом
-    /// вытягивания — «чтобы было у кого спрашивать».
-    ///
-    /// # Errors
-    ///
-    /// Отказ хранилища или сборки блока.
     /// Показывает канал по ссылке до подписки (§10.3, шаги 2–5).
     ///
     /// # Порядок шагов — тот, что в спеке, и он значим
@@ -716,6 +741,30 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Пришла просьба показать представление (фаза 2, §10.3, шаг 2).
+    ///
+    /// # Отвечаем только по открытому каналу
+    ///
+    /// У открытого ключ чтения лежит в ссылке (§6.1), значит документ
+    /// спросивший всё равно прочтёт — и §7.6 говорит то же самое про
+    /// любой блок канала: «вытянуть вправе любой». Отказывать здесь
+    /// значило бы держать закрытой дверь, ключ от которой роздан.
+    ///
+    /// У канала **по приглашению** ответа нет: там путь другой — заявка
+    /// §10.4 и впуск, и документ едет впуском. Молчим, а не отказываем:
+    /// «такого канала у меня нет» и «есть, но не покажу» для чужого
+    /// выглядят одинаково, и второе рассказало бы больше первого.
+    ///
+    /// # Что едет в ответ
+    ///
+    /// Представление — тем же действием, каким едут новые версии, чтобы
+    /// приём был один на все случаи. И записи каталога (§7.5): без них
+    /// подписчику не к кому привязаться, а §7.4 ставит их первым шагом
+    /// вытягивания — «чтобы было у кого спрашивать».
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища или сборки блока.
     pub(super) fn on_channel_intro_wanted(
         &mut self,
         now_ms: u64,
@@ -895,6 +944,27 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Принимает заявку на подписку (фаза 2, §10.4).
+    ///
+    /// # Что здесь проверяется и чего не проверяется
+    ///
+    /// Канал обязан быть нашим и быть каналом: заявка в чужой чат —
+    /// это кадр не по адресу, и молчать на него нечего. А вот право
+    /// или порода заявителя не спрашиваются вовсе: просить вправе кто
+    /// угодно, на то она и просьба. Решает владелец, и решает руками.
+    ///
+    /// # Открытый канал заявок не принимает
+    ///
+    /// §10.4: у открытого владелец «не участвует и не узнаёт». Заявка
+    /// туда — либо чужая ошибка, либо попытка узнать, жив ли владелец;
+    /// ни на что из этого отвечать не надо.
+    ///
+    /// # Повтор не двигает время
+    ///
+    /// Заявка, посланная второй раз, — это та же просьба, на которую
+    /// ещё не ответили. Время в строке остаётся временем первой:
+    /// §10.5 меряет ожидание от неё, и обновляй мы его, ожидание
+    /// начиналось бы заново при каждом повторе.
     pub(super) fn on_channel_request(
         &mut self,
         now_ms: u64,
@@ -980,14 +1050,23 @@ impl<S: Store> Engine<S> {
         // незнакомец мог стать владельцем канала, чью ссылку нам дали, —
         // и терять его карточку из-за адресов из ссылки нельзя. Адреса
         // же из ссылки недоверенные (§10.2), а карточка подписана.
+        // **Адреса сливаются, а не заменяются.** Ссылку вправе собрать
+        // узел без адресов (§10.2), а владельца мы уже могли знать
+        // с настоящими — из рукопожатия или прежней ссылки. Пока запись
+        // собиралась заново из одной ссылки, повторный переход по пустой
+        // ссылке стирал дорогу к владельцу: стенд показал `onion: None`
+        // у читателя, который минуту назад читал канал.
+        //
+        // Вид адреса из ссылки берётся, если он в ней есть; нет —
+        // остаётся прежний.
         let known = self.peers.get(&peer_ik);
         let mut stored = ratatosk_store::StoredPeer {
             ik: peer_ik,
-            onion: String::new(),
-            chatmail: String::new(),
-            ygg: Vec::new(),
+            onion: known.map(|peer| peer.onion.clone()).unwrap_or_default(),
+            chatmail: known.map(|peer| peer.chatmail.clone()).unwrap_or_default(),
+            ygg: known.map(|peer| peer.ygg.clone()).unwrap_or_default(),
             relays: Vec::new(),
-            nostr: Vec::new(),
+            nostr: known.map(|peer| peer.nostr.clone()).unwrap_or_default(),
             card: known.map(|peer| peer.card.clone()).unwrap_or_default(),
             // Прежняя причина сильнее новой: тот, кого мы знали владельцем
             // канала, остаётся им, даже если потом объявился сидом.
@@ -996,27 +1075,36 @@ impl<S: Store> Engine<S> {
             // узнан тогда, а не сейчас.
             added_ms: known.map_or(now_ms, |peer| peer.added_ms),
         };
+        // Первый адрес каждого вида из ссылки, а не последний: ссылку
+        // собирает тот, кто делится (§10.2), и порядок в ней его —
+        // а «последний побеждает» означало бы, что выбирает его хвост
+        // списка. Первый из ссылки перекрывает прежний: ссылка свежее.
+        let (mut onion_set, mut chatmail_set, mut ygg_set, mut nostr_set) =
+            (false, false, false, false);
         for endpoint in endpoints {
             match endpoint {
-                // Первый адрес каждого вида, а не последний: ссылку
-                // собирает тот, кто делится (§10.2), и порядок в ней
-                // его — а «последний побеждает» означало бы, что
-                // выбирает его хвост списка.
-                channel::Endpoint::Onion(address) if stored.onion.is_empty() => {
+                channel::Endpoint::Onion(address) if !onion_set => {
                     stored.onion.clone_from(address);
+                    onion_set = true;
                 }
-                channel::Endpoint::Chatmail(address) if stored.chatmail.is_empty() => {
+                channel::Endpoint::Chatmail(address) if !chatmail_set => {
                     stored.chatmail.clone_from(address);
+                    chatmail_set = true;
                 }
-                channel::Endpoint::Ygg(key) if stored.ygg.is_empty() => {
+                channel::Endpoint::Ygg(key) if !ygg_set => {
                     stored.ygg = key.to_vec();
+                    ygg_set = true;
                 }
                 channel::Endpoint::NostrRelay(relay) => stored.relays.push(relay.clone()),
-                channel::Endpoint::Nostr(key) if stored.nostr.is_empty() => {
+                channel::Endpoint::Nostr(key) if !nostr_set => {
                     stored.nostr = key.to_vec();
+                    nostr_set = true;
                 }
                 _ => {}
             }
+        }
+        if stored.relays.is_empty() {
+            stored.relays = known.map(|peer| peer.relays.clone()).unwrap_or_default();
         }
         self.store.put_peer(&stored)?;
 
@@ -1085,12 +1173,15 @@ impl<S: Store> Engine<S> {
     /// в очереди — они пролежали бы там до вытеснения, а разобрать их
     /// всё равно некому: чата больше нет.
     ///
-    /// # Чего здесь нет, потому что нет в дереве
+    /// # Раздача и рой
     ///
-    /// «Раздача прекращается» и «`PeerRecord` перестаёт продлеваться»
-    /// (§10.6) — ни раздачи, ни записей пира в ядре пока не существует,
-    /// это очередь 3. Стирать нечего, и делать вид, что стёрли,
-    /// не стоит.
+    /// «Раздача прекращается» (§10.6) — вместе с чатом уходят каталог
+    /// и участие в раздаче (каскадом), а из памяти — дерево и привязки
+    /// (`forget_swarm_state`). Своя запись каталога перестаёт
+    /// продлеваться и гаснет по сроку. Сидам, которых набирали сами,
+    /// уходит `PRUNE`, а канал ложится в список отписанных: блоки, которые
+    /// владелец и сиды слать не перестанут, отбрасываются, а не ждут
+    /// в очереди отложенного.
     ///
     /// # Errors
     ///
@@ -1173,12 +1264,35 @@ impl<S: Store> Engine<S> {
         // Сессия с ним при этом не трогается. Она живёт своей жизнью
         // (§8.5) и исчезнет сама; рвать её здесь значило бы гасить связь,
         // по которой, может быть, прямо сейчас едет наш же блок ухода.
+        //
+        // **И не сида.** Тот же ключ мог объявиться раздающим другого
+        // нашего канала; запись пира тогда держится каталогом, а не этим
+        // чатом, и стереть её значило бы оставить тот канал без дороги
+        // к сиду до следующего продления записи — дни.
         let owner_elsewhere =
             self.groups.iter().any(|(other, state)| *other != chat && state.group.owner == owner);
-        if !owner_elsewhere {
+        let seeds_elsewhere = self.groups.keys().filter(|other| **other != chat).any(|other| {
+            self.store.seeds(other).is_ok_and(|seeds| seeds.iter().any(|s| s.ik == owner))
+        });
+        if !owner_elsewhere && !seeds_elsewhere {
             self.store.delete_peer(&owner)?;
             self.peers.remove(&owner);
         }
+        // **Сидам, которых набирали сами, — `PRUNE`** (§7.1): «шли мне
+        // зовом, а не целиком». Своей отвязки у роя нет, а зов на чат,
+        // которого нет, отбрасывается даром.
+        let dialed: Vec<[u8; 32]> =
+            self.dialed.get(&chat).map(|set| set.iter().copied().collect()).unwrap_or_default();
+        for seed in dialed {
+            let cut = ratatosk_proto::swarm::Control::Prune { group: chat };
+            match self.send_swarm_control(now_ms, seed, &cut) {
+                Ok(produced) => effects.extend(produced),
+                Err(error) => tracing::debug!(?error, "сиду не сказать об уходе"),
+            }
+        }
+        // Всё роевое — за чатом: дерево, привязки, сроки, вектор владельца.
+        self.forget_swarm_state(chat)?;
+        self.remember_left(chat)?;
         self.pending_group.retain(|frame| frame.chat != chat);
         self.persist_pending_group();
         self.groups.remove(&chat);
@@ -1514,8 +1628,15 @@ impl<S: Store> Engine<S> {
         // не знают, и прежняя рассылка «всем участникам» до него
         // не доходит.
         if owner != me {
-            effects.extend(self.tell_member(now_ms, owner, PayloadType::GroupMembership, block)?);
+            // **И впущенному — тоже своя цепочка.** Ключ чтения едет ему
+            // запечатанным под ней (`content_key`, `carries_the_key`),
+            // и без неё он не открыл бы ни ключа, ни документа, который
+            // едет уже под ключом: стенд показал впущенного делегатом
+            // с нулём ключей и пятью кадрами в отложенном.
             let mine = self.current_sender_key(chat)?;
+            let value = self.sender_key_for(&mine, peer_ik)?;
+            effects.extend(self.tell_member(now_ms, peer_ik, PayloadType::SenderKey, value)?);
+            effects.extend(self.tell_member(now_ms, owner, PayloadType::GroupMembership, block)?);
             let value = self.sender_key_for(&mine, owner)?;
             effects.extend(self.tell_member(now_ms, owner, PayloadType::SenderKey, value)?);
         }
@@ -1595,9 +1716,17 @@ impl<S: Store> Engine<S> {
         if kind == channel::Kind::Open {
             return Err(EngineError::OpenChannelHasNoRotation);
         }
-        // Право «исключать»: поворот и есть механизм исключения (§6.4).
-        // Спрашивается тем же местом, что и всё остальное, — иначе
-        // у прав завелось бы второе толкование.
+        // **Поворачивает владелец, и только он.** §6.4 отдаёт поворот
+        // и держателю права «исключать», но §3.2 делает это невозможным
+        // по построению: новое поколение уезжает по составу, а состав
+        // у делегата — он сам. Стенд показал поворот делегатом дословно:
+        // поколение `1` у него одного, `0` у владельца и у всех читателей,
+        // и его же слова с этого мига не открывает никто. Отказ словами
+        // честнее: право «исключать» у делегата остаётся тем, что оно
+        // есть, — правом выдать ключ чтения (`Gate::AnyOf`).
+        if stored.owner_ik != me {
+            return Err(EngineError::OnlyOwnerRotates);
+        }
         if !self.right_holds(now_ms, chat, &me, channel::Rights::EVICT)? {
             return Err(EngineError::NotAllowedInChannel);
         }
@@ -1828,6 +1957,12 @@ impl<S: Store> Engine<S> {
             return Err(EngineError::OwnerNeedsNoGrant);
         }
 
+        // **Срок зажимается пределом хранилища.** «Навсегда» человек
+        // выражает как `u64::MAX`, а столбец у срока — знаковый: в релизе
+        // величина насыщалась молча, в отладочной сборке роняла процесс
+        // (`sql_types::to_sql`). Половина `u64` в миллисекундах —
+        // триста миллионов лет, и зажим ничего у человека не отнимает.
+        let until_ms = until_ms.min(i64::MAX as u64);
         let mut grants: Vec<channel::Grant> = stored
             .grants
             .iter()
@@ -2069,6 +2204,7 @@ impl<S: Store> Engine<S> {
         &mut self,
         now_ms: u64,
         chat: ChatId,
+        sender: [u8; 32],
         bytes: &[u8],
     ) -> Result<Vec<Effect>, EngineError> {
         let Ok(value) = ratatosk_codec::canonical::decode(bytes) else {
@@ -2104,22 +2240,18 @@ impl<S: Store> Engine<S> {
         // и стёрт. Очередь приняла бы кадр, разбор бы его потерял,
         // и починка выглядела бы работающей, ничего не чиня.
         //
-        // # Случай, в который эта ветка попадает, сегодня недостижим
+        // # Сюда доходит только кадр владельца
         //
-        // Документ везёт владелец, а его кадр открывается его же
-        // цепочкой — и карточку `open_group_frame` спросил **до**
-        // расшифровки и отложил бы кадр там, где откладывать ещё можно.
-        // Значит сюда попадает лишь документ, привезённый **чужими
-        // руками**: ретрансляция (§3.1) или чужая сборка. Первой ещё нет,
-        // второй мы ничего не должны.
-        //
-        // Когда ретрансляция появится, чинить это надо не очередью
-        // кадров, а очередью **документов**: байты здесь уже разобраны
-        // и от цепочки не зависят.
+        // Документ везёт владелец (`apply_group_action` отвергает чужой
+        // кадр с документом), а карточку владельца `open_group_frame`
+        // спросил **до** расшифровки и отложил бы кадр там, где
+        // откладывать ещё можно. Значит «проверить нечем» здесь —
+        // карточка, стёртая между открытием кадра и разбором, и ветка
+        // стоит против собственной завтрашней ошибки.
         let Some(owner) = self.public_identity_of(&authority)? else {
             return Ok(Vec::new());
         };
-        self.take_representation(now_ms, chat, &owner, unchecked)
+        self.take_representation(now_ms, chat, &owner, sender, unchecked)
     }
 
     /// Проверяет подпись и правило перехода, кладёт принятое.
@@ -2128,11 +2260,17 @@ impl<S: Store> Engine<S> {
     /// «чьим ключом проверять» и «можно ли это принять» не смешивались:
     /// первое зависит от того, откуда мы узнали про канал, второе —
     /// только от документов.
+    ///
+    /// `blame` — на кого писать аномалию: тот, кто **прислал** документ,
+    /// а не тот, чьим ключом он проверяется. Здесь стояло `owner.ik`,
+    /// и подложный документ в чужом кадре записывался в аномалии
+    /// владельцу, который его не слал.
     pub(super) fn take_representation(
         &mut self,
         now_ms: u64,
         chat: ChatId,
         owner: &ratatosk_crypto::PublicIdentity,
+        blame: [u8; 32],
         unchecked: channel::UncheckedRepresentation,
     ) -> Result<Vec<Effect>, EngineError> {
         // Байты и подпись снимаются **до** проверки: `verify` забирает
@@ -2142,7 +2280,7 @@ impl<S: Store> Engine<S> {
         let signature = *unchecked.signature();
         let Ok(next) = unchecked.verify(owner) else {
             // Чужая подпись приехать честно не могла.
-            self.sessions.note_anomaly(owner.ik, |c| c.malformed += 1);
+            self.sessions.note_anomaly(blame, |c| c.malformed += 1);
             return Ok(Vec::new());
         };
 
@@ -2174,24 +2312,45 @@ impl<S: Store> Engine<S> {
         // не было, называть порог некому, и ноль тут верен.
         let subscription = self.store.subscription(&chat)?;
         let min_version = subscription.map_or(0, |it| it.min_version);
-        // Обещание ссылки против подписанного (§6.1). Расхождение значит,
-        // что ссылка сулила доступ, которого нет: ключ был в ней, а канал
-        // оказался по приглашению. Принять документ значило бы оставить
-        // человека с чатом, который никогда ничего не покажет, и не
-        // сказать почему.
-        if let Some(it) = subscription {
-            if u64::from(it.kind_claimed) != next.kind.code() {
-                self.sessions.note_anomaly(owner.ik, |c| c.malformed += 1);
-                return Ok(Vec::new());
-            }
-        }
         match channel::accepts(previous.as_ref(), &next, min_version) {
             Ok(()) => {}
             // Устаревшая копия — штатное дело роя, молчим без отметки.
             Err(channel::ChannelError::StaleVersion) => return Ok(Vec::new()),
             Err(_) => {
-                self.sessions.note_anomaly(owner.ik, |c| c.malformed += 1);
+                self.sessions.note_anomaly(blame, |c| c.malformed += 1);
                 return Ok(Vec::new());
+            }
+        }
+        // **Обещание ссылки против подписанного** (§6.1). Ссылка сулила
+        // открытый канал и несла ключ, а владелец подписал канал
+        // по приглашению — соврала ссылка, не владелец, и аномалия тут
+        // никому не полагается. Раньше документ отвергался молча,
+        // и человек оставался с чатом, который «читаем» по ключу
+        // из ссылки и не покажет ничего никогда.
+        //
+        // Теперь ссылка переводится на честную дорогу: ключ из неё
+        // стирается, подписка становится заявкой (§10.4), заявка уезжает
+        // владельцу, а документ **принимается** — он подлинный. Обратный
+        // случай (ссылка без ключа, а канал открытый) оставляет заявку
+        // как есть: ключа взять неоткуда, кроме верной ссылки.
+        let mut effects = Vec::new();
+        if let Some(mut it) = subscription {
+            if u64::from(it.kind_claimed) != next.kind.code() {
+                tracing::info!(канал = ?chat, "ссылка назвала не ту породу канала (§6.1)");
+                it.kind_claimed = u32::try_from(next.kind.code()).unwrap_or(u32::MAX);
+                if next.kind == channel::Kind::ByInvite {
+                    self.store.delete_archive_keys(&chat)?;
+                    it.state = SUBSCRIPTION_REQUESTED;
+                    let (_, sent) = self.enqueue_request(
+                        now_ms,
+                        owner.ik,
+                        PayloadType::ChannelRequest,
+                        channel::request_value(&chat, false),
+                    )?;
+                    effects.extend(sent);
+                    effects.push(Effect::Notify(Event::ChannelSubscribed { chat, awaiting: true }));
+                }
+                self.store.put_subscription(&it)?;
             }
         }
 
@@ -2235,10 +2394,11 @@ impl<S: Store> Engine<S> {
         let at = self.clock.now(now_ms)?;
         self.apply_rename(chat, &next.title, at)?;
 
-        Ok(vec![Effect::Notify(Event::ChannelChanged {
+        effects.push(Effect::Notify(Event::ChannelChanged {
             chat,
             version: next.version,
             title: next.title,
-        })])
+        }));
+        Ok(effects)
     }
 }

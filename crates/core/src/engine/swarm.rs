@@ -435,6 +435,9 @@ impl<S: Store> Engine<S> {
     /// сутки прошли».
     pub(super) fn keep_catalogue_fresh(&mut self, now_ms: u64) -> Result<Vec<Effect>, EngineError> {
         self.store.prune_seeds(now_ms)?;
+        // Читатели, не назвавшиеся дольше срока, — тем же обходом, на
+        // котором живые называются снова (см. ниже, `attach_to_seeds`).
+        self.forget_stale_readers(now_ms);
         // Архив обрезается тем же обходом: окно §9.3 меряется сутками,
         // и повод у него тот же, что у продления записи и поворота
         // ключа — единственный, который случается на спящем телефоне.
@@ -953,6 +956,22 @@ impl<S: Store> Engine<S> {
         if state.profile.everyone_writes() {
             return Ok(effects);
         }
+        let attached = self.attached.entry(chat).or_default();
+        // Предел — против избыточных (§7.7, §9.2), а не против чужих.
+        // Переполнение **не вытесняет** прежних: вытеснение отдало бы
+        // любому желающему возможность выбить чужого читателя из раздачи
+        // одним кадром.
+        if attached.len() >= MAX_ATTACHED_READERS && !attached.contains_key(&peer_ik) {
+            return Ok(effects);
+        }
+        // **Привязка запоминается и тогда, когда не раздаём.** Кому отдавать,
+        // решается на каждом блоке (`push_candidates` спрашивает
+        // `may_serve` заново), а не на входе: человек сужает и расширяет
+        // круг когда захочет, и расширив его, он ждёт, что читатели,
+        // стучавшиеся всё это время, получат следующий же блок — а не
+        // через час, на их следующем обходе. Пока привязка жила вечно,
+        // это выходило само; со сроком у неё это надо делать вслух.
+        attached.insert(peer_ik, now_ms);
         // **Право на обслуживание** (§8.3, вторая половина). Молча:
         // сказать «я вам не раздаю» — значит сказать, что канал у нас
         // есть, а §7.5.1 обещает обратное тому, кто раздачу выключил.
@@ -960,15 +979,6 @@ impl<S: Store> Engine<S> {
             tracing::debug!(peer = ?&peer_ik[..4], "привязка отклонена: не раздаём (§8.3)");
             return Ok(effects);
         }
-        let attached = self.attached.entry(chat).or_default();
-        // Предел — против избыточных (§7.7, §9.2), а не против чужих.
-        // Переполнение **не вытесняет** прежних: вытеснение отдало бы
-        // любому желающему возможность выбить чужого читателя из раздачи
-        // одним кадром.
-        if attached.len() >= MAX_ATTACHED_READERS && !attached.contains(&peer_ik) {
-            return Ok(effects);
-        }
-        attached.insert(peer_ik);
         // **И свой вектор в ответ** — вторая половина обмена §7.2.
         // Без неё привязавшийся узнал бы только то, что появится
         // **после** привязки, а пропущенное так и осталось бы
@@ -1018,7 +1028,7 @@ impl<S: Store> Engine<S> {
             // канала она единственный список получателей.
             let mut targets =
                 self.groups.get(&chat).map(|state| state.group.recipients(&me)).unwrap_or_default();
-            for peer in self.attached.get(&chat).into_iter().flatten() {
+            for peer in self.attached.get(&chat).into_iter().flat_map(BTreeMap::keys) {
                 if !targets.contains(peer) {
                     targets.push(*peer);
                 }
@@ -1031,7 +1041,7 @@ impl<S: Store> Engine<S> {
         // означало бы «не беру новых», и прежние читатели получали бы
         // блоки дальше — то есть кнопка врала бы.
         let mut candidates = Vec::new();
-        for peer in self.attached.get(&chat).into_iter().flatten() {
+        for peer in self.attached.get(&chat).into_iter().flat_map(BTreeMap::keys) {
             if self.may_serve(chat, peer)? {
                 candidates.push(*peer);
             }
@@ -1240,7 +1250,7 @@ impl<S: Store> Engine<S> {
         let mut total = bytes.len();
         // Избыточность — **предыдущие** блоки этого же канала, самые
         // свежие. Берутся из архива: он и есть окно (§9.3).
-        for older in self.store.archive_recent(&chat, swarm::BUNDLE_BLOCKS)? {
+        for older in self.store.archive_recent(&chat, swarm::BUNDLE_BLOCKS, Some(&peer))? {
             if blocks.len() >= swarm::BUNDLE_BLOCKS {
                 break;
             }
@@ -1325,7 +1335,7 @@ impl<S: Store> Engine<S> {
         if self.groups.get(&chat).is_none_or(|state| state.profile.everyone_writes()) {
             return self.fan_out_group(now_ms, chat, msg_id, bytes);
         }
-        self.archive_channel_frame(now_ms, chat, msg_id, bytes)?;
+        self.archive_channel_frame(now_ms, chat, msg_id, bytes, None)?;
         let mut effects = Vec::new();
         for peer in self.push_candidates(chat, true)? {
             // Отказ по одному не обрывает раздачу остальным — тот же
@@ -1349,7 +1359,7 @@ impl<S: Store> Engine<S> {
         // Блок кладётся в архив **до** раздачи: на `GRAFT` и на просьбу
         // §7.2 отвечает он, и ответить надо будет тому, кто сейчас
         // получит зов.
-        self.archive_channel_frame(now_ms, chat, msg_id, bytes)?;
+        self.archive_channel_frame(now_ms, chat, msg_id, bytes, None)?;
         // Принёсший ответил делом: счёт неудач ему обнуляется, и он
         // становится «отвечавшим недавно» (§7.7).
         if let Some(from) = from {
@@ -1438,12 +1448,23 @@ impl<S: Store> Engine<S> {
     ///
     /// Не разобрался блок — не кладём: в архив идёт то, что мы приняли
     /// и проверили, а не всё, что приехало.
+    ///
+    /// # Адресат
+    ///
+    /// Ключ чтения впущенному и запись о впуске владельцу — блоки
+    /// **одному**, и `addressee` говорит кому. Отдаются они только ему
+    /// и в чужой have-вектор не входят: внешний слой у них открывается
+    /// ключом чтения либо цепочкой владельца, то есть у каждого читателя,
+    /// а внутри — кого впустили. Пока архив отдавал их всякому, состав
+    /// канала (§3.2) утекал первой же просьбой §7.2; стенд показал это
+    /// тремя чужими записями о впуске у читателя, догнавшего канал.
     pub(super) fn archive_channel_frame(
         &mut self,
         now_ms: u64,
         chat: ChatId,
         msg_id: MsgId,
         bytes: &[u8],
+        addressee: Option<[u8; 32]>,
     ) -> Result<(), EngineError> {
         let Ok(envelope) = Envelope::decode(bytes) else { return Ok(()) };
         let envelope = envelope.into_parts().1;
@@ -1458,9 +1479,38 @@ impl<S: Store> Engine<S> {
                 msg_id,
                 frame: bytes.to_vec(),
                 received_ms: now_ms,
+                addressee,
             },
         )?;
         Ok(())
+    }
+
+    /// Кому адресовано действие — для архива (см. `archive_channel_frame`).
+    ///
+    /// Перебор исчерпывающий, без `_`: новый адресный вид действия
+    /// обязан ронять сборку, а не лечь в архив «для всех» молча.
+    pub(super) fn addressee_of(
+        &self,
+        chat: ChatId,
+        action: &ratatosk_proto::group_action::Action,
+    ) -> Option<[u8; 32]> {
+        use ratatosk_proto::group_action::Action;
+        match action {
+            Action::ArchiveKey { recipient_ik, .. } => Some(*recipient_ik),
+            // Учёт смотрит владелец (§6.5), и едет запись ему одному.
+            Action::Admission { .. } => self.channel_owner(chat),
+            Action::Edit { .. }
+            | Action::Retract { .. }
+            | Action::Reaction { .. }
+            | Action::Reply { .. }
+            | Action::Files { .. }
+            | Action::Forward { .. }
+            | Action::ContactShare { .. }
+            | Action::Rename { .. }
+            | Action::Avatar { .. }
+            | Action::Representation { .. }
+            | Action::SeedRecord { .. } => None,
+        }
     }
 
     /// Обрезает архивы каналов по их окнам (§9.3).
@@ -1606,6 +1656,10 @@ impl<S: Store> Engine<S> {
                     // историю анти-энтропии.
                     return Ok(Vec::new());
                 };
+                // Адресный блок — только адресату (§3.2, §5.3).
+                if block.addressee.is_some_and(|to| to != peer_ik) {
+                    return Ok(Vec::new());
+                }
                 let (block, bytes) = (block.msg_id, block.frame);
                 self.send_group_copy(now_ms, block, peer_ik, &bytes)
             }
@@ -1684,7 +1738,9 @@ impl<S: Store> Engine<S> {
     ) -> Result<Vec<Effect>, EngineError> {
         let ranges: Vec<swarm::Range> = self
             .store
-            .archive_have(&chat)?
+            // Вектор — глазами того, кому он поедет: чужие адресные блоки
+            // в нём не значатся, иначе он просил бы то, чего не получит.
+            .archive_have(&chat, Some(&peer_ik))?
             .into_iter()
             .take(swarm::MAX_HAVE_RANGES)
             .map(|range| swarm::Range {
@@ -1850,7 +1906,7 @@ impl<S: Store> Engine<S> {
         peer_ik: [u8; 32],
         ranges: &[swarm::Range],
     ) -> Result<Vec<Effect>, EngineError> {
-        let mine = self.store.archive_have(&chat)?;
+        let mine = self.store.archive_have(&chat, None)?;
         // Дыры, а не просьбы: сперва собираются все, потом отбираются
         // самые нужные. Иначе порядок просьб зависел бы от порядка строк
         // в чужом векторе, то есть от чужой прихоти.
@@ -1941,7 +1997,7 @@ impl<S: Store> Engine<S> {
         if self.groups.get(&chat).is_some_and(|state| !state.profile.everyone_writes()) {
             let ours = self
                 .store
-                .archive_have(&chat)?
+                .archive_have(&chat, None)?
                 .into_iter()
                 .filter(|row| row.author_ik == *author)
                 .map(|row| row.first_seq)
@@ -2024,7 +2080,7 @@ impl<S: Store> Engine<S> {
         let width = usize::try_from(to_seq.saturating_sub(from_seq).saturating_add(1))
             .unwrap_or(swarm::MAX_WANT_BLOCKS);
         let limit = width.min(swarm::MAX_WANT_BLOCKS).min(left as usize);
-        let blocks = self.store.archived_range(&chat, author, from_seq, limit)?;
+        let blocks = self.store.archived_range(&chat, author, from_seq, limit, Some(&peer_ik))?;
         let mut effects = Vec::new();
         let mut given = 0u32;
         for block in blocks {
@@ -2231,6 +2287,107 @@ impl<S: Store> Engine<S> {
         // и случается. Поймано проверкой, а не рассуждением.
         let cut = swarm::Control::Prune { group: chat };
         self.send_swarm_control(now_ms, peer_ik, &cut)
+    }
+}
+
+impl<S: Store> Engine<S> {
+    /// Забывает всё роевое об этом канале — при отписке (§10.6).
+    ///
+    /// Дерево, привязки в обе стороны, ожидания `GRAFT` со сроками,
+    /// метка прокрутки, предпросмотр и вектор владельца на диске. Оставь
+    /// хоть что-то — сработавший срок позвал бы `GRAFT` по чату, которого
+    /// нет, а вектор владельца пережил бы повторную подписку и судил бы
+    /// новый канал по старому.
+    ///
+    /// Сессии не трогаются: по ним, может быть, прямо сейчас едет наш
+    /// блок ухода.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn forget_swarm_state(&mut self, chat: ChatId) -> Result<(), EngineError> {
+        self.tree.remove(&chat);
+        self.attached.remove(&chat);
+        self.dialed.remove(&chat);
+        self.history_pull.remove(&chat);
+        self.previews.remove(&chat);
+        self.awaited_blocks.retain(|(it, _), _| *it != chat);
+        self.graft_timers.retain(|_, (it, _)| *it != chat);
+        self.store.put_meta(&Self::owner_have_key(chat), &[])?;
+        Ok(())
+    }
+
+    /// Запоминает, что от канала отписались, — на диске и в памяти.
+    ///
+    /// Список держится коротким: последние `CHANNELS_LEFT_KEPT`. Больше
+    /// незачем — слать блоки давно оставленного канала перестают сами,
+    /// когда у сидов истекают сессии и привязки.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn remember_left(&mut self, chat: ChatId) -> Result<(), EngineError> {
+        self.left_channels.retain(|it| *it != chat);
+        self.left_channels.push(chat);
+        while self.left_channels.len() > ratatosk_store::CHANNELS_LEFT_KEPT {
+            self.left_channels.remove(0);
+        }
+        self.persist_left()
+    }
+
+    /// Снимает канал со списка отписанных — при повторной подписке.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn forget_left(&mut self, chat: ChatId) -> Result<(), EngineError> {
+        if !self.left_channels.contains(&chat) {
+            return Ok(());
+        }
+        self.left_channels.retain(|it| *it != chat);
+        self.persist_left()
+    }
+
+    fn persist_left(&mut self) -> Result<(), EngineError> {
+        let raw: Vec<u8> =
+            self.left_channels.iter().flat_map(|chat| chat.iter().copied()).collect();
+        self.store.put_meta(ratatosk_store::META_CHANNELS_LEFT, &raw)?;
+        Ok(())
+    }
+
+    /// Забывает читателей, которые давно не назывались (§7.5.1).
+    ///
+    /// Привязка — свойство живого соединения, и у нас она жила дольше
+    /// него: читатель, ушедший навсегда, оставался в списке тех, кому
+    /// шлём целиком, и каждый блок канала заводил ему доставку со всей
+    /// лестницей §5.4. Назваться снова читатель обязан сам — на каждом
+    /// обходе и на каждой новой сессии (`reattach_to`), — значит тишина
+    /// дольше [`swarm::ATTACH_TTL_MS`] и есть «ушёл».
+    ///
+    /// Отказы ступеней для этого не годятся, и это проверено: стенд теряет
+    /// кадры на прямых каналах штатно, а Tor-узел с одной ступенью
+    /// исчерпывает лестницу одним отказом; обе первые редакции снимали
+    /// привязку у живого сида.
+    ///
+    /// Наши собственные привязки (`dialed`) не трогаются: это наш выбор,
+    /// а не его.
+    pub(super) fn forget_stale_readers(&mut self, now_ms: u64) {
+        let mut gone: Vec<(ChatId, [u8; 32])> = Vec::new();
+        for (chat, attached) in &mut self.attached {
+            attached.retain(|peer, at| {
+                let stale = now_ms.saturating_sub(*at) >= swarm::ATTACH_TTL_MS;
+                if stale {
+                    gone.push((*chat, *peer));
+                }
+                !stale
+            });
+        }
+        for (chat, peer) in gone {
+            if let Some(tree) = self.tree.get_mut(&chat) {
+                tree.eager.remove(&peer);
+                tree.lazy.remove(&peer);
+            }
+        }
     }
 }
 

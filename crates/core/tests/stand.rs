@@ -5126,7 +5126,7 @@ fn the_archive_outlives_a_restart_and_answers_a_graft() {
     stand.settle();
 
     let seed = NodeId(1);
-    let archived = stand.sim.node(seed).engine().store().archive_have(&chat).expect("архив");
+    let archived = stand.sim.node(seed).engine().store().archive_have(&chat, None).expect("архив");
     let owner_ik = stand.ik(NodeId(0));
     assert!(!archived.is_empty(), "у читателя лёг журнал владельца");
     assert!(
@@ -5152,7 +5152,7 @@ fn the_archive_outlives_a_restart_and_answers_a_graft() {
         .node(NodeId(0))
         .engine()
         .store()
-        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000)
+        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000, None)
         .expect("кадры");
     let seqs: Vec<u64> = at_owner.iter().map(|b| b.seq).collect();
     assert_eq!(
@@ -5166,7 +5166,7 @@ fn the_archive_outlives_a_restart_and_answers_a_graft() {
         .node(seed)
         .engine()
         .store()
-        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000)
+        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000, None)
         .expect("кадры");
     assert!(
         all.len() < at_owner.len(),
@@ -5174,7 +5174,7 @@ fn the_archive_outlives_a_restart_and_answers_a_graft() {
     );
 
     stand.restart(seed);
-    let after = stand.sim.node(seed).engine().store().archive_have(&chat).expect("архив");
+    let after = stand.sim.node(seed).engine().store().archive_have(&chat, None).expect("архив");
     assert_eq!(after, archived, "архив на диске: перезапуск его не трогает");
 
     // И сам кадр цел — им отвечают на `GRAFT`, а значит он обязан быть
@@ -5201,7 +5201,7 @@ fn the_window_from_the_representation_is_what_cuts_the_archive() {
         stand.settle();
     }
     let reader = NodeId(1);
-    let before = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
+    let before = stand.sim.node(reader).engine().store().archive_have(&chat, None).expect("архив");
     // Последний номер берётся по всем строкам: у читателя вектор бывает
     // из нескольких кусков — адресные блоки чужих до него не доезжают
     // и оставляют провалы (§7.3).
@@ -5217,14 +5217,31 @@ fn the_window_from_the_representation_is_what_cuts_the_archive() {
     // блок ложится в архив свежим. Пустоты тут не бывает — бывает
     // сдвинутое начало, ровно как обещает §9.3: «удаляется префикс
     // журнала, `first_seq` в have-векторе поднимается».
+    //
+    // **Кроме адресных блоков** (§6.5): свой ключ чтения читатель держит
+    // вне окна, как владелец держит записи о впуске. Его позиция
+    // останется в векторе, и это не дыра в правиле, а его часть.
     stand.sleep_for(365 * 24 * 60 * 60 * 1000);
     stand.maintenance();
     stand.settle();
-    let after = stand.sim.node(reader).engine().store().archive_have(&chat).expect("архив");
+    let after = stand
+        .sim
+        .node(reader)
+        .engine()
+        .store()
+        .archived_range(&chat, &stand.ik(NodeId(0)), 0, 1_000, None)
+        .expect("архив");
+    let (kept_words, kept_addressed): (Vec<_>, Vec<_>) =
+        after.iter().partition(|block| block.addressee.is_none());
     assert!(
-        after.iter().all(|range| range.first_seq > last_before),
+        kept_words.iter().all(|block| block.seq > last_before),
         "окно обязано было снять весь прежний журнал: было {:?}, стало {after:?}; сид {:#x}",
         before,
+        stand.sim.seed()
+    );
+    assert!(
+        kept_addressed.iter().any(|block| block.seq <= last_before),
+        "а свой ключ чтения окно не трогает (§6.5); сид {:#x}",
         stand.sim.seed()
     );
 }
@@ -6744,3 +6761,473 @@ fn a_rotation_reaches_every_reader_and_leaves_the_one_who_left_behind() {
         stand.assert_seen(NodeId(i), chat, &["после поворота"]);
     }
 }
+
+// --- Аудит каналов: делегат, ссылка, состав, очередь отложенного ------------
+//
+// Заведены по проверке кода, а не по живому прогону: каждая из этих
+// проб сперва была написана падающей на прежнем дереве, и падения
+// записаны в `TESTING.md` («Аудит каналов»). Ниже — постоянные тесты.
+
+#[test]
+fn a_reader_admitted_by_a_delegate_reads_the_channel() {
+    // §6.2, §6.5: делегат с правом «впускать» впускает; впущенный обязан
+    // читать. На прежнем дереве у впущенного было ноль ключей, состав
+    // из себя одного и пять кадров в отложенном: ключ чтения ехал под
+    // цепочкой делегата, которую делегат ему не отдавал, а всё, что
+    // делегат присылал, откладывалось — он не значился участником.
+    //
+    // Чего не стережёт: **впуск делегатом, которого владелец ещё
+    // не «показал» владельцу** — здесь все друг другу контакты, и карточка
+    // делегата у владельца есть заранее.
+    let mut stand = Stand::new(0xA001, 3);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.grant(A, chat, B, ratatosk_proto::channel::Rights::ADMIT.bits(), TEN_YEARS_MS);
+    stand.admit(B, chat, C);
+    stand.settle();
+    assert_eq!(
+        stand.sim.node(C).engine().store().archive_keys(&chat).expect("ключи").len(),
+        1,
+        "впуск делегатом обязан отдать ключ чтения; сид {:#x}",
+        stand.sim.seed()
+    );
+    stand.say(A, chat, "слово владельца");
+    stand.settle();
+    stand.assert_seen(C, chat, &["слово владельца"]);
+    // И владелец знает о впущенном — учёт (§6.5) и состав (§3.2).
+    assert!(stand.sim.node(A).engine().groups()[&chat].group.contains(&stand.ik(C)));
+    assert!(stand
+        .sim
+        .node(A)
+        .engine()
+        .store()
+        .admits(&chat)
+        .unwrap()
+        .iter()
+        .any(|a| a.who == stand.ik(C)));
+}
+
+#[test]
+fn a_delegate_cannot_rotate_the_key_and_the_owner_still_can() {
+    // §6.4 отдаёт поворот держателю «исключать», §3.2 делает это
+    // невозможным: развезти поколение делегату некому. На прежнем дереве
+    // поворот делегатом проходил и уходил в никуда — поколение `1` у него
+    // одного, `0` у владельца и читателей, — а его же слова с этого мига
+    // не открывал никто. Теперь отказ словами, и поколения не двигаются.
+    let mut stand = Stand::new(0xA002, 4);
+    let chat = stand.create_channel(A, "лента", false);
+    for who in [B, C, NodeId(3)] {
+        stand.admit(A, chat, who);
+    }
+    stand.settle();
+    stand.grant(A, chat, B, ratatosk_proto::channel::Rights::EVICT.bits(), TEN_YEARS_MS);
+    stand.sleep_for(8 * 24 * 60 * 60 * 1000);
+    stand.sim.act(B, |node, ctx| {
+        let refused = node
+            .engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::RotateChannelKey { chat }));
+        assert!(
+            matches!(refused, Err(ratatosk_core::EngineError::OnlyOwnerRotates)),
+            "делегат: {refused:?}"
+        );
+    });
+    stand.settle();
+    for who in [A, B, C, NodeId(3)] {
+        assert_eq!(stand.generation(who, chat), 0, "поколение не сдвинулось ни у кого");
+    }
+    // Владелец — поворачивает, и читают все: иначе отказ выше значил бы
+    // «поворота нет вовсе».
+    stand.sim.act(A, |node, ctx| {
+        let effects = node
+            .engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::RotateChannelKey { chat }))
+            .expect("владелец поворачивает");
+        node.apply(ctx, effects);
+    });
+    stand.settle();
+    stand.say(A, chat, "после поворота");
+    stand.settle();
+    for who in [B, C, NodeId(3)] {
+        assert_eq!(stand.generation(who, chat), 1);
+        stand.assert_seen(who, chat, &["после поворота"]);
+    }
+}
+
+#[test]
+fn a_link_shared_by_a_reader_points_at_the_owner() {
+    // §10.2: «адрес владельца — всегда, последним рубежом». Ссылка везёт
+    // один ключ — владельца, — и подписчик стучится по её адресам к нему.
+    // На прежнем дереве читатель клал в ссылку **свой** адрес, и третий
+    // узел записывал его владельцу: рукопожатие §8.2 к ключу владельца
+    // в чужую дверь не доходит.
+    //
+    // Проверяется до затишья: стенд доставляет по ключу, а не по адресу,
+    // и после первого же ответа владельца запись поправила бы его
+    // карточка — поломка была бы скрыта тем, чего в живой сети не бывает.
+    let mut stand = Stand::strangers_by_address(0xA003, 3);
+    let chat = stand.create_channel(A, "лента", true);
+    let link = stand.channel_link(A, chat);
+    stand.subscribe(B, &link);
+    stand.settle();
+    stand.say(A, chat, "первое");
+    stand.settle();
+    stand.assert_seen(B, chat, &["первое"]);
+
+    let theirs = stand.channel_link(B, chat);
+    let uri = theirs.clone();
+    stand.sim.act(C, |node, ctx| {
+        node.command(ctx, Command::SubscribeToChannel { uri });
+    });
+    let owner_ik = stand.ik(A);
+    let held = stand.sim.node(C).engine().address_of(&owner_ik);
+    let real = stand.sim.node(A).engine().own_card().onion;
+    assert_eq!(held.onion.as_deref(), Some(real.as_str()), "в ссылке читателя — адрес владельца");
+    // И по ней канал открывается — у того, кто не знал никого.
+    stand.settle();
+    stand.say(A, chat, "второе");
+    stand.settle();
+    stand.assert_seen(C, chat, &["второе"]);
+}
+
+#[test]
+fn a_link_without_addresses_keeps_the_road_to_the_owner() {
+    // §10.2: пустой список адресов законен. На прежнем дереве повторный
+    // переход по такой ссылке **стирал** адреса владельца, известные
+    // из первой: запись пира собиралась из ссылки заново.
+    let mut stand = Stand::strangers_by_address(0xA006, 2);
+    let chat = stand.create_channel(A, "лента", true);
+    let link = stand.channel_link(A, chat);
+    stand.subscribe(B, &link);
+    stand.settle();
+    stand.say(A, chat, "первое");
+    stand.settle();
+    stand.assert_seen(B, chat, &["первое"]);
+    let owner_ik = stand.ik(A);
+    let before = stand.sim.node(B).engine().address_of(&owner_ik).onion;
+    assert!(before.is_some(), "дорога к владельцу есть — иначе проверка пуста");
+
+    let mut bare = ratatosk_proto::channel::Invitation::from_uri(&link).unwrap();
+    bare.endpoints = Vec::new();
+    let uri = bare.to_uri().unwrap();
+    stand.sim.act(B, |node, ctx| {
+        let answer = node
+            .engine_mut()
+            .step(ctx.now_ms(), Input::Command(Command::SubscribeToChannel { uri }));
+        assert!(matches!(answer, Err(ratatosk_core::EngineError::AlreadySubscribed)));
+    });
+    assert_eq!(
+        stand.sim.node(B).engine().address_of(&owner_ik).onion,
+        before,
+        "пустая ссылка не стирает известную дорогу"
+    );
+    stand.say(A, chat, "второе");
+    stand.settle();
+    stand.assert_seen(B, chat, &["первое", "второе"]);
+}
+
+#[test]
+fn readers_do_not_learn_the_roster_through_the_archive() {
+    // §3.2: состав известен владельцу. Читатель, догоняющий канал
+    // анти-энтропией (§7.2), не должен получить ни чужих записей о впуске,
+    // ни чужих ключей: на прежнем дереве архив отдавал их всякому, кто
+    // спросил диапазон, и у читателя после сна лежало три записи о впуске.
+    //
+    // Чего не стережёт: **владелец** видит всё, и это верно по §6.5.
+    let mut stand = Stand::new(0xA004, 4);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.offline(B);
+    stand.admit(A, chat, C);
+    stand.admit(A, chat, NodeId(3));
+    stand.settle();
+    stand.say(A, chat, "пока B спит");
+    stand.settle();
+    stand.drop_queue(A);
+    stand.online(B);
+    stand.settle();
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    stand.assert_seen(B, chat, &["пока B спит"]);
+    let admits = stand.sim.node(B).engine().store().admits(&chat).expect("учёт");
+    let (c, d) = (stand.ik(C), stand.ik(NodeId(3)));
+    assert!(
+        !admits.iter().any(|a| a.who == c || a.who == d),
+        "читатель узнал о чужом впуске; сид {:#x}",
+        stand.sim.seed()
+    );
+    let b_ik = stand.ik(B);
+    let foreign: Vec<u64> = stand
+        .sim
+        .node(B)
+        .engine()
+        .store()
+        .archived_range(&chat, &stand.ik(A), 0, 1_000, None)
+        .unwrap()
+        .iter()
+        .filter(|block| block.addressee.is_some_and(|to| to != b_ik))
+        .map(|block| block.seq)
+        .collect();
+    assert!(foreign.is_empty(), "чужих адресных блоков в архиве читателя нет: {foreign:?}");
+    // А владелец знает всех — это его учёт.
+    assert_eq!(stand.sim.node(A).engine().store().admits(&chat).unwrap().len(), 3);
+}
+
+#[test]
+fn a_forever_grant_does_not_crash_the_store() {
+    // «Навсегда» клиент выражает как `u64::MAX`, а столбец срока —
+    // знаковый. На прежнем дереве отладочная сборка падала в `to_sql`,
+    // релиз насыщал молча; парные проверки этого не видели — они на памяти.
+    let mut stand = Stand::new(0xA005, 2);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.grant(A, chat, B, ratatosk_proto::channel::Rights::WRITE.bits(), u64::MAX);
+    stand.say(B, chat, "навсегда");
+    stand.settle();
+    stand.assert_seen(A, chat, &["навсегда"]);
+}
+
+#[test]
+fn a_reader_who_left_gets_nothing_parked_and_seeds_forget_him() {
+    // §10.6: отписка местная, и владелец с сидами слать не перестанут —
+    // привязка у них в памяти. На прежнем дереве у ушедшего копились
+    // отложенные кадры чата, которого нет, и место в очереди из 64
+    // занимали блоки, которые не разберутся никогда.
+    let mut stand = Stand::strangers(0xA007, 3);
+    let chat = stand.create_channel(A, "лента", true);
+    let link = stand.channel_link(A, chat);
+    stand.subscribe(B, &link);
+    stand.subscribe(C, &link);
+    stand.settle();
+    stand.announce_seeding(B, chat);
+    stand.settle();
+    stand.say(A, chat, "раз");
+    stand.settle();
+    stand.assert_seen(C, chat, &["раз"]);
+    stand.unsubscribe(C, chat);
+    stand.settle();
+    stand.say(A, chat, "два");
+    stand.say(A, chat, "три");
+    stand.settle();
+    let parked = stand.sim.node(C).engine().parked_group_frames();
+    assert!(
+        parked.iter().all(|(group, _, _)| *group != chat),
+        "ушедший не откладывает кадры оставленного канала: {parked:?}"
+    );
+    // Список отписанных переживает перезапуск: слать будут и завтра.
+    stand.restart(C);
+    stand.say(A, chat, "четыре");
+    stand.settle();
+    let parked = stand.sim.node(C).engine().parked_group_frames();
+    assert!(parked.iter().all(|(group, _, _)| *group != chat), "и после перезапуска: {parked:?}");
+    // Вернулся по ссылке — снова читает: список отписанных не запирает.
+    stand.subscribe(C, &link);
+    stand.settle();
+    stand.say(A, chat, "пять");
+    stand.settle();
+    assert!(stand.sim.node(C).seen(chat).contains(&"пять".to_owned()));
+}
+
+#[test]
+fn a_silent_reader_drops_out_of_the_tree_until_he_comes_back() {
+    // §7.5.1: привязка живёт столько, сколько связь. На прежнем дереве
+    // сид держал в eager читателя, ушедшего навсегда, и каждый блок
+    // заводил ему доставку со всей лестницей §5.4.
+    let mut stand = Stand::strangers(0xA008, 3);
+    let chat = stand.create_channel(A, "лента", true);
+    let link = stand.channel_link(A, chat);
+    stand.subscribe(B, &link);
+    stand.subscribe(C, &link);
+    stand.settle();
+    stand.announce_seeding(B, chat);
+    stand.settle();
+    stand.say(A, chat, "раз");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(B).engine().swarm_tree(chat);
+    assert!(eager.contains(&stand.ik(C)) || lazy.contains(&stand.ik(C)), "C в дереве сида");
+
+    // Ушёл и не назывался четыре часа — три обхода подряд. Число своё:
+    // проверка стережёт «не назвавшийся забывается», а не срок.
+    //
+    // Уходит **сегментом**, а не выключателем: выключенный узел стенда
+    // не принимает, но шлёт, и его обход называл бы его сиду снова.
+    stand.sim.net_mut().set_segment(C, 1);
+    stand.sleep_for(4 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    stand.say(A, chat, "два");
+    stand.settle();
+    let (eager, lazy) = stand.sim.node(B).engine().swarm_tree(chat);
+    assert!(
+        !eager.contains(&stand.ik(C)) && !lazy.contains(&stand.ik(C)),
+        "не назвавшийся выпал из дерева сида; сид {:#x}",
+        stand.sim.seed()
+    );
+    // Вернулся — назвался снова и снова читает.
+    stand.sim.net_mut().set_segment(C, 0);
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    stand.say(A, chat, "три");
+    stand.settle();
+    assert!(stand.sim.node(C).seen(chat).contains(&"три".to_owned()));
+    let (eager, lazy) = stand.sim.node(B).engine().swarm_tree(chat);
+    assert!(
+        eager.contains(&stand.ik(C)) || lazy.contains(&stand.ik(C)),
+        "вернувшийся снова в дереве"
+    );
+}
+
+#[test]
+fn a_retraction_that_arrives_before_its_target_still_applies_later() {
+    // Отзыв обогнал слово (§9.2 разрешает; в канале это обычная дорога —
+    // слово приедет анти-энтропией §7.2). На прежнем дереве отзыв без
+    // цели молча пропадал, и слово, удалённое у всех, воскресало у одного.
+    //
+    // Чего не стережёт: **группу** — там ключ позиции цепочки
+    // израсходован, отложенный кадр не откроется, и действие без цели
+    // по-прежнему пропадает. Сказано в `TESTING.md`.
+    let mut stand = Stand::without_mail(0xB001, 2);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    let a_ik = stand.ik(A);
+
+    stand.offline(B);
+    stand.say(A, chat, "лишнее");
+    stand.settle();
+    let target = stand
+        .sim
+        .node(A)
+        .engine()
+        .store()
+        .messages(&chat, usize::MAX, None)
+        .unwrap()
+        .last()
+        .unwrap()
+        .msg_id;
+    stand.drop_queue(A);
+    stand.online(B);
+    stand.settle();
+    stand.sim.act(A, |node, ctx| {
+        node.command(ctx, Command::RetractMessages { chat, msg_ids: vec![target] });
+    });
+    stand.settle();
+    let seqs = |stand: &Stand, who: NodeId| -> Vec<u64> {
+        stand
+            .sim
+            .node(who)
+            .engine()
+            .store()
+            .archived_range(&chat, &a_ik, 0, 1_000, None)
+            .unwrap()
+            .iter()
+            .map(|b| b.seq)
+            .collect()
+    };
+    let at_owner = seqs(&stand, A);
+    let word_seq = at_owner[at_owner.len() - 2];
+    assert!(
+        !seqs(&stand, B).contains(&word_seq),
+        "слово до читателя не доехало — иначе проверка пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+    stand.assert_seen(A, chat, &[]);
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.maintenance();
+    stand.settle();
+    assert!(seqs(&stand, B).contains(&word_seq), "слово доехало анти-энтропией");
+    stand.assert_seen(B, chat, &[]);
+}
+
+#[test]
+fn words_parked_beyond_the_queue_are_recovered_by_anti_entropy() {
+    // Читатель пропустил поворот ключа; слова нового поколения ложатся
+    // в отложенное, а очередь — из 64 мест. На прежнем дереве вытесненные
+    // оставались «виденными» тридцать суток, и анти-энтропия их выбрасывала
+    // как повторы: из семидесяти слов доезжало шестьдесят четыре.
+    //
+    // Число 70 — своё: проверка стережёт «вытесненное возвращается»,
+    // а не длину очереди.
+    let mut stand = Stand::without_mail(0xC001, 2);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.settle();
+    stand.sleep_for(8 * 24 * 60 * 60 * 1000);
+    stand.offline(B);
+    stand.sim.act(A, |node, ctx| {
+        node.command(ctx, Command::RotateChannelKey { chat });
+    });
+    stand.settle();
+    stand.drop_queue(A);
+    stand.online(B);
+    stand.settle();
+    assert_eq!(stand.generation(B, chat), 0, "поворот до читателя не доехал — иначе проба пуста");
+    let words: Vec<String> = (0..70).map(|i| format!("слово {i}")).collect();
+    for word in &words {
+        stand.say(A, chat, word);
+        stand.settle();
+    }
+    for _ in 0..2 {
+        stand.sleep_for(2 * 60 * 60 * 1000);
+        stand.maintenance();
+        stand.settle();
+    }
+    let seen = stand.sim.node(B).seen(chat);
+    assert_eq!(stand.generation(B, chat), 1, "ключ доехал анти-энтропией");
+    assert_eq!(seen.len(), words.len(), "вытесненные из очереди слова вернулись");
+}
+
+#[test]
+fn a_rename_by_the_edit_holder_reaches_everyone_and_survives_the_next_document() {
+    // §6.2: держатель права «менять представление» правит название.
+    // На прежнем дереве команда отказывала «не владелец», и право было
+    // мёртвым. Теперь название едет действием, владелец подписывает его
+    // новой версией документа, и следующая правка документа его не откатывает.
+    let mut stand = Stand::new(0xB002, 3);
+    let chat = stand.create_channel(A, "лента", false);
+    stand.admit(A, chat, B);
+    stand.admit(A, chat, C);
+    stand.settle();
+    stand.grant(A, chat, B, ratatosk_proto::channel::Rights::EDIT.bits(), TEN_YEARS_MS);
+    stand.sim.act(B, |node, ctx| {
+        node.command(ctx, Command::RenameGroup { chat, title: "новое имя".into() });
+    });
+    stand.settle();
+    let title = |stand: &Stand, who: NodeId| -> String {
+        stand.sim.node(who).engine().groups().get(&chat).unwrap().title.clone()
+    };
+    for who in [A, B, C] {
+        assert_eq!(title(&stand, who), "новое имя", "переименование делегата доехало до {who:?}");
+    }
+    assert_eq!(
+        stand.sim.node(A).engine().store().channel(&chat).unwrap().unwrap().title,
+        "новое имя",
+        "владелец вписал названное в документ"
+    );
+    // Любая следующая правка документа — например, цена слова.
+    stand.sim.act(A, |node, ctx| {
+        node.command(ctx, Command::SetChannelPow { chat, bits: 1 });
+    });
+    stand.settle();
+    for who in [A, B, C] {
+        assert_eq!(title(&stand, who), "новое имя", "новая версия документа не откатила имя");
+    }
+    // А без права — отказ по имени права, не по владению.
+    stand.sim.act(C, |node, ctx| {
+        let refused = node.engine_mut().step(
+            ctx.now_ms(),
+            Input::Command(Command::RenameGroup { chat, title: "чужое".into() }),
+        );
+        assert!(
+            matches!(refused, Err(ratatosk_core::EngineError::NotAllowedInChannel)),
+            "{refused:?}"
+        );
+    });
+}
+
+/// Десять лет — «надолго» для выдачи, но в пределах знакового столбца.
+const TEN_YEARS_MS: u64 = 10 * 365 * 24 * 60 * 60 * 1000;

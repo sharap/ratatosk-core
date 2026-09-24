@@ -2835,6 +2835,153 @@ fn unsubscribing_works_even_when_the_owner_is_unreachable() {
 }
 
 #[test]
+fn coming_back_when_the_owner_never_heard_the_leaving_works() {
+    // **Разбор живого случая, и ответ на «через раз».** «Подписался,
+    // отписался, снова подписался — тишина: владельцу не приходит
+    // заявка, представление не загружается; не помогло даже исключение».
+    //
+    // Через раз — потому что всё зависит от того, доехал ли блок ухода
+    // (§10.6). Доехал — владелец знает, что читателя нет, и заявка
+    // проходит обычным путём. Не доехал — у владельца он **всё ещё
+    // в составе**, а у себя никто; заявка тонула в строке «уже
+    // впущенному просить нечего», впускать было нечего, и исключение
+    // не помогало: исключённому надо просить заново, а он уже просил
+    // и ждёт.
+    let mut stand = Stand::strangers(0x0_1EA_5E, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.say(NodeId(0), chat, "до ухода");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"до ухода".to_owned()),
+        "опора: с первого раза канал работал; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // **Уход, о котором владелец не узнал.** Он не в сети, а очередь
+    // §5.4 не ждёт вечно — снимаем её, как снимает жизнь.
+    stand.offline(NodeId(0));
+    stand.unsubscribe(NodeId(1), chat);
+    stand.settle();
+    let owner_ik = stand.ik(NodeId(0));
+    stand.sim.act(NodeId(1), |node, _| {
+        let doomed: Vec<_> = node
+            .engine()
+            .store()
+            .outbox()
+            .expect("очередь")
+            .into_iter()
+            .filter(|row| row.recipient_ik == owner_ik)
+            .map(|row| row.msg_id)
+            .collect();
+        for msg_id in doomed {
+            node.engine_mut().store_mut().delete_outbox(&msg_id, &owner_ik).expect("снято");
+        }
+    });
+    stand.online(NodeId(0));
+    stand.settle();
+    assert!(
+        stand
+            .sim
+            .node(NodeId(0))
+            .engine()
+            .groups()
+            .get(&chat)
+            .is_some_and(|state| state.group.contains(&stand.ik(NodeId(1)))),
+        "опора: владелец об уходе не узнал, иначе чинить нечего; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    // Человек возвращается по той же ссылке.
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // **И канал обязан открыться сам** — без впуска: впускать владельцу
+    // некого, читатель у него уже в составе.
+    stand.say(NodeId(0), chat, "после возвращения");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"после возвращения".to_owned()),
+        "вернувшийся обязан снова читать канал; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(1)).seen(chat),
+        stand.sim.seed()
+    );
+    assert_eq!(
+        stand.facts(NodeId(1), chat).version,
+        stand.facts(NodeId(0), chat).version,
+        "и документ обязан догнать; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn subscribing_again_after_leaving_a_channel_by_invite_works() {
+    // **Разбор живого случая.** «Подписался, отписался, снова
+    // подписался — и тишина: владельцу не приходит заявка,
+    // представление не загружается; не помогло даже исключение этого
+    // подписчика владельцем».
+    //
+    // §10.6 обещает обратное: отписка — это уход, а не запрет. Вернуться
+    // по той же ссылке человек вправе, и путь у него тот же, что
+    // у всякого нового: заявка §10.4 и впуск.
+    let mut stand = Stand::strangers(0x0_A_6A1, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", false);
+    let link = stand.channel_link(NodeId(0), chat);
+
+    stand.subscribe(NodeId(1), &link);
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.say(NodeId(0), chat, "до ухода");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"до ухода".to_owned()),
+        "опора: с первого раза канал работал; сид {:#x}",
+        stand.sim.seed()
+    );
+
+    stand.unsubscribe(NodeId(1), chat);
+    stand.settle();
+    // Между уходом и возвращением проходит жизнь телефона: перезапуск
+    // обеих сторон и час сна. Так это и случается у человека.
+    stand.restart(NodeId(0));
+    stand.restart(NodeId(1));
+    stand.sleep_for(2 * 60 * 60 * 1000);
+    stand.settle();
+
+    // И снова по той же ссылке.
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    // **Заявка обязана дойти.** Без неё владельцу нечего впускать,
+    // и человек сидит в вечном ожидании §10.5.
+    let asked = stand
+        .sim
+        .node(NodeId(0))
+        .engine()
+        .store()
+        .channel_requests(&chat)
+        .expect("заявки")
+        .iter()
+        .any(|(who, _)| *who == stand.ik(NodeId(1)));
+    assert!(asked, "заявка после возвращения обязана дойти; сид {:#x}", stand.sim.seed());
+
+    stand.admit(NodeId(0), chat, NodeId(1));
+    stand.settle();
+    stand.say(NodeId(0), chat, "после возвращения");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"после возвращения".to_owned()),
+        "вернувшийся обязан читать канал; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(1)).seen(chat),
+        stand.sim.seed()
+    );
+}
+
+#[test]
 fn the_waiting_screen_changes_before_the_machinery_does() {
     // §10.5 расписывает экран ожидания по времени: до полуминуты
     // «открываем канал», дальше «дольше обычного», с пяти минут

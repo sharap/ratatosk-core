@@ -488,6 +488,13 @@ impl<S: Store> Engine<S> {
 
         // Сюда приходят только по истечении срока, то есть кадр ушёл,
         // а подтверждения нет.
+        // Забытый собеседник — не отказ ядра (см. `on_link_down`):
+        // отписка и удаление контакта убирают запись, а срок кадра к нему
+        // мог быть взведён раньше. Двигать по лестнице §5.4 нечего,
+        // а падать нельзя — отказ уронил бы весь шаг.
+        if !self.contacts.contains_key(&peer_ik) && !self.peers.contains_key(&peer_ik) {
+            return Ok(Vec::new());
+        }
         self.on_delivery_failed(peer_ik, via, Failure::Silent)
     }
 

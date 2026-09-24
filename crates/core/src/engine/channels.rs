@@ -1005,10 +1005,36 @@ impl<S: Store> Engine<S> {
         if open {
             return Ok(effects);
         }
-        // Уже впущенному просить нечего: он в составе, ключ у него есть.
-        // Молчим, а не отмечаем аномалию: так выглядит повтор заявки,
-        // разминувшийся со впуском по дороге.
+        // **Уже в составе — значит у него ничего нет, и это надо
+        // починить, а не промолчать.**
+        //
+        // Раньше здесь стоял тихий возврат: «он в составе, ключ у него
+        // есть». Довод неверен, и живой прогон показал почему: человек
+        // отписался (§10.6) и вернулся по той же ссылке, а блок ухода
+        // до владельца не доехал — очередь §5.4 не ждёт вечно.
+        // У владельца он по-прежнему в составе, у себя — никто; заявка
+        // тонет в этой строке, впускать нечего, и «не помогло даже
+        // исключение»: исключённому надо просить заново, а он уже
+        // просил и ждёт.
+        //
+        // Чинится это тем же, чем впуск: отдать ему то, что получает
+        // впущенный. Дважды отданное безвредно — состав пополняется
+        // меткой, ключ и документ он применит или отвергнет как
+        // устаревшие, — а не отданное не появится уже никогда.
         if state.group.contains(&peer_ik) {
+            // **Вступление тоже заново.** Оно везёт цепочку отправителя
+            // (§11.5), а без неё вернувшийся не откроет ни ключа чтения,
+            // ни документа: блоки владельца запечатаны, и цепочка —
+            // единственное, чем они открываются до того, как появится
+            // ключ. Своя метка в составе от повтора не портится: состав
+            // — OR-множество, новая метка ложится рядом со старой.
+            match self.join_channel_reader(now_ms, chat, peer_ik).and_then(|mut again| {
+                again.extend(self.give_a_reader_what_he_needs(now_ms, chat, peer_ik)?);
+                Ok(again)
+            }) {
+                Ok(again) => effects.extend(again),
+                Err(error) => tracing::debug!(?error, "вернувшемуся не отдать канал"),
+            }
             return Ok(effects);
         }
 
@@ -1353,81 +1379,15 @@ impl<S: Store> Engine<S> {
         if !self.right_holds(now_ms, chat, &me, channel::Rights::ADMIT)? {
             return Err(EngineError::NotAllowedInChannel);
         }
+        // Поколение спрашивается **до** отдачи: `NoReadKeyYet` — отказ
+        // команде, и приходить он обязан раньше, чем что-то уедет.
+        // Ниже то же поколение понадобится записи о впуске (§6.5).
         let Some(current) = self.store.archive_keys(&chat)?.pop() else {
             return Err(EngineError::NoReadKeyYet);
         };
 
         let mut effects = self.join_channel_reader(now_ms, chat, peer_ik)?;
-
-        // **Представление — нынешнее, и отдаёт его впуск.**
-        //
-        // `join_member` отдаёт новичку всё групповое: состав, карточки,
-        // цепочки, название и породу. Канального в этом нет ничего:
-        // права, цена слова и окно сидирования живут **в документе**,
-        // а документ едет отдельным действием и только при правке (см.
-        // `publish_representation`).
-        //
-        // Пока его не отдавали здесь, впущенный видел канал без породы,
-        // с нулевой версией и без единого права — включая право, которое
-        // владелец выдал ему **до** впуска. Документ приезжал только
-        // со следующей правкой, то есть у канала, который никто не правит,
-        // не приезжал никогда. Нашёл это стенд: «каналы создаются,
-        // а обмена сведениями о них нет».
-        //
-        // Едет он **тем же действием**, каким едут новые версии, и потому
-        // проходит тот же приём: подпись владельца, правило перехода,
-        // порог версии из ссылки (§10.3). Своего пути для «первой копии»
-        // не заводится — разойдись они, первая копия однажды принималась
-        // бы по более слабому правилу, чем все последующие.
-        let stored = self.store.channel(&chat)?.ok_or(EngineError::UnknownGroup)?;
-        let document = ratatosk_proto::group_action::Action::Representation {
-            bytes: ratatosk_codec::canonical::encode(&channel::wire_value(
-                stored.block_bytes,
-                &stored.signature,
-            ))?,
-        };
-        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &document)?;
-        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
-
-        // Ключ — **запечатанным**, тем же блоком, что и при повороте
-        // (§5.3): у нас с ним есть сессия, но форма одна на оба случая,
-        // и второй дороги ключу заводить незачем.
-        let sealed = ratatosk_crypto::seal::seal_to_static(&peer_ik, &current.key)
-            .map_err(|_| EngineError::UnknownPeer)?;
-        let key_action = ratatosk_proto::group_action::Action::ArchiveKey {
-            generation: current.generation,
-            recipient_ik: peer_ik,
-            sealed,
-        };
-        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &key_action)?;
-        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
-
-        // **Каталог — вместе с впуском** (§7.5, §7.4 шаг 1: «представление
-        // и `PeerRecord`ы — чтобы было у кого спрашивать»).
-        //
-        // Нашёл это замер: появление новичка в канале с сидом стоило
-        // ровно столько же, сколько без сида, — он не привязывался
-        // ни к кому. Записи каталога развозятся, когда сид объявляется
-        // или продлевает запись (раз в несколько суток), а впущенный
-        // между этими событиями не узнавал о сидах до следующего
-        // продления. Снаружи это выглядело как «рой работает только
-        // для тех, кто пришёл раньше сида».
-        //
-        // Едет тем же действием, что и развоз: подпись внутри — самого
-        // сида, и впущенный проверит её сам, когда узнает его карточку.
-        for seed in self.store.seeds(&chat)? {
-            if seed.valid_until_ms <= now_ms || seed.ik == peer_ik {
-                continue;
-            }
-            let record = ratatosk_proto::group_action::Action::SeedRecord {
-                bytes: ratatosk_codec::canonical::encode(&ratatosk_proto::swarm::wire_value(
-                    seed.record_bytes.clone(),
-                    &seed.signature,
-                ))?,
-            };
-            let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &record)?;
-            effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
-        }
+        effects.extend(self.give_a_reader_what_he_needs(now_ms, chat, peer_ik)?);
 
         // Запись о впуске — **всем**, а не только впущенному: это учёт,
         // и смотрит в него владелец.
@@ -1482,6 +1442,120 @@ impl<S: Store> Engine<S> {
             who: peer_ik,
             admitted_by: me,
         }));
+        Ok(effects)
+    }
+
+    /// Отдаёт читателю всё, чем канал читается: документ, ключ, каталог.
+    ///
+    /// # Зачем отдельно от впуска
+    ///
+    /// Затем, что звать это приходится **дважды**. Первый раз — впуском
+    /// (§10.4): новичок получает канал целиком. Второй — когда тот же
+    /// человек просится снова, а у владельца он **всё ещё в составе**:
+    /// он отписался (§10.6), блок ухода не доехал, и два взгляда
+    /// на состав разошлись. Молчать в ответ значит оставить его
+    /// с пустым каналом навсегда.
+    ///
+    /// # Дважды отданное безвредно
+    ///
+    /// Документ он применит или отвергнет как устаревший (`version`
+    /// не растёт — приём отвергает сам), ключ ляжет тем же поколением,
+    /// записи каталога — по сроку. Ничего из этого не портится
+    /// от повтора; а вот неотданное не появится уже никогда.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NoReadKeyYet`] — поколения ключа чтения ещё нет;
+    /// отказ хранилища или сборки блока.
+    fn give_a_reader_what_he_needs(
+        &mut self,
+        now_ms: u64,
+        chat: ChatId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(current) = self.store.archive_keys(&chat)?.pop() else {
+            return Err(EngineError::NoReadKeyYet);
+        };
+
+        // **Сперва карточка** (§11.5). Всё, что едет ниже, подписано
+        // нами, а проверяется ключом из неё: нет карточки — и документ,
+        // и ключ чтения откладываются навсегда, то есть канал у человека
+        // остаётся пустым.
+        //
+        // Впущенному впервые её отдаёт вступление, а **вернувшемуся —
+        // никто**: отписка (§10.6) забывает владельца вместе с подпиской,
+        // а из ссылки приезжают одни адреса — подписи в ней нет (§10.2).
+        // Живой прогон описал это как «представление не загружается».
+        let card = self.own_card().encode()?;
+        let signature = self.identity.sign(&card);
+        let (_, mut effects) = self.enqueue_request(
+            now_ms,
+            peer_ik,
+            PayloadType::CardUpdate,
+            ratatosk_proto::card_update::payload(&card, &signature),
+        )?;
+
+        // **Представление — нынешнее.**
+        //
+        // Права, цена слова и окно сидирования живут **в документе**,
+        // а документ едет отдельным действием и только при правке (см.
+        // `publish_representation`). Пока его не отдавали здесь, впущенный
+        // видел канал без породы, с нулевой версией и без единого права —
+        // включая право, которое владелец выдал ему **до** впуска.
+        // Документ приезжал только со следующей правкой, то есть
+        // у канала, который никто не правит, не приезжал никогда.
+        //
+        // Едет он **тем же действием**, каким едут новые версии, и потому
+        // проходит тот же приём: подпись владельца, правило перехода,
+        // порог версии из ссылки (§10.3). Своего пути для «первой копии»
+        // не заводится — разойдись они, первая копия однажды принималась
+        // бы по более слабому правилу, чем все последующие.
+        let stored = self.store.channel(&chat)?.ok_or(EngineError::UnknownGroup)?;
+        let document = ratatosk_proto::group_action::Action::Representation {
+            bytes: ratatosk_codec::canonical::encode(&channel::wire_value(
+                stored.block_bytes,
+                &stored.signature,
+            ))?,
+        };
+        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &document)?;
+        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+
+        // Ключ — **запечатанным**, тем же блоком, что и при повороте
+        // (§5.3): у нас с ним есть сессия, но форма одна на оба случая,
+        // и второй дороги ключу заводить незачем.
+        let sealed = ratatosk_crypto::seal::seal_to_static(&peer_ik, &current.key)
+            .map_err(|_| EngineError::UnknownPeer)?;
+        let key_action = ratatosk_proto::group_action::Action::ArchiveKey {
+            generation: current.generation,
+            recipient_ik: peer_ik,
+            sealed,
+        };
+        let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &key_action)?;
+        effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+
+        // **Каталог — вместе с впуском** (§7.5, §7.4 шаг 1: «представление
+        // и `PeerRecord`ы — чтобы было у кого спрашивать»).
+        //
+        // Нашёл это замер: появление новичка в канале с сидом стоило
+        // ровно столько же, сколько без сида, — он не привязывался
+        // ни к кому. Записи каталога развозятся, когда сид объявляется
+        // или продлевает запись (раз в несколько суток), а впущенный
+        // между этими событиями не узнавал о сидах до следующего
+        // продления. Снаружи это выглядело как «рой работает только
+        // для тех, кто пришёл раньше сида».
+        for seed in self.store.seeds(&chat)? {
+            if seed.valid_until_ms <= now_ms || seed.ik == peer_ik {
+                continue;
+            }
+            let record = ratatosk_proto::group_action::Action::SeedRecord {
+                bytes: ratatosk_codec::canonical::encode(&ratatosk_proto::swarm::wire_value(
+                    seed.record_bytes.clone(),
+                    &seed.signature,
+                ))?,
+            };
+            let (msg_id, _, bytes) = self.seal_group_action(now_ms, chat, &record)?;
+            effects.extend(self.send_group_copy(now_ms, msg_id, peer_ik, &bytes)?);
+        }
         Ok(effects)
     }
 

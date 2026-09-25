@@ -1093,6 +1093,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_air_refuses_to_carry_the_archive() {
+        // §8.4 оставляет эфиру **хвост**, а не историю: 9–12 КБ/с,
+        // и мебибайт занял бы канал на полторы минуты, пока живая лента
+        // стоит за ним в очереди.
+        //
+        // Ступени здесь перечислены **поимённо**, а не выведены
+        // из `is_direct` или скорости: появится седьмая — и проверка
+        // обязана заставить назвать её, а не промолчать, приписав
+        // новичку чужое правило.
+        use crate::transport_policy::Transport;
+
+        assert!(!carries_archive(Transport::Bt), "эфир архива не возит");
+        for via in
+            [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Nostr, Transport::Mail]
+        {
+            assert!(carries_archive(via), "{via:?} архив возит");
+        }
+    }
+
+    #[test]
     fn a_hole_in_the_middle_is_asked_for_and_the_covered_part_is_not() {
         // §7.3: «узел, имеющий 46 и 48, знает, что 47 существует».
         // Знание превращается в просьбу ровно здесь.

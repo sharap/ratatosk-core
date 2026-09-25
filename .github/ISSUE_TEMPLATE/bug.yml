@@ -1,0 +1,55 @@
+name: Поломка
+description: Что-то работает не так, как обещано
+labels: [поломка]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Прежде чем писать: «работает через раз» — самая частая и самая
+        дорогая формулировка в этом проекте. Если удалось нащупать,
+        **при каком условии** работает, а при каком нет, — это половина
+        разбора.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что вы делали, что ожидали увидеть и что увидели.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Как повторить
+      description: |
+        По шагам. Сколько устройств участвовало, кто кому был контактом,
+        кто был объявленным сидом, какая ступень связи была жива.
+        Поломки этого дерева чаще всего живут **между** двумя исправными
+        частями, и состав участников важнее, чем кажется.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия
+      description: Коммит или тег, на котором воспроизвелось.
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Где
+      multiple: true
+      options:
+        - Android
+        - десктоп
+        - CLI-стенд (crates/lab)
+        - прогон тестов
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Журнал
+      description: Если есть. Ключей и открытого текста в нём быть не должно.
+      render: text

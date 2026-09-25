@@ -476,7 +476,7 @@ mod tests {
             .lines()
             .skip(1)
             .filter(|line| !line.trim().is_empty())
-            .filter(|line| line.splitn(8, ',').nth(6) == Some("FALSE"))
+            .filter(|line| line.split(',').nth(6) == Some("FALSE"))
             .count();
         assert_eq!(refusing, 10, "негодных векторов в наборе не столько");
     }

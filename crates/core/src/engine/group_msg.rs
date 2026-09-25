@@ -9,6 +9,11 @@
 
 use super::*;
 
+/// Что осталось от группового кадра, когда его открыли: чат, автор
+/// и содержимое. `Zeroizing` здесь не украшение — открытый текст обязан
+/// стереться, когда его положили в базу.
+type OpenedGroupFrame = (ChatId, ActorId, zeroize::Zeroizing<Vec<u8>>);
+
 impl<S: Store> Engine<S> {
     /// Едет ли кадр такого типа копией каждому участнику группы (§11.3).
     ///
@@ -1202,7 +1207,7 @@ impl<S: Store> Engine<S> {
         now_ms: u64,
         peer_ik: [u8; 32],
         envelope: &Envelope,
-    ) -> Result<Option<(ChatId, ActorId, zeroize::Zeroizing<Vec<u8>>)>, EngineError> {
+    ) -> Result<Option<OpenedGroupFrame>, EngineError> {
         let Ok(unchecked) = group::parse_message(&envelope.payload) else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(None);
@@ -1453,7 +1458,7 @@ impl<S: Store> Engine<S> {
         chat: ChatId,
         sender: ActorId,
         counter: u64,
-    ) -> Result<Option<(ChatId, ActorId, zeroize::Zeroizing<Vec<u8>>)>, EngineError> {
+    ) -> Result<Option<OpenedGroupFrame>, EngineError> {
         let Ok(unchecked) = group::parse_message(&envelope.payload) else {
             self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
             return Ok(None);

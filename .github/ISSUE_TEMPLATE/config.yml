@@ -1,0 +1,4 @@
+# Пункт «Report a vulnerability» GitHub показывает сам, раз в дереве
+# есть SECURITY.md и включены advisories. Второй ссылкой его
+# не дублируем — разошлись бы.
+blank_issues_enabled: true

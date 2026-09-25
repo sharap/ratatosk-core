@@ -1599,6 +1599,12 @@ impl LeaveConsequences {
 
 #[cfg(test)]
 mod tests {
+    // Утверждение о константе здесь не бессмысленно, как думает clippy,
+    // а составляет половину проверки: §14 требует, чтобы обещание текста
+    // не расходилось со свойством протокола, и держится это тем, что
+    // свойство **названо константой**, а текст её пересказывает. Убери
+    // строку — и останется проверка слов, не привязанная ни к чему.
+    #![allow(clippy::assertions_on_constants)]
     use super::*;
 
     const OWNER: ActorId = [1u8; 32];
@@ -1743,7 +1749,10 @@ mod tests {
         g.apply(g.invite(third, tag(3, OWNER, 2)).unwrap());
 
         let kick_third = g.evict(OWNER, third).unwrap();
-        assert!(removal_allowed(OWNER, OWNER, &[kick_third.clone()]), "создателю можно");
+        assert!(
+            removal_allowed(OWNER, OWNER, std::slice::from_ref(&kick_third)),
+            "создателю можно"
+        );
         assert!(!removal_allowed(OTHER, OWNER, &[kick_third]), "участнику чужое — нельзя");
     }
 
@@ -2428,7 +2437,7 @@ mod tests {
         });
         let forged = forge(&message, &moved, &sender);
         assert!(
-            matches!(parse_message(&forged).unwrap().verify(&sender.public()), Err(_)),
+            parse_message(&forged).unwrap().verify(&sender.public()).is_err(),
             "сдвинутая метка обязана ломать подпись"
         );
 
@@ -2439,7 +2448,7 @@ mod tests {
         });
         let forged = forge(&message, &renamed, &sender);
         assert!(
-            matches!(parse_message(&forged).unwrap().verify(&sender.public()), Err(_)),
+            parse_message(&forged).unwrap().verify(&sender.public()).is_err(),
             "подменённый номер обязан ломать подпись"
         );
     }

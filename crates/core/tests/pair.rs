@@ -1,3 +1,8 @@
+// Утверждение о константе — половина проверки, а не тавтология: §14
+// требует, чтобы текст не расходился со свойством протокола, и свойство
+// для того и названо константой, чтобы её можно было сверить.
+#![allow(clippy::assertions_on_constants)]
+
 //! Два ядра, говорящие друг с другом напрямую.
 //!
 //! Тест соединяет два [`Engine`] проводом из десяти строк: всё, что одно
@@ -967,7 +972,7 @@ fn a_text_at_the_very_limit_still_crosses_the_air() {
 
     // Ровно предел, ни байтом меньше: именно его и берёт замер.
     let limit = files::MAX_TEXT_BYTES;
-    let long: String = std::iter::repeat('щ').take(limit / 'щ'.len_utf8()).collect();
+    let long: String = "щ".repeat(limit / 'щ'.len_utf8());
     assert!(long.len() <= limit, "текст замера обязан влезать в предел");
     assert!(limit - long.len() < 'щ'.len_utf8(), "и быть у самого предела");
 
@@ -7798,7 +7803,7 @@ fn a_newcomer_gets_the_representation_as_it_stands_now() {
     // то есть у канала, который никто не правит, не приезжал никогда.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
 
     let chat = create_channel_for(&mut alice, 2_000, "лента", false);
@@ -7859,7 +7864,7 @@ fn a_channel_announces_itself_as_a_channel_to_the_one_admitted() {
     // ключ чтения.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
     let chat = create_channel_for(&mut alice, 2_000, "лента", false);
 
@@ -7893,7 +7898,7 @@ fn a_group_still_announces_itself_as_a_group() {
     // по профилю не должна задеть фазу 1.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
 
     let chat = alice
@@ -7938,9 +7943,9 @@ fn readers_of_a_channel_do_not_learn_about_each_other() {
     let mut carol = node(3, "carol");
     introduce(&mut alice, &mut bob);
     introduce(&mut alice, &mut carol);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
-    let effects = send_text(&mut alice, &mut carol, 1_100, "привет");
+    let effects = send_text(&mut alice, &carol, 1_100, "привет");
     pump(&mut alice, &mut carol, 1_100, effects);
 
     let chat = create_channel_for(&mut alice, 2_000, "лента", false);
@@ -8532,7 +8537,7 @@ fn a_request_for_a_channel_we_do_not_own_is_ignored() {
     let mut carol = node(3, "carol");
     let chat = shared_channel(&mut alice, &mut bob, 1_000, false);
     introduce(&mut bob, &mut carol);
-    let effects = send_text(&mut bob, &mut carol, 2_000, "привет");
+    let effects = send_text(&mut bob, &carol, 2_000, "привет");
     pump(&mut bob, &mut carol, 2_000, effects);
 
     // Ссылка врёт про владельца: там стоит Боб, который всего лишь читатель.
@@ -8654,7 +8659,7 @@ fn a_link_subscriber_hears_nothing_until_the_owner_admits_him() {
     // рой: тогда её надо переписать, а не подпереть.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
 
     let chat = create_channel_for(&mut alice, 2_000, "лента", true);
@@ -8715,7 +8720,7 @@ fn waiting_stops_being_waiting_when_the_read_key_arrives() {
     let link = alice.channel_link(chat).expect("ссылка");
 
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 2_000, "привет");
+    let effects = send_text(&mut alice, &bob, 2_000, "привет");
     pump(&mut alice, &mut bob, 2_000, effects);
 
     bob.step(5_000, Input::Command(Command::SubscribeToChannel { uri: link })).expect("подписка");
@@ -8818,7 +8823,7 @@ fn a_representation_older_than_the_link_promised_is_not_taken() {
     // говорит, что её поля заполняет делящийся, а не владелец.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
 
     // **Канал по приглашению, а не открытый, и это не выбор удобства.**
@@ -8847,7 +8852,7 @@ fn a_representation_older_than_the_link_promised_is_not_taken() {
     // §10.4 велит владельцу впустить по заявке, а самой заявки пока нет.
     let mut carol = node(3, "carol");
     introduce(&mut alice, &mut carol);
-    let effects = send_text(&mut alice, &mut carol, 4_000, "привет");
+    let effects = send_text(&mut alice, &carol, 4_000, "привет");
     pump(&mut alice, &mut carol, 4_000, effects);
     carol
         .step(5_000, Input::Command(Command::SubscribeToChannel { uri: promised }))
@@ -9144,7 +9149,7 @@ fn a_delegate_admits_and_the_owner_sees_whose_trace_it_is() {
     let mut carol = node(3, "carol");
     let chat = shared_channel(&mut alice, &mut bob, 1_000, false);
     introduce(&mut bob, &mut carol);
-    let effects = send_text(&mut bob, &mut carol, 2_000, "привет");
+    let effects = send_text(&mut bob, &carol, 2_000, "привет");
     pump(&mut bob, &mut carol, 2_000, effects);
     introduce(&mut alice, &mut carol);
 
@@ -9194,7 +9199,7 @@ fn an_invitation_is_refused_in_a_channel() {
     // ему не покажет: ключа ему никто не дал.
     let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
     introduce(&mut alice, &mut bob);
-    let effects = send_text(&mut alice, &mut bob, 1_000, "привет");
+    let effects = send_text(&mut alice, &bob, 1_000, "привет");
     pump(&mut alice, &mut bob, 1_000, effects);
     let chat = create_channel_for(&mut alice, 2_000, "лента", false);
 
@@ -9245,7 +9250,7 @@ fn those_admitted_stay_after_the_right_is_taken_away() {
     let mut carol = node(3, "carol");
     let chat = shared_channel(&mut alice, &mut bob, 1_000, false);
     introduce(&mut bob, &mut carol);
-    let effects = send_text(&mut bob, &mut carol, 2_000, "привет");
+    let effects = send_text(&mut bob, &carol, 2_000, "привет");
     pump(&mut bob, &mut carol, 2_000, effects);
     introduce(&mut alice, &mut carol);
 

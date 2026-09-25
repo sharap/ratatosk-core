@@ -22,6 +22,10 @@ use ratatosk_proto::swarm::{self, PeerRecord, Seeding, Sharing};
 
 use super::*;
 
+/// Как дерево раздачи поделилось (§7.1): кому шлём блок целиком
+/// и кому — только зов.
+type SplitTree = (Vec<[u8; 32]>, Vec<[u8; 32]>);
+
 impl<S: Store> Engine<S> {
     /// Наше участие в раздаче этого чата (§7.5.1).
     ///
@@ -344,6 +348,7 @@ impl<S: Store> Engine<S> {
     /// * срок: протухшую не берём вовсе, а слишком долгую **подрезаем**.
     ///   Запись «годна до три тысячи двадцатого года» иначе осталась бы
     ///   в каталоге навсегда: уборка ходит по сроку.
+    ///
     /// Есть ли в каталоге этого канала место под ещё одну запись (§7.5).
     ///
     /// Уже известному раздающему место есть всегда: продление записи
@@ -468,7 +473,7 @@ impl<S: Store> Engine<S> {
             // второго места, где он живёт, нет. Нет записи вовсе — значит
             // её унесла уборка, и объявиться надо заново.
             let mine = self.store.seeds(&chat)?.into_iter().find(|seed| seed.ik == me);
-            let due = mine.map_or(true, |seed| {
+            let due = mine.is_none_or(|seed| {
                 seed.valid_until_ms <= now_ms.saturating_add(swarm::RENEW_AHEAD_MS)
             });
             if due {
@@ -1107,7 +1112,7 @@ impl<S: Store> Engine<S> {
         now_ms: u64,
         chat: ChatId,
         own: bool,
-    ) -> Result<(Vec<[u8; 32]>, Vec<[u8; 32]>), EngineError> {
+    ) -> Result<SplitTree, EngineError> {
         let candidates = self.push_candidates(chat, own)?;
         // **Вопрос здесь один: есть ли у ленивого второй путь.** Ленивый
         // получает зов вместо блока и ждёт, что блок придёт иначе; нет

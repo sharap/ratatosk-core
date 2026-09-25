@@ -18,3 +18,8 @@ __pycache__/
 *.sqlite-shm
 /fuzz/artifacts/
 /fuzz/corpus/
+
+# GitHub и редакторы
+.DS_Store
+/.idea/
+/.vscode/

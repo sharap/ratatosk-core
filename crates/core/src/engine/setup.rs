@@ -922,8 +922,6 @@ impl<S: Store> Engine<S> {
     #[must_use = "не исполнив их, транспорты останутся выключенными, \
                   а недоделанные доставки — недоделанными"]
     pub fn startup_effects(&mut self) -> Vec<Effect> {
-        let mut effects = Vec::new();
-
         // **Сперва настройки, потом выключатели**, и порядок здесь стоил
         // отдельного разбора. Раннер поднимается по той настройке, которая
         // у него есть на момент включения. Приди «включить» раньше — он
@@ -935,9 +933,11 @@ impl<S: Store> Engine<S> {
         // и чинится он выключением и включением руками. То есть настройка
         // была на диске, была в ядре, доехала до раннера — и всё равно
         // не действовала, потому что доехала второй.
-        effects.push(Effect::SetMailAccount(self.mail.clone()));
-        effects.push(Effect::SetYgg(self.ygg_setup()));
-        effects.push(Effect::SetNostr(self.nostr_setup()));
+        let mut effects = vec![
+            Effect::SetMailAccount(self.mail.clone()),
+            Effect::SetYgg(self.ygg_setup()),
+            Effect::SetNostr(self.nostr_setup()),
+        ];
         // Список маяков — тоже настройка, и тоже вперёд выключателей.
         // Отправляется **без оглядки** на то, включена ли локальная сеть:
         // список чистый, ничего не занимает и не раскрывает, а раннер,

@@ -120,6 +120,10 @@ impl SqliteStore {
     }
 
     /// Собирает группу из прочитанной строки, расшифровывая название.
+    // Доводов восемь, потому что столько полей в строке. Свести их
+    // в структуру значило бы завести второе описание той же строки
+    // и следить, чтобы оно не разошлось с `SELECT`, — цена выше пользы.
+    #[allow(clippy::too_many_arguments)]
     fn group_row(
         &self,
         chat_id: [u8; 16],
@@ -2204,7 +2208,7 @@ impl Store for SqliteStore {
         )?;
         let mut rows = statement.query(rusqlite::params![&chat_id[..], &msg_id[..]])?;
         let Some(row) = rows.next()? else { return Ok(None) };
-        Ok(archived_from_row(row)?)
+        archived_from_row(row)
     }
 
     fn archived_range(

@@ -856,9 +856,8 @@ impl<S: Store> Engine<S> {
         // добираться до истории и ждать там нажатия, которое всё равно
         // ничем не кончится.
         let (card_bytes, card, forwarded) =
-            ratatosk_proto::contact_share::from_payload(&envelope.payload).map_err(|e| {
+            ratatosk_proto::contact_share::from_payload(&envelope.payload).inspect_err(|_| {
                 self.sessions.note_anomaly(peer_ik, |c| c.malformed += 1);
-                e
             })?;
         // Ключи обязаны складываться в отпечаток: карточка с мусором вместо
         // `SK` не добавится никогда, и держать её в истории незачем.

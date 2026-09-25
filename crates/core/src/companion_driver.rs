@@ -1333,7 +1333,7 @@ impl<R: Runner> CompanionDriver<R> {
                         }
                     }
                 }
-                let Some(sending) = self.sending.as_mut() else { return None };
+                let sending = self.sending.as_mut()?;
                 use std::io::{Seek, SeekFrom};
                 // **Смещение и длина — от терминала, а не свои.** Нарезку
                 // назначает телефон и он же сверяет длину каждого куска:

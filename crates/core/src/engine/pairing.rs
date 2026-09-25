@@ -97,10 +97,8 @@ impl<S: Store> Engine<S> {
                 // перерисует один кружок, а не перечитает весь список.
                 // Та же новость, что у лица контакта, и намеренно: снаружи
                 // это один вопрос — «что рисовать в кружке этого чата».
-                Event::GroupAvatarChanged { chat } => {
-                    if !group_avatars.contains(chat) {
-                        group_avatars.push(*chat);
-                    }
+                Event::GroupAvatarChanged { chat } if !group_avatars.contains(chat) => {
+                    group_avatars.push(*chat);
                 }
                 _ => {}
             }

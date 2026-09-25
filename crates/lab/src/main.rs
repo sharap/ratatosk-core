@@ -1247,7 +1247,7 @@ impl Console {
         if let Some(rest) = line.strip_prefix("/save ") {
             let words: Vec<&str> = rest.split_whitespace().collect();
             let (picked, path) = match words.as_slice() {
-                [n, path] => (format!("{n}"), *path),
+                [n, path] => ((*n).to_string(), *path),
                 [n, k, path] => (format!("{n} {k}"), *path),
                 _ => {
                     println!("< /save <номер строки> [номер вложения] <путь без пробелов>");

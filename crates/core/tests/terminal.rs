@@ -1,3 +1,7 @@
+// Кортеж в проверке читается на месте, а имя пришлось бы искать: в теле
+// сценария видно, что именно вернули, и это дороже краткости подписи.
+#![allow(clippy::type_complexity)]
+
 //! Телефон и десктоп — обе стороны настоящие (§13.4).
 //!
 //! Отличие от `companion.rs` в том, кто на другом конце. Там десктоп собран
@@ -1326,13 +1330,10 @@ fn upload_many(
     let mut shown = pump(phone, desktop, now_ms, started);
     // Терминал просит куски по одному — отдаём, пока просит. Какого файла,
     // говорит он сам: угадывать по имени нельзя, имена вправе совпадать.
-    loop {
-        let Some((which, index)) = shown.iter().rev().find_map(|event| match event {
-            ClientEvent::NeedChunk { which, index, .. } => Some((*which as usize, *index)),
-            _ => None,
-        }) else {
-            break;
-        };
+    while let Some((which, index)) = shown.iter().rev().find_map(|event| match event {
+        ClientEvent::NeedChunk { which, index, .. } => Some((*which as usize, *index)),
+        _ => None,
+    }) {
         let bytes = files[which].1;
         let at = index as usize * files::CHUNK_BYTES;
         let end = (at + files::CHUNK_BYTES).min(bytes.len());
@@ -1636,13 +1637,10 @@ fn finish_upload(
     files: &[(&str, &[u8])],
     mut shown: Vec<ClientEvent>,
 ) -> Vec<ClientEvent> {
-    loop {
-        let Some((which, index)) = shown.iter().rev().find_map(|event| match event {
-            ClientEvent::NeedChunk { which, index, .. } => Some((*which as usize, *index)),
-            _ => None,
-        }) else {
-            break;
-        };
+    while let Some((which, index)) = shown.iter().rev().find_map(|event| match event {
+        ClientEvent::NeedChunk { which, index, .. } => Some((*which as usize, *index)),
+        _ => None,
+    }) {
         let bytes = files[which].1;
         let at = index as usize * files::CHUNK_BYTES;
         let end = (at + files::CHUNK_BYTES).min(bytes.len());

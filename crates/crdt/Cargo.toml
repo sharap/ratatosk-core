@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Порядок и слияние состояния без сервера: HLC, OR-Set, окно дедупликации (§9, §11.2, §12)"
 
 # Зависимостей нет сознательно: это чистые структуры данных, и на них держатся

@@ -728,12 +728,11 @@ impl<S: Store> Engine<S> {
             // следующей смены картинки, которую владелец развезёт сам.
             let owner_speaks =
                 self.groups.get(&intro.group).is_some_and(|state| state.group.owner == peer_ik);
-            if owner_speaks && intro.avatar_hlc != Hlc::default() {
-                if self.apply_group_avatar(intro.group, &intro.avatar, intro.avatar_hlc)? {
-                    return Ok(vec![Effect::Notify(Event::GroupAvatarChanged {
-                        chat: intro.group,
-                    })]);
-                }
+            if owner_speaks
+                && intro.avatar_hlc != Hlc::default()
+                && self.apply_group_avatar(intro.group, &intro.avatar, intro.avatar_hlc)?
+            {
+                return Ok(vec![Effect::Notify(Event::GroupAvatarChanged { chat: intro.group })]);
             }
             return Ok(Vec::new());
         }

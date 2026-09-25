@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 description = "Стенд для проверки работы на живой сети: два узла, LAN, текст 1:1"
 
 # Стенд, а не продукт. Он существует ровно затем, чтобы проверять

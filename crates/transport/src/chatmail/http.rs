@@ -114,7 +114,7 @@ fn body_of(response: &[u8]) -> Result<Vec<u8>, HttpError> {
 
     // Заголовки — текст; тело может быть чем угодно, поэтому режется байтами.
     let head = core::str::from_utf8(&response[..head_end]).map_err(|_| HttpError::NotHttp)?;
-    let mut lines = head.split(|c| c == '\n').map(|line| line.trim_end_matches('\r'));
+    let mut lines = head.split('\n').map(|line| line.trim_end_matches('\r'));
 
     let status = lines.next().ok_or(HttpError::NotHttp)?;
     let code = status_code(status)?;

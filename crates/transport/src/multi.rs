@@ -152,7 +152,7 @@ impl<L: Runner, B: Runner, Y: Runner, O: Runner, N: Runner, M: Runner>
         &self.mail
     }
 
-    async fn to_one(
+    async fn send_to_one(
         &mut self,
         via: Transport,
         command: TransportCommand,
@@ -181,7 +181,7 @@ impl<L: Runner, B: Runner, Y: Runner, O: Runner, N: Runner, M: Runner>
     /// а сведение о составе. Считай мы иначе, каждое `Disconnect` возвращало бы
     /// ошибку, пока onion и почта не написаны, — и в журнале завёлся бы шум,
     /// в котором потом потерялся бы настоящий отказ.
-    async fn to_all(&mut self, command: TransportCommand) -> Result<(), TransportError> {
+    async fn send_to_all(&mut self, command: TransportCommand) -> Result<(), TransportError> {
         let mut failure = None;
         for via in [
             Transport::Lan,
@@ -191,7 +191,7 @@ impl<L: Runner, B: Runner, Y: Runner, O: Runner, N: Runner, M: Runner>
             Transport::Nostr,
             Transport::Mail,
         ] {
-            match self.to_one(via, command.clone()).await {
+            match self.send_to_one(via, command.clone()).await {
                 Ok(()) | Err(TransportError::Unavailable) => {}
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -213,18 +213,18 @@ impl<L: Runner, B: Runner, Y: Runner, O: Runner, N: Runner, M: Runner> Runner
             // Транспорт назван явно — §5.4 выбрал его и отвечает за выбор.
             TransportCommand::Send { via, .. } | TransportCommand::Connect { via, .. } => {
                 let via = *via;
-                self.to_one(via, command).await
+                self.send_to_one(via, command).await
             }
             // Транспорт назван полем — как и у отправки.
             TransportCommand::SetEnabled { transport, .. } => {
                 let transport = *transport;
-                self.to_one(transport, command).await
+                self.send_to_one(transport, command).await
             }
             // Список контактов — общий у обоих эфиров: и маяк mDNS (§5.1),
             // и объявление BLE (0.4) опознаются перебором одних и тех же
-            // `IK`. Кому он не нужен, тот отвечает `Unavailable`, а `to_all`
+            // `IK`. Кому он не нужен, тот отвечает `Unavailable`, а `send_to_all`
             // такой ответ отказом не считает.
-            TransportCommand::WatchPeers(_) => self.to_all(command).await,
+            TransportCommand::WatchPeers(_) => self.send_to_all(command).await,
             TransportCommand::SetMailAccount(_) | TransportCommand::CreateMailAccount { .. } => {
                 self.mail.execute(command).await
             }
@@ -234,17 +234,17 @@ impl<L: Runner, B: Runner, Y: Runner, O: Runner, N: Runner, M: Runner> Runner
             TransportCommand::SetNostr(_) => self.nostr.execute(command).await,
             // А тут `via` нет, и знать, кто держит соединение с этим
             // контактом, может только сам раннер.
-            TransportCommand::Disconnect { .. } => self.to_all(command).await,
+            TransportCommand::Disconnect { .. } => self.send_to_all(command).await,
             // Сеть сменилась у всех сразу, и каждая ступень решает сама,
             // что это для неё значит. Прежде команда звалась `RestartLan`
             // и доходила до одной — а остальные узнавали о смене сети
             // таймаутом на первой отправке.
-            TransportCommand::NetworkChanged => self.to_all(command).await,
+            TransportCommand::NetworkChanged => self.send_to_all(command).await,
             // Ступень названа полем: принятая связь принадлежит ей и только
             // ей. Раздавать всем нечего — номер связи у каждой ступени свой.
             TransportCommand::BindLink { via, .. } => {
                 let via = *via;
-                self.to_one(via, command).await
+                self.send_to_one(via, command).await
             }
         }
     }

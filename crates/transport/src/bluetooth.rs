@@ -98,6 +98,10 @@ pub struct BtConfig {
     pub enabled: bool,
 }
 
+// Выводить `Default` здесь нельзя, хотя значение то же: вывод унёс бы
+// ссылку на 0.4.2, а выключенность по умолчанию — требование спеки,
+// а не вкус. Правило без ссылки завтра «упростят».
+#[allow(clippy::derivable_impls)]
 impl Default for BtConfig {
     fn default() -> Self {
         // 0.4.2: «Ступень выключена по умолчанию.»
@@ -1329,12 +1333,16 @@ mod tests {
     /// **Ради него мост и писался так, как написан.** Настоящее радио есть
     /// только на устройстве, а мост — это правила: кто кому что говорит
     /// и в каком порядке. Правила проверяются здесь целиком, до всякого
+    /// Чем радио отчитывается об открытии: канал, адрес, наша ли это
+    /// сторона и класс кадра.
+    type OpenedCalls = Vec<(u64, Vec<u8>, bool, u16)>;
+
     /// телефона.
     #[derive(Default)]
     struct FakeRadio {
         started: AtomicBool,
         advertised: Mutex<Vec<Vec<u8>>>,
-        opened: Mutex<Vec<(u64, Vec<u8>, bool, u16)>>,
+        opened: Mutex<OpenedCalls>,
         written: Mutex<Vec<(u64, Vec<u8>)>>,
         closed: Mutex<Vec<u64>>,
         stopped: AtomicBool,
@@ -1416,7 +1424,7 @@ mod tests {
             let event = tokio::time::timeout(Duration::from_secs(5), bt.next_event())
                 .await
                 .expect("новость обязана прийти");
-            let Some(got) = event else { return None };
+            let got = event?;
             if want(&got) {
                 return Some(got);
             }
@@ -1744,7 +1752,7 @@ mod tests {
             wait_for(|| {
                 let written = radio.written.lock().expect("замок");
                 written.iter().map(|(_, bytes)| bytes.len()).sum::<usize>()
-                    >= SizeClass::S.frame_len() + 1
+                    > SizeClass::S.frame_len()
             })
             .await,
             "кадр обязан доехать до радио целиком"

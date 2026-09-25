@@ -2222,7 +2222,7 @@ impl<S: Store, R: Runner> Driver<S, R> {
                 None
             }
         };
-        let Some(command) = command else { return None };
+        let command = command?;
         let Err(error) = self.runner.execute(command).await else { return None };
 
         // Отказ транспорта — не отказ ядра: сообщение остаётся в очереди

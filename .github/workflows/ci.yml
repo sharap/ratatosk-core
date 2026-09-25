@@ -1,0 +1,68 @@
+# Лестница проверок из README, слово в слово. Порядок тот же и по той же
+# причине: `build` стоит рядом с `test`, а не вместо — `cargo test`
+# компилирует с `cfg(test)`, и вещь, которой пользуется только проверка,
+# выглядит использованной. Обычная сборка находит `dead_code` честно.
+name: проверки
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: тесты и сборка
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Версия и компоненты (rustfmt, clippy) объявлены
+      # в rust-toolchain.toml; `rustup show` их и ставит.
+      - name: тулчейн
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Живые ступени сидят за признаками (`bt`, `tor`, `mail`, `nostr`,
+      # `ygg-node`) и не входят в `default`. Правка в такой ветке проходит
+      # обычный прогон и ломает сборку тому, кто признак включит, — поэтому
+      # собирается и то и другое, а не только `default`.
+      - name: зависимости для признака bt
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: формат
+        run: cargo fmt --all --check
+
+      - name: тесты
+        run: cargo test --workspace
+
+      - name: сборка со всеми признаками
+        run: cargo build --workspace --all-features
+
+      - name: документация
+        run: cargo doc --workspace --all-features --no-deps
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Код возврата равен числу метёлок с находками. Молчание не считается
+      # чистотой: каждая метёлка печатает, сколько мест осмотрела.
+      - name: метёлки
+        run: python3 tools/sweeps/run_all.py
+
+  deny:
+    name: состав криптостека
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `native-tls` и OpenSSL запрещены в deny.toml намеренно: arti
+      # собирается с rustls, а OpenSSL пришлось бы кросс-компилировать
+      # под Android. Признаки взаимоисключающие, и выбор делается один раз.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

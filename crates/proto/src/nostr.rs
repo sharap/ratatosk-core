@@ -490,10 +490,8 @@ pub fn relay_target(url: &str) -> Option<RelayTarget> {
     // живёт в 2021.
     let (rest, tls, default_port) = if let Some(rest) = url.strip_prefix("wss://") {
         (rest, true, 443u16)
-    } else if let Some(rest) = url.strip_prefix("ws://") {
-        (rest, false, 80u16)
     } else {
-        return None;
+        (url.strip_prefix("ws://")?, false, 80u16)
     };
 
     let authority = rest.split(['/', '?', '#']).next()?;

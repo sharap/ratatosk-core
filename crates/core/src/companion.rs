@@ -1154,6 +1154,11 @@ pub enum ClientInput {
 }
 
 /// Что терминал просит сделать снаружи.
+// Разброс размеров вариантов намеренный. Боксировать крупный вариант
+// значило бы добавить разыменование в каждую разборку этого перечисления —
+// а их десятки, и все на горячем пути шага. Перечисление живёт в стеке
+// один шаг и не кладётся в длинные списки.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ClientEffect {
     /// Отправить кадр телефону.
@@ -2096,7 +2101,7 @@ impl CompanionClient {
             ))];
         }
 
-        let mut effects = self.from_cache(request);
+        let mut effects = self.cached_answer(request);
 
         // Телефон постарше про аватарки не знает и просьбу отбросит молча
         // (5бр). Ответ ему — тишина, а тишина здесь дороже, чем кажется:
@@ -2167,7 +2172,7 @@ impl CompanionClient {
     }
 
     /// Показывает то, что помним, — если помним хоть что-то.
-    fn from_cache(&self, request: &Request) -> Vec<ClientEffect> {
+    fn cached_answer(&self, request: &Request) -> Vec<ClientEffect> {
         match request {
             Request::Chats if !self.cache.chats().is_empty() => {
                 vec![ClientEffect::Show(ClientEvent::Chats {

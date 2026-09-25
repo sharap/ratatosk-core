@@ -581,7 +581,9 @@ mod tests {
         // Строка контрольной суммы начинается с `=`, и попади она в base64
         // — кадр приехал бы длиннее на три байта и не расшифровался.
         let frame = vec![1u8, 2u8, 3u8];
-        let letter = build_message("a@nine.example", "b@nine.example", &[frame.clone()]).unwrap();
+        let letter =
+            build_message("a@nine.example", "b@nine.example", std::slice::from_ref(&frame))
+                .unwrap();
         assert!(letter.contains("\r\n="), "броня обязана нести контрольную сумму");
         assert_eq!(parse_message(letter.as_bytes()).unwrap(), vec![frame]);
     }

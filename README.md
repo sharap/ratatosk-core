@@ -128,7 +128,13 @@ cargo build --workspace --all-features # предупреждений быть �
 cargo doc --workspace --all-features --no-deps
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
+cargo deny check                       # состав зависимостей и извещения RUSTSEC
 ```
+
+`cargo deny` ставится отдельно (`cargo install cargo-deny --locked`);
+в CI он идёт своей работой. Исключения в `deny.toml` — поимённо
+и с причиной, и у каждого записано, при каком условии строка
+снимается.
 
 Что каждая проверка держит и **чего в наборе честно нет** —
 в [`TESTING.md`](TESTING.md). Там же правило, по которому здесь живут:

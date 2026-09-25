@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Генератор биндингов UniFFI — инструмент сборки, не часть ядра"
 
 # Крейт существует ровно затем, чтобы признак `cli` не попадал в

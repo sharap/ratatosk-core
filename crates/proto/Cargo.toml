@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Протокольные конечные автоматы без ввода-вывода (§5.4, §9, §11)"
 
 # Крейт не знает ни про сокеты, ни про SQLite, ни про рантайм. Всё время

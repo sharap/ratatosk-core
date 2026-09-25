@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Ядро Ratatosk: sans-io Engine и драйвер (§13.3)"
 
 [dependencies]

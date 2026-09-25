@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Формат кадра Ratatosk v0.1: заголовок, классы размера, паддинг (§5.5, §7)"
 
 # Зависимостей нет и не должно появиться. Этот крейт описывает байты на проводе;

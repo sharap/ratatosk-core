@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Детерминированный CBOR, контакт-карточка, конверт сообщения (§4, §6, §9.1)"
 
 [dependencies]

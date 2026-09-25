@@ -2,8 +2,9 @@
 
 ## Куда
 
-Через **GitHub Security Advisories**: вкладка *Security* → *Report
-a vulnerability*. Так переписка остаётся закрытой, пока правка не выйдет.
+Через **GitHub Security Advisories**:
+<https://github.com/sharap/ratatosk-core/security/advisories/new>.
+Так переписка остаётся закрытой, пока правка не выйдет.
 
 Публичную задачу (issue) для уязвимости заводить не нужно. Если
 GitHub недоступен — напишите автору репозитория; адрес виден в истории

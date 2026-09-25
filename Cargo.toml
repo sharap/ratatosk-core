@@ -11,6 +11,7 @@ edition = "2021"
 rust-version = "1.85"
 publish = false
 license = "AGPL-3.0-only"
+repository = "https://github.com/sharap/ratatosk-core"
 
 # Версии сверены с crates.io на 15 августа 2026. Две из них выбраны НЕ по
 # принципу «самая свежая», и оба исключения отмечены на месте: rusqlite зажат

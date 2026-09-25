@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "UniFFI-граница ядра: Android и десктоп (§13.3)"
 
 # Cargo подбирает `src/bin/*.rs` сам, и генератор биндингов, однажды сюда

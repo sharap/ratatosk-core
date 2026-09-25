@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Детерминированная симуляция сети с виртуальным временем (§16)"
 
 # Зависимостей нет по принципиальной причине: харнесс, зависящий от рантайма,

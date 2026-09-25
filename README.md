@@ -128,8 +128,13 @@ cargo build --workspace --all-features # предупреждений быть �
 cargo doc --workspace --all-features --no-deps
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
-cargo deny check                       # состав зависимостей и извещения RUSTSEC
+cargo deny --all-features check        # состав зависимостей и извещения RUSTSEC
 ```
+
+**`--all-features` у `cargo deny` обязателен**, и это не симметрия ради
+красоты: половина ступеней сидит за признаками, и без них `webpki-roots`,
+Yggdrasil и часть графа arti в проверку не попадают. Без флага она зелена
+и не смотрит туда, где дерево живёт.
 
 `cargo deny` ставится отдельно (`cargo install cargo-deny --locked`);
 в CI он идёт своей работой. Исключения в `deny.toml` — поимённо

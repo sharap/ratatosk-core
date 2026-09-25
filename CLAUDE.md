@@ -62,7 +62,7 @@ python3 tools/sweeps/run_all.py          # код возврата = число 
 cargo build --workspace --all-features   # предупреждений быть не должно
 cargo doc --workspace --all-features --no-deps   # и здесь тоже
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo deny check                         # если правил зависимости
+cargo deny --all-features check          # если правил зависимости
 rustfmt --edition 2021 <изменённые файлы>
 ```
 

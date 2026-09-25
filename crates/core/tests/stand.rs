@@ -2164,6 +2164,111 @@ fn a_word_lost_by_the_tree_comes_back_from_a_seed() {
 }
 
 #[test]
+fn the_air_is_not_asked_for_the_archive() {
+    // **Вторая половина §8.4**, первый конец: «архив эфиром не просят».
+    // Эфир — 9–12 КБ/с, и мебибайт истории занял бы канал на полторы
+    // минуты, пока живая лента стоит за ним в очереди.
+    //
+    // Проверяется **сборка просьбы**, а не её исход: молчание в ответ
+    // и несобранная просьба снаружи выглядят одинаково, и отличить их
+    // можно только счётом видов (`swarm_controls_built`). Проверка
+    // на исход была написана первой и снята: она оставалась зелёной
+    // и со снятыми обеими строками.
+    let mut stand = Stand::strangers(0x0_A17, 2);
+    let chat = stand.create_channel(NodeId(0), "лента", true);
+    let link = stand.channel_link(NodeId(0), chat);
+    stand.say(NodeId(0), chat, "сказано до подписки");
+    stand.settle();
+    stand.subscribe(NodeId(1), &link);
+    stand.settle();
+
+    stand.air_only();
+    // Живая лента по эфиру ходит — §8.4 оставляет ему хвост. Без этой
+    // опоры «просьбы нет» было бы истинным на мёртвом канале.
+    stand.say(NodeId(0), chat, "живое слово");
+    stand.settle();
+    assert!(
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"живое слово".to_owned()),
+        "опора: хвост эфиром ходит; видно {:?}; сид {:#x}",
+        stand.sim.node(NodeId(1)).seen(chat),
+        stand.sim.seed()
+    );
+
+    let before = stand.sim.node(NodeId(1)).engine().swarm_controls_built("want");
+    stand.pull_older(NodeId(1), chat);
+    stand.settle();
+    let after = stand.sim.node(NodeId(1)).engine().swarm_controls_built("want");
+    assert_eq!(
+        after,
+        before,
+        "по эфиру просьба об архиве не собирается вовсе (§8.4); сид {:#x}",
+        stand.sim.seed()
+    );
+    // И вектор при этом уезжает: прокрутка не молчит, она упирается
+    // в ступень — а не ломается.
+    assert!(
+        stand.sim.node(NodeId(1)).engine().swarm_controls_built("have") > 0,
+        "опора: вектор по эфиру ходит, иначе проверка пуста; сид {:#x}",
+        stand.sim.seed()
+    );
+}
+
+#[test]
+fn the_air_does_not_answer_a_request_for_the_archive() {
+    // **Второй конец того же правила:** «архив эфиром… не отдают».
+    // Просящий по эфиру `Want` не собирает вовсе, значит обычным путём
+    // отдающего не проверить — просьбу приходится собрать руками
+    // (`send_swarm_control_unasked`).
+    //
+    // Сравниваются две раскладки, различающиеся **ровно ступенью**:
+    // по проводу та же просьба обязана принести блок, по эфиру — нет.
+    // Одной половины не хватило бы: «не принесло» само по себе
+    // объясняется и недоставкой.
+    let answered = |seed: u64, over_the_air: bool| -> bool {
+        let mut stand = Stand::strangers(seed, 2);
+        let chat = stand.create_channel(NodeId(0), "лента", true);
+        let link = stand.channel_link(NodeId(0), chat);
+        stand.say(NodeId(0), chat, "сказано до подписки");
+        stand.settle();
+        stand.subscribe(NodeId(1), &link);
+        stand.settle();
+        assert!(
+            !stand.sim.node(NodeId(1)).seen(chat).contains(&"сказано до подписки".to_owned()),
+            "опора: прошлого у читателя нет; сид {:#x}",
+            stand.sim.seed()
+        );
+        if over_the_air {
+            stand.air_only();
+        }
+
+        let author = stand.ik(NodeId(0));
+        let owner = author;
+        stand.sim.act(NodeId(1), |node, ctx| {
+            let now = ctx.now_ms();
+            let ask = ratatosk_proto::swarm::Control::Want {
+                group: chat,
+                author,
+                from_seq: 0,
+                to_seq: 64,
+            };
+            let effects = node
+                .engine_mut()
+                .send_swarm_control_unasked(now, owner, &ask)
+                .expect("просьба собралась");
+            node.apply(ctx, effects);
+        });
+        stand.settle();
+        stand.sim.node(NodeId(1)).seen(chat).contains(&"сказано до подписки".to_owned())
+    };
+
+    assert!(
+        answered(0x0_A19, false),
+        "опора: по проводу на просьбу отвечают, иначе проверка пуста"
+    );
+    assert!(!answered(0x0_A18, true), "архив эфиром не отдают (§8.4)");
+}
+
+#[test]
 fn the_sender_uploads_a_file_once_and_holders_spread_it() {
     // **То, с чего §9.1 начинается:** «отправитель выгружает файл
     // **один раз**, дальше куски расходятся между участниками. Было бы

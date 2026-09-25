@@ -1414,6 +1414,10 @@ impl<S: Store> Engine<S> {
         peer_ik: [u8; 32],
         control: &swarm::Control,
     ) -> Result<Vec<Effect>, EngineError> {
+        // Счёт видов — здесь и только здесь: это единственное место,
+        // где роевой кадр собирается, и потому единственное, где его
+        // вид ещё известен (§7.1, `Engine::swarm_controls`).
+        *self.swarm_controls.entry(control.label()).or_default() += 1;
         let (_, effects) =
             self.enqueue_request(now_ms, peer_ik, PayloadType::SwarmControl, control.value())?;
         Ok(effects)
@@ -2611,6 +2615,40 @@ impl<S: Store> Engine<S> {
         let (_, effects) =
             self.enqueue_request(now_ms, peer_ik, PayloadType::SwarmControl, call.value())?;
         Ok(effects)
+    }
+
+    /// Шлёт роевой кадр **не по правилам** — ради разбора.
+    ///
+    /// Нужна одной проверке: §8.4 запрещает отдавать архив эфиром,
+    /// и стережётся это **на обоих концах**. Просящий по эфиру `Want`
+    /// не собирает вовсе — значит отдающего обычным путём не проверить,
+    /// и просьбу приходится собрать руками.
+    ///
+    /// Границу UniFFI не пересекает (§13.3).
+    ///
+    /// # Errors
+    ///
+    /// Отказ сборки кадра.
+    pub fn send_swarm_control_unasked(
+        &mut self,
+        now_ms: u64,
+        peer_ik: [u8; 32],
+        control: &swarm::Control,
+    ) -> Result<Vec<Effect>, EngineError> {
+        self.send_swarm_control(now_ms, peer_ik, control)
+    }
+
+    /// Сколько роевых кадров какого вида мы собрали — наружу ради разбора.
+    ///
+    /// Наружу по той же причине, что `swarm_tree`: «попросили и молчат»
+    /// и «не попросили вовсе» снаружи выглядят одинаково, а различать
+    /// их приходится — §8.4 запрещает эфиру `Want` и не запрещает
+    /// `IHave`.
+    ///
+    /// Границу UniFFI это не пересекает (§13.3).
+    #[must_use]
+    pub fn swarm_controls_built(&self, kind: &str) -> u64 {
+        self.swarm_controls.get(kind).copied().unwrap_or_default()
     }
 
     /// Форма дерева раздачи: кому целиком, кому зовом (§7.1).

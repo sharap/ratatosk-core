@@ -989,6 +989,24 @@ pub const fn carries_archive(via: crate::transport_policy::Transport) -> bool {
     !matches!(via, Transport::Bt)
 }
 
+impl Control {
+    /// Как этот кадр зовут — одним словом, для счёта и журнала.
+    ///
+    /// Заведено ради проверок: все пять едут **одним** видом кадра
+    /// (`SwarmControl`), и счёт по виду их не различает. А различать
+    /// приходится: §8.4 запрещает эфиру `Want` и не запрещает `IHave`.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Control::IHave { .. } => "ihave",
+            Control::Graft { .. } => "graft",
+            Control::Prune { .. } => "prune",
+            Control::Have { .. } => "have",
+            Control::Want { .. } => "want",
+        }
+    }
+}
+
 /// Сколько ждать блок после `IHAVE`, прежде чем звать `GRAFT` (§7.1, §7.7).
 ///
 /// # Это срок второго пути, а не срок ступени

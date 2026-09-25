@@ -2088,8 +2088,9 @@ impl<S: Store> Engine<S> {
             // Держателей нет — идём к отправителю, если до него есть
             // дорога. Нет и его — просить некого, и это не отказ:
             // человек увидит, что файл ждёт (§14).
-            return Ok(offerer
-                .filter(|it| !matches!(self.file_route_of(it, file.size_bytes), FileRoute::Nowhere)));
+            return Ok(offerer.filter(|it| {
+                !matches!(self.file_route_of(it, file.size_bytes), FileRoute::Nowhere)
+            }));
         }
         // **Порядок запроса — случайный среди объявивших** (§9.1),
         // и выбирается он **на каждую просьбу**, а не один раз на файл:

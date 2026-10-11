@@ -279,6 +279,14 @@ pub enum YggSetup {
         seed: NodeSeed,
         /// Кому звонить, чтобы попасть в сеть. Пусто — узел одинок.
         peers: Vec<String>,
+        /// Искать соседей в своей сети мультикастом (0.2.7).
+        ///
+        /// Отдельным полем, а не выводится из пустоты списка: «пиров нет,
+        /// зато есть мультикаст» и «пиров нет вовсе» — разные состояния,
+        /// и во втором ступень обязана честно отвечать «не работает».
+        ///
+        /// Разрешено это не всегда: см. [`multicast_allowed`].
+        multicast: bool,
     },
 }
 
@@ -292,6 +300,318 @@ impl YggSetup {
             YggSetup::Embedded { .. } => YggMode::Embedded,
         }
     }
+}
+
+/// Что сделать с живым узлом, чтобы список пиров стал новым (0.2.7).
+///
+/// Пусто в обоих полях — делать нечего.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PeerEdit {
+    /// Этих добавить.
+    pub add: Vec<String>,
+    /// Этих снять.
+    pub remove: Vec<String>,
+}
+
+impl YggSetup {
+    /// Правка списка, если новая настройка отличается **только им** (0.2.7).
+    ///
+    /// `None` — правкой не обойтись, нужен переезд: выключить прежнее
+    /// и поднять заново.
+    ///
+    /// # Зачем различать
+    ///
+    /// Переезд рвёт все соединения и слушающий сокет. Пока пиров называли
+    /// руками по одному разу, это было незаметно; автонастройка добавляет
+    /// их по одному из принесённого списка, и переезд на каждом шаге
+    /// означал бы, что человек, добавляя третьего пира, теряет связь
+    /// с первыми двумя — на экране это «меш гаснет от того, что я его
+    /// настраиваю».
+    ///
+    /// # Что считается «только списком»
+    ///
+    /// Тот же режим, то же зерно, тот же мультикаст. Зерно — это наше имя
+    /// в меше, и смена его обязана пройти переездом, иначе мы слушали бы
+    /// под одним именем, а в карточке называли другое. Мультикаст
+    /// выбирается при подъёме: у библиотеки это отдельный конструктор,
+    /// а не выключатель на живом узле.
+    ///
+    /// # Почему пустой список — это переезд
+    ///
+    /// Пустой означает «ни с кем», и ступень в этом состоянии обязана
+    /// честно отвечать «не работает» (0.2.5). Доберись он сюда правкой —
+    /// узел остался бы поднятым и готовым, сняв последнего пира, и §5.4
+    /// звонил бы в пустоту с полным сроком на каждое сообщение.
+    ///
+    /// Исключение одно, и оно не исключение: с мультикастом пустой список
+    /// законен, но и тогда это переезд — потому что до него список был
+    /// непустым, а узел, потерявший всех названных, обязан начать искать
+    /// соседей с чистого листа.
+    #[must_use]
+    pub fn peers_only_change(&self, next: &YggSetup) -> Option<PeerEdit> {
+        let (
+            YggSetup::Embedded { seed: was_seed, peers: was, multicast: was_mc },
+            YggSetup::Embedded { seed: now_seed, peers: now, multicast: now_mc },
+        ) = (self, next)
+        else {
+            return None;
+        };
+        if was_seed != now_seed || was_mc != now_mc || now.is_empty() {
+            return None;
+        }
+        Some(PeerEdit {
+            add: now.iter().filter(|uri| !was.contains(uri)).cloned().collect(),
+            remove: was.iter().filter(|uri| !now.contains(uri)).cloned().collect(),
+        })
+    }
+}
+
+/// Разрешён ли мультикаст, когда локальная сеть вот в таком состоянии (0.2.7).
+///
+/// **Правило одно: мультикаст меша и локальная сеть одновременно не живут.**
+/// Спрашивается оно здесь, а не в клиенте и не в раннере: включателя два
+/// (ступень LAN и этот признак), и разъехавшись, они оставили бы работать
+/// оба — ровно та поломка, из-за которой [`YggSetup`] сделан одним типом
+/// на три режима.
+///
+/// # Чем это обосновано, и чем **не**
+///
+/// Правило взято как заданное: наблюдение с живого устройства — мультикаст
+/// меша находит соседей только при выключенной ступени LAN. Своей проверки
+/// на это у нас нет и быть не может: обе ступени слушают мультикаст
+/// на одной машине, и столкновение — свойство сети, а не кода.
+///
+/// Поэтому здесь **политика**, а не измерение, и написано это прямо:
+/// появится замер — правило либо подтвердится, либо сменится, но жить
+/// будет по-прежнему в одной функции.
+///
+/// # Почему не «просто выключить LAN за человека»
+///
+/// Ступень LAN работает и без меша, а мультикаст меша без неё — нет.
+/// Выключив LAN молча, мы отняли бы работающую связь ради той, которая
+/// может и не завестись. Поэтому ответ здесь — «нельзя», а сказать
+/// человеку, что для этого надо выключить, обязан клиент (§14).
+#[must_use]
+pub const fn multicast_allowed(lan_enabled: bool) -> bool {
+    !lan_enabled
+}
+
+/// Откуда берётся список публичных пиров — по именам областей (0.2.7).
+///
+/// # Почему это не список пиров
+///
+/// 0.2.5 запрещает **зашитый в сборку список публичных пиров**, и запрет
+/// остаётся в силе: здесь имена каталогов чужого репозитория, а не узлы.
+/// Ни одного адреса, который мы выбрали за человека, в сборке нет —
+/// список приезжает во время работы, и выбирает из него человек.
+///
+/// Протухнуть этот массив тоже не может так, как протух бы список узлов:
+/// каталог «europe» не выключают и не переносят, а узел — выключают
+/// каждый месяц.
+pub const PEER_REGIONS: [&str; 8] =
+    ["africa", "asia", "europe", "mena", "north-america", "oceania", "other", "south-america"];
+
+/// Почему поход за публичным списком пиров не удался (0.2.7).
+///
+/// Перечислением, а не строкой, и по той же причине, по какой так сделаны
+/// отказы канала: каждая причина — **своё действие человека**, и клиенту
+/// нужен не разбор чужого текста, а ветка. Текст к причине живёт в ядре
+/// (`ratatosk_core::honest::peer_list_refusal_text`), чтобы на двух
+/// клиентах он был один.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PeerListError {
+    /// Области или страны с таким именем нет. Делать: выбрать другую.
+    #[error("такого списка нет")]
+    NoSuchList,
+    /// В сборке нет Tor, а иначе список не спрашивается.
+    ///
+    /// Делать человеку нечего, и это **не** внутренняя ошибка: сказать
+    /// «переустановите» было бы ложью, сборка работает правильно.
+    /// Правильный текст — «в этой сборке списка нет, назовите пиров сами».
+    #[error("в этой сборке нет Tor")]
+    NoTor,
+    /// Чужой сервер не ответил или ответил не тем. Делать: повторить позже.
+    #[error("источник списка не ответил")]
+    SourceSilent,
+    /// Предел запросов у чужого API. Делать: назвать страну самому.
+    ///
+    /// Отдельно от [`PeerListError::SourceSilent`], потому что действие
+    /// другое: ждать здесь бесполезно, адрес выхода Tor общий на многих,
+    /// и предел скорее всего занят не нами.
+    #[error("предел запросов к перечню стран")]
+    IndexBusy,
+    /// Ответ пришёл, а адресов в нём нет. Делать: сообщить нам.
+    ///
+    /// Это не «пусто», а «формат чужого файла мог измениться»: пустых
+    /// файлов в репозитории не бывает. Пустой список, выданный за успех,
+    /// человек прочёл бы как «пиров нет» и пошёл искать их сам.
+    #[error("в ответе нет ни одного адреса")]
+    FormatChanged,
+}
+
+/// Откуда спрашивается сам список: репозиторий, который ведут авторы сети.
+///
+/// Адрес один и в сборке он есть — но это адрес **источника**, а не пиров.
+/// Разница существенная: кого спрашивать, выбрали мы, и об этом человеку
+/// сказано текстом (§14); кем пироваться — выбирает он.
+pub const PEER_LIST_HOST: &str = "raw.githubusercontent.com";
+
+/// Откуда спрашивается, какие страны в области есть.
+///
+/// Отдельный адрес, потому что каталог сам себя списком не отдаёт:
+/// `raw` на путь каталога отвечает 404 — проверено, а не предположено.
+///
+/// **Этот поход необязательный, и так и устроен.** У API предел
+/// в шестьдесят запросов в час на адрес, а через Tor адрес выхода общий
+/// на многих — то есть отказ здесь обычное дело, а не поломка. Главный
+/// поход (сам список) от него не зависит вовсе: знающий страну берёт
+/// её напрямую.
+pub const PEER_INDEX_HOST: &str = "api.github.com";
+
+/// Годится ли имя страны для подстановки в путь.
+///
+/// Строчные латинские буквы, цифры и дефис — ровно то, из чего состоят
+/// имена файлов в репозитории. Точка исключена нарочно: с ней прошло бы
+/// `..`, а с ним — выход из каталога.
+fn country_ok(country: &str) -> bool {
+    !country.is_empty()
+        && country.len() <= 64
+        && country.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Путь к файлу страны в репозитории сети.
+///
+/// `None` — области с таким именем нет или имя страны не годится. Проверка
+/// здесь, а не у вызывающего: подставленное в путь чужое значение увело бы
+/// запрос куда угодно, в том числе вверх по каталогам.
+#[must_use]
+pub fn peer_list_path(region: &str, country: &str) -> Option<String> {
+    if !PEER_REGIONS.contains(&region) || !country_ok(country) {
+        return None;
+    }
+    Some(format!("/yggdrasil-network/public-peers/master/{region}/{country}.md"))
+}
+
+/// Путь к перечню стран области.
+///
+/// `None` — области с таким именем нет.
+#[must_use]
+pub fn peer_index_path(region: &str) -> Option<String> {
+    if !PEER_REGIONS.contains(&region) {
+        return None;
+    }
+    Some(format!("/repos/yggdrasil-network/public-peers/contents/{region}"))
+}
+
+/// Достаёт имена стран из перечня, который отдаёт API репозитория.
+///
+/// # Почему разбор грубый
+///
+/// Нужны имена файлов и больше ничего: ни размеров, ни ссылок, ни типов.
+/// Полный разбор JSON принёс бы сюда зависимость ради одного поля — а поле
+/// опознаётся по `"name":` и расширению `.md`. Ошибка такого разбора
+/// возможна в одну сторону: пропустить страну, записанную иначе. Цена —
+/// одна страна в перечне, и перечень этот необязательный.
+///
+/// Расширение снимается: наружу едет `germany`, а не `germany.md` —
+/// человеку показывают страну, а не файл.
+///
+/// # Привязка к `"name"` — это точность, а не защита
+///
+/// Записано по возврату поломки: заменишь `"name"` на разбор по любому
+/// двоеточию — **ни одна проверка не краснеет**. Причина в том, что
+/// от чужих полей спасает не привязка, а `country_ok`: в перечне
+/// области `"path"` несёт `europe/germany.md`, и слеш отвергается уже им.
+///
+/// Привязку оставляем: она отсекает чужие поля **до** проверки имени,
+/// и завтрашнее поле, случайно похожее на страну, не попадёт в перечень
+/// лишь потому, что в нём нет слеша. Но считать её защитой нельзя —
+/// защита одна, и она ниже.
+#[must_use]
+pub fn countries_from_index(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in text.split("\"name\"").skip(1) {
+        let Some(rest) = part.split_once('"') else { continue };
+        let Some((value, _)) = rest.1.split_once('"') else { continue };
+        let Some(name) = value.strip_suffix(".md") else { continue };
+        if !country_ok(name) || out.iter().any(|had| had == name) {
+            continue;
+        }
+        out.push(name.to_owned());
+        if out.len() == MAX_LIST_PEERS {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Схемы, которыми пирование вообще бывает.
+///
+/// Список закрытый, и это защита, а не полнота: строка из чужого файла
+/// едет в чужую библиотеку, и `file://` или `unix://` там означали бы
+/// совсем не то, что человек выбирал на экране «публичные пиры».
+const PEER_SCHEMES: [&str; 5] = ["tcp://", "tls://", "quic://", "ws://", "wss://"];
+
+/// Сколько пиров берём из одного файла.
+///
+/// Область — это десятки узлов. Предел здесь затем, что файл чужой:
+/// подменённый или распухший, он не должен превратиться в список,
+/// который человек не в силах просмотреть глазами.
+pub const MAX_LIST_PEERS: usize = 256;
+
+/// Длиннее этого строка пиром не бывает: имя, порт и ключ в запросе.
+const MAX_PEER_URI: usize = 256;
+
+/// Достаёт адреса пиров из файла репозитория сети (0.2.7).
+///
+/// # Почему разбор грубый
+///
+/// Файл — markdown, написанный людьми: заголовки, списки, ссылки на
+/// владельцев, обратные кавычки вокруг адресов. Разбирать markdown целиком
+/// незачем — адреса в нём опознаются схемой, и правило «слово, начинающееся
+/// на известную схему» ошибается только в одну сторону: пропустит адрес,
+/// записанный не так, как все. Цена этой ошибки — одним пиром в списке
+/// меньше; цена ошибки в другую сторону — строка, которую человек примет
+/// за узел сети.
+///
+/// Обратные кавычки, запятые и прочая разметка снимаются по краям, потому
+/// что в живом файле адрес окружён именно ими.
+///
+/// # Что отбрасывается
+///
+/// Повторы (один узел называют и `tcp://`, и `tls://` — это разные
+/// адреса и оба остаются, а вот дословный повтор нет), схемы не из
+/// `PEER_SCHEMES`, слишком длинные строки и всё после [`MAX_LIST_PEERS`].
+/// Порядок сохраняется: он в файле осмысленный — узлы сгруппированы
+/// по владельцам.
+#[must_use]
+pub fn peers_from_list(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '/');
+        if word.len() > MAX_PEER_URI {
+            continue;
+        }
+        if !PEER_SCHEMES.iter().any(|scheme| word.starts_with(scheme)) {
+            continue;
+        }
+        // Схема без хоста — не адрес. Проверка грубая нарочно: разбирать
+        // чужой URI целиком значило бы завести здесь вторую реализацию
+        // того, что всё равно разбирает библиотека.
+        if !word.split("://").nth(1).is_some_and(|rest| rest.contains(':')) {
+            continue;
+        }
+        let peer = word.to_owned();
+        if out.contains(&peer) {
+            continue;
+        }
+        out.push(peer);
+        if out.len() == MAX_LIST_PEERS {
+            break;
+        }
+    }
+    out
 }
 
 /// Кодирует список пиров для служебной строки базы.
@@ -353,6 +673,326 @@ mod tests {
         }
         key
     }
+
+    // --- Список публичных пиров (0.2.7) ------------------------------------
+
+    /// Кусок настоящего файла репозитория сети, слово в слово.
+    ///
+    /// Выдуманная разметка стерегла бы наш разбор, а не их файл. Здесь —
+    /// `europe/germany.md`, с заголовком, пустой строкой из пробелов,
+    /// ссылкой на владельца в квадратных скобках и адресами в обратных
+    /// кавычках: ровно то, обо что разбор и спотыкается.
+    const REAL_FILE: &str = "\
+# Germany Peers
+
+Add connection strings from the below list to the `Peers: []` section of your
+Yggdrasil configuration file to peer with these nodes.
+
+      
+
+* Falkenstein, public node hosted on a Hetzner Online GmbH dedicated server, operated by [mkg20001](https://github.com/mkg20001)
+  * `tls://ygg.mkg20001.io:443`
+  * `tcp://ygg.mkg20001.io:80`
+
+* Nuremberg, hosted on Netcup, operated by [Marek Kuthe](https://mk16.de/)
+  * `tcp://ygg1.mk16.de:1337?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a`
+  * `quic://ygg1.mk16.de:1339?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a`
+";
+
+    #[test]
+    fn addresses_are_taken_out_of_the_real_file_and_the_prose_is_not() {
+        let peers = peers_from_list(REAL_FILE);
+        assert_eq!(
+            peers,
+            vec![
+                "tls://ygg.mkg20001.io:443",
+                "tcp://ygg.mkg20001.io:80",
+                "tcp://ygg1.mk16.de:1337?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+                "quic://ygg1.mk16.de:1339?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+            ],
+            "адреса обязаны выйти без кавычек, а проза и ссылки — не выйти вовсе"
+        );
+        // Опора: в файле есть `https://github.com/...` и `https://mk16.de/`.
+        // Не попади они в список — это могло бы значить и что разбор верен,
+        // и что он не нашёл вообще ничего. Поэтому сверяется список целиком,
+        // а не только его длина.
+        assert!(
+            !peers.iter().any(|p| p.contains("github.com")),
+            "ссылка на владельца пиром не является"
+        );
+    }
+
+    #[test]
+    fn a_scheme_the_mesh_does_not_speak_is_left_out() {
+        // Строка из чужого файла едет в чужую библиотеку. `file://`
+        // и `unix://` там означают совсем не то, что человек выбирал
+        // на экране «публичные пиры», а `http://` — вообще не пиринг.
+        let peers = peers_from_list(
+            "`file:///etc/passwd` `unix:///tmp/ygg.sock` `http://example.com:80` `tcp://ok.example:1`",
+        );
+        assert_eq!(peers, vec!["tcp://ok.example:1"]);
+    }
+
+    #[test]
+    fn the_same_address_written_twice_is_taken_once() {
+        let peers = peers_from_list("`tcp://a.example:1` `tcp://a.example:1`");
+        assert_eq!(peers, vec!["tcp://a.example:1"]);
+    }
+
+    #[test]
+    fn two_schemes_of_one_node_are_two_peers() {
+        // Это **не** повтор: узел слушает оба, и выбор между ними —
+        // человеческий. Схлопни мы их, экран показал бы один адрес там,
+        // где в файле названо два.
+        let peers = peers_from_list("`tcp://a.example:1` `tls://a.example:2`");
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[test]
+    fn a_scheme_without_a_host_and_port_is_not_a_peer() {
+        let peers = peers_from_list("`tcp://` `tls://nohost` `tcp://has.example:9`");
+        assert_eq!(peers, vec!["tcp://has.example:9"]);
+    }
+
+    #[test]
+    fn an_overlong_line_is_not_a_peer() {
+        let long = format!("tcp://{}:1", "a".repeat(300));
+        let peers = peers_from_list(&long);
+        assert!(peers.is_empty(), "строка длиннее предела пиром не считается");
+    }
+
+    #[test]
+    fn the_list_stops_at_the_ceiling() {
+        // Двести пятьдесят шесть написаны числом, а не взяты из крейта:
+        // возьми проверка константу — поднятие потолка подняло бы и её,
+        // и та смолчала бы о том, что чужой файл теперь вправе принести
+        // вдесятеро больше строк.
+        let many: String = (0..400).map(|n| format!("tcp://h{n}.example:1\n")).collect();
+        let peers = peers_from_list(&many);
+        assert_eq!(peers.len(), 256, "предел обязан резать чужой файл");
+    }
+
+    #[test]
+    fn the_order_of_the_file_is_kept() {
+        // Порядок в файле осмысленный: узлы сгруппированы по владельцам.
+        // Перемешай мы их — человек, выбирающий «двух разных операторов»,
+        // выбрал бы двух одинаковых.
+        let peers = peers_from_list("`tcp://b.example:1` `tcp://a.example:1`");
+        assert_eq!(peers, vec!["tcp://b.example:1", "tcp://a.example:1"]);
+    }
+
+    // --- Путь и перечень стран (0.2.7) -------------------------------------
+
+    /// Кусок настоящего ответа API, слово в слово.
+    ///
+    /// Выдуманный JSON стерёг бы наш разбор, а не их ответ. Здесь важно
+    /// именно то, обо что он спотыкается: в каждой записи **семь** полей
+    /// со строками, и одно из них — `"path": "other/i2p.md"`, тоже
+    /// кончающееся на `.md`. Имя обязано взяться из `"name"`, а не
+    /// из первой подходящей строки.
+    const REAL_INDEX: &str = r#"[
+  {
+    "name": "i2p.md",
+    "path": "other/i2p.md",
+    "sha": "3b8661651772538ff86ed600965178d6e20362b0",
+    "size": 2983,
+    "download_url": "https://raw.githubusercontent.com/yggdrasil-network/public-peers/master/other/i2p.md",
+    "type": "file"
+  },
+  {
+    "name": "tor.md",
+    "path": "other/tor.md",
+    "type": "file"
+  }
+]"#;
+
+    #[test]
+    fn country_names_come_out_of_the_real_index_without_the_extension() {
+        assert_eq!(countries_from_index(REAL_INDEX), vec!["i2p", "tor"]);
+    }
+
+    #[test]
+    fn a_name_with_a_slash_never_becomes_a_country() {
+        // Имя у проверки такое, а не «поле `path` не становится страной»,
+        // и это исправление по возврату поломки. `"path": "other/i2p.md"`
+        // в перечень действительно не попадает — но **не** оттого, что
+        // разбор привязан к `"name"`: сними привязку, и ничего
+        // не покраснеет. Отвергает его `country_ok`, по слешу.
+        //
+        // Поэтому стережём то, что есть: со слешем страны не бывает,
+        // откуда бы строка ни пришла.
+        let names = countries_from_index(REAL_INDEX);
+        assert!(
+            !names.iter().any(|n| n.contains('/')),
+            "в имени страны слеша быть не может: {names:?}"
+        );
+        assert_eq!(peer_list_path("other", "other/i2p"), None, "и в путь оно не уедет");
+    }
+
+    #[test]
+    fn a_country_name_that_could_climb_out_of_the_directory_is_refused() {
+        // Точка исключена нарочно: с ней прошло бы `..`, а с ним — выход
+        // из каталога репозитория куда угодно.
+        assert!(peer_list_path("europe", "germany").is_some());
+        assert_eq!(peer_list_path("europe", ".."), None);
+        assert_eq!(peer_list_path("europe", "../../etc/passwd"), None);
+        assert_eq!(peer_list_path("europe", "a/b"), None);
+        assert_eq!(peer_list_path("europe", "Germany"), None, "регистр их, не наш");
+        assert_eq!(peer_list_path("europe", ""), None);
+        assert_eq!(peer_list_path("../..", "germany"), None);
+    }
+
+    #[test]
+    fn a_name_with_a_hyphen_is_a_country_and_not_an_attack() {
+        // В репозитории такие есть: `north-america`, `hong-kong`.
+        // Запрети мы дефис — перечень потерял бы их молча.
+        assert!(peer_list_path("asia", "hong-kong").is_some());
+        assert!(peer_index_path("north-america").is_some());
+    }
+
+    #[test]
+    fn the_index_is_sorted_but_the_peer_list_is_not() {
+        // Разные порядки, и оба нарочно. Страны сортируются: их ищут
+        // глазами по алфавиту. Пиры — нет: порядок файла группирует узлы
+        // по владельцам, и это сведение, которого в алфавите не останется.
+        let shuffled = r#"[{"name":"zeta.md"},{"name":"alpha.md"}]"#;
+        assert_eq!(countries_from_index(shuffled), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn an_index_without_names_yields_nothing_rather_than_guessing() {
+        assert!(countries_from_index("").is_empty());
+        assert!(countries_from_index("[]").is_empty());
+        // Не `.md` — не страна: в каталоге бывают и подкаталоги.
+        assert!(countries_from_index(r#"[{"name":"readme.txt"}]"#).is_empty());
+    }
+
+    // --- Править или переезжать (0.2.7) ------------------------------------
+
+    fn embedded(peers: &[&str], multicast: bool) -> YggSetup {
+        YggSetup::Embedded {
+            seed: NodeSeed::new(vec![7; 32]),
+            peers: peers.iter().map(|p| (*p).to_owned()).collect(),
+            multicast,
+        }
+    }
+
+    #[test]
+    fn adding_one_peer_is_an_edit_and_not_a_move() {
+        // Суть всей правки: человек добавляет третьего пира и **не теряет**
+        // соединения с первыми двумя. Переезд рвёт их все.
+        let was = embedded(&["tcp://a:1", "tcp://b:2"], false);
+        let now = embedded(&["tcp://a:1", "tcp://b:2", "tcp://c:3"], false);
+        let edit = was.peers_only_change(&now).expect("это правка, а не переезд");
+        assert_eq!(edit.add, vec!["tcp://c:3"]);
+        assert!(edit.remove.is_empty());
+    }
+
+    #[test]
+    fn dropping_one_peer_is_an_edit_too() {
+        let was = embedded(&["tcp://a:1", "tcp://b:2"], false);
+        let now = embedded(&["tcp://a:1"], false);
+        let edit = was.peers_only_change(&now).expect("правка");
+        assert_eq!(edit.remove, vec!["tcp://b:2"]);
+        assert!(edit.add.is_empty(), "оставшегося не трогаем");
+    }
+
+    #[test]
+    fn a_new_seed_is_a_move_because_it_renames_us_in_the_mesh() {
+        // Зерно — наше имя в меше. Поправь мы по нему список на живом узле,
+        // слушали бы под прежним именем, а в карточке называли новое:
+        // собеседники звонят, а дозвониться не могут.
+        let was = embedded(&["tcp://a:1"], false);
+        let now = YggSetup::Embedded {
+            seed: NodeSeed::new(vec![8; 32]),
+            peers: vec!["tcp://a:1".to_owned()],
+            multicast: false,
+        };
+        assert_eq!(was.peers_only_change(&now), None);
+    }
+
+    #[test]
+    fn switching_multicast_is_a_move_because_it_is_chosen_at_startup() {
+        // У библиотеки мультикаст — отдельный конструктор, а не выключатель
+        // на живом узле. Сделай мы это правкой — признак сменился бы
+        // в настройке и не сменился бы в узле.
+        let was = embedded(&["tcp://a:1"], false);
+        let now = embedded(&["tcp://a:1"], true);
+        assert_eq!(was.peers_only_change(&now), None, "включение — переезд");
+        assert_eq!(now.peers_only_change(&was), None, "выключение тоже");
+    }
+
+    #[test]
+    fn an_empty_list_is_a_move_because_the_stage_must_stop_working() {
+        // Пустой список означает «ни с кем», и ступень обязана честно
+        // отвечать «не работает» (0.2.5). Доберись он сюда правкой —
+        // узел остался бы готовым, сняв последнего пира, и §5.4 звонил бы
+        // в пустоту с полным сроком на каждое сообщение.
+        let was = embedded(&["tcp://a:1"], false);
+        assert_eq!(was.peers_only_change(&embedded(&[], false)), None);
+        // И с мультикастом тоже переезд: узел, потерявший всех названных,
+        // начинает искать соседей с чистого листа.
+        let was_mc = embedded(&["tcp://a:1"], true);
+        assert_eq!(was_mc.peers_only_change(&embedded(&[], true)), None);
+    }
+
+    #[test]
+    fn a_change_of_mode_is_never_an_edit() {
+        let was = embedded(&["tcp://a:1"], false);
+        assert_eq!(was.peers_only_change(&YggSetup::Off), None);
+        assert_eq!(was.peers_only_change(&YggSetup::External { key: vec![1; 32] }), None);
+        assert_eq!(YggSetup::Off.peers_only_change(&was), None, "и обратно тоже");
+    }
+
+    #[test]
+    fn replacing_the_whole_list_edits_both_ends() {
+        // Автонастройка умеет и это: человек принёс список области и заменил
+        // прежних целиком. Снять и добавить — обе половины, и ни одна
+        // не лишняя: оставь мы снятие — старый пир продолжал бы видеть
+        // наш трафик после того, как человек его убрал.
+        let was = embedded(&["tcp://a:1"], false);
+        let now = embedded(&["tcp://b:2"], false);
+        let edit = was.peers_only_change(&now).expect("правка");
+        assert_eq!(edit.add, vec!["tcp://b:2"]);
+        assert_eq!(edit.remove, vec!["tcp://a:1"]);
+    }
+
+    // **Чего эти проверки не стерегут.** Что `add_peer` и `remove_peer`
+    // действительно меняют живой узел — у библиотеки это проверяется
+    // только живым мешом, которого в прогоне нет. Здесь стережётся
+    // **решение**: править или переезжать. Сам ввод-вывод — за стендом
+    // (`TESTING.md`, 0.2.7).
+
+    // --- Правило мультикаста (0.2.7) ---------------------------------------
+
+    #[test]
+    fn multicast_and_the_local_network_do_not_live_together() {
+        assert!(multicast_allowed(false), "сеть выключена — мультикаст можно");
+        assert!(!multicast_allowed(true), "сеть включена — нельзя");
+    }
+
+    #[test]
+    fn a_region_nobody_named_builds_no_path() {
+        // Имя области подставляется в путь, и чужое значение увело бы
+        // запрос куда угодно — в том числе вверх по каталогам.
+        assert!(peer_list_path("europe", "germany").is_some());
+        assert_eq!(peer_list_path("../../etc", "germany"), None);
+        assert_eq!(peer_list_path("Europe", "germany"), None, "регистр не наш, а их");
+        assert_eq!(peer_list_path("", "germany"), None);
+        for region in PEER_REGIONS {
+            assert!(
+                peer_list_path(region, "germany").is_some(),
+                "{region}: область названа, пути нет"
+            );
+            assert!(peer_index_path(region).is_some(), "{region}: перечня нет");
+        }
+    }
+
+    // **Чего эти проверки не стерегут.** Что файл по такому пути
+    // действительно лежит и выглядит так же — сеть здесь не зовётся,
+    // и образец взят из файла, прочитанного однажды руками. Протухнет
+    // чужой формат — разбор смолчит и вернёт пустой список, а поймает
+    // это только живой поход (`TESTING.md`, 0.2.7).
 
     #[test]
     fn every_address_carries_the_prefix() {
@@ -467,7 +1107,12 @@ mod tests {
         assert_eq!(YggSetup::Off.mode(), YggMode::Off);
         assert_eq!(YggSetup::External { key: Vec::new() }.mode(), YggMode::External);
         assert_eq!(
-            YggSetup::Embedded { seed: NodeSeed::new(vec![1; 32]), peers: Vec::new() }.mode(),
+            YggSetup::Embedded {
+                seed: NodeSeed::new(vec![1; 32]),
+                peers: Vec::new(),
+                multicast: false
+            }
+            .mode(),
             YggMode::Embedded
         );
     }
@@ -476,7 +1121,8 @@ mod tests {
     fn a_seed_is_not_printed() {
         // Настройка едет вниз эффектом, эффекты попадают в журнал целиком.
         let seed = NodeSeed::new(vec![0xab; 32]);
-        let shown = format!("{:?}", YggSetup::Embedded { seed, peers: Vec::new() });
+        let shown =
+            format!("{:?}", YggSetup::Embedded { seed, peers: Vec::new(), multicast: false });
         assert!(!shown.contains("171"), "зерно не должно печататься: {shown}");
         assert!(!shown.contains("ab"), "ни в каком виде: {shown}");
         assert!(shown.contains("32"), "а длина — можно, она не секрет: {shown}");

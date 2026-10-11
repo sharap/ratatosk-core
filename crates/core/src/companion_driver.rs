@@ -1599,6 +1599,13 @@ impl<R: Runner> CompanionDriver<R> {
         let setup = ratatosk_proto::ygg::YggSetup::Embedded {
             seed: ratatosk_proto::ygg::NodeSeed::new(self.client.mesh_seed().to_vec()),
             peers: peers.clone(),
+            // Мультикаста у компаньона нет, и это не упущение (0.2.7).
+            // Соседей он не ищет: пиры приезжают ему **с телефона** вместе
+            // с зерном (§13.4), и своего экрана настроек меша у него
+            // не бывает. Включить то, чего человек на этом устройстве
+            // не выбирал, значило бы пустить чужой мультикаст в его сеть
+            // от его имени.
+            multicast: false,
         };
         self.mesh_peers = peers;
         self.tell_runner(TransportCommand::SetYgg(setup)).await;

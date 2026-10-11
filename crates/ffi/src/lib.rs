@@ -210,12 +210,79 @@ pub enum RatatoskError {
         /// Что именно не дало команде пройти.
         reason: FfiChannelRefusal,
     },
+    /// Поход за публичным списком пиров меша не удался (0.2.7).
+    ///
+    /// **Отдельно от [`RatatoskError::Internal`] по той же причине, что
+    /// и отказы канала:** человеку есть что сделать с каждой из причин —
+    /// выбрать другую область, назвать страну самому, повторить позже.
+    /// Показанный внутренней ошибкой, такой отказ советовал бы
+    /// переустановить работающее.
+    ///
+    /// Текст к причине — [`peer_list_refusal_text`]; писать свой не надо.
+    #[error("{}", peer_list_refusal_text(*reason))]
+    PeerList {
+        /// Что именно не дало списку приехать.
+        reason: FfiPeerListRefusal,
+    },
     /// Внутренняя ошибка.
     #[error("внутренняя ошибка: {reason}")]
     Internal {
         /// Короткое описание для отчёта.
         reason: String,
     },
+}
+
+/// Почему не приехал публичный список пиров меша (0.2.7).
+///
+/// Зеркало `ratatosk_proto::ygg::PeerListError`. Своё перечисление здесь
+/// затем, что через UniFFI едет то, что рисуют, а не внутренний тип:
+/// метёлка `record_fields` стережёт, чтобы пары не разошлись.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPeerListRefusal {
+    /// Области или страны с таким именем нет.
+    NoSuchList,
+    /// В сборке нет Tor, а иначе список не спрашивается.
+    NoTor,
+    /// Источник не ответил. Повторить позже.
+    SourceSilent,
+    /// Предел запросов у перечня стран. Назвать страну самому.
+    IndexBusy,
+    /// Ответ пришёл, адресов в нём нет: разметка источника могла измениться.
+    FormatChanged,
+}
+
+/// Текст к причине отказа — один на оба клиента (0.2.7).
+#[must_use]
+pub fn peer_list_refusal_text(reason: FfiPeerListRefusal) -> String {
+    ratatosk_core::honest::peer_list_refusal_text(peer_list_why(reason)).to_owned()
+}
+
+/// Внутренняя причина по той, что едет наружу.
+const fn peer_list_why(reason: FfiPeerListRefusal) -> ratatosk_proto::ygg::PeerListError {
+    use ratatosk_proto::ygg::PeerListError as Why;
+    match reason {
+        FfiPeerListRefusal::NoSuchList => Why::NoSuchList,
+        FfiPeerListRefusal::NoTor => Why::NoTor,
+        FfiPeerListRefusal::SourceSilent => Why::SourceSilent,
+        FfiPeerListRefusal::IndexBusy => Why::IndexBusy,
+        FfiPeerListRefusal::FormatChanged => Why::FormatChanged,
+    }
+}
+
+/// Причина наружу по внутренней.
+///
+/// Под признаком `tor`: без него похода не бывает, и переводить
+/// внутреннюю причину некому — отказ там один и собирается на месте.
+#[cfg(feature = "tor")]
+const fn peer_list_refusal_of(reason: ratatosk_proto::ygg::PeerListError) -> FfiPeerListRefusal {
+    use ratatosk_proto::ygg::PeerListError as Why;
+    match reason {
+        Why::NoSuchList => FfiPeerListRefusal::NoSuchList,
+        Why::NoTor => FfiPeerListRefusal::NoTor,
+        Why::SourceSilent => FfiPeerListRefusal::SourceSilent,
+        Why::IndexBusy => FfiPeerListRefusal::IndexBusy,
+        Why::FormatChanged => FfiPeerListRefusal::FormatChanged,
+    }
 }
 
 /// Почему канал отказал (фаза 2, §6, §10).
@@ -2367,6 +2434,33 @@ struct Opened {
     fingerprint: String,
     contact_uri: String,
     own_ik: [u8; 32],
+    /// Ручка Tor и рантайм ядра — ради похода за списком пиров (0.2.7).
+    ///
+    /// Поход живёт **здесь, а не в ядре**, и это следствие sans-io:
+    /// `Engine` не владеет сокетами и не читает часы. Список же
+    /// не протокольное состояние, а то, что рисуют: решение из него
+    /// принимает человек, и уезжает оно уже существующей
+    /// [`Command::SetYggPeers`].
+    ///
+    /// Рантайм нужен потому, что методы UniFFI синхронные, а поход
+    /// асинхронный: задача уезжает на рантайм ядра, а вызывающий поток
+    /// ждёт ответа. Своего рантайма здесь заводить нельзя — клиент arti
+    /// привязан к тому, на котором поднят.
+    ///
+    /// Под признаком `tor`, потому что без него похода нет вовсе
+    /// и ручка эта никому не нужна. Поймал это перебор сочетаний
+    /// признаков, а не глаз: обычный прогон и `--all-features` оба
+    /// собирают `tor`, и мёртвое поле в них выглядит живым.
+    #[cfg(feature = "tor")]
+    net: Net,
+}
+
+/// Чем ходить в сеть мимо ядра (0.2.7).
+#[cfg(feature = "tor")]
+#[derive(Clone)]
+struct Net {
+    runtime: tokio::runtime::Handle,
+    tor: ratatosk_transport::onion::TorHandle,
 }
 
 /// Клиент ядра — то, что держит Kotlin.
@@ -2932,6 +3026,105 @@ impl RatatoskClient {
     /// «узел есть, а соединён он ни с кем», и это другая неисправность.
     pub fn ygg_peers_alive(&self) -> Result<Option<Vec<FfiYggPeer>>, RatatoskError> {
         Ok(self.transport_status()?.ygg_peers.map(|peers| peers.iter().map(ygg_peer_of).collect()))
+    }
+
+    /// Включает поиск соседей в своей сети мультикастом (0.2.7).
+    ///
+    /// Вторая половина автонастройки, и устроена она не как первая:
+    /// публичный список человек выбирает руками, а здесь выбирать нечего —
+    /// соседей называет сеть.
+    ///
+    /// **Покажите [`ygg_multicast_notice`] до нажатия.** Найденный сосед
+    /// становится пиром и видит источник и адресата пакетов в меше —
+    /// ровно как публичный узел. Дома это свои устройства, в чужой сети
+    /// кто угодно, и решать это человеку, а не нам.
+    ///
+    /// **Выбор сохраняется, но действует не всегда.** Вместе со ступенью
+    /// локальной сети мультикаст не живёт; когда так вышло, покажите
+    /// [`ygg_multicast_needs_lan_off`] рядом с включённым переключателем —
+    /// иначе экран показывает включённый поиск, который молчит.
+    /// Локальную сеть ядро само не выключает: она работает и без меша,
+    /// а мультикаст без неё — нет.
+    pub fn set_ygg_multicast(&self, on: bool) -> Result<(), RatatoskError> {
+        self.command(Command::SetYggMulticast(on))
+    }
+
+    /// Искать ли соседей мультикастом — **как выбрал человек** (0.2.7).
+    ///
+    /// Не «работает ли»: разрешён он только при выключенной локальной сети,
+    /// а библиотека может и не поднять его вовсе. Для экрана это положение
+    /// переключателя, а не состояние ступени.
+    pub fn ygg_multicast(&self) -> Result<bool, RatatoskError> {
+        self.opened
+            .handle
+            .ygg_multicast_blocking()
+            .ok_or_else(|| RatatoskError::internal("ядро остановлено"))
+    }
+
+    /// Области, по которым разложен публичный список пиров (0.2.7).
+    ///
+    /// Имена каталогов чужого репозитория, а не узлы: зашитого списка
+    /// пиров в сборке нет и не будет (0.2.5). Протухнуть этот перечень
+    /// так, как протух бы список узлов, не может — каталог «europe»
+    /// не выключают, а узел выключают каждый месяц.
+    #[must_use]
+    pub fn ygg_peer_regions(&self) -> Vec<String> {
+        ratatosk_proto::ygg::PEER_REGIONS.iter().map(|r| (*r).to_owned()).collect()
+    }
+
+    /// Какие страны есть в области — **необязательный** поход (0.2.7).
+    ///
+    /// Удобство, а не основа: у чужого API предел в шестьдесят запросов
+    /// в час на адрес, а через Tor адрес выхода общий на многих. Отказ
+    /// здесь обычное дело, и он **не мешает**
+    /// [`RatatoskClient::fetch_ygg_peers`]: знающий страну берёт её
+    /// напрямую. Так и скажите человеку, получив отказ.
+    pub fn ygg_peer_countries(&self, region: String) -> Result<Vec<String>, RatatoskError> {
+        #[cfg(feature = "tor")]
+        return fetch_list(&self.opened.net, move |tor| async move {
+            ratatosk_transport::peer_list::countries(&region, &tor).await
+        });
+        #[cfg(not(feature = "tor"))]
+        {
+            let _ = region;
+            fetch_list_unavailable()
+        }
+    }
+
+    /// Приносит публичный список пиров названной страны (0.2.7).
+    ///
+    /// **Это не настройка.** Список приносится, чтобы человек посмотрел
+    /// и выбрал; выбранное уезжает в ядро отдельным вызовом
+    /// [`RatatoskClient::set_ygg_peers`]. Выбирать за него нельзя —
+    /// пир видит источник и адресата его пакетов в меше (0.2.5).
+    ///
+    /// Порядок сохранён тот, что в файле: узлы там сгруппированы
+    /// по владельцам, и перемешав их, экран лишил бы человека возможности
+    /// выбрать двух **разных** операторов. Сами авторы сети советуют брать
+    /// пиров географически близких и всего два-три.
+    ///
+    /// Задержку до выбранных покажет [`RatatoskClient::ygg_peers_alive`]
+    /// после включения: мерить её до соединения нечем.
+    ///
+    /// # Цена, о которой надо сказать до нажатия
+    ///
+    /// Запрос говорит чужому серверу, что с этого адреса включают меш.
+    /// Поэтому он идёт **только через Tor**, и в сборке без Tor похода
+    /// нет вовсе — вернётся отказ, а не тихий прямой запрос.
+    pub fn fetch_ygg_peers(
+        &self,
+        region: String,
+        country: String,
+    ) -> Result<Vec<String>, RatatoskError> {
+        #[cfg(feature = "tor")]
+        return fetch_list(&self.opened.net, move |tor| async move {
+            ratatosk_transport::peer_list::fetch(&region, &country, &tor).await
+        });
+        #[cfg(not(feature = "tor"))]
+        {
+            let _ = (region, country);
+            fetch_list_unavailable()
+        }
     }
 
     /// Ключ нашего узла в меше, если он назван (0.2). Пусто — меша нет.
@@ -5199,8 +5392,53 @@ async fn start(
         fingerprint: opened_parts.0,
         contact_uri: opened_parts.1,
         own_ik: opened_parts.2,
+        // Ручка берётся **та же**, что у почты и реле: второй `TorClient`
+        // означал бы второй bootstrap и ещё десятки мегабайт (§5.2).
+        #[cfg(feature = "tor")]
+        net: Net { runtime: tokio::runtime::Handle::current(), tor: tor_handle.clone() },
     };
     Ok((driver, opened, events))
+}
+
+/// Общее у двух походов за списком: уехать на рантайм ядра и дождаться (0.2.7).
+///
+/// Свободной функцией, а не методом: блок методов [`RatatoskClient`] целиком
+/// под `#[uniffi::export]`, и приватный помощник в нём UniFFI пытался бы
+/// вывести наружу — а двух его редакций под признаками сборки граница
+/// не вынесет вовсе.
+///
+/// Метод UniFFI синхронный, поход асинхронный, а своего рантайма здесь
+/// заводить нельзя: клиент arti привязан к тому, на котором поднят.
+/// Поэтому задача уезжает на рантайм ядра, а вызывающий поток ждёт.
+#[cfg(feature = "tor")]
+fn fetch_list<F, Fut>(net: &Net, work: F) -> Result<Vec<String>, RatatoskError>
+where
+    F: FnOnce(ratatosk_transport::onion::TorHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Vec<String>, ratatosk_proto::ygg::PeerListError>>
+        + Send
+        + 'static,
+{
+    let tor = net.tor.clone();
+    let spawned = net.runtime.spawn(async move { work(tor).await });
+    // `block_on` ручки законен: вызывающий поток чужой (Kotlin), рантайма
+    // на нём нет. Второго рантайма здесь заводить нельзя — клиент arti
+    // привязан к тому, на котором поднят.
+    match net.runtime.block_on(spawned) {
+        Ok(Ok(list)) => Ok(list),
+        Ok(Err(reason)) => Err(RatatoskError::PeerList { reason: peer_list_refusal_of(reason) }),
+        Err(error) => Err(RatatoskError::internal(error)),
+    }
+}
+
+/// Без признака `tor` похода нет, и об этом говорится отказом (0.2.7).
+///
+/// Не тишиной и не пустым списком: правило «список спрашиваем только
+/// через Tor» записано в манифесте транспорта, и человек, нажавший
+/// «принести список», обязан узнать, что в его сборке этого нет, —
+/// в тот же момент, а не по пустому экрану.
+#[cfg(not(feature = "tor"))]
+fn fetch_list_unavailable() -> Result<Vec<String>, RatatoskError> {
+    Err(RatatoskError::PeerList { reason: FfiPeerListRefusal::NoTor })
 }
 
 /// Аккаунт в том виде, в каком он числится в реестре (§3, дополнение).
@@ -6053,6 +6291,28 @@ pub fn ygg_node_notice() -> String {
 #[must_use]
 pub fn ygg_node_stop_notice() -> String {
     ratatosk_core::honest::YGG_NODE_STOP_NOTICE.to_string()
+}
+
+/// Чем платят за поиск соседей мультикастом (0.2.7).
+///
+/// **Покажите до нажатия** [`RatatoskClient::set_ygg_multicast`]: найденный
+/// сосед становится пиром и видит источник и адресата пакетов в меше —
+/// ровно как публичный узел.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_multicast_notice() -> String {
+    ratatosk_core::honest::YGG_MULTICAST_NOTICE.to_owned()
+}
+
+/// Почему включённый поиск соседей молчит (0.2.7).
+///
+/// Покажите рядом с включённым переключателем, когда ступень локальной
+/// сети тоже включена: вместе они не работают. Иначе экран показывает
+/// включённый поиск, который ничего не ищет.
+#[uniffi::export]
+#[must_use]
+pub fn ygg_multicast_needs_lan_off() -> String {
+    ratatosk_core::honest::YGG_MULTICAST_NEEDS_LAN_OFF.to_owned()
 }
 
 /// Предупреждение при включении ступени nostr (0.3).

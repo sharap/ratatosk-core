@@ -378,6 +378,32 @@ impl<S: Store> Engine<S> {
         self.apply_ygg(now_ms)
     }
 
+    /// Включает или выключает поиск соседей мультикастом (0.2.7).
+    ///
+    /// Сохраняется **выбор**, а не его последствие: разрешён мультикаст
+    /// только при выключенной локальной сети, и запиши мы сюда результат
+    /// правила — включение LAN молча стёрло бы то, что человек выбирал.
+    ///
+    /// Имя в меше от этого не меняется, и карточка не едет: мультикаст —
+    /// про то, как мы ищем дорогу внутрь сети, а не про то, как нас
+    /// в ней зовут.
+    ///
+    /// # Errors
+    ///
+    /// Отказ хранилища.
+    pub(super) fn on_set_ygg_multicast(
+        &mut self,
+        now_ms: u64,
+        on: bool,
+    ) -> Result<Vec<Effect>, EngineError> {
+        if on == self.ygg_multicast {
+            return Ok(Vec::new());
+        }
+        self.ygg_multicast = on;
+        self.store.put_meta(ratatosk_store::META_YGG_MULTICAST, &[u8::from(on)])?;
+        self.apply_ygg(now_ms)
+    }
+
     /// Приводит меш в соответствие с настройками (0.2).
     ///
     /// Одно место на все три команды, и это не экономия строк. Действующее
@@ -432,6 +458,19 @@ impl<S: Store> Engine<S> {
             YggMode::Embedded => YggSetup::Embedded {
                 seed: NodeSeed::new(self.ygg_seed.clone()),
                 peers: self.ygg_peers.clone(),
+                // **Правило спрашивается здесь, и только здесь** (0.2.7).
+                // Выбор человека лежит на диске нетронутым, а что из него
+                // выходит прямо сейчас — считается в единственном месте,
+                // как и действующее имя выше.
+                //
+                // Спрашивается `enabled` — выбор человека, — а не
+                // `announcing`: маяк гаснет вместе с уходом с экрана,
+                // и считай мы по нему, мультикаст зажигался бы при
+                // сворачивании приложения.
+                multicast: self.ygg_multicast
+                    && ratatosk_proto::ygg::multicast_allowed(
+                        self.enabled.contains(ratatosk_proto::Transport::Lan),
+                    ),
             },
         }
     }

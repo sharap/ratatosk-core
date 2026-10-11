@@ -1875,6 +1875,13 @@ pub struct Engine<S: Store> {
     ygg: Vec<u8>,
     /// Откуда берётся меш (0.2). Переживает перезапуск.
     ygg_mode: ratatosk_proto::ygg::YggMode,
+    /// Искать ли соседей в своей сети мультикастом (0.2.7).
+    ///
+    /// Хранится **выбор человека**, а не то, что из него вышло: правило
+    /// `multicast_allowed` спрашивается при сборке настройки для раннера,
+    /// и запиши мы сюда его ответ — включение локальной сети молча
+    /// отменило бы выбор.
+    ygg_multicast: bool,
     /// Ключ, названный человеком для внешнего демона (0.2).
     ///
     /// Хранится **отдельно от действующего имени** и переживает уход
@@ -2298,6 +2305,7 @@ impl<S: Store> Engine<S> {
             // Умолчание — «меша нет», и оно же остаётся у базы, заведённой
             // до 0.2: строки в ней нет, и включать никому ничего не надо.
             ygg_mode: ratatosk_proto::ygg::YggMode::Off,
+            ygg_multicast: false,
             ygg_named: Vec::new(),
             ygg_seed: Vec::new(),
             ygg_peers: Vec::new(),
@@ -2705,6 +2713,7 @@ impl<S: Store> Engine<S> {
             Command::SetYggKey(key) => self.on_set_ygg_key(now_ms, key),
             Command::SetYggMode(mode) => self.on_set_ygg_mode(now_ms, mode),
             Command::SetYggPeers(peers) => self.on_set_ygg_peers(now_ms, peers),
+            Command::SetYggMulticast(on) => self.on_set_ygg_multicast(now_ms, on),
             Command::SetSeeding { chat, mode } => self.on_set_seeding(now_ms, chat, mode),
             Command::SetSharing { chat, level } => self.on_set_sharing(now_ms, chat, level),
             Command::SetGivingLimits(limits) => self.on_set_giving_limits(limits),
@@ -3088,6 +3097,11 @@ impl<S: Store> Engine<S> {
             .meta(ratatosk_store::META_YGG_PEERS)?
             .and_then(|raw| ratatosk_proto::ygg::peers_decode(&raw).ok())
             .unwrap_or_default();
+        self.ygg_multicast = self
+            .store
+            .meta(ratatosk_store::META_YGG_MULTICAST)?
+            .and_then(|raw| raw.first().copied())
+            == Some(1);
         // Действующее имя — производная от них, и считается она **одним**
         // способом на всё ядро (см. `ygg_name`). Второй способ здесь однажды
         // разошёлся бы с первым, и разошёлся бы молча.
@@ -3255,6 +3269,16 @@ impl<S: Store> Engine<S> {
     #[must_use]
     pub const fn auto_accept_bytes(&self) -> Option<u64> {
         self.auto_accept
+    }
+
+    /// Искать ли соседей мультикастом — **как выбрал человек** (0.2.7).
+    ///
+    /// Не «работает ли»: правило `multicast_allowed` может его запрещать,
+    /// а библиотека — не поднять вовсе. Экран настроек рисует этот выбор,
+    /// а рядом говорит, разрешён ли он сейчас.
+    #[must_use]
+    pub const fn ygg_multicast(&self) -> bool {
+        self.ygg_multicast
     }
 
     /// Откуда берётся меш (0.2).

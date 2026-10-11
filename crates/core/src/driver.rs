@@ -247,6 +247,11 @@ enum Query {
     NostrSettings { reply: oneshot::Sender<(Vec<String>, bool)> },
     /// Пиры встроенного узла меша (0.2).
     YggPeers { reply: oneshot::Sender<Vec<String>> },
+    /// Искать ли соседей мультикастом — **выбор человека** (0.2.7).
+    ///
+    /// Не «работает ли»: правило `multicast_allowed` может его запрещать,
+    /// и экран настроек рисует выбор, а рядом говорит, действует ли он.
+    YggMulticast { reply: oneshot::Sender<bool> },
     /// Какие транспорты сейчас включены (§5.4).
     ///
     /// Запросом, а не памятью клиента: выбор переживает перезапуск в `meta`,
@@ -1191,6 +1196,13 @@ impl DriverHandle {
         answer.blocking_recv().ok()
     }
 
+    /// Читает выбор про мультикаст у своего узла меша (0.2.7).
+    pub fn ygg_multicast_blocking(&self) -> Option<bool> {
+        let (reply, answer) = oneshot::channel();
+        self.requests.blocking_send(Request::Query(Query::YggMulticast { reply })).ok()?;
+        answer.blocking_recv().ok()
+    }
+
     /// Читает настройку ступени nostr (0.3), блокируя вызывающий поток.
     pub fn nostr_settings_blocking(&self) -> Option<(Vec<String>, bool)> {
         let (reply, answer) = oneshot::channel();
@@ -1715,6 +1727,9 @@ impl<S: Store, R: Runner> Driver<S, R> {
             }
             Query::YggPeers { reply } => {
                 let _ = reply.send(self.engine.ygg_peers().to_vec());
+            }
+            Query::YggMulticast { reply } => {
+                let _ = reply.send(self.engine.ygg_multicast());
             }
             Query::Transports { reply } => {
                 let _ = reply.send(TransportStatus {

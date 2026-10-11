@@ -50,7 +50,9 @@ pub mod switched;
 // TLS жил внутри `chatmail`, пока потребитель был один. Со ступенью nostr
 // их стало двое, и общий модуль внутри одного из них означал бы, что реле
 // тянет за собой почтовый признак сборки.
-#[cfg(any(feature = "chatmail-net", feature = "nostr"))]
+#[cfg(feature = "peer-list")]
+pub mod peer_list;
+#[cfg(any(feature = "chatmail-net", feature = "nostr", feature = "peer-list"))]
 pub mod tls;
 pub mod ygg;
 

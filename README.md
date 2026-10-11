@@ -129,7 +129,16 @@ cargo doc --workspace --all-features --no-deps
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo deny --all-features check        # состав зависимостей и извещения RUSTSEC
+RUSTFLAGS="-D warnings" cargo hack check --feature-powerset --depth 2 --workspace --no-dev-deps
 ```
+
+**Пустой и полный набор признаков — это не все наборы.** Условие вида
+«нет одного из трёх» верно и там, и там, а ломается на паре: сборка
+`--features nostr,mail` однажды падала неразрешённым `Disabled`, пока
+пар не собирал никто. Перебор берёт одиночки и пары (`--depth 2`);
+полный по девяти признакам транспорта — 512 сборок, и цена выше
+находки. `cargo hack` ставится отдельно
+(`cargo install cargo-hack --locked`), в CI он идёт своей работой.
 
 **`--all-features` у `cargo deny` обязателен**, и это не симметрия ради
 красоты: половина ступеней сидит за признаками, и без них `webpki-roots`,

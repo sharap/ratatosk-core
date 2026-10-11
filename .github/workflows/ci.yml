@@ -55,6 +55,38 @@ jobs:
       - name: метёлки
         run: python3 tools/sweeps/run_all.py
 
+  features:
+    name: сочетания признаков
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: тулчейн
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      # Эфиру нужен BlueZ: признак `bt` входит в перебор, и без этого
+      # пакета он падает связыванием, а не разбором — то есть находкой,
+      # которой нет.
+      - name: зависимости для признака bt
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      # Лестница гоняет ровно два набора признаков: пустой и полный.
+      # Условие вида «нет одного из трёх» верно в обоих, а ломается
+      # на паре — ровно так сборка `--features nostr,mail` падала
+      # неразрешённым `Disabled`, пока никто не собирал пары.
+      #
+      # Глубина 2 — не лень, а цена: у транспорта девять признаков,
+      # полный перебор это 512 сборок. Одиночки и пары ловят тот класс,
+      # который здесь водится, и укладываются в восемьдесят с лишним.
+      # `RUSTFLAGS` выписан, хотя он и так задан на всю работу.
+      # Без него находка этого шага выглядит предупреждением: `dead_code`
+      # за выключенным признаком именно так и проехал бы мимо человека,
+      # гоняющего лестницу руками, — среди восьмидесяти четырёх сборок.
+      - name: одиночки и пары
+        run: RUSTFLAGS="-D warnings" cargo hack check --feature-powerset --depth 2 --workspace --no-dev-deps
+
   deny:
     name: состав криптостека
     runs-on: ubuntu-latest

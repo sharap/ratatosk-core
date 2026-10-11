@@ -103,8 +103,13 @@ def ci_command_words(step):
 
 
 def tool_of(command):
-    """Чем команда зовётся — одним словом, для поиска её шага в CI."""
-    words = command.split()
+    """Чем команда зовётся — одним словом, для поиска её шага в CI.
+
+    Переменные среды впереди команды пропускаются: `RUSTFLAGS=...` стоит
+    в лестнице не для красоты — без него находка перебора признаков
+    выглядит предупреждением, — но средством вызова не является.
+    """
+    words = [w for w in command.split() if not re.match(r"^[A-Z_]+=", w)]
     if words[0] == "cargo":
         return words[1]
     return pathlib.Path(words[-1]).name

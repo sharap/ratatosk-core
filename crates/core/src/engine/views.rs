@@ -211,6 +211,15 @@ impl<S: Store> Engine<S> {
     /// на том же сценарии зелен.
     ///
     /// Теперь источник один, и стенд спрашивает то же, что раннер.
+    ///
+    /// # За признаком `driver`
+    ///
+    /// Тип ответа — транспортный, и без признака его в графе нет. Ядро
+    /// sans-io обязано собираться **без** транспорта: ровно так его
+    /// берёт симуляция (§16). Забытый признак это обещание отменял
+    /// молча — обычный прогон и `--all-features` оба зелены, потому что
+    /// транспорт в них есть всегда.
+    #[cfg(feature = "driver")]
     #[must_use]
     pub fn address_of(&self, peer_ik: &[u8; 32]) -> ratatosk_transport::PeerAddress {
         use ratatosk_transport::PeerAddress;
@@ -260,6 +269,10 @@ impl<S: Store> Engine<S> {
     /// разошлись зеркала молча: ключ nostr появился в карточке,
     /// `Reachability` начал считать ступень адресуемой — а сюда поле
     /// не дописали, и раннер получал `None`.
+    ///
+    /// За признаком `driver` по той же причине, что и [`Engine::address_of`]:
+    /// возвращает транспортный тип.
+    #[cfg(feature = "driver")]
     fn address_from_card(card: &ContactCard) -> ratatosk_transport::PeerAddress {
         ratatosk_transport::PeerAddress {
             ik: card.ik,
@@ -272,6 +285,13 @@ impl<S: Store> Engine<S> {
     }
 
     /// Пустая строка — это «нет адреса», а не адрес нулевой длины.
+    ///
+    /// За признаком `driver` следом за своими двумя потребителями:
+    /// [`Engine::address_of`] и `address_from_card`. Перебор сочетаний
+    /// нашёл это сразу после того, как признак появился у них —
+    /// и нашёл **предупреждением**, а не отказом: без `-D warnings`
+    /// оно проехало бы мимо среди восьмидесяти четырёх сборок.
+    #[cfg(feature = "driver")]
     fn some_text(value: &str) -> Option<String> {
         if value.is_empty() {
             None

@@ -32,17 +32,23 @@ use ratatosk_proto::DeliveryStatus;
 use ratatosk_store::{FsBlobs, SqliteStore};
 #[cfg(feature = "tor")]
 use ratatosk_transport::{onion::arti::OnionRunner, Switched};
-// `Disabled` нужен там, где ступени в сборке нет: она честно отказывает,
-// и это правда о сборке, а не заглушка. Потребителей у него ровно два —
-// `MailSide` и `NostrSide`, — и оба живут под `not(feature)`.
+// `Disabled` зовётся **полным путём** и не импортируется, и это не вкус.
 //
-// **Условие здесь обязано быть их отрицанием, а не отсутствовать.**
-// Стояло без условия, с объяснением «сборка с обоими признаками всё равно
-// бывает», — и в такой сборке импорт становился неиспользуемым. Поймалось
-// не сразу: `cargo build --workspace --all-features` в проверке не звался,
-// а без признаков предупреждения нет.
-#[cfg(not(all(feature = "mail", feature = "nostr")))]
-use ratatosk_transport::Disabled;
+// Он нужен там, где ступени в сборке нет: она честно отказывает, и это
+// правда о сборке, а не заглушка. Условным импорт быть не может —
+// потребителей у него три, и каждый под своим признаком: `MailSide`
+// под `not(mail)`, `NostrSide` под `not(nostr)`, слот onion под
+// `not(tor)`. Безусловным тоже: в сборке со всеми тремя признаками
+// импорт становится неиспользуемым.
+//
+// Условие стояло, и было **неверным**: `not(all(mail, nostr))`, без
+// `tor`. Сборка `--features nostr,mail` падала — импорта нет, а слот
+// onion его просит. Ни обычный прогон, ни `--all-features` этого
+// не видят: в первом признаков нет вовсе, во втором есть все три.
+//
+// Чинить условие значило бы оставить рукописное зеркало на объединение
+// всех мест использования — ровно тот класс, что живёт между двумя
+// исправными половинами. Полный путь убирает правило, а не поправляет.
 use ratatosk_transport::{
     BridgedAir, BtConfig, BtRunner, LanConfig, LanRunner, Transports, YggConfig, YggRunner,
     YGG_PORT,
@@ -4941,7 +4947,7 @@ type MailSide = ratatosk_transport::chatmail::runner::MailRunner;
 
 /// Почты в этой сборке нет: [`ratatosk_transport::Disabled`] честно отказывает.
 #[cfg(not(feature = "mail"))]
-type MailSide = Disabled;
+type MailSide = ratatosk_transport::Disabled;
 
 /// Раннер ступени nostr — или его отсутствие.
 ///
@@ -4954,7 +4960,7 @@ type NostrSide = ratatosk_transport::nostr::NostrRunner;
 /// Ступени nostr в этой сборке нет: [`ratatosk_transport::Disabled`] честно
 /// отказывает, а настройка при этом живёт и ждёт сборки с раннером.
 #[cfg(not(feature = "nostr"))]
-type NostrSide = Disabled;
+type NostrSide = ratatosk_transport::Disabled;
 
 /// Раннер эфира Bluetooth — один на все сборки.
 ///
@@ -5031,7 +5037,8 @@ type Runners = Transports<LanRunner, BtSide, YggRunner, Switched<OnionRunner>, N
 /// Набор транспортов сборки без Tor: локальная сеть, эфир, меш и, если
 /// собраны, реле nostr и почта.
 #[cfg(not(feature = "tor"))]
-type Runners = Transports<LanRunner, BtSide, YggRunner, Disabled, NostrSide, MailSide>;
+type Runners =
+    Transports<LanRunner, BtSide, YggRunner, ratatosk_transport::Disabled, NostrSide, MailSide>;
 
 /// Собирает ядро целиком — внутри потока, которому оно и принадлежит.
 async fn start(
@@ -5125,7 +5132,7 @@ async fn start(
     #[cfg(feature = "mail")]
     let mail = ratatosk_transport::chatmail::runner::MailRunner::new(tor_handle.clone());
     #[cfg(not(feature = "mail"))]
-    let mail = Disabled;
+    let mail = ratatosk_transport::Disabled;
 
     // Ступень nostr (0.3). Ручка Tor у неё общая с onion и почтой — по той же
     // причине: второй `TorClient` означал бы второй bootstrap.
@@ -5137,7 +5144,7 @@ async fn start(
     #[cfg(feature = "nostr")]
     let nostr = ratatosk_transport::nostr::NostrRunner::new(tor_handle.clone());
     #[cfg(not(feature = "nostr"))]
-    let nostr = Disabled;
+    let nostr = ratatosk_transport::Disabled;
 
     #[cfg(feature = "tor")]
     let runner = {
@@ -5183,7 +5190,7 @@ async fn start(
     #[cfg(not(feature = "tor"))]
     let runner = {
         let _ = &tor_handle;
-        Transports::new(lan, bt, ygg, Disabled, nostr, mail)
+        Transports::new(lan, bt, ygg, ratatosk_transport::Disabled, nostr, mail)
     };
 
     let (driver, handle, events) = Driver::new(engine, runner);

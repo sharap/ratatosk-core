@@ -8,14 +8,20 @@
 //! в сборку списка по-прежнему нет, и ни одного адреса, выбранного за
 //! человека, в бинарнике не лежит.
 //!
-//! # Почему только через Tor
+//! # Почему Tor не требуется
 //!
-//! Запрос говорит чужому серверу, что с этого адреса включают меш. Это
-//! ровно та метка, которой мы избегаем у реле nostr, и правило то же:
-//! ходим только через Tor. Записано оно **в манифесте** — признак
-//! `peer-list` требует `onion-arti`, — потому что там его не обойти
-//! забывчивостью. Сборка без Tor похода не содержит, и ядро отвечает
-//! человеку отказом, а не тихим прямым запросом.
+//! Первая редакция требовала его по образцу реле nostr: «запрос говорит
+//! чужому серверу, что с этого адреса включают меш». Образец не подошёл.
+//! У реле долговечный ключ, связанный с адресом устройства хоть раз,
+//! связан с ним навсегда; меш такой тайны не держит вовсе — адрес в нём
+//! выводится из открытого ключа и виден каждому узлу на пути (0.2.6),
+//! и опции «меш через Tor» в дереве нет. Требование защищало уже
+//! открытое и лишало похода тех, у кого меш работает, а Tor не собран.
+//!
+//! Через Tor поход **идёт, когда тот поднят** (спрашивается `is_up`,
+//! а не признак сборки), и это лучше, чем прямо: список спрашивается
+//! до того, как меш поднялся. Но условием это не является, и признак
+//! `peer-list` едет со своим узлом меша, а не с Tor.
 //!
 //! # Кого спрашиваем, и почему это тоже цена
 //!
@@ -159,6 +165,27 @@ fn agent_for(host: &str) -> Option<&'static str> {
     }
 }
 
+/// Что каждый из двух источников принимает в ответ (0.2.7).
+///
+/// Вторая половина той же поломки, что и [`agent_for`], и поймана она
+/// **после** починки первой: `api.github.com` на `Accept: text/plain`
+/// отвечает 415 («Must accept 'application/json'»), а 415 читался
+/// отказом «источник не ответил, попробуйте позже». То есть 403 сменился
+/// на 415, перечень стран по-прежнему не приезжал, а совет человеку
+/// остался тем же — подождать там, где ждать нечего.
+///
+/// Решается **по хосту**, как и имя, и по той же причине: требование
+/// принадлежит хосту. Умолчание здесь — `text/plain`, и оно верно для
+/// всего, что отдаёт файл как есть; JSON просит ровно тот, кто иного
+/// не отдаёт.
+fn accept_for(host: &str) -> &'static str {
+    if host == ygg::PEER_INDEX_AGENT_HOST {
+        ygg::PEER_INDEX_ACCEPT
+    } else {
+        ygg::PEER_LIST_ACCEPT
+    }
+}
+
 /// Один поход со сроком: соединиться, спросить, дочитать тело.
 async fn read(host: &str, path: &str, tor: &crate::onion::TorHandle) -> Result<Vec<u8>, Fail> {
     match tokio::time::timeout(DEADLINE, ask(host, path, tor)).await {
@@ -199,10 +226,10 @@ async fn ask(host: &str, path: &str, tor: &crate::onion::TorHandle) -> Result<Ve
     let via_tor = tor.is_up();
     let mut stream =
         crate::tls::connect(host, 443, via_tor, tor).await.map_err(|_| Fail::Network)?;
-    let request = match agent_for(host) {
-        Some(agent) => http::get_as(host, path, agent),
-        None => http::get(host, path),
-    };
+    // Оба заголовка решаются по хосту и в одном месте: ветвление сборки
+    // означало бы ещё один выбор между решением и запросом, а разойтись
+    // они могут молча.
+    let request = http::get(host, path, agent_for(host), accept_for(host));
     stream.write_all(request.as_bytes()).await.map_err(|_| Fail::Network)?;
     stream.flush().await.map_err(|_| Fail::Network)?;
 
@@ -241,18 +268,44 @@ mod tests {
     }
 
     #[test]
-    fn the_index_request_carries_the_header_and_the_list_request_does_not() {
+    fn only_the_index_asks_for_json_because_only_it_refuses_text() {
+        // Вторая половина той же поломки: имя добавили, и 403 сменился
+        // на 415 — «Must accept 'application/json'». `raw` про `Accept`
+        // не спрашивает вовсе, и `text/plain` там говорит правду о том,
+        // что мы разбираем.
+        assert_eq!(accept_for(ygg::PEER_INDEX_HOST), ygg::PEER_INDEX_ACCEPT);
+        assert_eq!(accept_for(ygg::PEER_LIST_HOST), ygg::PEER_LIST_ACCEPT);
+        assert_eq!(accept_for("example.test"), ygg::PEER_LIST_ACCEPT);
+        // Значения названы и здесь: возьми проверка только константы,
+        // смена `PEER_INDEX_ACCEPT` на `text/plain` оставила бы её
+        // зелёной — а это ровно та поломка, которую она стережёт.
+        assert_eq!(accept_for(ygg::PEER_INDEX_HOST), "application/json");
+        assert_eq!(accept_for(ygg::PEER_LIST_HOST), "text/plain");
+    }
+
+    #[test]
+    fn each_source_gets_the_request_its_own_rules_demand() {
         // Сверяется **собранный запрос**, а не только решение: между
         // решением и заголовком лежит сборщик, и разойтись они могут
-        // молча.
-        let index = http::get_as(ygg::PEER_INDEX_HOST, "/p", ygg::PEER_INDEX_AGENT);
+        // молча. Запрос собирается тем же вызовом, каким его собирает
+        // поход, — иначе проверялась бы не она.
+        let request = |host: &str| http::get(host, "/p", agent_for(host), accept_for(host));
+        let index = request(ygg::PEER_INDEX_HOST);
         assert!(index.contains("User-Agent: yggdrasil-peers\r\n"), "{index}");
-        let list = http::get(ygg::PEER_LIST_HOST, "/p");
+        assert!(index.contains("Accept: application/json\r\n"), "{index}");
+        assert!(!index.contains("text/plain"), "{index}");
+
+        let list = request(ygg::PEER_LIST_HOST);
         assert!(!list.contains("User-Agent"), "{list}");
+        assert!(list.contains("Accept: text/plain\r\n"), "{list}");
+
         // И оба обязаны остаться годным HTTP: пустая строка в конце одна.
         for request in [&index, &list] {
             assert!(request.ends_with("\r\n\r\n"), "{request}");
             assert!(request.starts_with("GET /p HTTP/1.1\r\n"));
+            // Заголовок ровно один на имя: второй `Accept` чужой сервер
+            // вправе прочесть как угодно.
+            assert_eq!(request.matches("Accept:").count(), 1, "{request}");
         }
     }
 
@@ -268,7 +321,13 @@ mod tests {
     }
 
     // **Чего эти проверки не стерегут.** Что чужой сервер и правда требует
-    // имя — это проверено запросом руками, а не прогоном: сеть здесь
-    // не зовётся. Сменит он требование — проверки смолчат, а поймает
-    // живой поход.
+    // имя и JSON — это проверено запросами руками, а не прогоном: сеть
+    // здесь не зовётся. Сменит он требования — проверки смолчат,
+    // а поймает живой поход.
+    //
+    // И не стерегут того, что 415 больше не придёт. Если придёт, он
+    // по-прежнему прочтётся как `SourceSilent` — «источник не ответил,
+    // попробуйте позже». Отдельной причины ему не завели нарочно:
+    // после этой правки 415 означал бы **нашу** ошибку в запросе,
+    // а не состояние источника, и человеку с ней делать нечего.
 }

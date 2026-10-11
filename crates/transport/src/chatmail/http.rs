@@ -114,10 +114,39 @@ pub fn credentials(response: &[u8]) -> Result<(String, String), HttpError> {
 /// добавлять к нему имя приложения незачем.
 #[must_use]
 pub fn get(host: &str, path: &str) -> String {
+    build_get(host, path, None)
+}
+
+/// То же, но с именем клиента (`User-Agent`).
+///
+/// # Зачем это вообще есть
+///
+/// `api.github.com` **требует** заголовок и без него отвечает 403
+/// («Request forbidden by administrative rules. Please make sure your
+/// request has a User-Agent header»). Проверено запросом, а не прочитано
+/// в документации. `raw.githubusercontent.com` при этом не требует —
+/// отсюда и поломка, которую принесли с устройства: список пиров ехал,
+/// а перечень стран нет.
+///
+/// Соседний [`get`] имени **не** посылает, и асимметрия здесь нарочная:
+/// посылать меньше лучше, чем посылать для порядка. Кто захочет
+/// «привести к одному виду» — прочтёт эту строку.
+#[must_use]
+pub fn get_as(host: &str, path: &str, agent: &str) -> String {
+    build_get(host, path, Some(agent))
+}
+
+/// Общий сборщик: имя клиента добавляется, только если его дали.
+fn build_get(host: &str, path: &str, agent: Option<&str>) -> String {
+    let named = match agent {
+        Some(agent) => format!("User-Agent: {agent}\r\n"),
+        None => String::new(),
+    };
     format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Accept: text/plain\r\n\
+         {named}\
          Connection: close\r\n\
          \r\n"
     )

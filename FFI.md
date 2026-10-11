@@ -208,7 +208,7 @@ RatatoskClient::open(db_path: String, pin: Option<String>, display_name: String)
 | `ygg_key() -> Vec<u8>` | действующее имя в меше из карточки; пусто — меша нет |
 | `set_ygg_peers(peers: Vec<String>)` | кому звонить своему узлу: `tcp://host:port`; список заменяется целиком |
 | `ygg_peer_regions() -> [String]` | области публичного списка (0.2.7) — имена каталогов источника, **не** узлы |
-| `ygg_peer_countries(region) -> [String]` | какие страны есть в области; поход **необязательный**, отказ `IndexBusy` — норма, назовите страну сами |
+| `ygg_peer_countries(region) -> [String]` | какие страны есть в области; поход **необязательный**, отказ `IndexBusy` — предел у источника, назовите страну сами |
 | `fetch_ygg_peers(region, country) -> [String]` | принести публичный список (0.2.7); **это не настройка** — выбранное отправьте `set_ygg_peers` |
 | `ygg_multicast_supported() -> bool` | бывает ли поиск соседей на этом устройстве (0.2.7); `false` — переключатель не рисовать |
 | `set_ygg_multicast(on: bool)` | искать ли соседей в своей сети (0.2.7); показать `ygg_multicast_notice()` **до** |

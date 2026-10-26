@@ -29,8 +29,10 @@
 //! экран и нажал. Реле закрываются и появляются чаще, чем выходят версии,
 //! и хранить вчерашний ответ значило бы предлагать вчерашнюю сеть.
 
+use crate::chatmail::http;
 use futures::{SinkExt, StreamExt};
 use ratatosk_proto::nostr::{self, RelayCandidate, RelayListError};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Сколько ждём ответа наблюдателя.
 ///
@@ -38,6 +40,15 @@ use ratatosk_proto::nostr::{self, RelayCandidate, RelayListError};
 /// норма. Предел нужен затем, чтобы экран не висел вечно: человек,
 /// нажавший «подобрать», обязан получить либо реле, либо отказ.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Сколько ждём ответа **самого реле** на вопрос о себе и на стук.
+///
+/// Короче, чем у наблюдателя: реле либо отвечает сразу, либо нам
+/// не подходит. Проверка идёт у всех сразу, и общий срок — этот же.
+const VET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Сколько реле проверяем. Больше — дольше ждать, а человеку нужно три.
+const VET_WIDTH: usize = 8;
 
 /// Сколько реле отдаём наружу.
 ///
@@ -64,7 +75,11 @@ pub async fn fetch(
         .ok_or(RelayListError::NoCountry)?;
     match tokio::time::timeout(DEADLINE, ask(&request, tor)).await {
         Ok(Ok(candidates)) => {
-            let picked = nostr::nearest_relays(&candidates, KEEP);
+            // Сперва ближние и разных владельцев, потом проверка: иначе
+            // мы проверяли бы десятки реле, чтобы выбросить их по тому же
+            // правилу, по которому не взяли бы и без проверки.
+            let nearest = nostr::nearest_relays(&candidates, VET_WIDTH);
+            let picked: Vec<_> = vet(nearest, tor).await.into_iter().take(KEEP).collect();
             if picked.is_empty() {
                 // Пустота после удачного похода — не успех: наблюдатель
                 // отвечает сотнями описаний, и ноль годных означает, что
@@ -129,6 +144,126 @@ async fn ask(
         .await;
     let _ = socket.close(None).await;
     Ok(candidates)
+}
+
+/// Спрашивает у самих реле, пускают ли они чужих.
+///
+/// # Почему наблюдателя мало
+///
+/// Его замер говорит «отвечает», а не «пустит вас», и разница эта
+/// стоила подборки: человек получил восемь живых реле, из которых
+/// ни одно не взяло его сообщений. Проверено после: два из них
+/// встречают запросом входа, хотя у наблюдателя помечены «входа
+/// не требует», ещё одно в своём NIP-11 пишет `restricted_writes`.
+///
+/// Поэтому спрашиваем дважды и у самого реле: что оно пишет о себе
+/// (NIP-11) и чем встречает (стук). Обе проверки идут у всех сразу —
+/// последовательно это были бы минуты.
+///
+/// # Чего и эта проверка не даёт
+///
+/// Обещания, что **запись** пройдёт. Проверить её можно только записью,
+/// а писать в чужое реле ради пробы — сорить у чужого человека. Реле,
+/// которое молчит о себе и пускает читать, остаётся догадкой; об этом
+/// клиент говорит человеку словами.
+async fn vet(
+    candidates: Vec<RelayCandidate>,
+    tor: &crate::onion::TorHandle,
+) -> Vec<RelayCandidate> {
+    let checks = candidates.into_iter().map(|candidate| async move {
+        let open = tokio::time::timeout(VET_DEADLINE, open_to_strangers(&candidate.url, tor))
+            .await
+            .unwrap_or(false);
+        open.then_some(candidate)
+    });
+    futures::future::join_all(checks).await.into_iter().flatten().collect()
+}
+
+/// Пускает ли это реле чужого: что говорит о себе и чем встречает.
+async fn open_to_strangers(url: &str, tor: &crate::onion::TorHandle) -> bool {
+    if says_it_is_closed(url, tor).await {
+        return false;
+    }
+    knock_at(url, tor).await
+}
+
+/// Что реле пишет о себе (NIP-11).
+///
+/// `true` — само сказало, что не пустит: вход по ключу, деньги или
+/// закрытая запись. Молчание — не отказ (см. `nostr::relay_refuses`).
+async fn says_it_is_closed(url: &str, tor: &crate::onion::TorHandle) -> bool {
+    let Some(target) = nostr::relay_target(url) else { return true };
+    let via_tor = tor.is_up() && target.tls;
+    // Тот же узел и тот же порт, что у веб-сокета: NIP-11 отдаётся
+    // обычным запросом с особым `Accept`.
+    let Ok(plain) = crate::tls::dial(&target.host, target.port, via_tor, tor).await else {
+        return false;
+    };
+    let Ok(mut stream) = crate::tls::wrap(&target.host, plain).await else { return false };
+    let request = http::get(&target.host, "/", None, "application/nostr+json");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+        }
+        if response.len() > http::MAX_RESPONSE_BYTES {
+            break;
+        }
+    }
+    let Ok(body) = http::body(&response) else { return false };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else { return false };
+    let limits = value.get("limitation");
+    let flag = |name: &str| {
+        limits.and_then(|limits| limits.get(name)).and_then(serde_json::Value::as_bool)
+    };
+    nostr::relay_refuses(flag("auth_required"), flag("payment_required"), flag("restricted_writes"))
+}
+
+/// Стук: соединиться и попросить показать что-нибудь.
+///
+/// Реле, которое требует входа, встречает `AUTH` — так отвечают оба
+/// случая, на которых подборка и сломалась. Записи здесь нет: проверить
+/// её можно только записью, а это мусор в чужом реле.
+async fn knock_at(url: &str, tor: &crate::onion::TorHandle) -> bool {
+    let Some(target) = nostr::relay_target(url) else { return false };
+    let via_tor = tor.is_up() && target.tls;
+    let Ok(plain) = crate::tls::dial(&target.host, target.port, via_tor, tor).await else {
+        return false;
+    };
+    let stream: crate::tls::Plain = if target.tls {
+        let Ok(wrapped) = crate::tls::wrap(&target.host, plain).await else { return false };
+        Box::new(wrapped)
+    } else {
+        plain
+    };
+    let Ok((mut socket, _)) = tokio_tungstenite::client_async(url, stream).await else {
+        return false;
+    };
+    let request = "[\"REQ\",\"knock\",{\"kinds\":[1],\"limit\":1}]".to_owned();
+    if socket.send(tokio_tungstenite::tungstenite::Message::text(request)).await.is_err() {
+        return false;
+    }
+    let mut open = false;
+    while let Some(Ok(message)) = socket.next().await {
+        let Ok(text) = message.to_text() else { continue };
+        match nostr::knock(text) {
+            nostr::Knock::Open => {
+                open = true;
+                break;
+            }
+            nostr::Knock::Closed => break,
+            // Своё реле вправе сказать что-то своё: ждём внятного ответа,
+            // а срок на всю проверку стоит снаружи.
+            nostr::Knock::Unclear => {}
+        }
+    }
+    let _ = socket.close(None).await;
+    open
 }
 
 /// Что приехало от наблюдателя.

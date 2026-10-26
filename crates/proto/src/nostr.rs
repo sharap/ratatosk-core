@@ -707,12 +707,21 @@ pub fn relay_candidate(tags: &[Vec<String>]) -> Option<RelayCandidate> {
     let mut rtt = None;
     let mut country = None;
     let mut clearnet = false;
+    let mut closed = false;
     for tag in tags {
         let (name, values) = tag.split_first()?;
         match name.as_str() {
             "d" => url = values.first().cloned(),
             "rtt-open" => rtt = values.first().and_then(|ms| ms.parse::<u32>().ok()),
             "n" => clearnet |= values.iter().any(|value| value == "clearnet"),
+            // Требования реле словами наблюдателя. Метки с восклицанием
+            // («!auth») означают «не требует», без него — требует.
+            // Верить им на слово нельзя (см. `relay_refuses`), но то,
+            // что наблюдатель прямо называет закрытым, спрашивать
+            // второй раз незачем.
+            "R" => {
+                closed |= values.iter().any(|value| value == "auth" || value == "payment");
+            }
             // Код страны узнаётся по виду: наблюдатель кладёт рядом
             // и название, и номер, и имя оператора связи. Берётся первый
             // похожий и больше не меняется: меток у реле несколько,
@@ -724,14 +733,36 @@ pub fn relay_candidate(tags: &[Vec<String>]) -> Option<RelayCandidate> {
         }
     }
     let url = url?;
-    if !clearnet {
+    if !clearnet || closed {
         return None;
     }
     let target = relay_target(&url)?;
     if !target.tls {
         return None;
     }
+    // Адрес с путём — обычно реле **одного человека**: `/inbox`
+    // по NIP-17 или `/users/кто-то` у сборщика лент. Такое реле читается
+    // кем угодно, а события берёт только от хозяина, и предложить его
+    // значило бы предложить тишину. Правило грубое — общее реле на пути
+    // тоже бывает, — и потому оно здесь, в подборе для человека,
+    // который адрес вводить не станет, а не в разборе адреса.
+    if !path_of(&url).is_empty() {
+        return None;
+    }
     Some(RelayCandidate { url, rtt_ms: rtt, country })
+}
+
+/// Что стоит в адресе после имени узла, без завершающей косой.
+fn path_of(url: &str) -> &str {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let path = match rest.find('/') {
+        Some(at) => &rest[at + 1..],
+        None => "",
+    };
+    path.split(['?', '#']).next().unwrap_or("").trim_end_matches('/')
 }
 
 /// Владелец реле — по двум последним частям имени.
@@ -758,6 +789,85 @@ fn relay_owner(url: &str) -> Option<String> {
     } else {
         Some(host)
     }
+}
+
+/// Пускает ли реле чужих — по тому, что оно говорит о себе (NIP-11).
+///
+/// # Зачем спрашивать само реле, когда есть наблюдатель
+///
+/// Наблюдатель ошибается, и это проверено на живых данных: два реле,
+/// помеченных у него `!auth` («входа не требует»), на соединении
+/// встречают запросом входа, а третье, помеченное так же, в своём
+/// NIP-11 честно пишет `restricted_writes`. Замер наблюдателя говорит
+/// «отвечает», а не «пустит вас», и путать это нельзя: человек получил
+/// подборку живых реле, из которых ни одно не взяло его сообщений.
+///
+/// # Почему молчание — не отказ
+///
+/// Большинство реле о себе не говорит ничего: в выборке из шестнадцати
+/// прямо ответили двое, и оба отказом. Требуй мы подтверждения,
+/// подборка осталась бы пустой. Поэтому молчание пропускается —
+/// а клиент говорит человеку словами, что молчание не обещание.
+#[must_use]
+pub const fn relay_refuses(
+    auth_required: Option<bool>,
+    payment_required: Option<bool>,
+    restricted_writes: Option<bool>,
+) -> bool {
+    matches!(auth_required, Some(true))
+        || matches!(payment_required, Some(true))
+        || matches!(restricted_writes, Some(true))
+}
+
+/// Чем реле встретило стук (0.3, дополнение).
+///
+/// Стук — это соединение и просьба показать что-нибудь: не запись,
+/// а проверка, что нас вообще пускают. Запись проверить нельзя,
+/// не написав, а писать в чужое реле ради пробы — значит сорить
+/// у чужого человека.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Knock {
+    /// Показало сохранённое или сказало, что его нет: нас пускают.
+    Open,
+    /// Требует входа (`AUTH`) или закрыло подписку: не наше реле.
+    Closed,
+    /// Ответило что-то своё — ждём дальше.
+    Unclear,
+}
+
+/// Как прочесть ответ реле на стук.
+///
+/// `AUTH` — вход по ключу: ступень его не умеет, и реле, которое просит
+/// войти, нам не подходит. `CLOSED` — подписку закрыли, и причина
+/// обычно та же (`auth-required`, `restricted`).
+#[must_use]
+pub fn knock(message: &str) -> Knock {
+    let head = message.trim_start();
+    if head.starts_with("[\"AUTH\"") || head.starts_with("[\"CLOSED\"") {
+        Knock::Closed
+    } else if head.starts_with("[\"EOSE\"") || head.starts_with("[\"EVENT\"") {
+        Knock::Open
+    } else {
+        Knock::Unclear
+    }
+}
+
+/// Отказ в приёме события — про нас или про само событие (NIP-01)?
+///
+/// Реле отвечает `["OK", id, false, "<причина>"]`, и причины там
+/// машиночитаемые. Три из них означают «ваших событий здесь не будет»:
+/// вход по ключу, закрытая запись и запрет. Остальные — про событие
+/// (повтор, работа, негодное) или про время (предел частоты).
+///
+/// Различать их надо затем, что реле, не берущее наших событий, обязано
+/// перестать выглядеть работающим: §14 запрещает показывать зелёное
+/// там, где ничего не уезжает.
+#[must_use]
+pub fn publish_refusal_is_final(note: &str) -> bool {
+    let lower = note.trim().to_lowercase();
+    lower.starts_with("auth-required:")
+        || lower.starts_with("restricted:")
+        || lower.starts_with("blocked:")
 }
 
 /// Ближайшие и **разных владельцев** — в том порядке, в каком предлагать.
@@ -1309,6 +1419,91 @@ mod tests {
             request,
             "[\"REQ\",\"relays\",{\"kinds\":[30166],\"#l\":[\"DE\"],\"limit\":64}]"
         );
+    }
+
+    #[test]
+    fn what_the_watcher_itself_calls_closed_is_not_offered() {
+        // Метки наблюдателя: «!auth» — входа не требует, «payment» —
+        // требует денег. Второе проверено живьём: `relay.azzamo.net`
+        // помечен так, и в своём NIP-11 подтверждает — платное
+        // и с закрытой записью.
+        let paid = tags(&[
+            ("d", &["wss://relay.azzamo.net/"]),
+            ("n", &["clearnet"]),
+            ("R", &["!auth", "payment", "!pow"]),
+            ("rtt-open", &["116"]),
+        ]);
+        assert!(relay_candidate(&paid).is_none());
+
+        let open = tags(&[
+            ("d", &["wss://nos.lol/"]),
+            ("n", &["clearnet"]),
+            ("R", &["!auth", "!payment", "!pow"]),
+            ("rtt-open", &["106"]),
+        ]);
+        assert!(relay_candidate(&open).is_some());
+    }
+
+    #[test]
+    fn a_personal_relay_is_not_offered_to_a_stranger() {
+        // Настоящие адреса из ответа наблюдателя: такое реле читается
+        // кем угодно, а события берёт только от хозяина.
+        let inbox = tags(&[("d", &["wss://h.codingarena.top/inbox"]), ("n", &["clearnet"])]);
+        assert!(relay_candidate(&inbox).is_none());
+        let feed =
+            tags(&[("d", &["wss://feeds.nostrarchives.com/users/upandc"]), ("n", &["clearnet"])]);
+        assert!(relay_candidate(&feed).is_none());
+
+        // Завершающая косая — это не путь, и отбрасывать по ней нельзя:
+        // так наблюдатель пишет почти все адреса.
+        let plain = tags(&[("d", &["wss://nos.lol/"]), ("n", &["clearnet"])]);
+        assert!(relay_candidate(&plain).is_some());
+    }
+
+    #[test]
+    fn a_relay_that_says_it_is_closed_is_believed() {
+        // NIP-11 самого реле: любое из трёх «да» означает, что наши
+        // события туда не поедут.
+        assert!(relay_refuses(Some(true), Some(false), Some(false)));
+        assert!(relay_refuses(Some(false), Some(true), Some(false)));
+        assert!(relay_refuses(Some(false), Some(false), Some(true)));
+        assert!(!relay_refuses(Some(false), Some(false), Some(false)));
+
+        // **Молчание — не отказ, и это решение, а не недосмотр.**
+        // В живой выборке из шестнадцати реле прямо ответили двое,
+        // и оба отказом; требуй мы подтверждения, подборка осталась бы
+        // пустой. Клиент говорит человеку словами, что молчание
+        // ничего не обещает.
+        assert!(!relay_refuses(None, None, None));
+        assert!(!relay_refuses(None, Some(false), None));
+    }
+
+    #[test]
+    fn a_request_to_log_in_is_a_closed_door() {
+        // Так отвечают два реле из первой подборки, которую наблюдатель
+        // пометил «входа не требует»: `basspistol.org`
+        // и `comrelay.nostrdvm.com`.
+        assert_eq!(knock(r#"["AUTH","51e782ee3786ff6b"]"#), Knock::Closed);
+        assert_eq!(knock(r#"["CLOSED","t","auth-required: we only serve ours"]"#), Knock::Closed);
+        assert_eq!(knock(r#"["EOSE","t"]"#), Knock::Open);
+        assert_eq!(knock(r#"["EVENT","t",{"kind":1}]"#), Knock::Open);
+        assert_eq!(knock(r#"["NOTICE","шумно"]"#), Knock::Unclear);
+    }
+
+    #[test]
+    fn a_refusal_about_us_is_told_from_a_refusal_about_the_event() {
+        // Про нас: входа нет, запись закрыта, ключ в запрете.
+        assert!(publish_refusal_is_final(
+            "auth-required: we only accept events from authenticated users"
+        ));
+        assert!(publish_refusal_is_final("restricted: not on the allow list"));
+        assert!(publish_refusal_is_final("blocked: pubkey not allowed"));
+        // Про событие или про время: реле наше, а эта отправка не вышла.
+        assert!(!publish_refusal_is_final("duplicate: already have this event"));
+        assert!(!publish_refusal_is_final("rate-limited: slow down"));
+        assert!(!publish_refusal_is_final("invalid: bad signature"));
+        assert!(!publish_refusal_is_final("error: could not connect to the database"));
+        assert!(!publish_refusal_is_final(""));
     }
 
     // **Чего эти проверки не стерегут.** Что наблюдатель и правда отвечает

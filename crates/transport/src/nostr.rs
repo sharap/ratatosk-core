@@ -1266,6 +1266,27 @@ async fn pump(relay: &mut Relay, since: &mut u64) -> Result<(), String> {
                         Some(Parsed::Ok { id, ok, note }) => {
                             if !ok {
                                 tracing::debug!(%url, %id, %note, "реле отвергло событие");
+                                // Отказ отказу рознь (NIP-01). «Повтор»
+                                // и «слишком часто» — про событие и про
+                                // время; вход по ключу, закрытая запись
+                                // и запрет — про **нас**, и такое реле
+                                // обязано перестать выглядеть
+                                // работающим. Зелёная строка при реле,
+                                // которое не возьмёт ни одного нашего
+                                // события, — ровно то «работает,
+                                // но не доходит», что §14 запрещает.
+                                if nostr::publish_refusal_is_final(&note)
+                                    && notes
+                                        .send(Note::Down {
+                                            url: url.to_owned(),
+                                            note: note.clone(),
+                                            own: subscribe,
+                                        })
+                                        .await
+                                        .is_err()
+                                {
+                                    return Ok(());
+                                }
                             }
                             if notes.send(Note::Accepted { id, ok }).await.is_err() {
                                 return Ok(());

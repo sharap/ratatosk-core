@@ -586,6 +586,208 @@ pub fn relays_decode(bytes: &[u8]) -> Result<Vec<String>, CodecError> {
         .collect()
 }
 
+// ---------------------------------------------------------------------
+// Подбор реле поближе (0.3, дополнение)
+// ---------------------------------------------------------------------
+
+/// У кого спрашивают, какие реле бывают.
+///
+/// # Это адрес **источника**, а не реле для переписки
+///
+/// Зашитого списка реле нет и не будет: реле видит, кто с кем
+/// переписывается, и выбирать его за человека нельзя (0.3.3, §14).
+/// Здесь лежит адрес наблюдателя сети — того, кто публикует описания
+/// реле (NIP-66), — и это тоже цена: кого спрашивать, выбрали мы.
+/// Сказать о ней человеку обязан клиент.
+///
+/// Разница с зашитым списком не словесная. Список в сборке протух бы
+/// вместе с релизом и остался бы выбором **нашим**; принесённое
+/// во время работы человек видит и выбирает сам, а наблюдатель
+/// переписку не возит вовсе.
+pub const RELAY_SOURCE: &str = "wss://relay.nostr.watch";
+
+/// Вид события, которым наблюдатели описывают реле (NIP-66, черновик).
+///
+/// Событие заменяемое: у каждого наблюдателя по одному на реле,
+/// и свежее вытесняет старое само.
+pub const RELAY_INFO_KIND: u16 = 30166;
+
+/// Сколько описаний просим у наблюдателя за один заход.
+///
+/// Не «все»: описаний тысячи, а человеку нужно два-три. Шестьдесят
+/// четыре — с запасом на то, что часть окажется негодной: открытый
+/// `ws://`, сеть Tor вместо обычной, адрес без замера.
+pub const RELAY_QUERY_LIMIT: usize = 64;
+
+/// Что наблюдатель рассказал про одно реле.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayCandidate {
+    /// Адрес реле, годный для [`relay_target`].
+    pub url: String,
+    /// Задержка рукопожатия **по замеру наблюдателя**, мс.
+    ///
+    /// Не наша: мерил её другой узел из другого места. Для «поближе»
+    /// этого хватает — реле в вашей стране отвечает быстрее всем
+    /// в этой стране, — а обещать человеку свою задержку нельзя:
+    /// её видно только после соединения.
+    pub rtt_ms: Option<u32>,
+    /// Страна реле, как её назвал наблюдатель.
+    pub country: Option<String>,
+}
+
+/// Почему не вышло спросить, какие реле бывают (0.3, дополнение).
+///
+/// Перечислением, а не строкой, и по той же причине, что у списка пиров
+/// меша: каждая причина — **своё действие человека**. Текст к причине
+/// живёт в ядре (`ratatosk_core::honest::relay_list_refusal_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RelayListError {
+    /// Ступени nostr в этой сборке нет, и спрашивать реле не для чего.
+    #[error("в этой сборке нет ступени nostr")]
+    NotInThisBuild,
+    /// Страна не названа или названа негодно. Делать: назвать страну.
+    #[error("страна не названа")]
+    NoCountry,
+    /// Наблюдатель не ответил или оборвал. Делать: повторить позже.
+    #[error("наблюдатель не ответил")]
+    SourceSilent,
+    /// Ответ пришёл, годных реле в нём нет.
+    #[error("в ответе нет ни одного годного реле")]
+    FormatChanged,
+}
+
+/// Годится ли код страны для подстановки в запрос.
+///
+/// Ровно две заглавные латинские буквы — то, чем страну называет
+/// и наблюдатель, и телефон. Проверка здесь, а не у вызывающего:
+/// код едет в запрос к чужому узлу, и чужое значение в нём означало бы
+/// запрос, который мы не писали.
+#[must_use]
+pub fn country_code_ok(code: &str) -> bool {
+    code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+/// Запрос к наблюдателю: реле названной страны.
+///
+/// `None` — код страны негоден, и походу незачем начинаться.
+#[must_use]
+pub fn relay_query_json(subscription: &str, country: &str, limit: usize) -> Option<String> {
+    if !country_code_ok(country) {
+        return None;
+    }
+    let mut out = String::with_capacity(128);
+    out.push_str("[\"REQ\",");
+    json_string(subscription, &mut out);
+    out.push_str(",{\"kinds\":[");
+    out.push_str(&RELAY_INFO_KIND.to_string());
+    out.push_str("],\"#l\":[");
+    json_string(country, &mut out);
+    out.push_str("],\"limit\":");
+    out.push_str(&limit.to_string());
+    out.push_str("}]");
+    Some(out)
+}
+
+/// Кандидат из тегов события наблюдателя; `None` — не годится.
+///
+/// Теги приходят плоско: имя и значения. Разбор JSON остаётся выше,
+/// в транспорте, — здесь живут **правила**, и проверяются они без сети.
+///
+/// # Что отбрасывается и почему
+///
+/// * открытый `ws://` — он отдал бы наблюдателю по дороге тот самый
+///   граф, ради сокрытия которого ступень и ходит через Tor (0.3.3);
+/// * реле не из обычной сети (`tor`, `i2p`): до них нужна своя дорога,
+///   и предложенное такое реле молчало бы;
+/// * адрес, который не разбирается [`relay_target`]: негодный адрес
+///   ядро всё равно не сохранит.
+#[must_use]
+pub fn relay_candidate(tags: &[Vec<String>]) -> Option<RelayCandidate> {
+    let mut url = None;
+    let mut rtt = None;
+    let mut country = None;
+    let mut clearnet = false;
+    for tag in tags {
+        let (name, values) = tag.split_first()?;
+        match name.as_str() {
+            "d" => url = values.first().cloned(),
+            "rtt-open" => rtt = values.first().and_then(|ms| ms.parse::<u32>().ok()),
+            "n" => clearnet |= values.iter().any(|value| value == "clearnet"),
+            // Код страны узнаётся по виду: наблюдатель кладёт рядом
+            // и название, и номер, и имя оператора связи. Берётся первый
+            // похожий и больше не меняется: меток у реле несколько,
+            // и последняя из них — не «более верная».
+            "l" if country.is_none() => {
+                country = values.iter().find(|value| country_code_ok(value)).cloned();
+            }
+            _ => {}
+        }
+    }
+    let url = url?;
+    if !clearnet {
+        return None;
+    }
+    let target = relay_target(&url)?;
+    if !target.tls {
+        return None;
+    }
+    Some(RelayCandidate { url, rtt_ms: rtt, country })
+}
+
+/// Владелец реле — по двум последним частям имени.
+///
+/// Нужен затем же, зачем человеку несколько реле: **делить след**
+/// (0.3.3). Два реле одного владельца след не делят, сколько их ни
+/// называй, и предложить такую пару значило бы предложить средство,
+/// которое не средство.
+///
+/// Правило приблизительное, и это сказано прямо: `example.co.uk`
+/// сольётся в `co.uk`, а два разных хозяина под одним хостингом
+/// не различаются вовсе. Адрес вместо имени остаётся собой — по номеру
+/// владельца не угадать, а гадать здесь хуже, чем не гадать.
+fn relay_owner(url: &str) -> Option<String> {
+    let host = relay_target(url)?.host.to_lowercase();
+    let looks_like_address =
+        host.bytes().all(|b| b.is_ascii_digit() || b == b'.') || host.contains(':');
+    if looks_like_address {
+        return Some(host);
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 2 {
+        Some(parts[parts.len() - 2..].join("."))
+    } else {
+        Some(host)
+    }
+}
+
+/// Ближайшие и **разных владельцев** — в том порядке, в каком предлагать.
+///
+/// Сперва те, у кого замер есть и он меньше: замер чужой, но реле
+/// в своей стране отвечает быстрее всем в этой стране. Без замера —
+/// в конец: такое реле не хуже, но называть его «поближе» было бы
+/// выдумкой.
+#[must_use]
+pub fn nearest_relays(candidates: &[RelayCandidate], limit: usize) -> Vec<RelayCandidate> {
+    let mut sorted: Vec<&RelayCandidate> = candidates.iter().collect();
+    // Устойчиво: при равных замерах порядок наблюдателя сохраняется,
+    // и перетасовки на ровном месте не будет.
+    sorted.sort_by_key(|candidate| candidate.rtt_ms.unwrap_or(u32::MAX));
+    let mut owners = Vec::new();
+    let mut picked = Vec::new();
+    for candidate in sorted {
+        let Some(owner) = relay_owner(&candidate.url) else { continue };
+        if owners.contains(&owner) {
+            continue;
+        }
+        owners.push(owner);
+        picked.push(candidate.clone());
+        if picked.len() == limit {
+            break;
+        }
+    }
+    picked
+}
+
 /// Сколько байт кадра едет в одном событии.
 ///
 /// # Откуда число
@@ -992,6 +1194,127 @@ mod bech32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Теги наблюдателя — в том виде, в каком они приходят.
+    fn tags(pairs: &[(&str, &[&str])]) -> Vec<Vec<String>> {
+        pairs
+            .iter()
+            .map(|(name, values)| {
+                let mut tag = vec![(*name).to_owned()];
+                tag.extend(values.iter().map(|value| (*value).to_owned()));
+                tag
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_watchers_note_becomes_a_candidate() {
+        let note = tags(&[
+            ("d", &["wss://relay.sigit.io/"]),
+            ("rtt-open", &["109"]),
+            ("n", &["clearnet"]),
+            ("l", &["v236", "176.9.50.120", "DE", "Hetzner Online GmbH"]),
+        ]);
+        let candidate = relay_candidate(&note).expect("реле годное");
+        assert_eq!(candidate.url, "wss://relay.sigit.io/");
+        assert_eq!(candidate.rtt_ms, Some(109));
+        // Страна узнаётся по виду: рядом лежат и версия, и адрес,
+        // и имя оператора — они на код страны не похожи.
+        assert_eq!(candidate.country.as_deref(), Some("DE"));
+    }
+
+    #[test]
+    fn an_open_socket_is_not_offered_to_anyone() {
+        // Настоящая строка из ответа наблюдателя: такие там есть.
+        // Открытый `ws://` отдал бы наблюдателю по дороге граф
+        // переписки — ровно то, ради чего ступень ходит через Tor.
+        let open = tags(&[("d", &["ws://wot.relayted.de/"]), ("n", &["clearnet"])]);
+        assert!(relay_candidate(&open).is_none());
+
+        // **Вторая половина, без которой проверка зелена зря.** Наружный
+        // `ws://` отвергает сам [`relay_target`], и сними мы запрет
+        // на нешифрованный поток — эта проверка бы смолчала. Запрет
+        // стережёт вот что: у петлевого адреса `relay_target` TLS
+        // не требует, а наблюдатель про чужой `localhost` рассказывать
+        // не вправе — такое реле было бы нашим, а не его.
+        let loopback = tags(&[("d", &["ws://127.0.0.1:7777/"]), ("n", &["clearnet"])]);
+        assert!(relay_target("ws://127.0.0.1:7777/").is_some(), "адрес сам по себе годен");
+        assert!(relay_candidate(&loopback).is_none(), "но кандидатом он не становится");
+    }
+
+    #[test]
+    fn a_relay_behind_another_network_is_not_offered() {
+        // До onion-реле нужна своя дорога; предложенное такое реле
+        // молчало бы, а человек считал бы ступень настроенной.
+        let onion = tags(&[
+            ("d", &["wss://ratatosk.example.onion/"]),
+            ("n", &["tor"]),
+            ("rtt-open", &["90"]),
+        ]);
+        assert!(relay_candidate(&onion).is_none());
+    }
+
+    #[test]
+    fn the_nearest_relays_come_from_different_owners() {
+        // Реле одного хозяина след не делят (0.3.3), сколько их
+        // ни называй: `nostr.xmr.rocks` и `nerostr.xmr.rocks` — это
+        // настоящая пара из ответа наблюдателя.
+        let candidates = vec![
+            RelayCandidate {
+                url: "wss://nostr.xmr.rocks/".to_owned(),
+                rtt_ms: Some(195),
+                country: Some("DE".to_owned()),
+            },
+            RelayCandidate {
+                url: "wss://nerostr.xmr.rocks/".to_owned(),
+                rtt_ms: Some(208),
+                country: Some("DE".to_owned()),
+            },
+            RelayCandidate {
+                url: "wss://relay.sigit.io/".to_owned(),
+                rtt_ms: Some(109),
+                country: Some("DE".to_owned()),
+            },
+            RelayCandidate {
+                url: "wss://greensoul.space/".to_owned(),
+                rtt_ms: None,
+                country: Some("DE".to_owned()),
+            },
+        ];
+        let picked = nearest_relays(&candidates, 3);
+        let urls: Vec<&str> = picked.iter().map(|c| c.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "wss://relay.sigit.io/",
+                "wss://nostr.xmr.rocks/",
+                // Без замера — в конец: такое реле не хуже, но звать
+                // его «поближе» было бы выдумкой.
+                "wss://greensoul.space/",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_country_that_was_not_named_asks_nothing() {
+        // Код едет в запрос к чужому узлу: чужое значение в нём
+        // означало бы запрос, которого мы не писали.
+        assert!(relay_query_json("relays", "de", RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", "DEU", RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", "", RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", "D\"]", RELAY_QUERY_LIMIT).is_none());
+
+        let request = relay_query_json("relays", "DE", 64).expect("код годный");
+        assert_eq!(
+            request,
+            "[\"REQ\",\"relays\",{\"kinds\":[30166],\"#l\":[\"DE\"],\"limit\":64}]"
+        );
+    }
+
+    // **Чего эти проверки не стерегут.** Что наблюдатель и правда отвечает
+    // такими событиями — это видно только живым походом, сеть здесь
+    // не зовётся. И что его замер говорит что-то о **нашей** задержке:
+    // мерил он из своего места, и своя видна только после соединения.
 
     /// Ключ из вектора NIP-19.
     fn vector_key() -> [u8; KEY_LEN] {

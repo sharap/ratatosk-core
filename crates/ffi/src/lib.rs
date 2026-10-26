@@ -224,6 +224,18 @@ pub enum RatatoskError {
         /// Что именно не дало списку приехать.
         reason: FfiPeerListRefusal,
     },
+    /// Поход за реле поближе не удался (0.3, дополнение).
+    ///
+    /// Отдельно от [`RatatoskError::Internal`] по той же причине, что
+    /// и отказ списка пиров: человеку есть что сделать с каждой
+    /// из причин — назвать страну, повторить позже, назвать реле сами.
+    ///
+    /// Текст к причине — [`relay_list_refusal_text`].
+    #[error("{}", relay_list_refusal_text(*reason))]
+    RelayList {
+        /// Что именно не дало реле приехать.
+        reason: FfiRelayListRefusal,
+    },
     /// Внутренняя ошибка.
     #[error("внутренняя ошибка: {reason}")]
     Internal {
@@ -251,7 +263,96 @@ pub enum FfiPeerListRefusal {
     FormatChanged,
 }
 
+/// Почему не вышло спросить, какие реле бывают (0.3, дополнение).
+///
+/// Зеркало `ratatosk_proto::nostr::RelayListError`: через границу едет
+/// то, что рисуют, а не внутренний тип.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRelayListRefusal {
+    /// Ступени nostr в этой сборке нет.
+    NotInThisBuild,
+    /// Страна не названа или названа негодно.
+    NoCountry,
+    /// Источник не ответил. Повторить позже.
+    SourceSilent,
+    /// Ответ пришёл, годных реле в нём нет.
+    FormatChanged,
+}
+
+/// Текст к причине отказа похода за реле (0.3, дополнение).
+#[uniffi::export]
+#[must_use]
+pub fn relay_list_refusal_text(reason: FfiRelayListRefusal) -> String {
+    ratatosk_core::honest::relay_list_refusal_text(relay_list_why(reason)).to_owned()
+}
+
+/// Чем платят за поход за реле; показать **до** нажатия.
+#[uniffi::export]
+#[must_use]
+pub fn relay_source_notice() -> String {
+    ratatosk_core::honest::RELAY_SOURCE_NOTICE.to_owned()
+}
+
+/// Внутренняя причина по той, что едет наружу.
+const fn relay_list_why(reason: FfiRelayListRefusal) -> ratatosk_proto::nostr::RelayListError {
+    use ratatosk_proto::nostr::RelayListError as Why;
+    match reason {
+        FfiRelayListRefusal::NotInThisBuild => Why::NotInThisBuild,
+        FfiRelayListRefusal::NoCountry => Why::NoCountry,
+        FfiRelayListRefusal::SourceSilent => Why::SourceSilent,
+        FfiRelayListRefusal::FormatChanged => Why::FormatChanged,
+    }
+}
+
+/// Причина наружу по внутренней.
+///
+/// Под признаком `nostr`: без него похода не бывает, и переводить
+/// внутреннюю причину некому.
+#[cfg(feature = "nostr")]
+const fn relay_list_refusal_of(
+    reason: ratatosk_proto::nostr::RelayListError,
+) -> FfiRelayListRefusal {
+    use ratatosk_proto::nostr::RelayListError as Why;
+    match reason {
+        Why::NotInThisBuild => FfiRelayListRefusal::NotInThisBuild,
+        Why::NoCountry => FfiRelayListRefusal::NoCountry,
+        Why::SourceSilent => FfiRelayListRefusal::SourceSilent,
+        Why::FormatChanged => FfiRelayListRefusal::FormatChanged,
+    }
+}
+
+/// Запись наружу по внутренней (0.3, дополнение).
+#[cfg(feature = "nostr")]
+fn relay_candidate_of(found: ratatosk_proto::nostr::RelayCandidate) -> FfiRelayCandidate {
+    FfiRelayCandidate { url: found.url, rtt_ms: found.rtt_ms, country: found.country }
+}
+
+/// Реле, которое показал наблюдатель (0.3, дополнение).
+///
+/// **Это ещё не настройка.** Выбранное человеком уезжает в ядро
+/// отдельным [`RatatoskClient::set_nostr_relays`]: реле видит, кто с кем
+/// переписывается, и выбирать его за человека нельзя (0.3.3, §14).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRelayCandidate {
+    /// Адрес реле: `wss://реле.пример`.
+    pub url: String,
+    /// Задержка рукопожатия **по замеру наблюдателя**, мс; пусто — не мерил.
+    ///
+    /// Не наша: мерил другой узел из другого места. Показывать её можно,
+    /// выдавать за свою — нет; свою видно только после включения,
+    /// в [`RatatoskClient::nostr_relays_alive`].
+    pub rtt_ms: Option<u32>,
+    /// Страна реле, как её назвал наблюдатель.
+    pub country: Option<String>,
+}
+
 /// Текст к причине отказа — один на оба клиента (0.2.7).
+///
+/// Выведено наружу: `FFI.md` обещает этот текст клиенту («своего
+/// не пишите»), а экспорта у него не было, и клиент Android держал
+/// зеркало из пяти строк. Зеркало разошлось с ядром на первой же
+/// правке причин.
+#[uniffi::export]
 #[must_use]
 pub fn peer_list_refusal_text(reason: FfiPeerListRefusal) -> String {
     ratatosk_core::honest::peer_list_refusal_text(peer_list_why(reason)).to_owned()
@@ -2448,16 +2549,17 @@ struct Opened {
     /// ждёт ответа. Своего рантайма здесь заводить нельзя — клиент arti
     /// привязан к тому, на котором поднят.
     ///
-    /// Под признаком `ygg-node`, потому что без своего узла похода
-    /// нет вовсе и ручка эта никому не нужна. Поймал это перебор сочетаний
-    /// признаков, а не глаз: обычный прогон и `--all-features` оба
-    /// собирают `tor`, и мёртвое поле в них выглядит живым.
-    #[cfg(feature = "ygg-node")]
+    /// Под признаками `ygg-node` и `nostr`: ими ходят два похода —
+    /// за пирами меша и за реле поближе, — и без обоих ручка никому
+    /// не нужна. Мёртвое поле в сборке без них поймал перебор сочетаний
+    /// признаков, а не глаз: обычный прогон и `--all-features` собирают
+    /// оба, и выглядит оно там живым.
+    #[cfg(any(feature = "ygg-node", feature = "nostr"))]
     net: Net,
 }
 
 /// Чем ходить в сеть мимо ядра (0.2.7).
-#[cfg(feature = "ygg-node")]
+#[cfg(any(feature = "ygg-node", feature = "nostr"))]
 #[derive(Clone)]
 struct Net {
     runtime: tokio::runtime::Handle,
@@ -3098,9 +3200,11 @@ impl RatatoskClient {
     /// напрямую. Так и скажите человеку, получив отказ.
     pub fn ygg_peer_countries(&self, region: String) -> Result<Vec<String>, RatatoskError> {
         #[cfg(feature = "ygg-node")]
-        return fetch_list(&self.opened.net, move |tor| async move {
-            ratatosk_transport::peer_list::countries(&region, &tor).await
-        });
+        return fetch_list(
+            &self.opened.net,
+            move |tor| async move { ratatosk_transport::peer_list::countries(&region, &tor).await },
+            |reason| RatatoskError::PeerList { reason: peer_list_refusal_of(reason) },
+        );
         #[cfg(not(feature = "ygg-node"))]
         {
             let _ = region;
@@ -3134,9 +3238,13 @@ impl RatatoskClient {
         country: String,
     ) -> Result<Vec<String>, RatatoskError> {
         #[cfg(feature = "ygg-node")]
-        return fetch_list(&self.opened.net, move |tor| async move {
-            ratatosk_transport::peer_list::fetch(&region, &country, &tor).await
-        });
+        return fetch_list(
+            &self.opened.net,
+            move |tor| async move {
+                ratatosk_transport::peer_list::fetch(&region, &country, &tor).await
+            },
+            |reason| RatatoskError::PeerList { reason: peer_list_refusal_of(reason) },
+        );
         #[cfg(not(feature = "ygg-node"))]
         {
             let _ = (region, country);
@@ -3181,6 +3289,53 @@ impl RatatoskClient {
     /// Перед включением ступени клиент обязан показать [`nostr_warning`].
     pub fn set_nostr_relays(&self, relays: Vec<String>) -> Result<(), RatatoskError> {
         self.command(Command::SetNostrRelays(relays))
+    }
+
+    /// Приносит реле названной страны, ближние — первыми (0.3, дополнение).
+    ///
+    /// **Это не настройка.** Реле приносятся, чтобы человек посмотрел
+    /// и выбрал; выбранное уезжает отдельным
+    /// [`RatatoskClient::set_nostr_relays`]. Выбирать за него нельзя:
+    /// реле видит, какие ключи переписываются между собой и когда (0.3.3),
+    /// и зашитого списка реле у нас нет и не будет — предложи мы свой,
+    /// этот выбор сделали бы мы.
+    ///
+    /// `country` — две заглавные латинские буквы, код страны. Его знает
+    /// телефон (оператор, SIM, язык системы); негодный код — отказ
+    /// `NoCountry`, а не тихий поход «куда-нибудь».
+    ///
+    /// Порядок — по замеру **наблюдателя**, и выдавать его за свою
+    /// задержку нельзя: свою видно только после включения,
+    /// в [`RatatoskClient::nostr_relays_alive`]. Реле в ответе — разных
+    /// владельцев: два реле одного хозяина след не делят, сколько их
+    /// ни называй (0.3.3).
+    ///
+    /// # Цена, о которой надо сказать до нажатия
+    ///
+    /// [`relay_source_notice`]: адрес наблюдателя лежит в сборке — кого
+    /// спрашивать, выбрали мы, — и он увидит, что с этого адреса ищут
+    /// реле. Поход идёт через Tor, когда тот поднят.
+    pub fn fetch_nostr_relays(
+        &self,
+        country: String,
+    ) -> Result<Vec<FfiRelayCandidate>, RatatoskError> {
+        #[cfg(feature = "nostr")]
+        return fetch_list(
+            &self.opened.net,
+            move |tor| async move { ratatosk_transport::relay_list::fetch(&country, &tor).await },
+            |reason| RatatoskError::RelayList { reason: relay_list_refusal_of(reason) },
+        )
+        .map(|found: Vec<ratatosk_proto::nostr::RelayCandidate>| {
+            found.into_iter().map(relay_candidate_of).collect()
+        });
+        #[cfg(not(feature = "nostr"))]
+        {
+            let _ = country;
+            // Не тишиной и не пустым списком: ступени в сборке нет,
+            // и человек, нажавший «подобрать», обязан узнать это сразу,
+            // а не по пустому экрану.
+            Err(RatatoskError::RelayList { reason: FfiRelayListRefusal::NotInThisBuild })
+        }
     }
 
     /// Реле nostr, как их назвал человек (0.3).
@@ -5411,7 +5566,7 @@ async fn start(
         own_ik: opened_parts.2,
         // Ручка берётся **та же**, что у почты и реле: второй `TorClient`
         // означал бы второй bootstrap и ещё десятки мегабайт (§5.2).
-        #[cfg(feature = "ygg-node")]
+        #[cfg(any(feature = "ygg-node", feature = "nostr"))]
         net: Net { runtime: tokio::runtime::Handle::current(), tor: tor_handle.clone() },
     };
     Ok((driver, opened, events))
@@ -5427,13 +5582,17 @@ async fn start(
 /// Метод UniFFI синхронный, поход асинхронный, а своего рантайма здесь
 /// заводить нельзя: клиент arti привязан к тому, на котором поднят.
 /// Поэтому задача уезжает на рантайм ядра, а вызывающий поток ждёт.
-#[cfg(feature = "ygg-node")]
-fn fetch_list<F, Fut>(net: &Net, work: F) -> Result<Vec<String>, RatatoskError>
+#[cfg(any(feature = "ygg-node", feature = "nostr"))]
+fn fetch_list<F, Fut, T, E>(
+    net: &Net,
+    work: F,
+    refuse: fn(E) -> RatatoskError,
+) -> Result<T, RatatoskError>
 where
     F: FnOnce(ratatosk_transport::onion::TorHandle) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<Vec<String>, ratatosk_proto::ygg::PeerListError>>
-        + Send
-        + 'static,
+    Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
 {
     let tor = net.tor.clone();
     let spawned = net.runtime.spawn(async move { work(tor).await });
@@ -5442,7 +5601,10 @@ where
     // привязан к тому, на котором поднят.
     match net.runtime.block_on(spawned) {
         Ok(Ok(list)) => Ok(list),
-        Ok(Err(reason)) => Err(RatatoskError::PeerList { reason: peer_list_refusal_of(reason) }),
+        // Отказ переводит вызывающий: причины у походов разные, и общий
+        // перевод здесь означал бы одно перечисление на три разных
+        // разговора с человеком.
+        Ok(Err(reason)) => Err(refuse(reason)),
         Err(error) => Err(RatatoskError::internal(error)),
     }
 }

@@ -52,7 +52,16 @@ pub mod switched;
 // тянет за собой почтовый признак сборки.
 #[cfg(feature = "peer-list")]
 pub mod peer_list;
-#[cfg(any(feature = "chatmail-net", feature = "nostr", feature = "peer-list"))]
+// Поход за реле поближе (0.3, дополнение): у ступени nostr он живёт
+// рядом с ней, но ведёт к чужому наблюдателю, а не к реле переписки.
+#[cfg(feature = "relay-list")]
+pub mod relay_list;
+#[cfg(any(
+    feature = "chatmail-net",
+    feature = "nostr",
+    feature = "peer-list",
+    feature = "relay-list"
+))]
 pub mod tls;
 pub mod ygg;
 

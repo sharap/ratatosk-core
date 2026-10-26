@@ -47,8 +47,13 @@ const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// не подходит. Проверка идёт у всех сразу, и общий срок — этот же.
 const VET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12);
 
-/// Сколько реле проверяем. Больше — дольше ждать, а человеку нужно три.
-const VET_WIDTH: usize = 8;
+/// Сколько реле проверяем.
+///
+/// Больше — дольше ждать, меньше — выше риск не найти ничего: страна,
+/// где годных реле нет вовсе, обычна, и спрашивают обычно сразу
+/// про несколько. Проверки идут у всех сразу, так что цена ширины —
+/// не время, а соединения.
+const VET_WIDTH: usize = 12;
 
 /// Сколько реле отдаём наружу.
 ///
@@ -68,24 +73,31 @@ const SUBSCRIPTION: &str = "relays";
 /// или не уложился в срок; [`RelayListError::FormatChanged`] — ответ
 /// пришёл, а годных реле в нём нет.
 pub async fn fetch(
-    country: &str,
+    countries: &[String],
     tor: &crate::onion::TorHandle,
 ) -> Result<Vec<RelayCandidate>, RelayListError> {
-    let request = nostr::relay_query_json(SUBSCRIPTION, country, nostr::RELAY_QUERY_LIMIT)
+    let request = nostr::relay_query_json(SUBSCRIPTION, countries, nostr::RELAY_QUERY_LIMIT)
         .ok_or(RelayListError::NoCountry)?;
     match tokio::time::timeout(DEADLINE, ask(&request, tor)).await {
         Ok(Ok(candidates)) => {
-            // Сперва ближние и разных владельцев, потом проверка: иначе
-            // мы проверяли бы десятки реле, чтобы выбросить их по тому же
-            // правилу, по которому не взяли бы и без проверки.
-            let nearest = nostr::nearest_relays(&candidates, VET_WIDTH);
-            let picked: Vec<_> = vet(nearest, tor).await.into_iter().take(KEEP).collect();
+            if candidates.is_empty() {
+                // Реле нет вовсе: либо спросили про страну, где их нет,
+                // либо разметка у наблюдателя сменилась и наш разбор
+                // отстал. Второе человеку важнее — о нём он может
+                // сообщить нам, — и потому причина эта.
+                return Err(RelayListError::FormatChanged);
+            }
+            // Проверяются **кандидаты подряд**, а не ближние по чужому
+            // замеру: замер наблюдателя сделан из его места, и для
+            // человека на другом конце света он не про близость вовсе.
+            // Свой порядок появится после стука.
+            let checked = vet(candidates.into_iter().take(VET_WIDTH).collect(), tor).await;
+            let picked: Vec<_> = nostr::nearest_relays(&checked, KEEP).into_iter().collect();
             if picked.is_empty() {
-                // Пустота после удачного похода — не успех: наблюдатель
-                // отвечает сотнями описаний, и ноль годных означает, что
-                // разметка у него сменилась, а наш разбор отстал. Выданный
-                // за успех, такой ответ человек прочёл бы как «реле нет».
-                Err(RelayListError::FormatChanged)
+                // Реле были, годных нет: все закрыты, платные, личные
+                // или не отвечают. Человеку тут надо искать шире,
+                // а не сообщать нам о разметке.
+                Err(RelayListError::NothingUsable)
             } else {
                 Ok(picked)
             }
@@ -170,21 +182,32 @@ async fn vet(
     candidates: Vec<RelayCandidate>,
     tor: &crate::onion::TorHandle,
 ) -> Vec<RelayCandidate> {
-    let checks = candidates.into_iter().map(|candidate| async move {
-        let open = tokio::time::timeout(VET_DEADLINE, open_to_strangers(&candidate.url, tor))
+    let checks = candidates.into_iter().map(|mut candidate| async move {
+        let measured = tokio::time::timeout(VET_DEADLINE, open_to_strangers(&candidate.url, tor))
             .await
-            .unwrap_or(false);
-        open.then_some(candidate)
+            .unwrap_or(None)?;
+        // Замер — **свой**, с этого устройства, и он же порядок
+        // «поближе». Чужой, пришедший от наблюдателя, здесь затирается
+        // нарочно: он про расстояние до наблюдателя, а не до человека.
+        candidate.rtt_ms = Some(measured);
+        Some(candidate)
     });
     futures::future::join_all(checks).await.into_iter().flatten().collect()
 }
 
-/// Пускает ли это реле чужого: что говорит о себе и чем встречает.
-async fn open_to_strangers(url: &str, tor: &crate::onion::TorHandle) -> bool {
+/// Пускает ли это реле чужого и за сколько отвечает **нам**.
+///
+/// `None` — не пускает или не ответило. `Some(мс)` — пустило, и вот
+/// сколько ушло на соединение со стуком.
+async fn open_to_strangers(url: &str, tor: &crate::onion::TorHandle) -> Option<u32> {
     if says_it_is_closed(url, tor).await {
-        return false;
+        return None;
     }
-    knock_at(url, tor).await
+    let started = std::time::Instant::now();
+    if !knock_at(url, tor).await {
+        return None;
+    }
+    Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX))
 }
 
 /// Что реле пишет о себе (NIP-11).

@@ -624,12 +624,15 @@ pub const RELAY_QUERY_LIMIT: usize = 64;
 pub struct RelayCandidate {
     /// Адрес реле, годный для [`relay_target`].
     pub url: String,
-    /// Задержка рукопожатия **по замеру наблюдателя**, мс.
+    /// Сколько миллисекунд ушло на соединение **с этого устройства**.
     ///
-    /// Не наша: мерил её другой узел из другого места. Для «поближе»
-    /// этого хватает — реле в вашей стране отвечает быстрее всем
-    /// в этой стране, — а обещать человеку свою задержку нельзя:
-    /// её видно только после соединения.
+    /// Ставится при проверке (стуке), а не берётся у наблюдателя,
+    /// и это следствие разбора с устройства: его замеры сделаны из его
+    /// места. Для человека в Корее европейский наблюдатель мерил
+    /// корейские реле в полторы секунды, а японские в тысячу
+    /// с лишним — по такому порядку «поближе» не выбирают.
+    ///
+    /// Пусто — не мерили (кандидат пришёл, но до стука дело не дошло).
     pub rtt_ms: Option<u32>,
     /// Страна реле, как её назвал наблюдатель.
     pub country: Option<String>,
@@ -651,8 +654,17 @@ pub enum RelayListError {
     /// Наблюдатель не ответил или оборвал. Делать: повторить позже.
     #[error("наблюдатель не ответил")]
     SourceSilent,
-    /// Ответ пришёл, годных реле в нём нет.
-    #[error("в ответе нет ни одного годного реле")]
+    /// Реле в ответе есть, но ни одно не годится: все закрыты,
+    /// платные, личные или не отвечают.
+    ///
+    /// Отдельно от [`RelayListError::FormatChanged`], и разница
+    /// не косметическая: там разметка у источника сменилась и человеку
+    /// надо сообщить нам, здесь — искать шире. Путать их значит
+    /// советовать не то; с Кореей это уже случилось.
+    #[error("годных реле в этих странах нет")]
+    NothingUsable,
+    /// Ответ пришёл, а реле в нём нет вовсе.
+    #[error("в ответе нет ни одного реле")]
     FormatChanged,
 }
 
@@ -667,22 +679,42 @@ pub fn country_code_ok(code: &str) -> bool {
     code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase())
 }
 
-/// Запрос к наблюдателю: реле названной страны.
+/// Запрос к наблюдателю: реле названных стран.
 ///
-/// `None` — код страны негоден, и походу незачем начинаться.
+/// Стран несколько, а не одна, и это не роскошь. В Корее наблюдатель
+/// знает пятнадцать реле; проверку проходят три, и все три одного
+/// владельца — после склейки остаётся **одно**. Страна, где реле нет
+/// вовсе, — обычное дело, и поиск по одной стране оставлял бы человека
+/// ни с чем там, где в соседней всё есть.
+///
+/// Пустой список — «где угодно»: фильтра по стране тогда нет вовсе.
+/// Это последняя ступень расширения, и решает её клиент — он знает,
+/// что уже спрашивал.
+///
+/// `None` — ни один код не годится; поход тогда не начинается.
 #[must_use]
-pub fn relay_query_json(subscription: &str, country: &str, limit: usize) -> Option<String> {
-    if !country_code_ok(country) {
+pub fn relay_query_json(subscription: &str, countries: &[String], limit: usize) -> Option<String> {
+    let good: Vec<&String> = countries.iter().filter(|code| country_code_ok(code)).collect();
+    if good.is_empty() && !countries.is_empty() {
         return None;
     }
-    let mut out = String::with_capacity(128);
+    let mut out = String::with_capacity(128 + good.len() * 8);
     out.push_str("[\"REQ\",");
     json_string(subscription, &mut out);
     out.push_str(",{\"kinds\":[");
     out.push_str(&RELAY_INFO_KIND.to_string());
-    out.push_str("],\"#l\":[");
-    json_string(country, &mut out);
-    out.push_str("],\"limit\":");
+    out.push(']');
+    if !good.is_empty() {
+        out.push_str(",\"#l\":[");
+        for (n, code) in good.iter().enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            json_string(code, &mut out);
+        }
+        out.push(']');
+    }
+    out.push_str(",\"limit\":");
     out.push_str(&limit.to_string());
     out.push_str("}]");
     Some(out)
@@ -872,10 +904,14 @@ pub fn publish_refusal_is_final(note: &str) -> bool {
 
 /// Ближайшие и **разных владельцев** — в том порядке, в каком предлагать.
 ///
-/// Сперва те, у кого замер есть и он меньше: замер чужой, но реле
-/// в своей стране отвечает быстрее всем в этой стране. Без замера —
-/// в конец: такое реле не хуже, но называть его «поближе» было бы
-/// выдумкой.
+/// Сперва те, до кого ближе **с этого устройства**: замер ставит стук,
+/// и это единственный замер, про который можно сказать «поближе».
+/// Без замера — в конец: такое реле не хуже, но звать его ближним
+/// было бы выдумкой.
+///
+/// Склейка по владельцу стоит после сортировки нарочно: у одного
+/// хозяина несколько имён, и выбрать из них надо то, до которого
+/// ближе, а не то, что первым пришло от наблюдателя.
 #[must_use]
 pub fn nearest_relays(candidates: &[RelayCandidate], limit: usize) -> Vec<RelayCandidate> {
     let mut sorted: Vec<&RelayCandidate> = candidates.iter().collect();
@@ -1409,16 +1445,41 @@ mod tests {
     fn a_country_that_was_not_named_asks_nothing() {
         // Код едет в запрос к чужому узлу: чужое значение в нём
         // означало бы запрос, которого мы не писали.
-        assert!(relay_query_json("relays", "de", RELAY_QUERY_LIMIT).is_none());
-        assert!(relay_query_json("relays", "DEU", RELAY_QUERY_LIMIT).is_none());
-        assert!(relay_query_json("relays", "", RELAY_QUERY_LIMIT).is_none());
-        assert!(relay_query_json("relays", "D\"]", RELAY_QUERY_LIMIT).is_none());
+        let one = |code: &str| vec![code.to_owned()];
+        assert!(relay_query_json("relays", &one("de"), RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", &one("DEU"), RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", &one(""), RELAY_QUERY_LIMIT).is_none());
+        assert!(relay_query_json("relays", &one("D\"]"), RELAY_QUERY_LIMIT).is_none());
 
-        let request = relay_query_json("relays", "DE", 64).expect("код годный");
+        let request = relay_query_json("relays", &one("DE"), 64).expect("код годный");
         assert_eq!(
             request,
             "[\"REQ\",\"relays\",{\"kinds\":[30166],\"#l\":[\"DE\"],\"limit\":64}]"
         );
+    }
+
+    #[test]
+    fn the_search_widens_to_neighbours_and_then_to_anywhere() {
+        // Страна, где реле нет вовсе, — обычное дело: в Корее
+        // у наблюдателя пятнадцать реле, проверку проходят три,
+        // и все три одного владельца.
+        let asia = vec!["KR".to_owned(), "JP".to_owned(), "SG".to_owned()];
+        let request = relay_query_json("relays", &asia, 64).expect("коды годные");
+        assert_eq!(
+            request,
+            "[\"REQ\",\"relays\",{\"kinds\":[30166],\"#l\":[\"KR\",\"JP\",\"SG\"],\"limit\":64}]"
+        );
+
+        // Пустой список — «где угодно»: фильтра нет вовсе. Это
+        // последняя ступень, и решает её клиент.
+        let anywhere = relay_query_json("relays", &[], 64).expect("без стран тоже можно");
+        assert_eq!(anywhere, "[\"REQ\",\"relays\",{\"kinds\":[30166],\"limit\":64}]");
+
+        // Негодные коды среди годных отбрасываются молча: один
+        // неверный не повод не искать вовсе.
+        let mixed = vec!["KR".to_owned(), "nope".to_owned()];
+        let request = relay_query_json("relays", &mixed, 64).expect("годный остался");
+        assert!(request.contains("\"#l\":[\"KR\"]"), "{request}");
     }
 
     #[test]

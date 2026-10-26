@@ -275,7 +275,9 @@ pub enum FfiRelayListRefusal {
     NoCountry,
     /// Источник не ответил. Повторить позже.
     SourceSilent,
-    /// Ответ пришёл, годных реле в нём нет.
+    /// Реле нашлись, но ни одно не годится: искать шире.
+    NothingUsable,
+    /// Ответ пришёл, а реле в нём нет вовсе.
     FormatChanged,
 }
 
@@ -300,6 +302,7 @@ const fn relay_list_why(reason: FfiRelayListRefusal) -> ratatosk_proto::nostr::R
         FfiRelayListRefusal::NotInThisBuild => Why::NotInThisBuild,
         FfiRelayListRefusal::NoCountry => Why::NoCountry,
         FfiRelayListRefusal::SourceSilent => Why::SourceSilent,
+        FfiRelayListRefusal::NothingUsable => Why::NothingUsable,
         FfiRelayListRefusal::FormatChanged => Why::FormatChanged,
     }
 }
@@ -317,6 +320,7 @@ const fn relay_list_refusal_of(
         Why::NotInThisBuild => FfiRelayListRefusal::NotInThisBuild,
         Why::NoCountry => FfiRelayListRefusal::NoCountry,
         Why::SourceSilent => FfiRelayListRefusal::SourceSilent,
+        Why::NothingUsable => FfiRelayListRefusal::NothingUsable,
         Why::FormatChanged => FfiRelayListRefusal::FormatChanged,
     }
 }
@@ -336,11 +340,13 @@ fn relay_candidate_of(found: ratatosk_proto::nostr::RelayCandidate) -> FfiRelayC
 pub struct FfiRelayCandidate {
     /// Адрес реле: `wss://реле.пример`.
     pub url: String,
-    /// Задержка рукопожатия **по замеру наблюдателя**, мс; пусто — не мерил.
+    /// За сколько миллисекунд реле ответило **этому устройству**, мс.
     ///
-    /// Не наша: мерил другой узел из другого места. Показывать её можно,
-    /// выдавать за свою — нет; свою видно только после включения,
-    /// в [`RatatoskClient::nostr_relays_alive`].
+    /// Своя, а не чужая: ядро соединяется с каждым кандидатом, проверяя,
+    /// пускают ли нас, и это же время ставит сюда. Замеры наблюдателя
+    /// для «поближе» не годятся — он мерил из своего места.
+    ///
+    /// Пусто — не мерили.
     pub rtt_ms: Option<u32>,
     /// Страна реле, как её назвал наблюдатель.
     pub country: Option<String>,
@@ -3300,15 +3306,21 @@ impl RatatoskClient {
     /// и зашитого списка реле у нас нет и не будет — предложи мы свой,
     /// этот выбор сделали бы мы.
     ///
-    /// `country` — две заглавные латинские буквы, код страны. Его знает
-    /// телефон (оператор, SIM, язык системы); негодный код — отказ
-    /// `NoCountry`, а не тихий поход «куда-нибудь».
+    /// `countries` — коды стран по две заглавные латинские буквы.
+    /// **Список, а не одна страна**, и пустой список означает «где
+    /// угодно»: страна, где годных реле нет вовсе, — обычное дело.
+    /// В Корее наблюдатель знает пятнадцать реле, проверку проходят
+    /// три, и все три одного владельца. Расширять поиск — дело клиента:
+    /// он знает, что уже спрашивал, и может сказать об этом человеку.
     ///
-    /// Порядок — по замеру **наблюдателя**, и выдавать его за свою
-    /// задержку нельзя: свою видно только после включения,
-    /// в [`RatatoskClient::nostr_relays_alive`]. Реле в ответе — разных
-    /// владельцев: два реле одного хозяина след не делят, сколько их
-    /// ни называй (0.3.3).
+    /// Порядок — по замеру **с этого устройства**: каждого кандидата
+    /// ядро проверяет соединением, и время этого соединения и есть
+    /// «поближе». Замер наблюдателя для этого не годится — он про
+    /// расстояние до наблюдателя, и для человека в Корее корейские реле
+    /// у него выходят медленнее европейских.
+    ///
+    /// Реле в ответе — разных владельцев: два реле одного хозяина след
+    /// не делят, сколько их ни называй (0.3.3).
     ///
     /// # Цена, о которой надо сказать до нажатия
     ///
@@ -3317,12 +3329,12 @@ impl RatatoskClient {
     /// реле. Поход идёт через Tor, когда тот поднят.
     pub fn fetch_nostr_relays(
         &self,
-        country: String,
+        countries: Vec<String>,
     ) -> Result<Vec<FfiRelayCandidate>, RatatoskError> {
         #[cfg(feature = "nostr")]
         return fetch_list(
             &self.opened.net,
-            move |tor| async move { ratatosk_transport::relay_list::fetch(&country, &tor).await },
+            move |tor| async move { ratatosk_transport::relay_list::fetch(&countries, &tor).await },
             |reason| RatatoskError::RelayList { reason: relay_list_refusal_of(reason) },
         )
         .map(|found: Vec<ratatosk_proto::nostr::RelayCandidate>| {
@@ -3330,7 +3342,7 @@ impl RatatoskClient {
         });
         #[cfg(not(feature = "nostr"))]
         {
-            let _ = country;
+            let _ = countries;
             // Не тишиной и не пустым списком: ступени в сборке нет,
             // и человек, нажавший «подобрать», обязан узнать это сразу,
             // а не по пустому экрану.

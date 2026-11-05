@@ -68,7 +68,7 @@ pub mod ygg;
 pub use bluetooth::bridge::{BridgedAir, BtRadio};
 #[cfg(all(feature = "bt", target_os = "linux"))]
 pub use bluetooth::local::LocalAir;
-pub use bluetooth::{Air, BtAddress, BtConfig, BtRunner};
+pub use bluetooth::{Air, BtAddress, BtConfig, BtDirectory, BtRunner};
 pub use lan::{LanConfig, LanDirectory, LanRunner};
 pub use multi::{Disabled, Transports};
 pub use runner::{PeerAddress, Runner, TransportCommand, TransportError, TransportEvent};

@@ -26,6 +26,11 @@
 //! руками. Передача и обнаружение проверяются по отдельности намеренно:
 //! иначе неудача не отличима от «сеть не пропускает mDNS».
 //!
+//! В эфире Bluetooth (0.4) то же правило и та же команда: `/btaddr` вписывает
+//! адрес радио, номер канала L2CAP и вид адреса — их печатает журнал
+//! собеседника строкой «эфир: канал L2CAP занят». Без неё «нас не слышат»
+//! и «кадр не доехал» выглядят одинаково; порядок разбора — `TESTING.md`, 8ш.
+//!
 //! # Режим компаньона (§13.4)
 //!
 //! Ключ `--tordir` даёт терминалу свой onion-сервис: с ним телефон дотянется
@@ -1671,6 +1676,11 @@ async fn run<S: Store + 'static>(
     )
     .await?;
 
+    // Справочник эфира берётся **здесь**, пока раннер ещё свой: ниже он
+    // уезжает в `Transports::new` целиком. Та же причина, по которой
+    // строкой выше взят справочник локальной сети.
+    let bt_directory = bt.directory();
+
     // Ручка общего Tor-клиента — одна на обе ветки и на оба транспорта.
     // Onion-раннер кладёт в неё клиента, когда поднимется; почта берёт его
     // оттуда, а своего второго не заводит (§5.2: второй bootstrap — это
@@ -1779,7 +1789,7 @@ async fn run<S: Store + 'static>(
     println!("меняется, и свежую печатает /card — копировать нужно её.");
     println!();
     println!(
-        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off|quiet>   /quiet <id чата> <on|off> [часов]   /seeds <id канала>   /pull <id канала>   /sharing <id|-> <all|contacts|verified|default>   /limits [<на пира> <общий>]   /peeraddr <ключ> <ip:порт>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
+        "команды: /add <карточка> [ip:порт]   /card   /who   /lan   /bt [on|off]   /ygg [on|off|mode|peer]   /tor [on|off]   /mail [set|new|tor|off]   /net   /onion   /pair <метка>   /devices   /devaddr <ключ> <ip:порт>   /peers   /unpair <id>   /newgroup <название>   /invite <id группы> [ключ]   /groups   /say <id группы> <текст>   /gedit <id группы> <текст>   /greply <id группы> <текст>   /greact <id группы> [эмодзи]   /gretract <id группы>   /rename <id группы> <название>   /gavatar <id группы> [путь]   /leave <id группы>   /evict <id группы> <ключ>   /newchannel <open|invite> <название>   /clink <id канала>   /sub <ссылка>   /unsub <id канала>   /admit <id канала> <ключ>   /right <id канала> <ключ> <waed|-> <дней>   /pow <id канала> <бит>   /rotate <id канала>   /grants <id канала>   /admits <id канала>   /requests <id канала>   /seed <id канала> <on|off|quiet>   /quiet <id чата> <on|off> [часов]   /seeds <id канала>   /pull <id канала>   /sharing <id|-> <all|contacts|verified|default>   /limits [<на пира> <общий>]   /peeraddr <ключ> <ip:порт>   /btaddr <ключ> <адрес> <канал> <public|random>   /find <слова>   /share   /take <msg_id>   /react [эмодзи]   /long [килобайт]   /probe <s|m|l> [сколько]   /file <путь>   /files   /accept <id>   /pause <id>   /decline <id>   /save <id> <путь>   /auto [байт|off]   /sweep   /export [nofiles|graph] <путь> [-- фраза]   /merge <архив> -- <фраза>   /quit\n\nввоз архива — отдельным запуском: --import <файл> --data <база> и --phrase <фраза> либо --key <ключ>"
     );
     println!("всё остальное уходит текстом первому добавленному контакту");
     println!();
@@ -1819,7 +1829,7 @@ async fn run<S: Store + 'static>(
                 eprintln!("ядро остановилось: {error}");
             }
         }
-        () = console(handle, events, directory, own_ik, onion_address, lan_now) => {}
+        () = console(handle, events, directory, bt_directory, own_ik, onion_address, lan_now) => {}
     }
     Ok(())
 }
@@ -1829,6 +1839,10 @@ async fn console(
     handle: DriverHandle,
     mut events: EventStream,
     directory: LanDirectory,
+    // Справочник эфира — для `/btaddr`. Отдельным доводом, а не полем
+    // в одном с LAN: справочники у ступеней разные, и адреса в них
+    // разного вида.
+    bt_directory: ratatosk_transport::BtDirectory,
     own_ik: [u8; 32],
     // Свой onion-адрес — для команды `/onion` (§4.3).
     onion_address: String,
@@ -2913,6 +2927,53 @@ async fn console(
                     ygg_command(&handle, rest).await;
                     continue;
                 }
+                if let Some(rest) = line.strip_prefix("/btaddr ") {
+                    // **Адрес в эфире руками — ровно затем, зачем `/addr`
+                    // в локальной сети.** Обнаружение и передача — разные
+                    // механизмы, и первое не должно быть условием проверки
+                    // второго.
+                    //
+                    // В эфире это дороже, чем в сети. Объявление могут
+                    // не услышать по десятку причин — маяк разъехался
+                    // слотом, контроллер не объявляется вовсе, обзор держит
+                    // чужое приложение, — и без этой команды «нас
+                    // не слышат» не отличить от «кадр не доехал». Первый
+                    // же прогон на PinePhone упёрся ровно в это: эфир
+                    // работал в одну сторону, и сказать, какая половина
+                    // сломана, было нечем.
+                    //
+                    // Адрес, номер канала и вид адреса печатает **сам
+                    // собеседник** — строкой «эфир: канал L2CAP занят»
+                    // в своём журнале. Номер динамический: после
+                    // перезапуска он другой, и вписывать надо свежий.
+                    let mut parts = rest.split_whitespace();
+                    let key = parts.next().unwrap_or_default();
+                    let addr = parts.next().unwrap_or_default();
+                    let psm = parts.next().unwrap_or_default();
+                    let kind = parts.next().unwrap_or_default();
+                    match (decode_ik(key), parse_bt_address(addr, psm, kind)) {
+                        (Some(ik), Some(target)) => {
+                            if !BT_BUILT_IN {
+                                println!(
+                                    "< ВНИМАНИЕ: эфира нет в этой сборке — пересоберите \
+                                     с --features bt"
+                                );
+                            }
+                            bt_directory.note(ik, target);
+                            println!(
+                                "< {} в эфире по {addr}, канал {} — набор пойдёт туда",
+                                short(&ik),
+                                target.psm
+                            );
+                        }
+                        _ => println!(
+                            "< нужно: /btaddr <64 знака hex> <AA:BB:CC:DD:EE:FF> <номер канала> \
+                             <public|random>; адрес, номер и вид печатает журнал собеседника \
+                             строкой «эфир: канал L2CAP занят»"
+                        ),
+                    }
+                    continue;
+                }
                 if line == "/bt" || line.starts_with("/bt ") {
                     let rest = line.strip_prefix("/bt").unwrap_or_default().trim();
                     bt_command(&handle, rest).await;
@@ -3303,6 +3364,11 @@ fn channel_usage(line: &str) -> Option<&'static str> {
         "/peeraddr" => {
             "/peeraddr <ключ владельца> <ip:порт> — когда маяка нет; ключ печатает /groups"
         }
+        "/btaddr" => {
+            "/btaddr <ключ> <AA:BB:CC:DD:EE:FF> <номер канала> <public|random> — адрес в эфире \
+             руками, когда объявления не слышно; все три печатает журнал собеседника строкой \
+             «эфир: канал L2CAP занят»"
+        }
         // `/channels` не существует: каналы показывает `/groups` — они
         // и есть группы со вторым профилем (§3.2).
         "/channels" => "/groups — каналы показываются там же, где группы",
@@ -3358,6 +3424,41 @@ fn subscription_notice(open: bool) -> &'static str {
 }
 
 /// Разбирает ключ участника из шестидесяти четырёх знаков hex.
+/// Разбирает адрес эфира, набранный руками: адрес радио, номер канала
+/// L2CAP и вид адреса.
+///
+/// **Вид адреса спрашивается словом, а не угадывается.** Публичный адрес,
+/// набранный как случайный, не находится вовсе (см. `BtAddress::random`),
+/// а отказ при этом выглядит как «собеседника нет в эфире» — то есть
+/// умолчание здесь стоило бы часа разбора. Печатает его тот же журнал,
+/// что и сам адрес.
+///
+/// Нулевой номер канала — не номер: нулём просят у системы свободный
+/// при `bind`, и набрать по нему нельзя никого.
+fn parse_bt_address(addr: &str, psm: &str, kind: &str) -> Option<ratatosk_transport::BtAddress> {
+    let mut bytes = [0u8; 6];
+    let mut parts = addr.split(':');
+    for slot in &mut bytes {
+        *slot = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let psm = match psm.strip_prefix("0x") {
+        Some(hex) => u16::from_str_radix(hex, 16).ok()?,
+        None => psm.parse::<u16>().ok()?,
+    };
+    if psm == 0 {
+        return None;
+    }
+    let random = match kind {
+        "random" => true,
+        "public" => false,
+        _ => return None,
+    };
+    Some(ratatosk_transport::BtAddress { addr: bytes, random, psm })
+}
+
 fn decode_ik(text: &str) -> Option<[u8; 32]> {
     let raw = data_encoding::HEXLOWER.decode(text.trim().as_bytes()).ok()?;
     let mut ik = [0u8; 32];
@@ -5519,6 +5620,9 @@ mod tests {
             "/rotate",
             "/grants",
             "/admits",
+            // Голый `/btaddr` — тот же случай: без подсказки он уехал бы
+            // собеседнику текстом, как когда-то `/clink`.
+            "/btaddr",
         ] {
             assert!(channel_usage(bare).is_some(), "{bare} без аргументов обязан подсказывать");
         }
@@ -5527,6 +5631,45 @@ mod tests {
         // А команда **с** аргументами сюда не попадает: её разбирают ниже.
         assert!(channel_usage("/clink 76ee0a3d").is_none());
         assert!(channel_usage("обычное сообщение").is_none(), "текст человека — не команда");
+    }
+
+    #[test]
+    fn an_air_address_named_by_hand_is_read_exactly_as_written() {
+        // Адрес в эфире вписывают руками тогда, когда объявления не слышно,
+        // — и ошибка разбора здесь выглядит не ошибкой, а «собеседника нет
+        // в эфире»: набор просто не находит никого. Поэтому проверяются
+        // все три части, и вид адреса — наравне с остальными.
+        let named = parse_bt_address("AA:BB:CC:DD:EE:FF", "193", "public")
+            .expect("строка из журнала обязана читаться");
+        assert_eq!(named.addr, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(named.psm, 193);
+        assert!(!named.random, "`public` — это публичный адрес, а не случайный");
+        // Номер канала печатается журналом десятичным, но шестнадцатеричный
+        // встречается в чужих записях о L2CAP — принимаются оба.
+        assert_eq!(
+            parse_bt_address("aa:bb:cc:dd:ee:ff", "0x81", "random").map(|a| (a.psm, a.random)),
+            Some((129, true)),
+            "строчные знаки и `0x` — та же запись"
+        );
+    }
+
+    #[test]
+    fn an_air_address_without_its_kind_or_channel_is_refused_instead_of_guessed() {
+        // **Угадывать здесь нельзя ни одного довода.** Публичный адрес,
+        // набранный как случайный, не находится вовсе, а нулевым номером
+        // просят у системы свободный при `bind` — набрать по нему нельзя
+        // никого. И то и другое выглядело бы как «собеседник не отвечает».
+        for (addr, psm, kind, why) in [
+            ("AA:BB:CC:DD:EE:FF", "193", "", "вид адреса не назван"),
+            ("AA:BB:CC:DD:EE:FF", "193", "Random", "вид назван не тем словом"),
+            ("AA:BB:CC:DD:EE:FF", "0", "public", "нулевой номер канала"),
+            ("AA:BB:CC:DD:EE", "193", "public", "адрес короче шести байт"),
+            ("AA:BB:CC:DD:EE:FF:01", "193", "public", "адрес длиннее шести байт"),
+            ("AA:BB:CC:DD:EE:ZZ", "193", "public", "не шестнадцатеричный знак"),
+            ("AA:BB:CC:DD:EE:FF", "ноль", "public", "номер канала не число"),
+        ] {
+            assert!(parse_bt_address(addr, psm, kind).is_none(), "обязан быть отказ: {why}");
+        }
     }
 
     #[test]

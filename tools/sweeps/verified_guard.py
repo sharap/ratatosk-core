@@ -20,6 +20,7 @@ ROOT_DIR = __import__("pathlib").Path(__file__).resolve().parents[2]
 ROOT = ROOT_DIR / "crates/core/src"
 WINDOW = 30
 found = []
+seen = 0
 
 for path in ROOT.rglob("*.rs"):
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -30,11 +31,21 @@ for path in ROOT.rglob("*.rs"):
         tail = "\n".join(lines[n:n + 6])
         if not re.search(r"add_contact\([^)]*\bfalse\b", tail, re.S):
             continue
+        seen += 1
         window = "\n".join(lines[max(0, n - WINDOW):n])
         if "contains_key" not in window:
             found.append(f"{path}:{n+1}: {line.strip()}")
 
 for f in found:
     print(f)
+print(f"вызовов add_contact осмотрено: {seen}")
 print("-- всего", len(found) if found else "чисто")
-sys.exit(0)
+
+# Находок должно быть **ноль**.
+#
+# Возврат обязателен, и цену этого свёртка показала сама: её единственная
+# находка была **настоящей** — ветка десктопа повторяла добавление своими
+# руками, без проверки «уже знаем», и присланная карточка уводила маршрут
+# знакомого к пришельцу. Печаталась она при этом в зелёный прогон:
+# `sys.exit(0)` стоял в конце жёстко.
+sys.exit(1 if found else 0)

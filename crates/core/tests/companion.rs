@@ -2229,6 +2229,80 @@ fn the_desktop_adds_an_unknown_contact_by_naming_the_message() {
 }
 
 #[test]
+fn a_card_sent_for_a_known_contact_is_refused_and_changes_nothing() {
+    // Поломка, которую нашла метелка `verified_guard`, пока не умела
+    // краснеть. Ветка десктопа повторяла операцию своими руками и не
+    // проверяла «этого человека мы уже знаем», а `add_contact` ставит
+    // карточку целиком и `verified` по аргументу. Выходило так: кто угодно
+    // присылает карточку знакомого со своими адресами, человек нажимает
+    // добавить **на десктопе** — и маршрут уезжает к пришельцу, а сверка
+    // §4.2 снимается молча. С телефона та же кнопка была безопасна.
+    //
+    // Проверяются обе половины, потому что имя обещает обе: и отказ
+    // словами, и неизменность записи.
+    //
+    // Чего тест **не** стережёт: путь телефона (`Command::AddSharedContact`)
+    // — он был исправен и стережётся в `pair.rs`; и подмену карточки
+    // незнакомца — её добавить можно и нужно, это соседний тест.
+    let (mut phone, mut desktop, _) = paired(1_000);
+    let peer_ik = with_contact(&mut phone, 1_100);
+    let chat = Engine::<MemoryStore>::chat_id_for(&peer_ik);
+
+    // Сообщение с карточкой в истории — ради самой записи рядом с ним.
+    phone
+        .step(1_200, Input::Command(Command::ShareContact { chat, peer_ik }))
+        .expect("поделились знакомым");
+    let msg_id =
+        phone.store().messages(&chat, 10, None).expect("история").last().expect("сообщение").msg_id;
+
+    // Подменяем запись: тот же человек, чужие адреса, версия повыше.
+    // Ключи в карточке публичны, подделывать их незачем — подделывают путь.
+    let friend = Identity::from_seed([9u8; 32]);
+    let evil = ratatosk_codec::ContactCard {
+        ik: friend.public().ik,
+        sk: friend.public().sk,
+        onion: "ccccccccccccccccccccccccccccccccccccccccccccccccccccc.onion".into(),
+        chatmail: "пришелец@nine.example".into(),
+        display_name: "сосед".into(),
+        version: 99,
+        ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
+    };
+    phone
+        .store_mut()
+        .put_contact_share(&ratatosk_store::StoredContactShare {
+            msg_id,
+            ik: evil.ik,
+            card_bytes: evil.encode().expect("кодирование"),
+        })
+        .expect("запись карточки");
+
+    let answer = ask(&mut phone, &mut desktop, 1_400, &Request::AddSharedContact { msg_id });
+
+    // Опасная половина — первой: если запись уехала, видеть надо её,
+    // а не отсутствие слов.
+    let contact = phone.contacts().get(&peer_ik).expect("контакт на месте");
+    assert_eq!(
+        contact.card.chatmail, "сосед@nine.example",
+        "адрес обязан остаться своим: иначе маршрут уехал бы к пришельцу"
+    );
+    assert_eq!(
+        contact.card.version, 1,
+        "версию карточки меняет только подписанный CardUpdate из сессии (§4.3)"
+    );
+    assert!(
+        contact.verified,
+        "сверка §4.2 — разовая встреча голосом, и присланной карточкой не снимается"
+    );
+
+    assert!(
+        matches!(answer, Response::Refused(_)),
+        "молчание десктоп прочтёт как поломку окна (§14): {answer:?}"
+    );
+}
+
+#[test]
 fn adding_from_a_message_without_a_card_is_refused_out_loud() {
     // Сообщение могли стереть, а карточка уходит вместе с ним. Молчание
     // здесь человек за ноутбуком прочтёт как поломку окна (§14).

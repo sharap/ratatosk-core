@@ -136,3 +136,11 @@ for crate in sorted(crates):
             bad += 1
             print(f'{f.relative_to(root.parent)}:{i + 1}: {text}')
 print('чисто' if not bad else f'-- всего {bad}')
+
+# Находок должно быть **ноль**: `missing_docs` в крейтах включён, а эта
+# метелка стережёт то, чего компилятор не видит.
+#
+# Возврат обязателен. Без него метелка умела печатать находки и
+# возвращать ноль — то есть не умела краснеть вовсе.
+import sys
+sys.exit(1 if bad else 0)

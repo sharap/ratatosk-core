@@ -71,8 +71,17 @@ def scan(path):
             continue
         for p in params_of(sig):
             p=p.strip()
-            if not p or p.startswith('&self') or p=='self' or p.startswith('mut self') or p.startswith('#['): continue
+            if not p or p.startswith('#['): continue
             name=p.split(':')[0].strip().replace('mut ','')
+            # Получатель не считается никогда, в какой бы форме он ни стоял:
+            # `self`, `&self`, `mut self`, `self: Pin<&mut Self>`. Имя ему
+            # выбираем не мы — его задаёт трейт, — поэтому «параметр назван
+            # зря» к нему неприменимо в принципе.
+            #
+            # Пять ложных находок были ровно этой формы: заглушки `poll_flush`
+            # и `poll_shutdown` у `AsyncWrite`, где тело `Ready(Ok(()))`
+            # получателя не читает. Прежний список форм знал три из четырёх.
+            if name=='self': continue
             if not re.match(r'^[a-z_][a-z_0-9]*$', name) or name.startswith('_'): continue
             if not re.search(r'\b'+re.escape(name)+r'\b', bodytext.split('{',1)[1] if '{' in bodytext else bodytext):
                 problems.append((path, start+1, m.group(1), name))
@@ -96,3 +105,12 @@ for path in paths:
         any_found=True
         print('UNUSED %s:%d fn %s param %s' % p)
 print('чисто' if not any_found else 'есть находки')
+
+# Находок должно быть **ноль**: получатель исключён по правилу, прочих
+# исключений у метелки нет.
+#
+# Возврат обязателен, и это и была поломка: метелка печатала «есть находки»
+# и возвращала ноль, поэтому `run_all` считал её чистой и лестница была
+# зелена при пяти находках на экране. Та же метелка уже зеленела однажды —
+# проверяя ноль файлов.
+sys.exit(1 if any_found else 0)

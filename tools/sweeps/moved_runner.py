@@ -47,3 +47,10 @@ for f in sorted(root.rglob('**/*.rs')):
             if not names:
                 break
 print('чисто' if not bad else f'-- всего {bad}')
+
+# Находок должно быть **ноль**.
+#
+# Возврат обязателен. Без него метелка умела печатать находки и
+# возвращать ноль — то есть не умела краснеть вовсе.
+import sys
+sys.exit(1 if bad else 0)

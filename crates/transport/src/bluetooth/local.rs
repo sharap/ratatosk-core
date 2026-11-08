@@ -110,6 +110,38 @@ const BUSY_TRIES: u32 = 2;
 /// и не устроим при этом опрос вхолостую.
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
+/// Самый большой пакет, который мы пишем в эфир.
+///
+/// # Почему число наше, а не провода
+///
+/// Спросить сокет **необходимо и недостаточно**. Договорный предел
+/// отдаёт `BT_SNDMTU`, и на живом замере он сказал 4097 с обеих сторон
+/// — ровно то, что мы просили, — а на деле пакет такого размера
+/// доезжал до PinePhone (RTL8723CS, ядро 6.17.5) **один раз
+/// из четырёх**, тогда как пакеты до 672 байт доезжали все. То есть
+/// число, которое называет стек, бывает ложью, и верить ему
+/// без потолка нельзя.
+///
+/// # Почему 672
+///
+/// Стандарт тут не помощник: он гарантирует только 23 байта у LE
+/// (MTU и MPS), 64 — у расширенного режима и 48 у BR/EDR. Кадрами
+/// такого размера не живут.
+///
+/// А 672 — умолчание MTU базового режима L2CAP, и ровно оно зашито
+/// в BlueZ (`L2CAP_DEFAULT_MTU`). Похоже, что стек, пообещавший
+/// больше, тихо откатывается именно на него; на замере это и видно.
+/// Значит 672 — наименьшее число, которое держат все, а не наша
+/// догадка.
+///
+/// # Чего это стоит
+///
+/// Почти ничего. В эфире пакет всё равно режется контроллером
+/// на куски по 27–251 байт, так что кадр в четыре килобайта и так
+/// едет десятками посылок. Деление на 672 добавляет лишь заголовок
+/// L2CAP на каждый кусок — меньше процента от объёма.
+const AIR_SAFE_PACKET: usize = 672;
+
 /// Как часто вещать объявление.
 ///
 /// # Это число стоило замера, и до замера его тут не было вовсе
@@ -149,6 +181,76 @@ const ADVERT_INTERVAL: Duration = Duration::from_millis(250);
 /// собеседник примет (§5.1 проверяет −1, 0, +1), а вот запись
 /// из будущего при расхождении часов — не обязательно.
 const SLOT_MARGIN: Duration = Duration::from_secs(2);
+
+/// Перо, которое не пишет пакетов больше безопасного.
+///
+/// На L2CAP **запись и есть пакет**, и слишком большой пакет собеседник
+/// может не принять вовсе — разбор у `AIR_SAFE_PACKET`. Резать надо здесь,
+/// а не в `link`: предел — свойство этого звена, а `link` один на все
+/// ступени и про радио не знает.
+///
+/// Короткая запись законна: `link` пишет кадры через `write_all`
+/// и сам докладывает остаток.
+pub struct Chunked<W> {
+    inner: W,
+    limit: usize,
+}
+
+impl<W> Chunked<W> {
+    /// Сколько писать одним пакетом: меньшее из обещанного и безопасного.
+    ///
+    /// Отдельной функцией ради проверки — радио для неё не нужно.
+    #[must_use]
+    fn limit_from(announced: Option<usize>) -> usize {
+        match announced {
+            // Собеседник вправе назвать **меньше** нашего потолка —
+            // тогда слушаем его: стандарт разрешает и 23 байта.
+            Some(mtu) if mtu > 0 => mtu.min(AIR_SAFE_PACKET),
+            // Не спросилось — берём потолок. Это не «на всякий случай»:
+            // без ответа мы не знаем ничего, а безопасное известно.
+            _ => AIR_SAFE_PACKET,
+        }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Chunked<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let limit = self.limit;
+        let me = self.get_mut();
+        let cut = buf.len().min(limit);
+        std::pin::Pin::new(&mut me.inner).poll_write(cx, &buf[..cut])
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        std::pin::Pin::new(&mut me.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        std::pin::Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}
+
+/// Делит поток надвое, обрезав пакеты пера по звену.
+fn split_chunked(stream: Stream) -> (tokio::io::ReadHalf<Stream>, Chunked<WriteHalf<Stream>>) {
+    // Предел спрашивается **у этого** сокета: он у каждого звена свой.
+    let announced = stream.as_ref().send_mtu().ok().map(usize::from);
+    let limit = Chunked::<WriteHalf<Stream>>::limit_from(announced);
+    tracing::info!(обещано = ?announced, пишем_по = limit, "эфир: предел пакета");
+    let (reader, writer) = tokio::io::split(stream);
+    (reader, Chunked { inner: writer, limit })
+}
 
 /// Эфир этой машины: `bluer`, сокеты L2CAP, свои задачи.
 ///
@@ -284,7 +386,7 @@ impl LocalAir {
 }
 
 impl Air for LocalAir {
-    type Stream = WriteHalf<Stream>;
+    type Stream = Chunked<WriteHalf<Stream>>;
 
     fn raise(&mut self, setup: AirSetup<Self::Stream>) {
         if let Ok(mut held) = self.events.lock() {
@@ -333,7 +435,7 @@ impl Drop for Radio {
 impl Radio {
     /// Поднимает эфир в своей задаче.
     fn start(
-        setup: AirSetup<WriteHalf<Stream>>,
+        setup: AirSetup<Chunked<WriteHalf<Stream>>>,
         adapter: AdapterSlot,
         airtime: Arc<Airtime>,
     ) -> Radio {
@@ -371,7 +473,7 @@ fn refused(what: &str, error: impl std::fmt::Display) -> TransportError {
 
 /// Поднимает эфир и не возвращается, пока он жив.
 async fn run(
-    setup: AirSetup<WriteHalf<Stream>>,
+    setup: AirSetup<Chunked<WriteHalf<Stream>>>,
     slot: AdapterSlot,
     airtime: Arc<Airtime>,
 ) -> Result<(), TransportError> {
@@ -596,7 +698,7 @@ fn fresh_nonce() -> [u8; 8] {
 fn spawn_accept_loop(
     listener: StreamListener,
     events: mpsc::Sender<TransportEvent>,
-    accepted: mpsc::Sender<(u64, WriteHalf<Stream>)>,
+    accepted: mpsc::Sender<(u64, Chunked<WriteHalf<Stream>>)>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Номера принятых каналов свои и растут подряд. Совпасть им
@@ -612,7 +714,7 @@ fn spawn_accept_loop(
                     // из `bluer` — чужой тип, и обещать ему `Display`
                     // мы не вправе.
                     tracing::debug!(?from, link, "эфир: входящий канал");
-                    let (reader, writer) = tokio::io::split(stream);
+                    let (reader, writer) = split_chunked(stream);
                     // Перо — первым: раннер обязан знать про канал раньше,
                     // чем ядро получит пришедший им кадр, иначе имя
                     // приедет каналу, о котором раннер ещё не слышал.
@@ -635,7 +737,7 @@ fn spawn_accept_loop(
 /// Слушает эфир и опознаёт объявления маяком.
 fn spawn_scan_loop(
     adapter: Adapter,
-    setup: AirSetup<WriteHalf<Stream>>,
+    setup: AirSetup<Chunked<WriteHalf<Stream>>>,
     airtime: Arc<Airtime>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -720,7 +822,7 @@ enum Yielded {
 /// Один заход сканирования — до конца потока событий.
 async fn scan(
     adapter: &Adapter,
-    setup: &AirSetup<WriteHalf<Stream>>,
+    setup: &AirSetup<Chunked<WriteHalf<Stream>>>,
     airtime: &Airtime,
 ) -> Result<Yielded, TransportError> {
     let filter = DiscoveryFilter {
@@ -968,7 +1070,7 @@ async fn dial(
     adapter: AdapterSlot,
     airtime: Arc<Airtime>,
     events: Option<mpsc::Sender<TransportEvent>>,
-) -> Result<WriteHalf<Stream>, TransportError> {
+) -> Result<Chunked<WriteHalf<Stream>>, TransportError> {
     let address_type = if target.random { AddressType::LeRandom } else { AddressType::LePublic };
     let sa = L2capAddr::new(Address::new(target.addr), address_type, target.psm);
     let budget = Duration::from_millis(BT_CONNECT_TIMEOUT_MS);
@@ -1118,7 +1220,7 @@ async fn dial(
             // Номера у этой половины нет: **мы сами набрали**, то есть
             // знаем собеседника без всякого имени. Номер нужен только
             // принятому каналу — его чей, решает ядро.
-            let (reader, writer) = tokio::io::split(stream);
+            let (reader, writer) = split_chunked(stream);
             match events {
                 Some(events) => spawn_read_loop(reader, Transport::Bt, None, events),
                 // **Канал без чтения — это звено в одну сторону, и молчать
@@ -1179,7 +1281,86 @@ async fn peer_connected(slot: &AdapterSlot, addr: [u8; 6]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWriteExt as _;
+
     use super::*;
+
+    /// Перо, запоминающее **каждую** запись по отдельности.
+    ///
+    /// Ради этого и заведено: на L2CAP размер записи и есть размер
+    /// пакета, а весь разбор упёрся именно в него. Сложить байты
+    /// в один буфер значило бы стереть то единственное, что проверяется.
+    #[derive(Clone, Default)]
+    struct EachWrite(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl tokio::io::AsyncWrite for EachWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().expect("замок").push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_leaves_the_air_in_packets_no_bigger_than_the_safe_one() {
+        // **Замер с устройства, а не осторожность.** Пакет в 4097 байт
+        // доезжал до PinePhone один раз из четырёх, пакеты до 672 —
+        // все. Сокет при этом обещал 4097 с обеих сторон: договорный
+        // предел бывает ложью.
+        //
+        // Число здесь повторено руками. Возьми проверка
+        // `AIR_SAFE_PACKET` — поднятие потолка подняло бы и её, и она
+        // смолчала бы о том, что пакеты снова стали непроходимыми.
+        let seen = EachWrite::default();
+        let mut pen =
+            Chunked { inner: seen.clone(), limit: Chunked::<EachWrite>::limit_from(None) };
+
+        let frame = vec![9u8; ratatosk_wire::SizeClass::S.frame_len()];
+        pen.write_all(&[7u8]).await.expect("байт класса");
+        pen.write_all(&frame).await.expect("кадр");
+
+        let writes = seen.0.lock().expect("замок").clone();
+        assert!(
+            writes.iter().all(|packet| packet.len() <= 672),
+            "пакетов больше 672 байт быть не должно: {:?}",
+            writes.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        // И ни байта не потеряно: кадр собирается из пакетов целиком.
+        let together: Vec<u8> = writes.concat();
+        let mut whole = vec![7u8];
+        whole.extend_from_slice(&frame);
+        assert_eq!(together, whole, "кадр обязан доехать побайтно тем же");
+    }
+
+    #[test]
+    fn the_packet_limit_listens_to_the_peer_when_the_peer_asks_for_less() {
+        // Три случая, и все три настоящие: стандарт разрешает собеседнику
+        // назвать и 23 байта (LE), стек может пообещать больше
+        // безопасного — и может не ответить вовсе.
+        assert_eq!(Chunked::<EachWrite>::limit_from(Some(23)), 23, "меньше нашего — слушаем его");
+        assert_eq!(
+            Chunked::<EachWrite>::limit_from(Some(4097)),
+            672,
+            "больше безопасного — режем по безопасному: 4097 доезжал раз из четырёх"
+        );
+        assert_eq!(Chunked::<EachWrite>::limit_from(None), 672, "не спросилось — берём безопасное");
+        assert_eq!(Chunked::<EachWrite>::limit_from(Some(0)), 672, "ноль — это не ответ");
+    }
 
     #[test]
     fn the_advert_names_an_interval_fast_enough_for_our_own_dial_budget() {

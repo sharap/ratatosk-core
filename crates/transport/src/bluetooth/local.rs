@@ -1334,21 +1334,20 @@ mod tests {
             Chunked { inner: seen.clone(), limit: Chunked::<EachWrite>::limit_from(None) };
 
         // Кадр разговора — класса XS: именно он ходит по эфиру (§5.5).
-        let frame = vec![9u8; ratatosk_wire::SizeClass::XS.frame_len()];
-        pen.write_all(&[7u8]).await.expect("байт класса");
-        pen.write_all(&frame).await.expect("кадр");
+        // Пишем так, как пишет `link`: кадр вместе с байтом класса
+        // одним вызовом — одним пакетом.
+        let mut packet = vec![7u8];
+        packet.extend(std::iter::repeat_n(9u8, ratatosk_wire::SizeClass::XS.frame_len()));
+        pen.write_all(&packet).await.expect("кадр с байтом класса");
 
         let writes = seen.0.lock().expect("замок").clone();
         assert_eq!(
             writes.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![1, 1024],
-            "байт класса и кадр — по пакету каждый, и кадр не поделён"
+            vec![1025],
+            "кадр XS с байтом класса обязан уйти одним пакетом и не быть поделён"
         );
-        // И ни байта не потеряно: кадр собирается из пакетов целиком.
-        let together: Vec<u8> = writes.concat();
-        let mut whole = vec![7u8];
-        whole.extend_from_slice(&frame);
-        assert_eq!(together, whole, "кадр обязан доехать побайтно тем же");
+        // И ни байта не потеряно.
+        assert_eq!(writes.concat(), packet, "кадр обязан доехать побайтно тем же");
     }
 
     #[test]

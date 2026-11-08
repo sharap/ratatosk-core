@@ -79,21 +79,37 @@ class BtRadio(
         const val FNV_PRIME = 1099511628211L
 
         /**
-         * Сколько ждать между запусками обзора.
+         * Окно, за которое Android считает запуски обзора.
          *
          * **Android считает запуски и молча наказывает за частые.**
          * Ограничение — пять `startScan` за тридцать секунд на приложение;
          * шестой не отвергается с ошибкой, а принимается и не приносит
          * ни одного объявления. Снаружи это выглядит как «блютуз устал»:
-         * связь есть, а собеседников больше не видно, и починить это можно
-         * только перезапуском ступени.
+         * связь есть, а собеседников больше не видно.
          *
-         * Набор останавливает обзор и поднимает его снова, то есть на каждый
-         * набор приходится один запуск. Шесть секунд между запусками
-         * оставляют пять штук на тридцать секунд ровно — с запасом в ноль,
-         * зато честным.
+         * **Прежде здесь стоял один срок — шесть секунд между запусками,**
+         * и в этом же комментарии было признано: пять штук на тридцать
+         * секунд ровно, с запасом в ноль. Запас в ноль и кончился: на живом
+         * прогоне (8 ноября) телефон перестал видеть и второй телефон,
+         * и PinePhone, а перезапуск приложения вернул обоих — то есть квота
+         * была исчерпана, и ждать её возврата приложение не умело.
+         *
+         * Теперь запуски считаются **окном**, как считает их система: мы
+         * помним времена последних [SCAN_BUDGET] подъёмов и, если все они
+         * внутри тридцати секунд, ждём, пока старший из них выйдет
+         * из окна. Там, где наборы редки, ожидания не будет вовсе.
          */
-        const val SCAN_COOLDOWN_MS = 6_000L
+        const val SCAN_WINDOW_MS = 30_000L
+
+        /**
+         * Сколько запусков обзора Android разрешает за [SCAN_WINDOW_MS].
+         *
+         * Пять — и считаем мы четыре, оставляя один системе. Запас нужен
+         * потому, что окно у неё своё и начинается не там, где наше:
+         * совпадать они не обязаны, а цена ошибки — слепое приложение
+         * до перезапуска.
+         */
+        const val SCAN_BUDGET = 4
 
         /** Через сколько поднимать обзор после набора. */
         const val SCAN_RESUME_MS = 1_500L
@@ -231,7 +247,8 @@ class BtRadio(
     }
 
     /** Когда обзор запускали в последний раз. */
-    @Volatile private var scanStarted = 0L
+    /** Времена последних подъёмов обзора — для окна квоты Android. */
+    private val scanStarts = java.util.ArrayDeque<Long>()
 
     /** Самая глубокая очередь к ядру, какую видели. Только для журнала. */
     @Volatile private var deepest = 0
@@ -648,11 +665,16 @@ class BtRadio(
         if (server == null) {
             return
         }
-        val waited = System.currentTimeMillis() - scanStarted
-        if (waited < SCAN_COOLDOWN_MS) {
+        val delay = synchronized(scanStarts) {
+            val now = System.currentTimeMillis()
+            while (scanStarts.isNotEmpty() && now - scanStarts.peekFirst() >= SCAN_WINDOW_MS) {
+                scanStarts.pollFirst()
+            }
+            if (scanStarts.size < SCAN_BUDGET) 0L else SCAN_WINDOW_MS - (now - scanStarts.peekFirst())
+        }
+        if (delay > 0) {
             if (scanPending.compareAndSet(false, true)) {
-                val delay = SCAN_COOLDOWN_MS - waited
-                Log.i(TAG, "обзор придержан на $delay мс: квота Android")
+                Log.i(TAG, "обзор придержан на $delay мс: квота Android израсходована")
                 timer.schedule(
                     {
                         scanPending.set(false)
@@ -666,6 +688,10 @@ class BtRadio(
         }
         val scanner = adapter.bluetoothLeScanner ?: return
         scanning?.let { runCatching { scanner.stopScan(it) } }
+        // Подъём записывается **до** вызова, а не после: система считает
+        // попытку, а не удачу, и запись после успешного `startScan`
+        // не учла бы того подъёма, который не состоялся.
+        synchronized(scanStarts) { scanStarts.addLast(System.currentTimeMillis()) }
 
         // Фильтр по коду производителя — не ради приватности, а ради
         // батареи: в вагоне метро под BLE вещает всякий наушник, и
@@ -730,7 +756,8 @@ class BtRadio(
         scanning = callback
         try {
             scanner.startScan(listOf(filter), settings, callback)
-            scanStarted = System.currentTimeMillis()
+            // Время подъёма уже записано выше — до вызова, потому что
+            // система считает попытки.
             Log.i(TAG, "обзор пошёл: режим ${if (busy) "экономный" else "обычный"}")
         } catch (e: SecurityException) {
             toCore("onLost") { bridge.onLost("нет разрешения на обзор") }

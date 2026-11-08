@@ -1055,12 +1055,46 @@ impl<A: Air> BtRunner<A> {
         found
     }
 
-    /// Сообщает ядру о неудаче, а не только возвращает ошибку.
+    /// Сообщает ядру о неудаче **набора** и забывает адрес.
     ///
     /// Без события §5.4 узнал бы об отказе лишь по таймауту — двадцать
     /// секунд там, где ответ уже есть.
+    ///
+    /// Зовётся только там, где радио **тронули** и оно подвело: оборвался
+    /// открытый канал. Отказ, случившийся до радио, — это
+    /// [`BtRunner::report_refusal`], и разница между ними не косметическая.
     async fn report_failure(&self, peer_ik: [u8; 32]) {
         forget_address(&self.directory, &self.heard, peer_ik);
+        self.report_refusal(peer_ik).await;
+    }
+
+    /// Сообщает ядру об отказе, случившемся **до** радио, не трогая адрес.
+    ///
+    /// Развилка та же, что у счёта неудач ниже («тронули радио или нет»),
+    /// и обошлась она дороже.
+    ///
+    /// # Разбор по журналу с устройства
+    ///
+    /// Набор к собеседнику не удавался, ступень уходила в выдержку — и
+    /// каждый следующий кадр получал отказ **нашей же выдержки**. Отказ
+    /// этот забывал адрес: тот самый, который объявление принесло секунду
+    /// назад и по которому радио даже не пробовали. Стоило это трёх вещей
+    /// сразу:
+    ///
+    /// * адреса нет в справочнике — значит кого-то мы «ждём», и опрос
+    ///   `bluetoothd` идёт **каждую секунду**, устройство за устройством;
+    ///   ровно то, чего `resweep` обещает не делать в покое, а в вагоне
+    ///   метро это сотни запросов в секунду;
+    /// * объявление снова «новость» — и строка о нём печатается на каждый
+    ///   тик, хотя правило «повтор новостью не считается» написано
+    ///   и проверено;
+    /// * лестница §5.4 проходится заново на каждое такое событие: четыре
+    ///   строки в секунду сорок пять секунд подряд, и в этой стене тонет
+    ///   всё остальное.
+    ///
+    /// Адрес устаревает от неудавшегося **набора**, а не от нашего решения
+    /// не набирать.
+    async fn report_refusal(&self, peer_ik: [u8; 32]) {
         let _ = self
             .events_tx
             .send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt })
@@ -1255,8 +1289,11 @@ impl<A: Air> Runner for BtRunner<A> {
                             Err(error)
                         }
                     },
+                    // Отказ `ensure_link` означает, что радио не трогали:
+                    // выдержка, адреса нет, набирать нечего. Адрес при
+                    // таком отказе остаётся — см. `report_refusal`.
                     Err(error) => {
-                        self.report_failure(peer.ik).await;
+                        self.report_refusal(peer.ik).await;
                         Err(error)
                     }
                 }
@@ -1269,8 +1306,9 @@ impl<A: Air> Runner for BtRunner<A> {
                 // когда появится объёмный кадр, и ни минутой раньше.
                 match self.ensure_link(peer.ik, false) {
                     Ok(_) => Ok(()),
+                    // Радио не тронуто — адрес не трогаем тоже.
                     Err(error) => {
-                        self.report_failure(peer.ik).await;
+                        self.report_refusal(peer.ik).await;
                         Err(error)
                     }
                 }
@@ -2412,6 +2450,96 @@ mod tests {
         let link = bt.ensure_link(peer_ik, false).expect("принятый канал выдержке не подчиняется");
         assert!(!link.is_closed(), "по нему и поедем");
         assert_eq!(radio.opened.lock().expect("замок").len(), 1, "и всё ещё ни одного набора");
+    }
+
+    #[tokio::test]
+    async fn a_frame_refused_during_the_backoff_keeps_the_address_the_radio_never_dialled() {
+        // **Разбор журнала с устройства, и поломка жила на стыке.** Набор
+        // не удавался, ступень уходила в выдержку — и каждый следующий
+        // кадр получал отказ **нашей же выдержки**. Отказ этот забывал
+        // адрес, принесённый объявлением секунду назад и радио даже
+        // не пробованный. В журнале это выглядело стеной: раз в секунду
+        // «контакт объявился» (адрес снова новость), «выдержка», «транспорт
+        // отказал», «отправлять некуда» — и опрос `bluetoothd` каждую
+        // секунду, потому что в справочнике опять никого.
+        //
+        // Соседняя проверка (`a_dial_that_failed_is_not_retried_on_every_advert`)
+        // этого не видела и видеть не могла: она зовёт `ensure_link` руками,
+        // а забывал адрес путь **ядра** — `execute(Send)`. Две исправные
+        // половины, поломка между ними.
+        //
+        // Чего она не стережёт: ни самой выдержки (её держит соседняя),
+        // ни обратного правила — его держит
+        // `a_dial_that_failed_forgets_the_address_it_could_not_reach`.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [9u8; 32];
+        // Адрес постоянный: приватный не набирается и без всякой выдержки.
+        let heard = BtAddress { addr: [3; 6], random: false, psm: 0x0081 };
+        bt.note_address(peer_ik, heard);
+
+        // Один настоящий набор, и он не удался — дальше выдержка.
+        bt.ensure_link(peer_ik, false).expect("адрес известен — набираем");
+        assert!(wait_for(|| radio.opened.lock().expect("замок").len() == 1).await, "набор пошёл");
+        bt.links.clear();
+        let _ =
+            bt.events_tx.send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt }).await;
+        next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))
+            .await
+            .expect("новость об отказе");
+        assert!(bt.waiting_out(&peer_ik), "выдержка пошла");
+
+        // Объявление приносит адрес снова — на устройстве это раз в секунду.
+        bt.note_address(peer_ik, heard);
+
+        let refused = bt
+            .execute(TransportCommand::Send {
+                peer: peer(peer_ik),
+                via: Transport::Bt,
+                frame: vec![1u8; SizeClass::S.frame_len()],
+                handoff: None,
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(TransportError::NoAddress)),
+            "во время выдержки кадр не едет: {refused:?}"
+        );
+        assert_eq!(
+            bt.address_of(&peer_ik),
+            Some(heard),
+            "адрес принесло объявление, а отказала наша же выдержка — забывать нечего"
+        );
+        assert_eq!(
+            radio.opened.lock().expect("замок").len(),
+            1,
+            "и радио мы при этом не тронули ни разу"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dial_that_failed_forgets_the_address_it_could_not_reach() {
+        // Обратная половина, и она была написана правилом, но не стерёглась
+        // ничем: адрес в эфире — не свойство контакта, а последнее, что мы
+        // о нём слышали, и ротируется он вместе с объявлением. Не
+        // дозвонившись, держать его дальше значит набирать мертвеца
+        // на каждом кадре.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [11u8; 32];
+        bt.note_address(peer_ik, BtAddress { addr: [4; 6], random: false, psm: 0x0082 });
+        bt.ensure_link(peer_ik, false).expect("адрес известен — набираем");
+        assert!(wait_for(|| !radio.opened.lock().expect("замок").is_empty()).await, "набор пошёл");
+        let channel = radio.opened.lock().expect("замок")[0].0;
+
+        air.on_open_failed(channel, "по этому адресу никого нет");
+        assert!(
+            wait_for(|| bt.address_of(&peer_ik).is_none()).await,
+            "набор не удался — адрес обязан уйти из справочника"
+        );
     }
 
     #[tokio::test]

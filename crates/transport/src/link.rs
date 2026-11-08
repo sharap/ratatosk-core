@@ -104,7 +104,7 @@ use std::future::Future;
 
 use ratatosk_proto::transport_policy::Transport;
 use ratatosk_wire::SizeClass;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::runner::{TransportError, TransportEvent};
@@ -363,6 +363,14 @@ fn frame_kind(frame: &[u8]) -> String {
     out
 }
 
+/// Сколько просить у ядра одним чтением.
+///
+/// Ровно один пакет эфира: кадр класса S и байт класса перед ним. Число
+/// повторено здесь, а не взято у эфира, нарочно — `link` ничего
+/// не знает про Bluetooth, а правило «читать пакет целиком» касается
+/// любой ступени, у которой пакеты есть.
+const READ_CHUNK: usize = SizeClass::S.frame_len() + 1;
+
 /// Читающая задача: разбирает поток на кадры и отдаёт их ядру.
 ///
 /// `link` — номер принятой связи, если у ступени связи счётные и в них
@@ -371,7 +379,7 @@ fn frame_kind(frame: &[u8]) -> String {
 /// двусторонний. У остальных ступеней `None` — см.
 /// [`TransportEvent::Received::link`].
 pub(crate) fn spawn_read_loop<R>(
-    mut reader: R,
+    reader: R,
     via: Transport,
     link: Option<u64>,
     events: mpsc::Sender<TransportEvent>,
@@ -379,6 +387,28 @@ pub(crate) fn spawn_read_loop<R>(
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
+        // **Чтение идёт через буфер, и это не про скорость.**
+        //
+        // Разбор с устройства. Цикл ниже читает сперва один байт класса,
+        // потом кадр целиком — два `read_exact` подряд. На L2CAP так
+        // делать нельзя: пакет, прочитанный по частям, теряется весь.
+        // Проверено на PinePhone (ядро 6.17.5) сокетами **не нашим**
+        // кодом: пакет в 13 байт двумя приёмами читается, пакет
+        // в 4097 — нет, и канал после этого сбрасывается. Снаружи
+        // это выглядело как «эфир работает в одну сторону»: телефон
+        // отправлял, а принять не мог ни одного кадра, молча.
+        //
+        // Молча — потому что неудачу чтения цикл возвращает без слова
+        // (см. три `return` ниже): байты пропали, связь числится живой.
+        // Буфер убирает причину: первое чтение просит **целый пакет**,
+        // ядро отдаёт его целиком, а байт класса и кадр берутся уже
+        // из буфера.
+        //
+        // Ёмкости хватает на один пакет эфира (класс S плюс байт
+        // класса). Кадры крупнее приезжают несколькими пакетами —
+        // для них `read_exact` просит больше ёмкости и читает
+        // напрямую, то есть опять **целыми** пакетами.
+        let mut reader = BufReader::with_capacity(READ_CHUNK, reader);
         // Счёт и отпечаток **всего потока**, байты классов включая, — пара
         // к таким же на записи. Сличаются они покадрово: у обеих сторон
         // строка выходит на одном и том же кадре, и `всего` у них сходится
@@ -619,6 +649,68 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
+
+    /// Радио, которое не отдаёт пакет по частям.
+    ///
+    /// Так ведёт себя L2CAP на ядре PinePhone (6.17.5): большой пакет,
+    /// прочитанный двумя приёмами — байт класса, потом кадр, — пропадает
+    /// целиком, и канал после этого сбрасывается. Проверено
+    /// на устройстве сокетами **не нашим** кодом: пакет в 13 байт двумя
+    /// приёмами читается, пакет в 4097 — нет.
+    ///
+    /// Короткое чтение здесь отдаёт ноль байт: для `read_exact` это конец
+    /// потока, то есть ровно та тишина, что была на устройстве.
+    struct WholePacketsOnly {
+        packets: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl AsyncRead for WholePacketsOnly {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Some(front) = self.packets.front() else { return Poll::Ready(Ok(())) };
+            if buf.remaining() < front.len() {
+                // Пакет потерян весь — как на устройстве.
+                self.packets.pop_front();
+                return Poll::Ready(Ok(()));
+            }
+            let packet = self.packets.pop_front().expect("только что смотрели");
+            buf.put_slice(&packet);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_arrives_as_one_packet_reaches_the_core() {
+        // **Поломка с устройства, и её не видел ни один тест.** Цикл чтения
+        // просит сперва один байт класса, потом кадр; на L2CAP такое
+        // короткое чтение уносит пакет целиком, и ступень молча перестаёт
+        // принимать что-либо. Телефон при этом отправлял исправно —
+        // снаружи «эфир работает в одну сторону».
+        //
+        // Чего проверка не стережёт: ни того, что ядро ведёт себя именно
+        // так (это свойство чужого стека, и названо оно в заголовке
+        // поддельного радио), ни размера пакета у настоящего L2CAP.
+        let mut packet = vec![tag_of(SizeClass::S)];
+        packet.extend(std::iter::repeat_n(7u8, SizeClass::S.frame_len()));
+        let reader = WholePacketsOnly { packets: std::collections::VecDeque::from([packet]) };
+
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        spawn_read_loop(reader, Transport::Bt, Some(5), events_tx);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("новость обязана прийти, а не повиснуть");
+        assert!(
+            matches!(
+                event,
+                Some(TransportEvent::Received { via: Transport::Bt, link: Some(5), .. })
+            ),
+            "кадр обязан доехать до ядра одним пакетом: {event:?}"
+        );
+    }
 
     /// Перо, запоминающее **каждую** запись по отдельности.
     ///

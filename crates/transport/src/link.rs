@@ -420,9 +420,16 @@ pub(crate) fn spawn_read_loop<R>(
         // называет кадр, на котором провод соврал впервые.
         let mut taken: u64 = 0;
         let mut stream = FNV_OFFSET;
+        // **Начало и конец чтения говорят вслух.** Молчащий цикл чтения —
+        // это звено в одну сторону, которое снаружи выглядит исправным:
+        // связь жива, кадры уходят, ответов нет. Разбор на устройстве
+        // упёрся ровно в это — пришлось доказывать, что цикл вообще
+        // запущен, и нечем было.
+        tracing::debug!(?via, link, "поток: читаем");
         loop {
             let mut tag = [0u8; 1];
-            if reader.read_exact(&mut tag).await.is_err() {
+            if let Err(error) = reader.read_exact(&mut tag).await {
+                tracing::debug!(?via, link, ?error, прочитано = taken, "поток: чтение кончилось");
                 return;
             }
             let Some(class) = class_of_tag(tag[0]) else {
@@ -432,7 +439,18 @@ pub(crate) fn spawn_read_loop<R>(
                 return;
             };
             let mut frame = vec![0u8; class.frame_len()];
-            if reader.read_exact(&mut frame).await.is_err() {
+            if let Err(error) = reader.read_exact(&mut frame).await {
+                // Отдельно от предыдущей: байт класса пришёл, а кадр нет —
+                // это не «связь кончилась», а «пакет оборвался посередине»,
+                // и лечится это иначе.
+                tracing::debug!(
+                    ?via,
+                    link,
+                    ?error,
+                    ?class,
+                    прочитано = taken,
+                    "поток: кадр не дочитан"
+                );
                 return;
             }
             taken = taken.saturating_add(frame.len() as u64 + 1);

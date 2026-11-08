@@ -131,6 +131,12 @@ pub(crate) const fn tag_of(class: SizeClass) -> u8 {
         SizeClass::S => 0,
         SizeClass::M => 1,
         SizeClass::L => 2,
+        // **Новый класс получает новый байт, а не сдвигает прежние.**
+        // Сдвиг переименовал бы кадры у всех разом; так же старая сборка
+        // читает `S`, `M` и `L` по-прежнему — и честно закрывает поток
+        // на незнакомом байте, вместо того чтобы разобрать кадр не того
+        // размера.
+        SizeClass::XS => 3,
     }
 }
 
@@ -140,6 +146,7 @@ pub(crate) fn class_of_tag(tag: u8) -> Option<SizeClass> {
         0 => Some(SizeClass::S),
         1 => Some(SizeClass::M),
         2 => Some(SizeClass::L),
+        3 => Some(SizeClass::XS),
         _ => None,
     }
 }

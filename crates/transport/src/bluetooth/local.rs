@@ -110,6 +110,38 @@ const BUSY_TRIES: u32 = 2;
 /// и не устроим при этом опрос вхолостую.
 const SETTLE_POLL: Duration = Duration::from_millis(25);
 
+/// Как часто вещать объявление.
+///
+/// # Это число стоило замера, и до замера его тут не было вовсе
+///
+/// Интервал не задавался, то есть действовало умолчание BlueZ. Чем оно
+/// обходится — снято на живых устройствах (PinePhone 1.2 и этот ПК,
+/// L2CAP-сокеты **не нашим** кодом, чтобы мерить радио, а не себя):
+///
+/// | Кто объявляется | Сколько шло открытие канала |
+/// |---|---|
+/// | PinePhone, умолчание BlueZ | 4,3 с · 4,9 с · 8,3 с · дважды дольше 10 с |
+/// | ПК, умолчание BlueZ | 1,6 с · 4,2 с · 5,2 с |
+/// | ПК, интервал задан (100–150 мс) | 0,35 с · 0,41 с · 0,42 с · 0,48 с |
+///
+/// Разница в **десять раз**, и она объясняет поломку целиком. Предел
+/// одной попытки по постоянному адресу — восемь секунд
+/// (`DIAL_PUBLIC`), ступени отведено десять
+/// (`BT_CONNECT_TIMEOUT_MS`): с умолчанием BlueZ набор к PinePhone
+/// укладывался в срок примерно раз из трёх, а три неудачи подряд
+/// уводили ступень в выдержку на сорок пять секунд. Снаружи это
+/// выглядело как «эфир работает в одну сторону»: свои наборы телефон
+/// делал (его-то срок начинался раньше), а до него не доезжал никто.
+///
+/// Четверть секунды — не выбор, а **равенство с Android**: там
+/// `ADVERTISE_MODE_BALANCED` стоит с самого начала и означает те же
+/// 250 мс. Одна и та же мысль дошла до одной половины из двух, и это
+/// второй раз в этом файле — первым был «набор старше обзора».
+///
+/// Меньше брать нельзя без разговора про заряд: объявление — то
+/// немногое, что радио делает **всегда** (0.4.3).
+const ADVERT_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Запас к границе слота при переобъявлении.
 ///
 /// Объявление меняется вместе с записью маяка, и менять его надо
@@ -419,22 +451,10 @@ async fn advertise_loop(
         let payload =
             advert::payload(&record, psm).map_err(|e| refused("нагрузка объявления", e))?;
 
-        let mut manufacturer_data = BTreeMap::new();
-        manufacturer_data.insert(advert::COMPANY_ID, payload.to_vec());
-        let announcement = Advertisement {
-            // **Именно `Peripheral`.** По умолчанию тип
-            // `Broadcast`, а широковещательное объявление
-            // не подключаемо: видно нас было бы, а подойти нельзя.
-            advertisement_type: AdvType::Peripheral,
-            manufacturer_data,
-            discoverable: Some(true),
-            // Имя устройства не объявляется никогда: оно и бюджет
-            // объявления рвёт (0.4.3), и вещает в эфир имя телефона.
-            local_name: None,
-            ..Default::default()
-        };
-
-        let handle = adapter.advertise(announcement).await.map_err(|e| refused("объявление", e))?;
+        let handle = adapter
+            .advertise(announcement(&payload))
+            .await
+            .map_err(|e| refused("объявление", e))?;
 
         if !announced {
             announced = true;
@@ -469,6 +489,32 @@ async fn advertise_loop(
         // одного устройства в эфире — это два разных маяка от одного
         // радио, то есть подсказка тому, кто их сличает.
         drop(handle);
+    }
+}
+
+/// Собирает объявление: нагрузка, тип, интервал.
+///
+/// Отдельной функцией затем, что её можно проверить **без радио**:
+/// числа и тип здесь — обещания, а не настройки.
+fn announcement(payload: &[u8]) -> Advertisement {
+    let mut manufacturer_data = BTreeMap::new();
+    manufacturer_data.insert(advert::COMPANY_ID, payload.to_vec());
+    Advertisement {
+        // **Именно `Peripheral`.** По умолчанию тип `Broadcast`,
+        // а широковещательное объявление не подключаемо: видно нас
+        // было бы, а подойти нельзя.
+        advertisement_type: AdvType::Peripheral,
+        manufacturer_data,
+        discoverable: Some(true),
+        // Имя устройства не объявляется никогда: оно и бюджет
+        // объявления рвёт (0.4.3), и вещает в эфир имя телефона.
+        local_name: None,
+        // **Интервал называется, а не наследуется.** Разбор — у
+        // `ADVERT_INTERVAL`; коротко: умолчание BlueZ стоило секунд
+        // на открытие канала, а наш предел попытки — восемь секунд.
+        min_interval: Some(ADVERT_INTERVAL),
+        max_interval: Some(ADVERT_INTERVAL),
+        ..Default::default()
     }
 }
 
@@ -1073,4 +1119,40 @@ async fn peer_connected(slot: &AdapterSlot, addr: [u8; 6]) -> Option<bool> {
         held.clone()?
     };
     adapter.device(Address::new(addr)).ok()?.is_connected().await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_advert_names_an_interval_fast_enough_for_our_own_dial_budget() {
+        // **Проверка обещания, а не настройки.** Интервал объявления
+        // не задавался вовсе, и с умолчанием BlueZ открытие канала шло
+        // секунды — до десяти и дольше к PinePhone, при пределе попытки
+        // в восемь секунд. Снаружи это выглядело как «эфир работает
+        // в одну сторону».
+        //
+        // Числа здесь повторены руками, а не взяты из крейта: возьми
+        // проверка `ADVERT_INTERVAL` и `DIAL_PUBLIC` сама, и поднятие
+        // интервала до секунды подняло бы заодно и проверку — та
+        // смолчала бы о том, что набор снова перестал укладываться
+        // в срок.
+        let advert = announcement(&[0u8; 20]);
+        let min = advert.min_interval.expect("интервал обязан быть назван, а не унаследован");
+        let max = advert.max_interval.expect("и верхняя граница тоже");
+        assert!(
+            min <= Duration::from_millis(250) && max <= Duration::from_millis(250),
+            "четверть секунды — то же, что платит Android (`ADVERTISE_MODE_BALANCED`); \
+             медленнее — и набор перестанет укладываться в срок, {min:?}..{max:?}"
+        );
+        assert!(min <= max, "BlueZ отвергает объявление, у которого нижняя граница выше верхней");
+        // И то, без чего объявление бесполезно: по широковещательному
+        // к нам не подойдёт никто.
+        assert!(matches!(advert.advertisement_type, AdvType::Peripheral));
+        assert!(advert.local_name.is_none(), "имя телефона в эфир не вещаем (0.4.3)");
+
+        // Чего проверка не стережёт: того, что контроллер этот интервал
+        // примет. BlueZ вправе дать своё, и видно это только на радио.
+    }
 }

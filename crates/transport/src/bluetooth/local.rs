@@ -444,6 +444,45 @@ async fn advertise_loop(
     events: mpsc::Sender<TransportEvent>,
 ) -> Result<(), TransportError> {
     let mut announced = false;
+    // Просить ли интервал — спрашивается **до** первой попытки.
+    //
+    // # Разбор, стоивший живого устройства
+    //
+    // Интервал ядро ставит командой расширенного объявления, а у
+    // контроллеров старше BT 5.0 её нет: BlueZ отвечает «Failed to
+    // register advertisement», и объявления не выходит **никакого**.
+    // То есть правка, ускоряющая набор на новых устройствах, на старых
+    // убивает ступень целиком. Проверено на PinePhone (RTL8723CS,
+    // BT 4.2): эфир не поднялся вовсе.
+    //
+    // Хуже того, **каждая отказная попытка съедает место под
+    // объявление**: на том же PinePhone `SupportedInstances` упал
+    // с пяти до трёх ровно по числу моих попыток, и обратно их
+    // возвращает только перезапуск `bluetoothd`. Значит «попробовать
+    // и отступить» — плохой способ: он тратит невозвратное.
+    //
+    // Спрашивать надо платформу, и признак у неё есть: вторичные
+    // каналы (`SupportedSecondaryChannels`) бывают только
+    // у расширенного объявления. У ПК (BT 5.3) там 1M, 2M и Coded,
+    // у PinePhone список пуст.
+    let extended = adapter
+        .supported_advertising_secondary_channels()
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|channels| !channels.is_empty());
+    if !extended {
+        // Вслух и один раз: набирать нас будут в разы дольше, и знать
+        // это надо до разбора «почему до меня не доходят», а не после.
+        tracing::warn!(
+            "эфир: контроллер не умеет расширенного объявления — интервал назначить \
+             нечем, объявляемся умолчанием платформы, и набирать нас будут дольше (0.4.3)"
+        );
+    }
+    // Отступление остаётся сверх расспроса: платформа может ответить
+    // «умею», а регистрация всё равно не пройдёт — тогда лучше медленное
+    // объявление, чем никакое.
+    let mut interval_taken = extended;
     loop {
         let now = unix_seconds();
         let slot = beacon::slot(now);
@@ -451,10 +490,26 @@ async fn advertise_loop(
         let payload =
             advert::payload(&record, psm).map_err(|e| refused("нагрузка объявления", e))?;
 
-        let handle = adapter
-            .advertise(announcement(&payload))
-            .await
-            .map_err(|e| refused("объявление", e))?;
+        let handle = match adapter.advertise(announcement(&payload, interval_taken)).await {
+            Ok(handle) => handle,
+            Err(error) if interval_taken => {
+                // Платформа сказала «умею», а не вышло. Отступаем — но
+                // место под объявление эта попытка уже потратила, и
+                // вернуть его может только перезапуск `bluetoothd`.
+                tracing::warn!(
+                    %error,
+                    просили_мс = ADVERT_INTERVAL.as_millis(),
+                    "эфир: интервал объявления не принят, хотя платформа обещала — \
+                     объявляемся умолчанием, и набирать нас будут дольше (0.4.3)"
+                );
+                interval_taken = false;
+                adapter
+                    .advertise(announcement(&payload, false))
+                    .await
+                    .map_err(|e| refused("объявление", e))?
+            }
+            Err(error) => return Err(refused("объявление", error)),
+        };
 
         if !announced {
             announced = true;
@@ -496,7 +551,7 @@ async fn advertise_loop(
 ///
 /// Отдельной функцией затем, что её можно проверить **без радио**:
 /// числа и тип здесь — обещания, а не настройки.
-fn announcement(payload: &[u8]) -> Advertisement {
+fn announcement(payload: &[u8], with_interval: bool) -> Advertisement {
     let mut manufacturer_data = BTreeMap::new();
     manufacturer_data.insert(advert::COMPANY_ID, payload.to_vec());
     Advertisement {
@@ -509,11 +564,12 @@ fn announcement(payload: &[u8]) -> Advertisement {
         // Имя устройства не объявляется никогда: оно и бюджет
         // объявления рвёт (0.4.3), и вещает в эфир имя телефона.
         local_name: None,
-        // **Интервал называется, а не наследуется.** Разбор — у
-        // `ADVERT_INTERVAL`; коротко: умолчание BlueZ стоило секунд
-        // на открытие канала, а наш предел попытки — восемь секунд.
-        min_interval: Some(ADVERT_INTERVAL),
-        max_interval: Some(ADVERT_INTERVAL),
+        // **Интервал называется, а не наследуется** — но только там, где
+        // его принимают. Разбор — у `ADVERT_INTERVAL`; коротко: умолчание
+        // платформы стоило секунд на открытие канала, а наш предел
+        // попытки — восемь секунд.
+        min_interval: with_interval.then_some(ADVERT_INTERVAL),
+        max_interval: with_interval.then_some(ADVERT_INTERVAL),
         ..Default::default()
     }
 }
@@ -1138,7 +1194,7 @@ mod tests {
         // интервала до секунды подняло бы заодно и проверку — та
         // смолчала бы о том, что набор снова перестал укладываться
         // в срок.
-        let advert = announcement(&[0u8; 20]);
+        let advert = announcement(&[0u8; 20], true);
         let min = advert.min_interval.expect("интервал обязан быть назван, а не унаследован");
         let max = advert.max_interval.expect("и верхняя граница тоже");
         assert!(
@@ -1152,7 +1208,23 @@ mod tests {
         assert!(matches!(advert.advertisement_type, AdvType::Peripheral));
         assert!(advert.local_name.is_none(), "имя телефона в эфир не вещаем (0.4.3)");
 
-        // Чего проверка не стережёт: того, что контроллер этот интервал
-        // примет. BlueZ вправе дать своё, и видно это только на радио.
+        // **Вторая форма — та, которой объявляются, когда интервал
+        // не приняли.** Она обязана остаться законным объявлением:
+        // контроллеры старше BT 5.0 интервала не принимают вовсе, и без
+        // этой формы ступень у них не поднимается ни разу. Проверено
+        // на устройстве: PinePhone отвечал «Failed to register
+        // advertisement», и эфира не было вовсе.
+        let plain = announcement(&[0u8; 20], false);
+        assert!(plain.min_interval.is_none() && plain.max_interval.is_none());
+        assert!(matches!(plain.advertisement_type, AdvType::Peripheral), "подойти всё равно надо");
+        assert!(plain.local_name.is_none(), "имя телефона в эфир не вещаем и здесь");
+        assert_eq!(
+            plain.manufacturer_data, advert.manufacturer_data,
+            "отступление меняет только интервал: нагрузка маяка (§5.1) та же"
+        );
+
+        // Чего проверка не стережёт: того, что контроллер интервал
+        // примет, и того, что отступление случится. И то и другое видно
+        // только на радио — здесь проверено лишь, что обе формы законны.
     }
 }

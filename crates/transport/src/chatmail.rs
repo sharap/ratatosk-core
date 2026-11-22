@@ -34,6 +34,10 @@ pub mod imap;
 pub mod json;
 #[cfg(feature = "chatmail-net")]
 pub mod runner;
+// Поход за перечнем серверов едет вместе с живой почтой: спрашивают его
+// ровно затем, чтобы завести ящик, а без сети заводить его нечем.
+#[cfg(feature = "chatmail-net")]
+pub mod server_list;
 #[cfg(feature = "chatmail-net")]
 pub mod smtp;
 // TLS переехал на уровень крейта: потребителей у него стало двое — почта

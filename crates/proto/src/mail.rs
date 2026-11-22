@@ -460,6 +460,317 @@ fn check_address(address: &str) -> Result<(), MailAccountError> {
     Ok(())
 }
 
+// --- Публичный перечень chatmail-серверов ------------------------------------
+
+/// Кого спрашиваем, какие chatmail-серверы бывают.
+///
+/// Страница, которую ведут авторы chatmail. Адрес источника в сборке есть —
+/// и это выбор, который сделали мы, а не человек; поэтому о нём сказано
+/// текстом (`ratatosk_core::honest::MAIL_SERVER_SOURCE_NOTICE`, §14).
+/// **Серверов в сборке нет**: сервер видит адрес ящика и то, с кем и когда
+/// он переписывается, и выбирать его за человека нельзя — как пира меша
+/// и реле nostr.
+pub const MAIL_SERVER_LIST_HOST: &str = "chatmail.at";
+
+/// Путь перечня у источника.
+pub const MAIL_SERVER_LIST_PATH: &str = "/relays";
+
+/// Сколько серверов берём из ответа, не больше.
+///
+/// Перечень короткий (десятки), и предел здесь не про него: страница чужая,
+/// и разбирать из неё тысячу ссылок, окажись они там, незачем.
+pub const MAX_LIST_SERVERS: usize = 64;
+
+/// Предел пояснения к серверу, символов.
+pub const MAX_SERVER_NOTE: usize = 200;
+
+/// Сервер из публичного перечня.
+///
+/// **Это ещё не настройка.** Ящик заводится отдельным вызовом, по ссылке
+/// [`MailServer::account_url`], и только когда человек выбрал сервер сам.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailServer {
+    /// Имя сервера: `nine.testrun.org`.
+    pub host: String,
+    /// Что о сервере сказано в перечне — словами его составителей, как есть:
+    /// где стоит, на кого рассчитан. Бывает пустым. Не проверено никем.
+    pub note: String,
+}
+
+impl MailServer {
+    /// Ссылка, по которой этот сервер заводит новый ящик (§5.3).
+    ///
+    /// `/new` — общее место chatmail-серверов; этой же ссылкой заводит
+    /// ящик Delta Chat. Сервер, который по ней не отвечает, скажет об этом
+    /// отказом регистрации, а не тишиной.
+    #[must_use]
+    pub fn account_url(&self) -> String {
+        format!("https://{}/new", self.host)
+    }
+}
+
+/// Почему не приехал перечень chatmail-серверов.
+///
+/// Перечислением, как у списка пиров меша и у реле: каждая причина —
+/// **своё действие человека**. Текст к причине живёт в ядре
+/// (`ratatosk_core::honest::mail_server_list_refusal_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MailServerListError {
+    /// Почтовой ступени в этой сборке нет, и сервер ей не нужен.
+    #[error("в этой сборке нет почтовой ступени")]
+    NotInThisBuild,
+    /// Источник не ответил или ответил не тем. Делать: повторить позже
+    /// или назвать сервер самому.
+    #[error("источник перечня не ответил")]
+    SourceSilent,
+    /// Ответ пришёл, а серверов в нём нет: разметка страницы могла
+    /// измениться. Делать: назвать сервер самому и сообщить нам.
+    #[error("в ответе нет ни одного сервера")]
+    FormatChanged,
+}
+
+/// Достаёт серверы из страницы перечня.
+///
+/// Страница — обычный HTML: пункт списка, в нём ссылка на сервер и строка
+/// пояснения. Разбор нарочно свой и грубый, как у ссылки на регистрацию:
+/// разборщик HTML ради двух десятков ссылок — лишняя зависимость в дереве,
+/// где каждая объяснена (§8.1).
+///
+/// # Что считается сервером
+///
+/// Ссылка `https://имя/` **внутри пункта списка**, ведущая в корень сайта.
+/// Этого хватает, чтобы не принять за сервер ссылку на документацию
+/// (`https://chatmail.at/doc/relay` — и не в пункте, и с путём) и меню
+/// сайта (там ссылки без имени сервера). Сам источник сервером не считается.
+///
+/// Имя проверяется строго — строчные латинские буквы, цифры, точка, дефис,
+/// хотя бы одна точка: оно уедет в ссылку регистрации, и чужая строка в ней
+/// означала бы запрос, которого мы не писали.
+///
+/// В пункте бывает два сервера сразу (два имени одного оператора) — оба
+/// берутся, пояснение у них общее. Порядок страницы сохраняется: первым
+/// там стоит сервер, с которого начинают другие приложения, и переставлять
+/// чужой порядок незачем. Повторы отбрасываются.
+#[must_use]
+pub fn mail_servers_from_page(html: &str) -> Vec<MailServer> {
+    let mut out: Vec<MailServer> = Vec::new();
+    let mut rest = html;
+    while let Some(start) = item_start(rest) {
+        let item = &rest[start..];
+        let end = item.find("</li>").unwrap_or(item.len());
+        let (item, after) = item.split_at(end);
+        rest = after.strip_prefix("</li>").unwrap_or(after);
+
+        let hosts = hosts_in_item(item);
+        if hosts.is_empty() {
+            continue;
+        }
+        let note = plain_text(item);
+        for host in hosts {
+            if out.len() == MAX_LIST_SERVERS {
+                return out;
+            }
+            if out.iter().all(|known| known.host != host) {
+                out.push(MailServer { host, note: note.clone() });
+            }
+        }
+    }
+    out
+}
+
+/// Где начинается ближайший пункт списка.
+///
+/// Именно тег `li`, а не всё, что начинается с этих букв: в шапке страницы
+/// стоит `<link …>`, и принятый за пункт, он утащил в пояснение к первому
+/// серверу всю шапку с меню. Поймано живым походом.
+fn item_start(html: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = html[from..].find("<li") {
+        let at = from + found;
+        match html[at + 3..].chars().next() {
+            Some(next) if next == '>' || next.is_ascii_whitespace() => return Some(at),
+            _ => from = at + 3,
+        }
+    }
+    None
+}
+
+/// Имена серверов, на которые ссылается пункт списка.
+fn hosts_in_item(item: &str) -> Vec<String> {
+    const LINK: &str = "href=\"https://";
+    let mut hosts = Vec::new();
+    let mut rest = item;
+    while let Some(start) = rest.find(LINK) {
+        rest = &rest[start + LINK.len()..];
+        let Some(end) = rest.find('"') else { break };
+        let address = &rest[..end];
+        let (host, path) = address.split_once('/').unwrap_or((address, ""));
+        // Только корень сайта: ссылка глубже ведёт на страницу, а не на сервер.
+        if path.is_empty() && server_host_ok(host) && host != MAIL_SERVER_LIST_HOST {
+            hosts.push(host.to_owned());
+        }
+    }
+    hosts
+}
+
+/// Годится ли имя, чтобы поставить его в ссылку регистрации.
+#[must_use]
+pub fn server_host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_FIELD_LEN
+        && host.contains('.')
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-'])
+        && !host.contains("..")
+        && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+}
+
+/// Текст пункта без разметки: теги сняты, пробелы и переводы строк сведены
+/// к одному пробелу, четыре обычные сущности раскрыты, длина ограничена.
+///
+/// Текст чужой и уходит на экран как есть — поэтому из него убирается
+/// всё, что могло бы оказаться разметкой, а клиент обязан показывать его
+/// **простым текстом**.
+fn plain_text(item: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for symbol in item.chars() {
+        match symbol {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if in_tag => {}
+            _ => text.push(symbol),
+        }
+    }
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    joined.chars().take(MAX_SERVER_NOTE).collect()
+}
+
+#[cfg(test)]
+mod server_list_tests {
+    use super::*;
+
+    /// Кусок настоящей страницы — с её меню, пунктом на два сервера
+    /// и ссылкой на документацию в конце.
+    const PAGE: &str = r#"<head><link rel="stylesheet" href="/assets/main.css">
+<link type="application/atom+xml" rel="alternate" href="https://chatmail.at/feed.xml" title="Chatmail" /></head>
+<header><nav><ul>
+  <li><a class="page-link" href="/relays">Relays</a></li>
+  <li><a class="page-link" href="https://chatmail.at/doc/relay">Docs</a></li>
+</ul></nav></header>
+<ul>
+  <li>
+    <p><a href="https://nine.testrun.org" class="hilite">nine.testrun.org</a>
+is the default onboarding relay for many chatmail apps</p>
+  </li>
+  <li>
+    <p><a href="https://chat.adminforge.de/" class="hilite">chat.adminforge.de</a>
+is hosted in Falkenstein, Germany and is geared towards German speaking users</p>
+  </li>
+  <li>
+    <p><a href="https://woodpeckersnest.space/">woodpeckersnest.space</a> and
+<a href="https://culturanerd.it/">culturanerd.it</a> are hosted in Italy &amp; run by one operator</p>
+  </li>
+  <li><p><a href="https://nine.testrun.org/">nine.testrun.org</a> again</p></li>
+</ul>
+<p>please refer to the <a href="https://chatmail.at/doc/relay">documentation</a>.</p>"#;
+
+    #[test]
+    fn servers_come_out_in_page_order_with_their_notes() {
+        let servers = mail_servers_from_page(PAGE);
+        let hosts: Vec<&str> = servers.iter().map(|server| server.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            ["nine.testrun.org", "chat.adminforge.de", "woodpeckersnest.space", "culturanerd.it"]
+        );
+        assert_eq!(
+            servers[1].note,
+            "chat.adminforge.de is hosted in Falkenstein, Germany and is geared towards German speaking users"
+        );
+        // Два сервера одного пункта делят пояснение; сущность раскрыта.
+        assert_eq!(servers[2].note, servers[3].note);
+        assert!(servers[2].note.ends_with("are hosted in Italy & run by one operator"), "{}", servers[2].note);
+        assert_eq!(servers[0].account_url(), "https://nine.testrun.org/new");
+        // `<link>` в шапке — не пункт списка: пояснение к первому серверу
+        // начинается с него самого, а не с шапки страницы.
+        assert_eq!(servers[0].note, "nine.testrun.org is the default onboarding relay for many chatmail apps");
+    }
+
+    #[test]
+    fn neither_the_menu_nor_the_docs_link_is_a_server() {
+        // Меню — пункты списка, но ссылки в них без имени сервера либо
+        // с путём; ссылка на документацию — с именем, но вне пункта.
+        let servers = mail_servers_from_page(PAGE);
+        assert!(servers.iter().all(|server| server.host != MAIL_SERVER_LIST_HOST));
+        assert_eq!(servers.len(), 4);
+    }
+
+    #[test]
+    fn a_page_without_servers_gives_nothing() {
+        assert!(mail_servers_from_page("").is_empty());
+        assert!(mail_servers_from_page("<html><body><p>503</p></body></html>").is_empty());
+        assert!(mail_servers_from_page("<li>без ссылки</li><li><a href=\"http://plain.example/\">x</a></li>").is_empty());
+        // Оборванная страница не роняет разбор.
+        assert_eq!(mail_servers_from_page("<li><a href=\"https://a.example/\">a").len(), 1);
+        assert!(mail_servers_from_page("<li><a href=\"https://a.example").is_empty());
+    }
+
+    #[test]
+    fn only_a_plain_host_name_reaches_the_account_url() {
+        for bad in [
+            "",
+            "localhost",
+            "a.example:8443",
+            "user@a.example",
+            "A.Example",
+            "a..example",
+            ".a.example",
+            "a.example.",
+            "-a.example",
+            "a.example/new",
+            "a.example?x",
+            "a b.example",
+            "пример.рф",
+        ] {
+            assert!(!server_host_ok(bad), "{bad:?} не должно годиться");
+        }
+        assert!(server_host_ok("nine.testrun.org"));
+        assert!(server_host_ok("chika.aangat.lahat.computer"));
+        assert!(server_host_ok("e2ee.wang"));
+        // И в разборе: негодное имя сервером не становится.
+        let page = "<li><a href=\"https://Evil.Example/\">x</a><a href=\"https://a.example:444/\">y</a>\
+                    <a href=\"https://good.example/\">z</a></li>";
+        let hosts: Vec<String> = mail_servers_from_page(page).into_iter().map(|server| server.host).collect();
+        assert_eq!(hosts, ["good.example"]);
+    }
+
+    #[test]
+    fn foreign_text_is_flattened_and_bounded() {
+        let long = "x".repeat(MAX_SERVER_NOTE * 2);
+        let page = format!("<li><a href=\"https://a.example/\">a</a> <b>жирно</b>\n  {long}</li>");
+        let note = &mail_servers_from_page(&page)[0].note;
+        assert!(note.starts_with("a жирно x"), "{note}");
+        assert!(!note.contains('<') && !note.contains('\n'));
+        assert_eq!(note.chars().count(), MAX_SERVER_NOTE);
+    }
+
+    #[test]
+    fn the_list_is_bounded() {
+        let page: String =
+            (0..MAX_LIST_SERVERS + 10).map(|n| format!("<li><a href=\"https://s{n}.example/\">s</a></li>")).collect();
+        assert_eq!(mail_servers_from_page(&page).len(), MAX_LIST_SERVERS);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

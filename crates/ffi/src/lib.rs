@@ -236,6 +236,18 @@ pub enum RatatoskError {
         /// Что именно не дало реле приехать.
         reason: FfiRelayListRefusal,
     },
+    /// Поход за перечнем chatmail-серверов не удался.
+    ///
+    /// Отдельно от [`RatatoskError::Internal`] по той же причине, что
+    /// и два соседних отказа: человеку есть что сделать — повторить позже
+    /// или назвать сервер самому.
+    ///
+    /// Текст к причине — [`mail_server_list_refusal_text`].
+    #[error("{}", mail_server_list_refusal_text(*reason))]
+    MailServerList {
+        /// Что именно не дало перечню приехать.
+        reason: FfiMailServerListRefusal,
+    },
     /// Внутренняя ошибка.
     #[error("внутренняя ошибка: {reason}")]
     Internal {
@@ -329,6 +341,83 @@ const fn relay_list_refusal_of(
 #[cfg(feature = "nostr")]
 fn relay_candidate_of(found: ratatosk_proto::nostr::RelayCandidate) -> FfiRelayCandidate {
     FfiRelayCandidate { url: found.url, rtt_ms: found.rtt_ms, country: found.country }
+}
+
+/// Почему не приехал перечень chatmail-серверов.
+///
+/// Зеркало `ratatosk_proto::mail::MailServerListError`: через границу едет
+/// то, что рисуют, а не внутренний тип.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMailServerListRefusal {
+    /// Почтовой ступени в этой сборке нет.
+    NotInThisBuild,
+    /// Источник не ответил. Повторить позже или назвать сервер самому.
+    SourceSilent,
+    /// Ответ пришёл, а серверов в нём нет: разметка источника могла измениться.
+    FormatChanged,
+}
+
+/// Текст к причине отказа похода за перечнем chatmail-серверов.
+#[uniffi::export]
+#[must_use]
+pub fn mail_server_list_refusal_text(reason: FfiMailServerListRefusal) -> String {
+    ratatosk_core::honest::mail_server_list_refusal_text(mail_server_list_why(reason)).to_owned()
+}
+
+/// Чем платят за поход за перечнем chatmail-серверов; показать **до** нажатия.
+#[uniffi::export]
+#[must_use]
+pub fn mail_server_source_notice() -> String {
+    ratatosk_core::honest::MAIL_SERVER_SOURCE_NOTICE.to_owned()
+}
+
+/// Внутренняя причина по той, что едет наружу.
+const fn mail_server_list_why(
+    reason: FfiMailServerListRefusal,
+) -> ratatosk_proto::mail::MailServerListError {
+    use ratatosk_proto::mail::MailServerListError as Why;
+    match reason {
+        FfiMailServerListRefusal::NotInThisBuild => Why::NotInThisBuild,
+        FfiMailServerListRefusal::SourceSilent => Why::SourceSilent,
+        FfiMailServerListRefusal::FormatChanged => Why::FormatChanged,
+    }
+}
+
+/// Причина наружу по внутренней.
+///
+/// Под признаком `mail`: без него похода не бывает, и переводить
+/// внутреннюю причину некому.
+#[cfg(feature = "mail")]
+const fn mail_server_list_refusal_of(
+    reason: ratatosk_proto::mail::MailServerListError,
+) -> FfiMailServerListRefusal {
+    use ratatosk_proto::mail::MailServerListError as Why;
+    match reason {
+        Why::NotInThisBuild => FfiMailServerListRefusal::NotInThisBuild,
+        Why::SourceSilent => FfiMailServerListRefusal::SourceSilent,
+        Why::FormatChanged => FfiMailServerListRefusal::FormatChanged,
+    }
+}
+
+/// Сервер из публичного перечня chatmail.
+///
+/// **Это ещё не настройка.** Ящик заводится отдельным
+/// [`RatatoskClient::create_mail_account`] по ссылке `account_url`,
+/// и только когда человек выбрал сервер сам: сервер видит, какие адреса
+/// переписываются между собой и когда (§14), и выбирать его за человека
+/// нельзя.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMailServer {
+    /// Имя сервера: `nine.testrun.org`.
+    pub host: String,
+    /// Что о сервере сказано в перечне — словами его составителей, как
+    /// есть (сегодня по-английски): где стоит, на кого рассчитан. Бывает
+    /// пустым. **Никем не проверено**, и показывать его надо простым
+    /// текстом: он чужой.
+    pub note: String,
+    /// Готовая ссылка для [`RatatoskClient::create_mail_account`]:
+    /// `https://имя/new`. Собирать её клиенту самому не надо.
+    pub account_url: String,
 }
 
 /// Реле, которое показал наблюдатель (0.3, дополнение).
@@ -2560,12 +2649,12 @@ struct Opened {
     /// не нужна. Мёртвое поле в сборке без них поймал перебор сочетаний
     /// признаков, а не глаз: обычный прогон и `--all-features` собирают
     /// оба, и выглядит оно там живым.
-    #[cfg(any(feature = "ygg-node", feature = "nostr"))]
+    #[cfg(any(feature = "ygg-node", feature = "nostr", feature = "mail"))]
     net: Net,
 }
 
 /// Чем ходить в сеть мимо ядра (0.2.7).
-#[cfg(any(feature = "ygg-node", feature = "nostr"))]
+#[cfg(any(feature = "ygg-node", feature = "nostr", feature = "mail"))]
 #[derive(Clone)]
 struct Net {
     runtime: tokio::runtime::Handle,
@@ -3418,6 +3507,52 @@ impl RatatoskClient {
     /// показать глазами, а не оставлять выяснять по молчанию.
     pub fn nostr_advertised_relays(&self) -> Result<Vec<String>, RatatoskError> {
         Ok(self.own_card()?.nostr_relays)
+    }
+
+    /// Приносит публичный перечень chatmail-серверов.
+    ///
+    /// **Это не настройка.** Перечень приносится, чтобы человек посмотрел
+    /// и выбрал; ящик заводит отдельный
+    /// [`RatatoskClient::create_mail_account`] по `account_url` выбранного.
+    /// Серверов в сборке нет и не будет: сервер видит, какие адреса
+    /// переписываются между собой и когда (§14).
+    ///
+    /// Порядок — как у источника; серверы **не проверены**: жив ли сервер
+    /// и заведёт ли он ящик, покажет сама регистрация.
+    ///
+    /// Вызов блокирующий — до 45 секунд; зовите не с потока окна.
+    ///
+    /// # Цена, о которой надо сказать до нажатия
+    ///
+    /// [`mail_server_source_notice`]: адрес источника лежит в сборке —
+    /// кого спрашивать, выбрали мы, — и он увидит, что с этого адреса ищут
+    /// сервер. Поход идёт через Tor, когда тот поднят, иначе прямо.
+    ///
+    /// # Errors
+    ///
+    /// [`RatatoskError::MailServerList`] с причиной; текст к ней —
+    /// [`mail_server_list_refusal_text`].
+    pub fn fetch_mail_servers(&self) -> Result<Vec<FfiMailServer>, RatatoskError> {
+        #[cfg(feature = "mail")]
+        return fetch_list(
+            &self.opened.net,
+            move |tor| async move { ratatosk_transport::chatmail::server_list::fetch(&tor).await },
+            |reason| RatatoskError::MailServerList { reason: mail_server_list_refusal_of(reason) },
+        )
+        .map(|found: Vec<ratatosk_proto::mail::MailServer>| {
+            found
+                .into_iter()
+                .map(|server| FfiMailServer {
+                    account_url: server.account_url(),
+                    host: server.host,
+                    note: server.note,
+                })
+                .collect()
+        });
+        // Не тишиной и не пустым списком: ступени в сборке нет, и человек,
+        // нажавший «подобрать», обязан узнать это сразу.
+        #[cfg(not(feature = "mail"))]
+        Err(RatatoskError::MailServerList { reason: FfiMailServerListRefusal::NotInThisBuild })
     }
 
     /// Просит chatmail-сервер завести **новый** ящик (§5.3).
@@ -5578,13 +5713,13 @@ async fn start(
         own_ik: opened_parts.2,
         // Ручка берётся **та же**, что у почты и реле: второй `TorClient`
         // означал бы второй bootstrap и ещё десятки мегабайт (§5.2).
-        #[cfg(any(feature = "ygg-node", feature = "nostr"))]
+        #[cfg(any(feature = "ygg-node", feature = "nostr", feature = "mail"))]
         net: Net { runtime: tokio::runtime::Handle::current(), tor: tor_handle.clone() },
     };
     Ok((driver, opened, events))
 }
 
-/// Общее у двух походов за списком: уехать на рантайм ядра и дождаться (0.2.7).
+/// Общее у походов за списком: уехать на рантайм ядра и дождаться (0.2.7).
 ///
 /// Свободной функцией, а не методом: блок методов [`RatatoskClient`] целиком
 /// под `#[uniffi::export]`, и приватный помощник в нём UniFFI пытался бы
@@ -5594,7 +5729,7 @@ async fn start(
 /// Метод UniFFI синхронный, поход асинхронный, а своего рантайма здесь
 /// заводить нельзя: клиент arti привязан к тому, на котором поднят.
 /// Поэтому задача уезжает на рантайм ядра, а вызывающий поток ждёт.
-#[cfg(any(feature = "ygg-node", feature = "nostr"))]
+#[cfg(any(feature = "ygg-node", feature = "nostr", feature = "mail"))]
 fn fetch_list<F, Fut, T, E>(
     net: &Net,
     work: F,

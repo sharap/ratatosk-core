@@ -1529,6 +1529,13 @@ pub struct FfiRung {
     pub addressable: bool,
     /// Годится прямо сейчас — все три признака сразу.
     pub usable: bool,
+    /// Ехать есть куда, но первым шагом должен быть **его** набор (0.4.3).
+    ///
+    /// Четвёртый признак, и чинится он ничем: это не выключатель, не время
+    /// и не карточка, а чужой контроллер, который мы набрать не можем.
+    /// Ступень при этом годна — принятый канал работает, — и показывать
+    /// это надо спокойно: не «связи нет», а «ответит, когда заговорит сам».
+    pub awaits_their_dial: bool,
 }
 
 /// Куда поедет следующее сообщение этому контакту — и почему не дальше.
@@ -1551,6 +1558,12 @@ pub struct FfiReachability {
     /// это надо спокойно. Оба пустые — ждать нечего: нужен адрес или
     /// переключатель, и человек может это сделать сам.
     pub rising: Option<FfiTransport>,
+    /// Что сказать человеку про ждущее сообщение этому контакту (§14).
+    ///
+    /// Готовая строка, а не признак: выбор между «его нет в сети» и «он
+    /// рядом, но дозвониться не выходит» — решение, а решения остаются
+    /// ниже границы (§13.3). Клиенту остаётся нарисовать.
+    pub waiting_notice: String,
 }
 
 /// Сколько кадров от этого источника отброшено (§7.3).
@@ -5424,10 +5437,12 @@ fn reachability(view: ratatosk_proto::transport_policy::Reachability) -> FfiReac
                 ready: rung.ready,
                 addressable: rung.addressable,
                 usable: rung.usable(),
+                awaits_their_dial: rung.awaits_their_dial,
             })
             .collect(),
         route: view.route().map(FfiTransport::from),
         rising: view.rising().map(FfiTransport::from),
+        waiting_notice: ratatosk_core::honest::waiting_notice(&view).to_string(),
     }
 }
 

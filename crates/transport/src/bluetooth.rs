@@ -915,6 +915,17 @@ impl<A: Air> BtRunner<A> {
     /// это не пропущенный такт, а действительно ушедший собеседник.
     const GONE_FOR: Duration = Duration::from_secs(30);
 
+    /// Говорит ядру, ждём ли мы теперь встречного набора.
+    ///
+    /// Отдельной функцией, потому что мест три — сдались, набрали,
+    /// вернулся, — и порядок слов в них обязан совпадать.
+    async fn say_awaiting(&self, peer_ik: [u8; 32], awaiting: bool) {
+        let _ = self
+            .events_tx
+            .send(TransportEvent::AwaitsTheirDial { peer_ik, via: Transport::Bt, awaiting })
+            .await;
+    }
+
     /// Отмечает, что собеседника слышно, и говорит, возвращение ли это.
     ///
     /// Возвращением считается только молчание дольше [`Self::GONE_FOR`]:
@@ -924,18 +935,25 @@ impl<A: Air> BtRunner<A> {
     ///
     /// Время приходит снаружи, а не берётся здесь: иначе правило нельзя
     /// было бы проверить, не прождав полминуты по-настоящему.
+    /// Возвращает `true`, если снято именно **ожидание встречного набора**:
+    /// об этом ядру надо сказать отдельно, иначе §14 продолжит обещать
+    /// человеку то, чего больше не ждём.
     fn heard_at(&mut self, peer_ik: [u8; 32], now: std::time::Instant) -> bool {
         let came_back = self
             .last_heard
             .insert(peer_ik, now)
             .is_some_and(|was| now.saturating_duration_since(was) > Self::GONE_FOR);
-        if came_back && self.undialable.remove(&peer_ik).is_some() {
-            tracing::info!(
-                peer = %short(&peer_ik),
-                "эфир: собеседник пропадал и объявился снова — набираем как впервые"
-            );
+        if !came_back {
+            return false;
         }
-        came_back
+        let Some(vain) = self.undialable.remove(&peer_ik) else {
+            return false;
+        };
+        tracing::info!(
+            peer = %short(&peer_ik),
+            "эфир: собеседник пропадал и объявился снова — набираем как впервые"
+        );
+        vain.fails > Vain::ENOUGH
     }
 
     /// Связь с контактом — существующая или набираемая.
@@ -1447,14 +1465,20 @@ impl<A: Air> Runner for BtRunner<A> {
                 // установленной, и считать её доказательством набора значило
                 // бы снимать отметку, ничего не проверив.
                 if self.dialed.remove(peer_ik) {
-                    self.undialable.remove(peer_ik);
+                    if let Some(vain) = self.undialable.remove(peer_ik) {
+                        if vain.fails > Vain::ENOUGH {
+                            self.say_awaiting(*peer_ik, false).await;
+                        }
+                    }
                 }
             }
             TransportEvent::SeenOnBt { peer_ik } => {
                 // Объявление само по себе ничего не сбрасывает: оно приходит
                 // каждые несколько секунд. Сбрасывает **возвращение** —
                 // решает [`BtRunner::heard_at`], и решает по времени.
-                self.heard_at(*peer_ik, std::time::Instant::now());
+                if self.heard_at(*peer_ik, std::time::Instant::now()) {
+                    self.say_awaiting(*peer_ik, false).await;
+                }
             }
             TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt } => {
                 // **Считается набор, а не отказ, и это правка поломки.**
@@ -1480,6 +1504,7 @@ impl<A: Air> Runner for BtRunner<A> {
                 vain.fails = vain.fails.saturating_add(1);
                 let wait = Vain::wait(vain.fails);
                 vain.until = std::time::Instant::now() + wait;
+                let gave_up_just_now = vain.fails == Vain::ENOUGH + 1;
                 if vain.fails > Vain::ENOUGH {
                     // Отдельная строка, а не то же слово с другим числом:
                     // это смена решения, а не рост паузы. Набирать мы
@@ -1498,6 +1523,13 @@ impl<A: Air> Runner for BtRunner<A> {
                         выдержка_с = wait.as_secs(),
                         "эфир: набор не удаётся — ждём, объёмное пойдёт принятым каналом"
                     );
+                }
+                // Ядру — только про **переход**, и только один раз: иначе
+                // новость уезжала бы на каждый отказ, а их на один набор
+                // бывает сорок (см. разбор выдержки, кормившей саму себя).
+                if gave_up_just_now {
+                    let peer_ik = *peer_ik;
+                    self.say_awaiting(peer_ik, true).await;
                 }
             }
             _ => {}
@@ -2700,6 +2732,53 @@ mod tests {
                 .expect("новость об отказе");
         }
         assert!(bt.waiting_out(&peer_ik), "после четырёх неудач набирать перестали");
+    }
+
+    #[tokio::test]
+    async fn giving_up_dialling_is_told_to_the_core_once_and_taken_back_when_he_returns() {
+        // Ядру нужна не попытка, а **решение**: пока набираем, §14 обещает
+        // «уйдёт, когда появится», и это правда; когда перестали — правда
+        // другая. Один раз, а не на каждый отказ: отказ уезжает событием
+        // на каждый кадр, а их в очереди бывает сорок.
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+        let peer_ik = [23u8; 32];
+        gave_up_dialling(&mut bt, peer_ik).await;
+
+        let told =
+            next_such(&mut bt, |event| matches!(event, TransportEvent::AwaitsTheirDial { .. }))
+                .await
+                .expect("новость о том, что набирать перестали");
+        assert!(
+            matches!(told, TransportEvent::AwaitsTheirDial { peer_ik: got, awaiting: true, .. } if got == peer_ik),
+            "сказано про того собеседника и сказано «ждём»: {told:?}"
+        );
+
+        // Пятая неудача — то же решение, и повторять его ядру незачем.
+        bt.dialed.insert(peer_ik);
+        let _ =
+            bt.events_tx.send(TransportEvent::ConnectFailed { peer_ik, via: Transport::Bt }).await;
+        next_such(&mut bt, |event| matches!(event, TransportEvent::ConnectFailed { .. }))
+            .await
+            .expect("новость об отказе");
+        let again = tokio::time::timeout(Duration::from_millis(80), bt.next_event()).await;
+        assert!(again.is_err(), "решение сказано один раз, а не на каждый отказ: {again:?}");
+
+        // Вернулся — и новость о том, что ждать больше нечего.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(31))
+            .expect("часы монотонны и до загрузки не отматываются");
+        bt.last_heard.insert(peer_ik, long_ago);
+        let _ = bt.events_tx.send(TransportEvent::SeenOnBt { peer_ik }).await;
+        let taken_back =
+            next_such(&mut bt, |event| matches!(event, TransportEvent::AwaitsTheirDial { .. }))
+                .await
+                .expect("новость о том, что снова набираем");
+        assert!(
+            matches!(taken_back, TransportEvent::AwaitsTheirDial { awaiting: false, .. }),
+            "вернулся — ждать больше нечего: {taken_back:?}"
+        );
     }
 
     #[tokio::test]

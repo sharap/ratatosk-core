@@ -2352,6 +2352,9 @@ fn translate(event: TransportEvent) -> Wake {
         TransportEvent::ConnectFailed { peer_ik, via } => Input::ConnectFailed { peer_ik, via },
         TransportEvent::SeenOnLan { peer_ik } => Input::SeenOnLan { peer_ik },
         TransportEvent::SeenOnBt { peer_ik } => Input::SeenOnBt { peer_ik },
+        TransportEvent::AwaitsTheirDial { peer_ik, via, awaiting } => {
+            Input::AwaitsTheirDial { peer_ik, via, awaiting }
+        }
         TransportEvent::TorReady { onion } => return Wake::TorReady(onion),
         TransportEvent::TorProgress { fraction, note, blocked } => {
             return Wake::Notice(Event::TorStatus { fraction, note, blocked })

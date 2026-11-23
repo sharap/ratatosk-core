@@ -145,6 +145,8 @@ impl<S: Store> Engine<S> {
         self.store.put_peer(&stored)?;
 
         let availability = PeerAvailability {
+            // Живое состояние, а не записанное: эфир скажет сам (0.4.3).
+            bt_awaits_their_dial: false,
             has_ygg: !card.ygg.is_empty(),
             has_onion: !card.onion.is_empty(),
             has_nostr: !card.nostr.is_empty(),

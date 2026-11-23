@@ -394,6 +394,42 @@ pub const WAITING_NOTICE: &str =
     "Собеседника нет в сети. Сообщение сохранено и уйдёт само, как только он \
      появится, — но для этого приложение должно быть запущено.";
 
+/// То же обещание, когда собеседник **уже рядом**, а набрать его не выходит.
+///
+/// §14 требует не обещать того, чего протокол не даёт, и прежний текст тут
+/// давал неправду дважды: «нет в сети» — а он слышен в эфире с хорошим
+/// сигналом; «как только появится» — а он уже появился, и ждать надо не его
+/// появления, а его слова.
+///
+/// Заведено по замеру 23 ноября: к легаси-контроллеру набор открывался за
+/// 1 263, 2 017 и 20 329 мс, а чаще не открывался и за тридцать секунд,
+/// тогда как встречный набор удавался всякий раз. Эфир после трёх напрасных
+/// попыток перестаёт набирать (0.4.3) — и тогда верно именно это обещание.
+///
+/// **Чего текст не обещает.** Срока. Сколько ждать его слова, не знает
+/// никто: собеседнику может быть нечего сказать часами. Назвать здесь
+/// минуты значило бы выдумать их.
+pub const THEIR_MOVE_NOTICE: &str =
+    "Собеседник рядом, но дозвониться до него отсюда не выходит. Сообщение \
+     сохранено и уйдёт само, как только он заговорит сам, — для этого \
+     приложение должно быть запущено.";
+
+/// Что сказать про ждущее сообщение **этому** собеседнику.
+///
+/// Выбор живёт здесь, а не в клиенте, и это §13.3: наружу едет уже
+/// выбранная строка. Две копии правила разошлись бы молча — экран
+/// обещал бы появление тому, кто и так рядом.
+#[must_use]
+pub fn waiting_notice(
+    reachability: &ratatosk_proto::transport_policy::Reachability,
+) -> &'static str {
+    if reachability.rungs.iter().any(|rung| rung.awaits_their_dial) {
+        THEIR_MOVE_NOTICE
+    } else {
+        WAITING_NOTICE
+    }
+}
+
 /// Предупреждение перед отзывом сообщения.
 ///
 /// §14 требует не обещать того, чего протокол не даёт. «Удалить у обоих» —
@@ -485,6 +521,34 @@ pub const ACCOUNT_SWITCH_NOTICE: &str =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatosk_proto::transport_policy::{PeerAvailability, Reachability, TransportSet};
+    use ratatosk_proto::Transport;
+
+    /// Контакт, которого эфир слышит и готов везти.
+    fn heard_on_the_air() -> PeerAvailability {
+        let mut peer = PeerAvailability { seen_on_bt: true, ..PeerAvailability::default() };
+        peer.enabled = TransportSet::none().with(Transport::Bt);
+        peer.ready = TransportSet::none().with(Transport::Bt);
+        peer
+    }
+
+    #[test]
+    fn the_waiting_notice_stops_claiming_he_is_offline_once_the_air_gave_up_dialling() {
+        // §14: не обещать того, чего протокол не даёт. Прежний текст давал
+        // неправду дважды — «нет в сети» про того, кто слышен, и «как только
+        // появится» про того, кто уже появился.
+        let mut peer = heard_on_the_air();
+        peer.bt_awaits_their_dial = true;
+        let said = waiting_notice(&Reachability::of(peer));
+
+        assert_eq!(said, THEIR_MOVE_NOTICE, "перестали набирать — и слова другие");
+        assert!(!said.contains("нет в сети"), "он слышен: так говорить нельзя");
+        assert!(said.contains("заговорит сам"), "человеку сказано, чего ждать");
+
+        // А пока набираем — прежнее обещание верно, и менять его незачем.
+        let dialling = waiting_notice(&Reachability::of(heard_on_the_air()));
+        assert_eq!(dialling, WAITING_NOTICE, "пока набираем, прежние слова верны");
+    }
 
     #[test]
     fn all_seven_points_are_present() {

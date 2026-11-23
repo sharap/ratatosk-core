@@ -694,6 +694,60 @@ fn fire_timers(node: &mut Node, now_ms: u64, effects: &[Effect]) -> Vec<Effect> 
 }
 
 #[test]
+fn the_air_that_gave_up_dialling_changes_what_the_person_is_told() {
+    // **Стык, а не половина.** Раннер эфира считает напрасные наборы,
+    // ядро хранит отметку, §14 выбирает слова — и проверять это по частям
+    // бессмысленно: расходятся такие цепочки молча. Здесь путь целиком:
+    // вход транспорта → доступность контакта → строка, которую увидит
+    // человек.
+    use ratatosk_core::honest;
+    use ratatosk_proto::transport_policy::Reachability;
+    use ratatosk_proto::Transport;
+
+    let mut alice = node(1, "alice");
+    let peer_ik = lan_only_contact(&mut alice, 9);
+    let _ = air_only(&mut alice, peer_ik);
+    let _ = alice.step(1_000, Input::SeenOnBt { peer_ik }).expect("объявление опознано");
+
+    // Пока набираем — прежнее обещание верно слово в слово.
+    let heard = Reachability::of(alice.contacts()[&peer_ik].availability);
+    assert_eq!(
+        honest::waiting_notice(&heard),
+        honest::WAITING_NOTICE,
+        "пока набираем, «уйдёт, когда появится» — правда"
+    );
+
+    // Эфир сдался: три напрасных набора подряд, он перестал пробовать.
+    let _ = alice
+        .step(1_100, Input::AwaitsTheirDial { peer_ik, via: Transport::Bt, awaiting: true })
+        .expect("новость эфира принята");
+    assert!(
+        alice.contacts()[&peer_ik].availability.bt_awaits_their_dial,
+        "ядро обязано запомнить: набирать перестали"
+    );
+    let gave_up = Reachability::of(alice.contacts()[&peer_ik].availability);
+    assert_eq!(
+        honest::waiting_notice(&gave_up),
+        honest::THEIR_MOVE_NOTICE,
+        "и человеку говорится другое: он рядом, ждём его слова"
+    );
+    assert!(
+        gave_up.rung(Transport::Bt).may_open(),
+        "обещание §14 остаётся в силе: сообщение не выбрасывается"
+    );
+
+    // Вернулся из тишины — набираем снова, и слова снова прежние.
+    let _ = alice
+        .step(1_200, Input::AwaitsTheirDial { peer_ik, via: Transport::Bt, awaiting: false })
+        .expect("новость эфира принята");
+    assert_eq!(
+        honest::waiting_notice(&Reachability::of(alice.contacts()[&peer_ik].availability)),
+        honest::WAITING_NOTICE,
+        "снова набираем — снова прежнее обещание"
+    );
+}
+
+#[test]
 fn being_nearby_goes_out_when_the_peer_stops_being_heard() {
     // **Ради чего заведён срок.** Отметка «слышно» ставилась объявлением
     // и снималась только выключением ступени: собеседник, ушедший

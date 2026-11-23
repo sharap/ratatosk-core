@@ -478,6 +478,23 @@ pub struct PeerAvailability {
     /// маяком ([`crate::bluetooth::Advert::matches`]). Пока раннера нет,
     /// поле остаётся ложным всегда, и ступень честно не годится ни разу.
     pub seen_on_bt: bool,
+    /// Эфир слышит контакт, но набрать его отсюда не выходит (0.4.3).
+    ///
+    /// Третий факт рядом с двумя предыдущими, и он не выводится из них.
+    /// «Слышно» и «можно набрать» — разные вещи: объявление приходит
+    /// с RSSI −43, а набор к тому же адресу и номеру канала виснет.
+    /// Замер 23 ноября: к легаси-контроллеру набор открывался за 1 263,
+    /// 2 017 и 20 329 мс, а чаще не открывался и за тридцать секунд,
+    /// тогда как встречный набор удавался всякий раз.
+    ///
+    /// Заполняет поле раннер эфира — он один считает напрасные наборы
+    /// и один знает, когда перестал набирать. Ядру этот счёт не копируется
+    /// нарочно: две половины одного правила расходятся на первой же правке.
+    ///
+    /// Ступень от этого **не перестаёт годиться**: принятый канал работает
+    /// по-прежнему, и отправка по нему уходит в тот же миг, как он получает
+    /// имя. Поле меняет не решение, а **слова** — журнал и §14-текст.
+    pub bt_awaits_their_dial: bool,
     /// Какие транспорты включены на этом устройстве.
     ///
     /// Не «есть ли адрес», а «разрешено ли им пользоваться»: это выбор
@@ -641,6 +658,14 @@ pub struct Rung {
     pub ready: bool,
     /// Есть куда ехать: адрес в карточке или маяк в эфире.
     pub addressable: bool,
+    /// Ехать есть куда, но первым шагом должен быть **его** набор (0.4.3).
+    ///
+    /// Не четвёртое препятствие, а оговорка к третьему: адрес есть, ступень
+    /// поднята, кадры по открытому каналу идут — но открыть канал отсюда
+    /// не выходит. Отдельным полем, потому что ответ «почему висит» тут
+    /// другой и человеку говорится другое: не «его нет в сети», а «он
+    /// рядом, уйдёт, как только он заговорит сам».
+    pub awaits_their_dial: bool,
 }
 
 impl Rung {
@@ -719,6 +744,10 @@ impl Rung {
             RungState::NotReady
         } else if !self.addressable {
             RungState::NoAddress
+        } else if self.awaits_their_dial {
+            // После годности, а не до неё: ступень годна, и это важнее.
+            // Оговорка лишь называет, чьим шагом она откроется.
+            RungState::AwaitsTheirDial
         } else {
             RungState::Usable
         }
@@ -744,6 +773,14 @@ pub enum RungState {
     /// прямо сейчас, не делает ступень адресуемой. У LAN адрес даёт
     /// только маяк.
     NoAddress,
+    /// Годна, но откроется только встречным набором (0.4.3).
+    ///
+    /// Слышно, адрес есть, ступень поднята — а набор отсюда не удаётся
+    /// третий раз подряд, и эфир перестал пробовать. В журнале это
+    /// отличает «связи нет» от «связь будет, но не нашим шагом»: первое
+    /// чинится приближением к собеседнику, второе не чинится ничем —
+    /// его надо дождаться.
+    AwaitsTheirDial,
 }
 
 impl RungState {
@@ -755,6 +792,7 @@ impl RungState {
             RungState::Disabled => "выключен",
             RungState::NotReady => "не поднят",
             RungState::NoAddress => "адреса нет",
+            RungState::AwaitsTheirDial => "ждём встречного",
         }
     }
 }
@@ -789,6 +827,7 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Lan),
                     ready: peer.ready.contains(Transport::Lan),
                     addressable: peer.seen_on_lan,
+                    awaits_their_dial: false,
                 },
                 // Bluetooth сразу за локальной сетью, и порядок этот
                 // не про скорость: LAN быстрее на два порядка и берёт
@@ -806,6 +845,7 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Bt),
                     ready: peer.ready.contains(Transport::Bt),
                     addressable: peer.seen_on_bt,
+                    awaits_their_dial: peer.bt_awaits_their_dial,
                 },
                 // Ygg выше onion, потому что он **прямой и быстрый**:
                 // десятки миллисекунд против секунд у трёх реле Tor,
@@ -819,12 +859,14 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Ygg),
                     ready: peer.ready.contains(Transport::Ygg),
                     addressable: peer.has_ygg,
+                    awaits_their_dial: false,
                 },
                 Rung {
                     transport: Transport::Onion,
                     enabled: peer.enabled.contains(Transport::Onion),
                     ready: peer.ready.contains(Transport::Onion),
                     addressable: peer.has_onion,
+                    awaits_their_dial: false,
                 },
                 // Nostr ниже onion, потому что он не прямой: события
                 // лежат на реле и ждут, квитанции по нему не ходят (§9.4).
@@ -838,12 +880,14 @@ impl Reachability {
                     enabled: peer.enabled.contains(Transport::Nostr),
                     ready: peer.ready.contains(Transport::Nostr),
                     addressable: peer.has_nostr,
+                    awaits_their_dial: false,
                 },
                 Rung {
                     transport: Transport::Mail,
                     enabled: peer.enabled.contains(Transport::Mail),
                     ready: peer.ready.contains(Transport::Mail),
                     addressable: peer.has_chatmail,
+                    awaits_their_dial: false,
                 },
             ],
         }
@@ -857,6 +901,7 @@ impl Reachability {
             enabled: false,
             ready: false,
             addressable: false,
+            awaits_their_dial: false,
         })
     }
 
@@ -1143,10 +1188,33 @@ mod tests {
     #![allow(clippy::assertions_on_constants)]
     use super::*;
 
+    #[test]
+    fn a_stage_that_only_their_dial_opens_says_whose_move_it_is_and_stays_usable() {
+        // Две половины, и обе обязательны. Первая: ступень называет, чьим
+        // шагом она откроется, — иначе журнал и §14 говорят «годен» там,
+        // где отправка висит. Вторая: она **остаётся годной**, потому что
+        // принятый канал работает по-прежнему, и отправка по нему уходит
+        // в тот же миг, как он получает имя (замер 23 ноября).
+        let mut peer = full();
+        peer.bt_awaits_their_dial = true;
+        let bt = Reachability::of(peer).rung(Transport::Bt);
+
+        assert_eq!(bt.state(), RungState::AwaitsTheirDial, "ступень обязана назвать, чей ход");
+        assert_eq!(bt.state().label(), "ждём встречного");
+        assert!(bt.usable(), "принятый канал работает — ступень годна");
+        assert!(bt.may_open(), "обещание §14 остаётся в силе: сообщение уйдёт");
+
+        // Без оговорки — прежние слова, слово в слово.
+        let plain = Reachability::of(full()).rung(Transport::Bt);
+        assert_eq!(plain.state(), RungState::Usable, "без оговорки ступень просто годна");
+        assert_eq!(plain.state().label(), "годен");
+    }
+
     /// Всё разрешено, всё работает и всё достижимо — от этого отталкиваются
     /// проверки.
     fn full() -> PeerAvailability {
         PeerAvailability {
+            bt_awaits_their_dial: false,
             seen_on_lan: true,
             seen_on_bt: true,
             enabled: everything(),
@@ -1985,6 +2053,7 @@ mod tests {
                 ready.set(Transport::Mail, true);
             }
             let peer = PeerAvailability {
+                bt_awaits_their_dial: false,
                 seen_on_lan: bits & 8 != 0,
                 enabled,
                 ready,
@@ -2020,6 +2089,7 @@ mod tests {
         let mut enabled = TransportSet::none();
         enabled.set(Transport::Onion, true);
         let rising = PeerAvailability {
+            bt_awaits_their_dial: false,
             seen_on_lan: false,
             seen_on_bt: false,
             enabled,
@@ -2065,6 +2135,7 @@ mod tests {
         let mut enabled = everything();
         enabled.set(Transport::Lan, false);
         let peer = PeerAvailability {
+            bt_awaits_their_dial: false,
             seen_on_lan: false,
             seen_on_bt: false,
             enabled,

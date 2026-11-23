@@ -2600,6 +2600,9 @@ impl<S: Store> Engine<S> {
             }
             Input::SeenOnLan { peer_ik } => self.note_heard(now_ms, peer_ik, Transport::Lan),
             Input::SeenOnBt { peer_ik } => self.note_heard(now_ms, peer_ik, Transport::Bt),
+            Input::AwaitsTheirDial { peer_ik, via, awaiting } => {
+                self.note_awaits_their_dial(&peer_ik, via, awaiting)
+            }
             Input::Connected { .. } => Ok(Vec::new()),
             // Разрыв соединения — это событие **сокета**, а не сессии, и
             // путать их оказалось дорого. Раньше здесь закрывалась LAN-сессия:
@@ -2919,6 +2922,8 @@ impl<S: Store> Engine<S> {
             let card = ContactCard::decode(&contact.card_bytes)?.into_parts().1;
             let peer_ik = card.ik;
             let availability = PeerAvailability {
+                // Живое состояние, а не записанное: эфир скажет сам (0.4.3).
+                bt_awaits_their_dial: false,
                 has_ygg: !card.ygg.is_empty(),
                 has_onion: !card.onion.is_empty(),
                 has_nostr: !card.nostr.is_empty(),
@@ -2970,6 +2975,8 @@ impl<S: Store> Engine<S> {
         self.peers.clear();
         for peer in self.store.peers()? {
             let availability = PeerAvailability {
+                // Живое состояние, а не записанное: эфир скажет сам (0.4.3).
+                bt_awaits_their_dial: false,
                 has_ygg: !peer.ygg.is_empty(),
                 has_onion: !peer.onion.is_empty(),
                 // По ключу, а не по реле: см. `Peer::nostr`.

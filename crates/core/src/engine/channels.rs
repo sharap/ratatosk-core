@@ -1142,6 +1142,8 @@ impl<S: Store> Engine<S> {
         self.store.put_peer(&stored)?;
 
         let availability = PeerAvailability {
+            // Живое состояние, а не записанное: эфир скажет сам (0.4.3).
+            bt_awaits_their_dial: false,
             has_ygg: !stored.ygg.is_empty(),
             has_onion: !stored.onion.is_empty(),
             // По ключу, а не по реле (см. `Peer::nostr`): реле без ключа —

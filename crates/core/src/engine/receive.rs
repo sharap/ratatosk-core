@@ -110,6 +110,9 @@ impl<S: Store> Engine<S> {
                 self.remember_reply(peer_ik, via, &frame);
                 effects.push(Effect::Send { peer_ik, via, frame, handoff: None });
                 effects.extend(self.note_presence(now_ms, peer_ik, via)?);
+                // Ответ ушёл — но если собеседник здоровается снова и снова,
+                // значит он его не получает, и сказать об этом надо вслух.
+                effects.extend(self.note_unheard(now_ms, peer_ik, via));
                 return Ok(effects);
             }
         };
@@ -316,6 +319,43 @@ impl<S: Store> Engine<S> {
         Ok(effects)
     }
 
+    /// Считает повторы первого шага и один раз говорит, что нас не слышат.
+    ///
+    /// **Считает повтор, а не рукопожатие.** Новое рукопожатие с новым
+    /// эфемерным ключом — обычное дело (§8.5, переподнятие сессии); сюда
+    /// приходит только тот случай, когда пришли **те же байты**, то есть
+    /// собеседник повторяет свою же попытку, не увидев ответа.
+    ///
+    /// Молчит на почте и nostr: там повтор — устройство ступени, а не беда
+    /// ([`ratatosk_proto::Transport::repeat_means_unheard`]).
+    fn note_unheard(&mut self, now_ms: u64, peer_ik: [u8; 32], via: Transport) -> Vec<Effect> {
+        if !via.repeat_means_unheard() {
+            return Vec::new();
+        }
+        let seen = self.unheard.entry(peer_ik).or_insert(Unheard {
+            count: 0,
+            first_ms: now_ms,
+            told: false,
+        });
+        // Окно считается от первого повтора: три штуки, разнесённые на час,
+        // — это три разные встречи, а не сломанный приём.
+        if now_ms.saturating_sub(seen.first_ms) > Unheard::WINDOW_MS {
+            *seen = Unheard { count: 0, first_ms: now_ms, told: false };
+        }
+        seen.count = seen.count.saturating_add(1);
+        if seen.count < Unheard::ENOUGH || seen.told {
+            return Vec::new();
+        }
+        seen.told = true;
+        tracing::info!(
+            peer = %short_ik(&peer_ik),
+            повторов = seen.count,
+            ступень = via.label(),
+            "собеседник здоровается впустую — наши ответы до него не доходят"
+        );
+        vec![Effect::Notify(Event::PeerCannotHearUs { peer_ik, via })]
+    }
+
     pub(super) fn on_handshake_response(
         &mut self,
         now_ms: u64,
@@ -517,6 +557,9 @@ impl<S: Store> Engine<S> {
         // его дальше незачем, а переотправить потом — значит послать шаг
         // рукопожатия в уже работающую переписку.
         self.forget_reply(peer_ik, via);
+        // Тем же доказательством снимается и счёт впустую повторённых
+        // приветствий: раз сессия у него есть, ответ он получил.
+        self.unheard.remove(&peer_ik);
 
         let bound = self.sessions.get_mut(session_id).ok_or(EngineError::UnknownPeer)?;
 

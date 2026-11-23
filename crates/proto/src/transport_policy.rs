@@ -403,6 +403,24 @@ impl Transport {
         }
     }
 
+    /// Значит ли повтор рукопожатия по этой ступени, что нас не слышат.
+    ///
+    /// **Не везде он что-то значит.** Почта дублирует письма штатно (§9.2),
+    /// а реле nostr отдаёт сохранённые события заново при каждом подключении
+    /// — повтор там говорит об устройстве ступени, а не о собеседнике.
+    /// На прямом канале он говорит ровно одно: наш ответ до него не дошёл,
+    /// и он здоровается снова.
+    ///
+    /// Перебор полный нарочно, как и у соседей: появится седьмая ступень —
+    /// компилятор потребует сказать про неё вслух.
+    #[must_use]
+    pub const fn repeat_means_unheard(self) -> bool {
+        match self {
+            Transport::Lan | Transport::Bt | Transport::Ygg | Transport::Onion => true,
+            Transport::Nostr | Transport::Mail => false,
+        }
+    }
+
     /// Короткое имя для журнала.
     ///
     /// Одно место на всё дерево: имена ступеней читает человек, сверяя
@@ -1187,6 +1205,23 @@ mod tests {
     // строку — и останется проверка слов, не привязанная ни к чему.
     #![allow(clippy::assertions_on_constants)]
     use super::*;
+
+    #[test]
+    fn a_repeated_hello_means_being_unheard_only_where_repeats_are_not_normal() {
+        // Почта дублирует письма штатно (§9.2), реле nostr отдаёт сохранённое
+        // заново при каждом подключении. Повтор там говорит об устройстве
+        // ступени, и принять его за «он вас не слышит» значит послать
+        // человека чинить то, что не сломано.
+        for direct in [Transport::Lan, Transport::Bt, Transport::Ygg, Transport::Onion] {
+            assert!(direct.repeat_means_unheard(), "{direct:?}: прямой канал повторов не плодит");
+        }
+        for storing in [Transport::Nostr, Transport::Mail] {
+            assert!(
+                !storing.repeat_means_unheard(),
+                "{storing:?}: повтор здесь штатен и ничего о собеседнике не говорит"
+            );
+        }
+    }
 
     #[test]
     fn a_stage_that_only_their_dial_opens_says_whose_move_it_is_and_stays_usable() {

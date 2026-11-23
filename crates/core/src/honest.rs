@@ -414,6 +414,46 @@ pub const THEIR_MOVE_NOTICE: &str =
      сохранено и уйдёт само, как только он заговорит сам, — для этого \
      приложение должно быть запущено.";
 
+/// Что сказать, когда собеседник здоровается впустую (0.4.3).
+///
+/// §14 требует называть границу обещания, а здесь граница резкая: с нашей
+/// стороны не чинится ничего. Ответы уходят — их не получают; значит сломан
+/// приём у него, и сделать это можем не мы.
+///
+/// **Совет называется, потому что он проверен.** Прогон 23 ноября: PinePhone
+/// за подъём записал восемь кадров и прочитал ноль, повторяя одно и то же
+/// рукопожатие каждые двадцать две секунды. `bluetoothctl power off/on`
+/// на его стороне — и сразу пришло сообщение, лежавшее сорок минут.
+pub const NOT_HEARD_ON_AIR_NOTICE: &str =
+    "Собеседник здоровается снова и снова — наши ответы до него не доходят. \
+     С этой стороны починить нечего: помогает выключить и включить Bluetooth \
+     на его устройстве.";
+
+/// То же, но про ступень, где советовать нечего.
+///
+/// Без выдуманного совета: что именно перезапускать у собеседника в меше
+/// или onion, мы не знаем, и назвать наугад значило бы послать человека
+/// делать бесполезное.
+pub const NOT_HEARD_NOTICE: &str =
+    "Собеседник здоровается снова и снова — наши ответы до него не доходят. \
+     Это беда его стороны, и с этой её не починить.";
+
+/// Что сказать про собеседника, который здоровается впустую.
+///
+/// Перебор полный: появится седьмая ступень — компилятор потребует сказать,
+/// есть ли человеку что делать на ней.
+#[must_use]
+pub const fn not_heard_notice(via: ratatosk_proto::Transport) -> &'static str {
+    match via {
+        ratatosk_proto::Transport::Bt => NOT_HEARD_ON_AIR_NOTICE,
+        ratatosk_proto::Transport::Lan
+        | ratatosk_proto::Transport::Ygg
+        | ratatosk_proto::Transport::Onion
+        | ratatosk_proto::Transport::Nostr
+        | ratatosk_proto::Transport::Mail => NOT_HEARD_NOTICE,
+    }
+}
+
 /// Что сказать про ждущее сообщение **этому** собеседнику.
 ///
 /// Выбор живёт здесь, а не в клиенте, и это §13.3: наружу едет уже
@@ -530,6 +570,23 @@ mod tests {
         peer.enabled = TransportSet::none().with(Transport::Bt);
         peer.ready = TransportSet::none().with(Transport::Bt);
         peer
+    }
+
+    #[test]
+    fn the_notice_about_being_unheard_advises_only_where_the_advice_is_known() {
+        // §14: не обещать и не советовать того, чего не знаем. Для эфира
+        // совет проверен прогоном 23 ноября — перезапуск Bluetooth вернул
+        // приём и выпустил сообщение, лежавшее сорок минут. Для меша и onion
+        // такого знания нет, и выдумывать его нельзя.
+        let air = not_heard_notice(Transport::Bt);
+        assert!(air.contains("Bluetooth"), "для эфира совет известен и назван");
+        assert!(air.contains("его устройстве"), "и сказано, на чьей стороне чинить");
+
+        for other in [Transport::Lan, Transport::Ygg, Transport::Onion, Transport::Mail] {
+            let said = not_heard_notice(other);
+            assert_eq!(said, NOT_HEARD_NOTICE, "{other:?}: без выдуманного совета");
+            assert!(!said.contains("Bluetooth"), "{other:?}: чужой совет здесь — вред");
+        }
     }
 
     #[test]

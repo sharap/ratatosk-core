@@ -1076,6 +1076,110 @@ fn a_short_text_over_the_air_still_goes_in_one_frame() {
     assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned(), "ещё раз".to_owned()]);
 }
 
+/// Сколько раз в эффектах сказано «нас не слышат».
+fn unheard_notices(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Notify(Event::PeerCannotHearUs { .. })))
+        .count()
+}
+
+#[test]
+fn a_peer_who_keeps_saying_hello_is_named_as_one_who_cannot_hear_us() {
+    // **Разбор живой беды, а не выдумка.** Прогон 23 ноября: PinePhone
+    // за подъём записал восемь кадров и прочитал ноль, повторяя одно и то же
+    // рукопожатие каждые двадцать две секунды. Мы на каждый повтор отвечали,
+    // ответ уходил — и он здоровался снова. Снаружи это «связь есть,
+    // а сообщения не ходят», и человеку не говорилось ничего.
+    //
+    // Признак виден только нам: те же байты первого шага, каждый раз новым
+    // потоком. Значит сломан его приём, и сказать об этом — наше дело.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    let first =
+        air_sends(&outgoing).first().cloned().expect("первый шаг рукопожатия уходит эфиром");
+
+    // Первый приход — не повтор: сессия заводится, и говорить не о чем.
+    let settled = bob
+        .step(1_100, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+        .expect("рукопожатие разобрано");
+    assert_eq!(unheard_notices(&settled), 0, "первое приветствие — обычное дело");
+
+    // Два повтора — ещё не ответ на вопрос: ответ мог разойтись с набором.
+    for (n, at) in [(1u32, 1_200u64), (2, 1_300)] {
+        let again = bob
+            .step(at, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+            .expect("повтор разобран");
+        assert_eq!(unheard_notices(&again), 0, "на {n}-м повторе молчим: рано");
+    }
+
+    // А третий отвечает. И говорится это **один раз**: повторы идут каждые
+    // двадцать секунд, и вторая такая строка была бы шумом, а не новостью.
+    let told = bob
+        .step(1_400, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+        .expect("повтор разобран");
+    assert_eq!(unheard_notices(&told), 1, "на третьем повторе сказано: {told:?}");
+    let silent = bob
+        .step(1_500, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+        .expect("повтор разобран");
+    assert_eq!(unheard_notices(&silent), 0, "второй раз об одном и том же — шум");
+
+    // Кадр по сессии — доказательство того, что ответ дошёл. Счёт снимается
+    // им же, и без этого новость осталась бы сказанной навсегда: следующая
+    // такая беда прошла бы молча.
+    let reply = air_sends(&told).first().cloned().expect("на повтор отвечают");
+    let settled = alice
+        .step(1_600, Input::Received { via: ratatosk_proto::Transport::Bt, frame: reply })
+        .expect("ответ разобран");
+    pump(&mut alice, &mut bob, 1_700, settled);
+    assert_eq!(inbox(&bob, &alice), vec!["привет".to_owned()], "сессия сошлась");
+
+    for at in [1_800u64, 1_900] {
+        let again = bob
+            .step(at, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first.clone() })
+            .expect("повтор разобран");
+        assert_eq!(unheard_notices(&again), 0, "счёт начался заново: рано");
+    }
+    let told_again = bob
+        .step(2_000, Input::Received { via: ratatosk_proto::Transport::Bt, frame: first })
+        .expect("повтор разобран");
+    assert_eq!(
+        unheard_notices(&told_again),
+        1,
+        "после живого кадра счёт начинается заново — и беда называется снова"
+    );
+}
+
+#[test]
+fn the_same_hello_arriving_by_mail_says_nothing_about_being_unheard() {
+    // Вторая половина правила, и без неё первая врёт. Почта дублирует письма
+    // штатно (§9.2), а реле nostr отдаёт сохранённые события заново при
+    // каждом подключении: повтор там — свойство ступени, а не собеседника.
+    // Сказать по такому поводу «он вас не слышит» значило бы послать человека
+    // перезапускать чужой Bluetooth из-за второго письма.
+    let (mut alice, mut bob) = (node(1, "alice"), node(2, "bob"));
+    introduce(&mut alice, &mut bob);
+    let bob_ik = bob.own_card().ik;
+    let mut outgoing = air_only(&mut alice, bob_ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    let first = air_sends(&outgoing).first().cloned().expect("первый шаг уходит");
+
+    let mut said = 0;
+    for at in [1_100u64, 1_200, 1_300, 1_400, 1_500] {
+        let step = bob
+            .step(
+                at,
+                Input::Received { via: ratatosk_proto::Transport::Mail, frame: first.clone() },
+            )
+            .expect("письмо разобрано");
+        said += unheard_notices(&step);
+    }
+    assert_eq!(said, 0, "пять одинаковых писем — это почта, а не глухой собеседник");
+}
+
 #[test]
 fn a_handshake_answer_nobody_could_send_goes_out_when_the_peer_is_heard() {
     // **Разбор тихой поломки со стенда.** Отвечающая сторона заводит сессию

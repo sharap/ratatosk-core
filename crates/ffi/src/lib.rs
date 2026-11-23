@@ -1337,6 +1337,23 @@ pub enum FfiEvent {
         /// Что именно не вышло — словами, для показа.
         reason: String,
     },
+    /// Собеседник здоровается впустую: наши ответы до него не доходят (0.4.3).
+    ///
+    /// Повтор первого шага приходит теми же байтами, мы на него отвечаем —
+    /// и он здоровается снова. Значит сломан его приём, а не наш, и с этой
+    /// стороны не чинится ничем. Текст едет готовым (§13.3): совет зависит
+    /// от ступени, а решать это клиенту незачем.
+    ///
+    /// Показывать стоит там же, где состояние связи с человеком, и **один
+    /// раз**: ядро само молчит до тех пор, пока счёт не начнётся заново.
+    PeerCannotHearUs {
+        /// Кто здоровается впустую.
+        peer_ik: Vec<u8>,
+        /// По какой ступени.
+        via: FfiTransport,
+        /// Что сказать человеку (§14).
+        notice: String,
+    },
     /// Вход на почтовый сервер не удался (§5.3, §14).
     ///
     /// Отдельно от [`FfiEvent::MailAccountFailed`], потому что беды разные
@@ -6148,6 +6165,11 @@ fn translate(event: Event) -> Option<FfiEvent> {
             chat_id: chat.to_vec(),
             msg_id: msg_id.to_vec(),
             author_ik: author_ik.to_vec(),
+        },
+        Event::PeerCannotHearUs { peer_ik, via } => FfiEvent::PeerCannotHearUs {
+            peer_ik: peer_ik.to_vec(),
+            via: via.into(),
+            notice: ratatosk_core::honest::not_heard_notice(via).to_string(),
         },
         Event::ContactChanged { peer_ik } => FfiEvent::ContactChanged { peer_ik: peer_ik.to_vec() },
         Event::ContactRemoved { peer_ik } => FfiEvent::ContactRemoved { peer_ik: peer_ik.to_vec() },

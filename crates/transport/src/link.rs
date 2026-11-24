@@ -385,10 +385,35 @@ const READ_CHUNK: usize = SizeClass::S.frame_len() + 1;
 /// приватным адресом, набрать его в ответ нельзя, а открытый им канал
 /// двусторонний. У остальных ступеней `None` — см.
 /// [`TransportEvent::Received::link`].
+///
+/// `peer_ik` — кому принадлежит этот канал, **если это известно отсюда**.
+/// Известно оно ровно у набранного эфирного канала: его набирали к
+/// определённому собеседнику. Нужно оно затем, чтобы об обрыве узнало
+/// ядро, — и вот разбор, из которого это выросло.
+///
+/// # Конец чтения — это обрыв, и раньше о нём не знал никто
+///
+/// Об обрыве эфирной связи говорило **одно** место — неудачная запись
+/// (см. цикл записи ниже). То есть канал, умерший в тишине, считался
+/// живым до первой отправки в него. На стенде это вышло так: канал к
+/// pinephone умер в 13:11, чтение честно сообщило `ConnectionReset`
+/// в журнал — и **пять часов шестнадцать минут** связь числилась живой.
+/// Первое же сообщение после этого ушло в мертвеца (`ENOTCONN`), ядро
+/// объявило «отправлять некуда» и положило его в ожидание, и только
+/// **второе** пошло набором. Снаружи это ровно та поломка, на которую
+/// жаловались: «пишу одному, потом другому — и эфир начинает глючить».
+///
+/// Читающая половина знает об обрыве первой и бесплатно: чтение падает
+/// на нём сразу. Поэтому новость едет отсюда.
+///
+/// `None` у ступеней, где обрыв замечает своя петля: LAN и меш гасят
+/// связи при смене сети (`restart`), onion — в своей задаче набора.
+/// Их молчание здесь не недосмотр, а отсутствие второго пути.
 pub(crate) fn spawn_read_loop<R>(
     reader: R,
     via: Transport,
     link: Option<u64>,
+    peer_ik: Option<[u8; 32]>,
     events: mpsc::Sender<TransportEvent>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -437,13 +462,13 @@ pub(crate) fn spawn_read_loop<R>(
             let mut tag = [0u8; 1];
             if let Err(error) = reader.read_exact(&mut tag).await {
                 tracing::debug!(?via, link, ?error, прочитано = taken, "поток: чтение кончилось");
-                return;
+                break;
             }
             let Some(class) = class_of_tag(tag[0]) else {
                 // Неизвестный класс — поток дальше не разобрать: где кончается
                 // этот кадр, неизвестно. Единственный корректный ход — закрыть.
                 tracing::debug!(tag = tag[0], "неизвестный класс кадра, закрываем поток");
-                return;
+                break;
             };
             let mut frame = vec![0u8; class.frame_len()];
             if let Err(error) = reader.read_exact(&mut frame).await {
@@ -458,7 +483,7 @@ pub(crate) fn spawn_read_loop<R>(
                     прочитано = taken,
                     "поток: кадр не дочитан"
                 );
-                return;
+                break;
             }
             taken = taken.saturating_add(frame.len() as u64 + 1);
             stream = fnv_update(fnv_update(stream, &tag), &frame);
@@ -507,8 +532,15 @@ pub(crate) fn spawn_read_loop<R>(
                 frame,
             };
             if events.send(event).await.is_err() {
+                // Ядра больше нет — говорить об обрыве некому и незачем.
                 return;
             }
+        }
+        // **Обрыв, замеченный чтением, едет ядру.** Отказ отправки здесь
+        // глотается сознательно: ядра может уже не быть, а закрывать
+        // нечего — канал и так кончился.
+        if let Some(peer_ik) = peer_ik {
+            let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
         }
     });
 }
@@ -739,7 +771,7 @@ mod tests {
         let reader = WholePacketsOnly { packets: std::collections::VecDeque::from([packet]) };
 
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        spawn_read_loop(reader, Transport::Bt, Some(5), events_tx);
+        spawn_read_loop(reader, Transport::Bt, Some(5), None, events_tx);
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
             .await
@@ -750,6 +782,57 @@ mod tests {
                 Some(TransportEvent::Received { via: Transport::Bt, link: Some(5), .. })
             ),
             "кадр обязан доехать до ядра одним пакетом: {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_loop_that_knows_its_peer_reports_the_break() {
+        // **Поломка со стенда.** Об обрыве эфирной связи говорило одно
+        // место — неудачная запись. Канал, умерший в тишине, числился
+        // живым до первой отправки в него: задаче записи умирать не с
+        // чего, пока писать нечего. На стенде канал умер в 13:11, чтение
+        // сообщило `ConnectionReset` в журнал — и связь считалась живой
+        // пять часов с лишним.
+        //
+        // Чего проверка не стережёт: того, что об обрыве узнает сама
+        // ступень и перестанет отдавать мёртвую связь на отправку, —
+        // это проверяется у эфира (`bluetooth::tests`).
+        let (writer, reader) = tokio::io::duplex(64);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        spawn_read_loop(reader, Transport::Bt, None, Some([9u8; 32]), events_tx);
+        // Канал кончился, и больше ничего не произошло: ни кадра,
+        // ни отправки. Именно в этом и состоит проверка.
+        drop(writer);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("новость обязана прийти, а не повиснуть");
+        assert!(
+            matches!(
+                event,
+                Some(TransportEvent::Disconnected { peer_ik, via: Transport::Bt })
+                    if peer_ik == [9u8; 32]
+            ),
+            "конец чтения — это обрыв, и ядро обязано узнать о нём: {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_loop_without_a_peer_says_nothing_about_the_break() {
+        // Пара к предыдущей, и она про границу правила. У принятого
+        // канала имени нет: чей он, решает ядро рукопожатием (§8.2),
+        // а не адрес радио. Сказать «оборвалось» было бы нечем —
+        // и выдумывать имя здесь нельзя.
+        let (writer, reader) = tokio::io::duplex(64);
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        spawn_read_loop(reader, Transport::Bt, Some(3), None, events_tx);
+        drop(writer);
+
+        let event =
+            tokio::time::timeout(std::time::Duration::from_millis(200), events_rx.recv()).await;
+        assert!(
+            matches!(event, Ok(None)),
+            "без имени об обрыве сказать нечего, канал новостей обязан просто кончиться: {event:?}"
         );
     }
 
@@ -1021,7 +1104,7 @@ mod tests {
         // о себе ничего не сообщает.
         let (writer, reader) = tokio::io::duplex(SizeClass::S.frame_len() * 2);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        spawn_read_loop(reader, Transport::Onion, None, events_tx);
+        spawn_read_loop(reader, Transport::Onion, None, None, events_tx);
 
         // Новости самой связи уезжают в отдельный канал: этот тест смотрит
         // на приём, а не на набор.

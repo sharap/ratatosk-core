@@ -585,7 +585,7 @@ fn spawn_accept_loop(listener: TcpListener, events: mpsc::Sender<TransportEvent>
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
-                    spawn_read_loop(stream, Transport::Lan, None, events.clone());
+                    spawn_read_loop(stream, Transport::Lan, None, None, events.clone());
                 }
                 // Исчерпание дескрипторов лечится ожиданием, а не выходом
                 // из цикла: выйдя, транспорт замолчал бы навсегда.

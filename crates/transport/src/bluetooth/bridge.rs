@@ -303,9 +303,9 @@ impl Air for BridgedAir {
         self.inner.lower();
     }
 
-    fn dial(&self, target: BtAddress) -> DialFuture<Self::Stream> {
+    fn dial(&self, target: BtAddress, peer_ik: [u8; 32]) -> DialFuture<Self::Stream> {
         let bridge = Arc::clone(&self.inner);
-        Box::pin(async move { bridge.dial(target).await })
+        Box::pin(async move { bridge.dial(target, peer_ik).await })
     }
 }
 
@@ -555,7 +555,7 @@ impl Bridge {
             // Кадры отсюда сразу едут сборщику, и вместе с ними — номер
             // канала: ответить в него можно, а набрать телефон в ответ
             // нельзя (см. `AirSetup::accepted`).
-            spawn_read_loop(Incoming::new(rx), Transport::Bt, Some(channel), events);
+            spawn_read_loop(Incoming::new(rx), Transport::Bt, Some(channel), None, events);
         });
         if spawned.is_none() {
             // Ступень не поднята: читать этот канал некому и незачем.
@@ -684,7 +684,11 @@ impl Bridge {
         }
     }
 
-    async fn dial(self: Arc<Self>, target: BtAddress) -> Result<Outgoing, TransportError> {
+    async fn dial(
+        self: Arc<Self>,
+        target: BtAddress,
+        peer_ik: [u8; 32],
+    ) -> Result<Outgoing, TransportError> {
         let Some(radio) = self.radio() else {
             return Err(TransportError::Unavailable);
         };
@@ -744,9 +748,13 @@ impl Bridge {
             // знаем собеседника без всякого имени. Номер нужен только
             // принятому каналу — чей он, решает ядро.
             //
+            // Зато имя у неё есть, и оно едет в чтение: конец чтения —
+            // это обрыв, и ядро узнаёт о нём отсюда, а не с первой
+            // неудачной записи (разбор — у `spawn_read_loop`).
+            //
             // Заводить задачу здесь можно прямо: `dial` живёт внутри
             // задачи связи, а та — в рантайме ядра. Чужих потоков тут нет.
-            spawn_read_loop(Incoming::new(rx), Transport::Bt, None, events);
+            spawn_read_loop(Incoming::new(rx), Transport::Bt, None, Some(peer_ik), events);
         }
         Ok(Outgoing { bridge: self, channel, alive })
     }

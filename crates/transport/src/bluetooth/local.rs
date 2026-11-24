@@ -410,11 +410,17 @@ impl Air for LocalAir {
         }
     }
 
-    fn dial(&self, target: BtAddress) -> DialFuture<Self::Stream> {
+    fn dial(&self, target: BtAddress, peer_ik: [u8; 32]) -> DialFuture<Self::Stream> {
         // Набор не заимствует эфир: он уезжает в задачу связи, которая
         // переживает и выключение ступени, и сам раннер.
         let events = self.events.lock().ok().and_then(|held| held.clone());
-        Box::pin(dial(target, Arc::clone(&self.adapter), Arc::clone(&self.airtime), events))
+        Box::pin(dial(
+            target,
+            peer_ik,
+            Arc::clone(&self.adapter),
+            Arc::clone(&self.airtime),
+            events,
+        ))
     }
 }
 
@@ -801,7 +807,7 @@ fn spawn_accept_loop(
                         // Раннера больше нет — читать некому и незачем.
                         return;
                     }
-                    spawn_read_loop(reader, Transport::Bt, Some(link), events.clone());
+                    spawn_read_loop(reader, Transport::Bt, Some(link), None, events.clone());
                 }
                 // Выйти из цикла значило бы замолчать навсегда.
                 Err(error) => {
@@ -1146,6 +1152,7 @@ async fn connect_with_mtu(sa: L2capAddr) -> std::io::Result<Stream> {
 /// Различить их можно только увидев код, который вернуло ядро.
 async fn dial(
     target: BtAddress,
+    peer_ik: [u8; 32],
     adapter: AdapterSlot,
     airtime: Arc<Airtime>,
     events: Option<mpsc::Sender<TransportEvent>>,
@@ -1301,7 +1308,10 @@ async fn dial(
             // принятому каналу — его чей, решает ядро.
             let (reader, writer) = split_chunked(stream);
             match events {
-                Some(events) => spawn_read_loop(reader, Transport::Bt, None, events),
+                // Набранный канал знает собеседника: его и набирали.
+                // Поэтому обрыв, замеченный чтением, доедет до ядра
+                // отсюда — см. разбор у `spawn_read_loop`.
+                Some(events) => spawn_read_loop(reader, Transport::Bt, None, Some(peer_ik), events),
                 // **Канал без чтения — это звено в одну сторону, и молчать
                 // о нём нельзя.** Писать в него будут как в исправный:
                 // кадры уезжают, ответы собеседника уходят в брошенный

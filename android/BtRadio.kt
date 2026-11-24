@@ -367,6 +367,10 @@ class BtRadio(
             // просить человека сопрягать телефоны ради переписки.
             val socket = adapter.listenUsingInsecureL2capChannel()
             server = socket
+            // **Номер слушающего канала — вслух.** Объявляем мы его же
+            // (`onReady` ниже), и если набирающий стучится не туда, по двум
+            // журналам это видно сразу; без строки — не видно никак.
+            Log.i(TAG, "слушаем L2CAP: psm=${socket.psm}")
             thread(name = "ratatosk-bt-accept") { acceptLoop(socket) }
             startScan(adapter)
             // Номер канала — последним: объявление ядро соберёт по нему.
@@ -574,10 +578,20 @@ class BtRadio(
             val accepted = try {
                 socket.accept()
             } catch (e: IOException) {
-                // Сокет закрыли — значит ступень выключили. Это не беда.
+                // Сокет закрыли — значит ступень выключили. Это не беда,
+                // но сказать надо: молчащий приём и выключенный приём
+                // снаружи неотличимы, а стоило это целого разбора.
+                Log.i(TAG, "приём каналов кончился: сокет закрыт")
                 return
             }
             val channel = nextChannel()
+            // **Принимающая половина молчала, и это было слепым местом.**
+            // Набор с Linux открывал сокет за четверть секунды, канал
+            // не оживал за десять, — и по журналу телефона нельзя было
+            // сказать, дошло ли дело до `accept` вообще. Linux-половина
+            // про входящий канал говорит («эфир: входящий канал»), эта —
+            // не говорила.
+            Log.i(TAG, "входящий канал $channel от ${runCatching { accepted.remoteDevice?.address }.getOrNull()}")
             register(channel.toULong(), accepted)
             toCore("onIncoming") { bridge.onIncoming(channel.toULong()) }
         }

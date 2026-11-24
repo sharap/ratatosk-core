@@ -9856,3 +9856,103 @@ fn a_personal_message_is_not_evicted_from_the_waiting_queue_by_silent_copies() {
         "личное письмо пережило двести молчаливых копий"
     );
 }
+
+#[test]
+fn a_link_coming_up_makes_the_half_downloaded_file_ask_again() {
+    // **Разбор с устройств, 24 ноября.** Файл с Redmi на ПК встал
+    // посередине и стоял минутами при живом канале. Недокачанное
+    // возобновлялось только двумя путями — переходом «не слышали →
+    // слышим» и рукопожатием, — а оба работают, пока связь новая.
+    // Устоявшаяся сессия не здоровается заново, собеседник в эфире слышен
+    // постоянно, и просьба уходила лишь по сроку молчания, который
+    // удваивается с каждой неудачей. Канал же держит набравшая сторона:
+    // срок растёт, канал короток, совпадают они всё реже.
+    //
+    // `Input::Connected` ядро при этом **получало и выбрасывало**
+    // (`Ok(Vec::new())`). Здесь закрепляется, что не выбрасывает.
+    //
+    // **Чего проверка не стережёт.** Что просьба названа верным номером
+    // куска — это держит `next_missing_chunk` и проверки вокруг передачи
+    // целиком. Что связь на устройстве и правда появляется в этот миг —
+    // не стережёт ничто, кроме устройства: событие сюда подаётся руками.
+    // И что отложенные **сообщения** тоже поедут: их будит объявление,
+    // и трогать их эта правка не стала нарочно.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let mut bob = node(2, "bob");
+    introduce(&mut alice, &mut bob);
+    bob.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+        .expect("порог согласия");
+
+    let chunks = 40usize;
+    alice_blobs.lock().unwrap().seed("/tmp/half.bin", payload_of(files::CHUNK_BYTES * chunks + 5));
+    let started = alice
+        .step(
+            1_000,
+            Input::Command(Command::SendFiles {
+                chat: Engine::<MemoryStore>::chat_id_for(&bob.own_card().ik),
+                files: vec![OutgoingFile { path: "/tmp/half.bin".into(), preview: None }],
+                text: "половина".into(),
+            }),
+        )
+        .expect("отправка файла принята");
+
+    // **Обмен обрывается посередине нарочно.** Бюджет кадров подобран так,
+    // чтобы часть кусков доехала, а часть нет: ровно то состояние, в котором
+    // передача и застревала на устройстве.
+    let mut queue: VecDeque<(bool, Effect)> = started.into_iter().map(|e| (true, e)).collect();
+    let mut via = None;
+    let mut budget = 24;
+    while let Some((from_first, effect)) = queue.pop_front() {
+        if budget == 0 {
+            break;
+        }
+        if let Effect::Send { peer_ik, via: sent_via, frame, handoff } = effect {
+            budget -= 1;
+            via = Some(sent_via);
+            if let Some(handoff) = handoff {
+                let sender = if from_first { &mut alice } else { &mut bob };
+                let produced = sender
+                    .step(1_000, Input::Handed { peer_ik, via: sent_via, handoff })
+                    .expect("подтверждение передачи");
+                queue.extend(produced.into_iter().map(|e| (from_first, e)));
+            }
+            let target = if from_first { &mut bob } else { &mut alice };
+            let produced =
+                target.step(1_000, Input::Received { via: sent_via, frame }).expect("приём кадра");
+            queue.extend(produced.into_iter().map(|e| (!from_first, e)));
+        }
+    }
+    let via = via.expect("хоть один кадр обязан был уйти");
+
+    let file_id = only_file(&bob, &alice);
+    let got = bob.store().received_chunks(&file_id).expect("сколько кусков принято");
+    assert!(
+        got > 0 && got < chunks as u64,
+        "обмен обязан был оборваться посередине, а принято {got} из {chunks}"
+    );
+
+    // Вот он, тот самый миг: канал появился. Время взято далёким от начала —
+    // срок молчания к этой минуте уже вышел бы, и спутать его с правкой
+    // нельзя: сроки здесь никто не спускает, таймеры лежат нетронутыми.
+    let alice_ik = alice.own_card().ik;
+    let produced = bob
+        .step(500_000, Input::Connected { peer_ik: alice_ik, via })
+        .expect("новость о связи не должна отказывать");
+    let asked: Vec<Effect> =
+        produced.into_iter().filter(|effect| matches!(effect, Effect::Send { .. })).collect();
+    assert!(
+        !asked.is_empty(),
+        "связь установилась, а недокачанный файл не спросил ни одного куска"
+    );
+
+    // И это именно просьба о кусках, а не что-нибудь ещё: Алиса,
+    // получив её, обязана ответить кадрами.
+    let mut answered = 0;
+    for effect in asked {
+        let Effect::Send { via: sent_via, frame, .. } = effect else { continue };
+        let back =
+            alice.step(500_000, Input::Received { via: sent_via, frame }).expect("приём просьбы");
+        answered += back.iter().filter(|e| matches!(e, Effect::Send { .. })).count();
+    }
+    assert!(answered > 0, "на просьбу о кусках отправитель обязан ответить кадрами");
+}

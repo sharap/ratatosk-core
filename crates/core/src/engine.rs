@@ -2641,7 +2641,7 @@ impl<S: Store> Engine<S> {
             Input::AwaitsTheirDial { peer_ik, via, awaiting } => {
                 self.note_awaits_their_dial(&peer_ik, via, awaiting)
             }
-            Input::Connected { .. } => Ok(Vec::new()),
+            Input::Connected { peer_ik, via } => self.on_connected(now_ms, peer_ik, via),
             // Разрыв соединения — это событие **сокета**, а не сессии, и
             // путать их оказалось дорого. Раньше здесь закрывалась LAN-сессия:
             // читалось это как §5.4 («сессия, начатая в LAN, через onion

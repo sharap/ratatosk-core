@@ -6321,16 +6321,22 @@ pub fn enable_logging(filter: String) {
 
     #[cfg(target_os = "android")]
     {
-        let layer = match tracing_android::layer("ratatosk") {
-            Ok(layer) => layer,
-            Err(error) => {
-                // Сказать некуда — журнала-то и нет. Остаётся системный
-                // поток ошибок: на Android он уходит в никуда, но на
-                // эмуляторе и в тестах виден.
-                eprintln!("ratatosk: журнал не завёлся: {error}");
-                return;
-            }
-        };
+        // **Строку складывает тот же `fmt`-слой, что и на десктопе**,
+        // а платформа даёт только писателя. Прежде слой брался у
+        // `tracing-android` целиком, и тот склеивал поля с текстом:
+        // в `logcat` приходило «список контактов принятизвестных=0ключи=».
+        // Разбирать эфир по такому журналу нельзя — а именно по нему
+        // его и разбирают, другого с телефона нет.
+        //
+        // Время и уровень сняты не ради краткости: их `logcat` ставит
+        // сам, отдельными полями, и вторая копия внутри текста мешала бы
+        // `grep`-у. Цвет снят по той же причине, что и на десктопе:
+        // управляющие последовательности в журнале читать нечем.
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_writer(paranoid_android::AndroidLogMakeWriter::new("ratatosk".to_owned()));
         // `try_init`, а не `init`: второй вызов — обычное дело
         // (клиент открыл второй аккаунт), а не повод ронять приложение.
         let _ = tracing_subscriber::registry().with(env).with(layer).try_init();
@@ -7442,5 +7448,70 @@ mod tests {
             let inner: ratatosk_proto::swarm::Seeding = mode.into();
             assert_eq!(FfiSeeding::from(inner), mode, "состояние {mode:?} вернулось другим");
         }
+    }
+
+    /// Куда писал слой журнала в проверке ниже.
+    ///
+    /// Своя запись, а не `Mutex<Vec<u8>>` из `tracing-subscriber`: слою
+    /// нужен писатель на каждое событие, а прочитать написанное надо
+    /// после — отсюда общая ссылка.
+    #[derive(Clone)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("запись журнала").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn a_journal_line_separates_its_fields_from_the_text_and_from_each_other() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // Поломка, из которой проверка выросла: под Android слой журнала
+        // брался у чужого крейта, и тот писал поля впритык — «список
+        // контактов принятизвестных=0ключи=». Нашлось на живом Redmi.
+        //
+        // **Чего проверка не стережёт.** Она не трогает `logcat` и не
+        // поднимает android-писателя: ни того, ни другого на машине
+        // сборки нет. Стережётся ровно то, чем мы заменили чужой слой, —
+        // что `fmt`-слой, настроенный так, как мы его настраиваем
+        // в `enable_logging`, складывает строку читаемо. Что в
+        // `enable_logging` стоит именно он, стережёт метёлка `log_layer`.
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_level(false)
+            .with_writer(Captured(written.clone()));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            // Поля взяты с живой строки эфира: число и пустой список
+            // через `Display` — ровно как их пишет транспорт.
+            tracing::info!(известных = 0, ключи = %String::new(), "эфир: список контактов принят");
+        });
+
+        let line = String::from_utf8(written.lock().expect("чтение журнала").clone())
+            .expect("строка журнала — текст");
+        // Строка названа целиком, а не кусками: разъехаться она может
+        // и по краям — лишним уровнем, временем, цветом, — а в `logcat`
+        // всё это уже есть своими полями.
+        assert_eq!(
+            line,
+            format!("{}: эфир: список контактов принят известных=0 ключи=\n", module_path!()),
+            "строка журнала сложена не так, как её читают с телефона"
+        );
     }
 }

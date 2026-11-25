@@ -374,6 +374,27 @@ pub struct AirSetup<S> {
     pub closed: mpsc::Sender<u64>,
 }
 
+// **Копия руками, а не выводом, и причина не вкусовая.** `derive(Clone)`
+// потребовал бы `S: Clone`, а `S` здесь — поток записи, и копировать
+// его нельзя по смыслу. Всё, что лежит в записи, — ручки и счётчики,
+// копируемые сами по себе независимо от `S`.
+//
+// Копия нужна затем, что ступень поднимается **не один раз**: адаптер
+// выключают и включают, и каждый подъём получает свою.
+impl<S> Clone for AirSetup<S> {
+    fn clone(&self) -> Self {
+        AirSetup {
+            my_ik: self.my_ik,
+            watched: Arc::clone(&self.watched),
+            heard: Arc::clone(&self.heard),
+            directory: Arc::clone(&self.directory),
+            events: self.events.clone(),
+            accepted: self.accepted.clone(),
+            closed: self.closed.clone(),
+        }
+    }
+}
+
 /// Сколько ждать одну попытку набора по **постоянному** адресу.
 ///
 /// Восемь секунд из десяти, отведённых §5.4 (`BT_CONNECT_TIMEOUT_MS`).

@@ -461,6 +461,20 @@ impl<S: Store> Engine<S> {
             return self.on_file_stall(now_ms, file_id);
         }
 
+        // Срок тишины получателя (0.4.15) — зеркало срока молчания,
+        // и разбирается рядом с ним. Разница в том, что делают
+        // по истечении: получатель спрашивает заново, отправитель
+        // набирает, чтобы вопрос мог прийти.
+        let quiet = self
+            .sending_timers
+            .iter()
+            .find(|(_, armed)| **armed == token)
+            .map(|((file_id, peer_ik), _)| (*file_id, *peer_ik));
+        if let Some((file_id, peer_ik)) = quiet {
+            self.sending_timers.remove(&(file_id, peer_ik));
+            return self.on_quiet_receiver(file_id, peer_ik);
+        }
+
         // Срок повтора отложенного (§10.5) — не про ступень и не про
         // сессию: он про то, что путь до собеседника когда-нибудь
         // откроется, а сказать об этом на меше и onion некому.

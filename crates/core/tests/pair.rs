@@ -220,7 +220,14 @@ fn pump_both(
         // это удар раз в полторы минуты. Здесь времени нет, `now_ms`
         // стоит, и такой срок спускался бы подряд до упора в предел
         // шагов — обмен объявлялся бы кольцом на ровном месте.
-        if produced.len() == 1 && matches!(produced[0], Effect::SetTimer { .. }) {
+        //
+        // **Набор считается тем же сердцебиением** (0.4.15). Срок тишины
+        // получателя даёт `Connect` плюс новый срок: в жизни это «открой
+        // дверь, чтобы он мог спросить», а на проводе — ничего, потому что
+        // транспорта здесь нет вовсе и `Connect` провод выбрасывает.
+        // Считай мы это обменом — любая незаконченная передача упиралась
+        // бы в предел шагов на ровном месте.
+        if produced.iter().all(|e| matches!(e, Effect::SetTimer { .. } | Effect::Connect { .. })) {
             continue;
         }
         queue.extend(produced.into_iter().map(|e| (owner_first, e)));
@@ -1027,6 +1034,131 @@ fn a_card_added_again_does_not_forget_that_the_peer_is_heard_on_lan_or_in_the_ai
     assert!(
         Reachability::of(alice.contacts()[&peer_ik].availability).rung(Transport::Bt).usable(),
         "иначе §5.4 отправит почтой тому, кто сидит за столом напротив"
+    );
+}
+
+/// Передаёт эфирные кадры в одну сторону и возвращает, что ответил приёмник.
+///
+/// Нужна там, где провод `pump` не годится: он доводит обмен до конца,
+/// а проверяется молчание — то есть обмен, оборванный посередине.
+fn hand_over(to: &mut Node, now_ms: u64, effects: &[Effect]) -> Vec<Effect> {
+    use ratatosk_proto::Transport;
+
+    let mut back = Vec::new();
+    for frame in air_sends(effects) {
+        back.extend(
+            to.step(now_ms, Input::Received { via: Transport::Bt, frame })
+                .expect("приём кадра не должен отказывать"),
+        );
+    }
+    back
+}
+
+/// Метка последнего взведённого срока.
+fn last_timer(effects: &[Effect]) -> Option<u64> {
+    effects.iter().rev().find_map(|e| match e {
+        Effect::SetTimer { token, .. } => Some(*token),
+        _ => None,
+    })
+}
+
+/// Доводит отдачу до того состояния, ради которого всё и затевалось:
+/// получатель спросил один раз и замолчал.
+///
+/// Возвращает метку срока тишины, взведённого отправителем.
+fn transfer_left_hanging(alice: &mut Node, bob: &mut Node, alice_blobs: &Blobs, path: &str) -> u64 {
+    let air = files::chunk_bytes_for(ratatosk_proto::Transport::Bt);
+    alice_blobs.lock().unwrap().seed(path, payload_of(air * 6 + 3));
+    let offer = send_file(alice, bob, 1_000, path);
+    // Боб соглашается сам (порог выставлен) и спрашивает первый кусок.
+    let asked = hand_over(bob, 1_100, &offer);
+    // Просьба доезжает — и отдача взводит срок тишины.
+    let served = hand_over(alice, 1_200, &asked);
+    // Дальше боб молчит: кадры алисы ему не отдаём.
+    last_timer(&served).expect("отдача обязана взвести срок тишины получателя")
+}
+
+#[test]
+fn a_quiet_receiver_makes_the_sender_dial_instead_of_waiting_forever() {
+    // **Тупик со стенда, 24 ноября.** Файл с Redmi на ПК оборван
+    // на 12 чанках из 854 и не пошёл дальше ни разу. Куски просит
+    // получатель — и это верно, только он знает, какие у него есть, —
+    // но из этого следовало, что незаконченная **отдача** не повод
+    // ни для чего. А набрать нас получателю бывает нечем: телефон
+    // объявляется приватным адресом (§8.2), и канал держит набравшая
+    // сторона.
+    //
+    // Отправитель здесь не отправляет ничего: он набирает, чтобы вопрос
+    // мог прийти. Дальше работает 0.4.5 — получатель узнаёт о связи
+    // и спрашивает сам.
+    //
+    // Чего проверка не стережёт: что на устройстве набор удастся. Это
+    // дело транспорта и радио; здесь проверено, что ядро **просит
+    // набрать**, а не молчит.
+    use ratatosk_proto::Transport;
+
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    for who in [&mut alice, &mut bob] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    air_only(&mut bob, alice.own_card().ik);
+    let mut outgoing = air_only(&mut alice, bob.own_card().ik);
+    let bob_ik = bob.own_card().ik;
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, outgoing);
+
+    let token = transfer_left_hanging(&mut alice, &mut bob, &alice_blobs, "/tmp/dolgiy.bin");
+
+    let effects = alice.step(500_000, Input::Timer { token }).expect("срок тишины");
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::Connect { peer_ik, via: Transport::Bt } if *peer_ik == bob_ik
+        )),
+        "замолчавший получатель — повод набрать: {effects:?}"
+    );
+}
+
+#[test]
+fn a_quiet_receiver_does_not_make_the_sender_dial_a_busy_channel() {
+    // Пара к предыдущей, и она про оговорку: набор ради отдачи
+    // не вправе забивать канал, по которому уже идёт передача. Предел
+    // §10.2 на эфире равен одному, и второй набор не дал бы ничего,
+    // кроме отнятой у обзора антенны (0.4.3).
+    //
+    // Занятость подаётся встречной передачей: алиса сама принимает файл
+    // той же ступенью, то есть место на ней занято приёмом.
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    for who in [&mut alice, &mut bob] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    air_only(&mut bob, alice.own_card().ik);
+    let mut outgoing = air_only(&mut alice, bob.own_card().ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, outgoing);
+
+    let token = transfer_left_hanging(&mut alice, &mut bob, &alice_blobs, "/tmp/dolgiy.bin");
+
+    // Встречная передача: боб отдаёт, алиса принимает — ступень занята.
+    let air = files::chunk_bytes_for(ratatosk_proto::Transport::Bt);
+    bob_blobs.lock().unwrap().seed("/tmp/vstrechnyi.bin", payload_of(air * 6 + 1));
+    let offer = send_file(&mut bob, &alice, 2_000, "/tmp/vstrechnyi.bin");
+    let _ = hand_over(&mut alice, 2_100, &offer);
+
+    let effects = alice.step(500_000, Input::Timer { token }).expect("срок тишины");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Connect { .. })),
+        "канал занят своей передачей — набирать нечего: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "но срок обязан взвестись заново: ступень освободится, и набрать будет нужно"
     );
 }
 
@@ -6679,6 +6811,12 @@ fn pump_many(
         }
         let Some((owner, token)) = timers.pop() else { break };
         let produced = nodes[owner].step(now_ms, Input::Timer { token }).expect("таймер доставки");
+        // Та же оговорка, что у провода на двоих: срок, не сделавший
+        // ничего, кроме как взвёлся заново (и, может, позвал набрать), —
+        // не часть обмена.
+        if produced.iter().all(|e| matches!(e, Effect::SetTimer { .. } | Effect::Connect { .. })) {
+            continue;
+        }
         queue.extend(produced.into_iter().map(|e| (owner, e)));
     }
     events

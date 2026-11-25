@@ -1662,6 +1662,11 @@ impl<S: Store> Engine<S> {
                     sending.sent_upto = sending.sent_upto.max(next_index);
                 }
                 sending.acked_upto = next_index;
+                // **Просьба — это признак жизни**, и счёт тишины она
+                // обнуляет. Иначе отступление росло бы через всю передачу,
+                // и к её середине отправитель набирал бы раз в несколько
+                // минут собеседника, который спрашивает каждую секунду.
+                sending.quiet = 0;
                 *sending
             }
             None => {
@@ -1680,6 +1685,8 @@ impl<S: Store> Engine<S> {
                     acked_upto: next_index,
                     sent_upto: next_index,
                     asked_seq,
+                    quiet: 0,
+                    quiet_mark: next_index,
                 };
                 self.sending.push(sending);
                 sending
@@ -1694,6 +1701,237 @@ impl<S: Store> Engine<S> {
             return Ok(Vec::new());
         }
         self.pump_file(now_ms, &file, peer_ik)
+    }
+
+    /// Ставит срок тишины получателя (0.4.15).
+    ///
+    /// Пара к [`Engine::watch_for_stall`], и разница между ними — в том,
+    /// что делают по истечении. Получатель по своему сроку **спрашивает
+    /// заново**; отправителю спрашивать нечего — он **набирает**, чтобы
+    /// вопрос мог прийти.
+    ///
+    /// **Живой срок один, и второго не ставим.** Это не экономия: срок
+    /// мерит отсутствие движения, а просьб от получателя приходит
+    /// по просьбе на чанк. Взводи мы срок на каждую — цена сроков
+    /// удвоилась бы, и потолок, посчитанный в `proto::files`, перестал бы
+    /// быть верным молча. Поймано проверкой
+    /// `one_chunk_costs_exactly_one_stall_timer`: 119 лишних сроков
+    /// вместо шестидесяти. Движение опознаёт сам срок, по `quiet_mark`.
+    fn watch_for_quiet(
+        &mut self,
+        file_id: FileId,
+        peer_ik: [u8; 32],
+        via: Transport,
+        quiet: u32,
+    ) -> Vec<Effect> {
+        if self.sending_timers.contains_key(&(file_id, peer_ik)) {
+            return Vec::new();
+        }
+        let token = self.allocate_timer();
+        self.sending_timers.insert((file_id, peer_ik), token);
+        if let Some(slot) =
+            self.sending.iter_mut().find(|s| s.file_id == file_id && s.peer_ik == peer_ik)
+        {
+            slot.quiet_mark = slot.acked_upto;
+        }
+        let after_ms = ratatosk_proto::files::stall_backoff_ms(via, quiet);
+        vec![Effect::SetTimer { after_ms, token }]
+    }
+
+    /// Получатель замолчал — набираем, чтобы он мог спросить (0.4.15).
+    ///
+    /// # Зачем отправителю набирать
+    ///
+    /// Куски просит получатель, и это верно: только он знает, какие у него
+    /// есть. Но из этого следовало, что незаконченная **отдача** не была
+    /// поводом ни для чего — а на эфире канал держит набравшая сторона,
+    /// и набрать нас получателю бывает нечем: телефон объявляется
+    /// приватным адресом, разрешить который может только сопряжённое
+    /// устройство (§8.2).
+    ///
+    /// Выходил тупик, снятый со стенда 24 ноября: файл с Redmi на ПК
+    /// оборван на 12 чанках из 854 и не пошёл дальше ни разу. Получателю
+    /// (ПК) нечем набрать телефон; телефону нечего сказать, потому что
+    /// незавершённость лежит не у него.
+    ///
+    /// Отправитель здесь не отправляет ничего — он открывает дверь.
+    /// Появился канал — получатель узнаёт о связи и спрашивает сам
+    /// (0.4.5, `Input::Connected`).
+    ///
+    /// # Чего он при этом не делает
+    ///
+    /// **Не забивает канал, занятый другой передачей.** Пределы §10.2
+    /// считают по одной передаче на ступень, и набор ради второй не дал
+    /// бы ничего, кроме отнятой антенны: обзор уступает каждому набору
+    /// (0.4.3). Занятым считается канал, по которому идёт **любая**
+    /// другая передача — своя отдача или чужой приём. Срок при этом
+    /// взводится заново: ступень освободится, и тогда набрать будет
+    /// и можно, и нужно.
+    ///
+    /// **Не набирает, когда у файла есть другой источник** (§9.1):
+    /// получателю есть у кого спросить, а наш набор только отнял бы
+    /// антенну у обзора.
+    ///
+    /// **Не звонит без конца** (`files::QUIET_DIALS`).
+    ///
+    /// Останавливать набор на уровне радио незачем — это дело транспорта:
+    /// после `Vain::ENOUGH` напрасных попыток он перестаёт трогать радио
+    /// и ждёт встречного набора (0.4.3), возвращая отказ мгновенно
+    /// и без единого пакета в эфир.
+    pub(super) fn on_quiet_receiver(
+        &mut self,
+        file_id: FileId,
+        peer_ik: [u8; 32],
+    ) -> Result<Vec<Effect>, EngineError> {
+        let Some(sending) =
+            self.sending.iter().find(|s| s.file_id == file_id && s.peer_ik == peer_ik).copied()
+        else {
+            // Передачи больше нет: получатель всё подтвердил, или исходник
+            // пропал, или файл убрали. Срок просто опоздал.
+            return Ok(Vec::new());
+        };
+        if sending.acked_upto >= sending.chunk_total {
+            return Ok(Vec::new());
+        }
+        let Some(via) = self.file_channel(&peer_ik, sending.size_bytes) else {
+            // Ступени для этого файла нет вовсе — набирать нечего и нечем.
+            // Срок не взводим: разбудит просьба получателя.
+            return Ok(Vec::new());
+        };
+        // **Передача, которая двигалась, молчащей не считается.** Срок
+        // один на всю передачу, и отличить «получатель спрашивал всё это
+        // время» от «получатель замолчал» можно только по движению.
+        if sending.acked_upto > sending.quiet_mark {
+            if let Some(slot) =
+                self.sending.iter_mut().find(|s| s.file_id == file_id && s.peer_ik == peer_ik)
+            {
+                slot.quiet = 0;
+            }
+            return Ok(self.watch_for_quiet(file_id, peer_ik, via, 0));
+        }
+        if self.served_by_others(file_id, peer_ik)? {
+            tracing::debug!(
+                peer = %short_ik(&peer_ik),
+                "отдача встала, но у файла есть другой источник — набирать не нам"
+            );
+            return Ok(Vec::new());
+        }
+        // **Набирает только переписка один на один, и это не осторожность.**
+        //
+        // В группе и в канале у получателя есть рой: держатели (§9.1)
+        // и сиды (§7.5) отдают то же самое, и отдают первыми. Набор
+        // отправителя там не ускоряет ничего — он лишь делает
+        // отправителя источником вместо роя, то есть ровно отменяет
+        // §9.1.
+        //
+        // Померено сценарием стенда (`the_sender_uploads_a_file_once…`):
+        // с набором в канале второй читатель брал у отправителя
+        // одиннадцать кусков из двадцати вместо пяти. Знать про рой
+        // отправитель при этом не мог — из сидов канала он видит только
+        // свой собственный, — так что оговоркой «есть другой источник»
+        // этот случай не покрывается.
+        //
+        // Тупик, ради которого правка и делалась, — именно про один
+        // на один: там второго источника нет по построению.
+        if self.swarm_can_serve(file_id)? {
+            tracing::debug!(
+                peer = %short_ik(&peer_ik),
+                "отдача встала, но это групповое вложение — отдадут держатели"
+            );
+            return Ok(Vec::new());
+        }
+        let quiet = sending.quiet.saturating_add(1);
+        if let Some(slot) =
+            self.sending.iter_mut().find(|s| s.file_id == file_id && s.peer_ik == peer_ik)
+        {
+            slot.quiet = quiet;
+        }
+        if quiet > ratatosk_proto::files::QUIET_DIALS {
+            tracing::info!(
+                ?via,
+                peer = %short_ik(&peer_ik),
+                набрали = quiet - 1,
+                "получатель так и молчит — перестаём набирать, ждём его просьбы"
+            );
+            return Ok(Vec::new());
+        }
+        if self.channel_busy_elsewhere(via, file_id, peer_ik) {
+            tracing::debug!(
+                ?via,
+                peer = %short_ik(&peer_ik),
+                "отдача встала, но канал занят другой передачей — не набираем"
+            );
+            return Ok(self.watch_for_quiet(file_id, peer_ik, via, quiet));
+        }
+        tracing::info!(
+            ?via,
+            peer = %short_ik(&peer_ik),
+            тишины = quiet,
+            отдано = sending.acked_upto,
+            всего = sending.chunk_total,
+            "получатель замолчал — набираем, чтобы он мог спросить"
+        );
+        let mut effects = vec![Effect::Connect { peer_ik, via }];
+        effects.extend(self.watch_for_quiet(file_id, peer_ik, via, quiet));
+        Ok(effects)
+    }
+
+    /// Есть ли у файла источник помимо нас.
+    ///
+    /// Спрашивается в двух местах, потому что их два и они разные:
+    /// держатели (§9.1) объявляют, что у них **есть этот файл**, а сиды
+    /// (§7.5) — что они раздают **этот канал**.
+    ///
+    /// Себя в расчёт не берём — вопрос ровно про «кроме нас», — и
+    /// получателя тоже: он и есть тот, кому не хватает.
+    fn served_by_others(&self, file_id: FileId, peer_ik: [u8; 32]) -> Result<bool, EngineError> {
+        let mine = self.identity.public().ik;
+        let holders = self
+            .file_holders
+            .get(&file_id)
+            .is_some_and(|who| who.keys().any(|holder| *holder != peer_ik && *holder != mine));
+        if holders {
+            return Ok(true);
+        }
+        for msg_id in self.store.messages_of_file(&file_id)? {
+            let Some(chat) = self.store.message(&msg_id)?.map(|m| m.chat_id) else { continue };
+            if self.store.seeds(&chat)?.iter().any(|seed| seed.ik != peer_ik && seed.ik != mine) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Групповое ли это вложение — то есть есть ли у получателя рой.
+    ///
+    /// Вопрос нужен ровно одному месту — набору ради замолчавшей отдачи
+    /// (разбор — у [`Engine::on_quiet_receiver`]), — и ответ на него
+    /// не «кто сейчас отдаёт», а «бывает ли тут кому отдавать кроме нас».
+    /// В группе и в канале бывает по построению: копия ушла каждому,
+    /// и §9.1 делает из каждого получателя источник.
+    fn swarm_can_serve(&self, file_id: FileId) -> Result<bool, EngineError> {
+        for msg_id in self.store.messages_of_file(&file_id)? {
+            let Some(chat) = self.store.message(&msg_id)?.map(|m| m.chat_id) else { continue };
+            if self.groups.contains_key(&chat) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Идёт ли по этой ступени **другая** передача.
+    ///
+    /// Своя отдача или чужой приём — для канала разницы нет: предел §10.2
+    /// один на ступень, и вторая передача в него не влезет. Спрашивается
+    /// это перед набором ради замолчавшей отдачи (разбор —
+    /// у [`Engine::on_quiet_receiver`]).
+    fn channel_busy_elsewhere(&self, via: Transport, file_id: FileId, peer_ik: [u8; 32]) -> bool {
+        let serving = self
+            .sending
+            .iter()
+            .filter(|other| other.file_id != file_id || other.peer_ik != peer_ik)
+            .any(|other| self.file_channel(&other.peer_ik, other.size_bytes) == Some(via));
+        serving || self.file_lane.values().any(|lane| *lane == via)
     }
 
     /// Снимает записи об отдаче и отмечает, что место освободилось.
@@ -1723,6 +1961,9 @@ impl<S: Store> Engine<S> {
         self.sending.retain(|s| !gone(s));
         for key in &doomed {
             self.sending_queued.remove(key);
+            // И срок тишины: будить набором передачу, которой больше нет,
+            // значило бы трогать радио ради пустого места.
+            self.sending_timers.remove(key);
         }
         self.lanes_freed = true;
     }
@@ -1906,6 +2147,12 @@ impl<S: Store> Engine<S> {
                 sent: next,
                 total: file.chunk_total,
             }));
+        }
+        // **Срок тишины получателя** (0.4.15) — пока отдавать есть что.
+        // Подтверждённое до конца снимает запись об отдаче выше, и будить
+        // тут уже некого.
+        if sending.acked_upto < file.chunk_total {
+            effects.extend(self.watch_for_quiet(file.file_id, peer_ik, via, sending.quiet));
         }
         Ok(effects)
     }

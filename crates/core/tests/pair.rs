@@ -931,6 +931,105 @@ fn air_only(node: &mut Node, peer_ik: [u8; 32]) -> Vec<Effect> {
     effects
 }
 
+#[test]
+fn a_card_added_again_does_not_forget_that_the_peer_is_heard_on_lan_or_in_the_air() {
+    // **Поломка со стенда, 25 ноября.** Я вставил карточку pinephone,
+    // которого ПК уже знал, — и §5.4 тут же отказал с `bt=адреса нет`
+    // при живом принятом канале. Через минуту отметка вернулась сама:
+    // пришёл следующий кадр.
+    //
+    // Причина: `add_contact` зовётся не только при первом добавлении
+    // (§4.3, карточка из архива, карточка от третьего человека), и
+    // доступность он собирает заново — из набора услышанных объявлений.
+    // А у **знакомого** контакта отметка «слышен» живёт не в наборе,
+    // а в самой доступности: набор нужен тем, кого услышали **до**
+    // добавления. Значит повторное добавление её теряет.
+    //
+    // Чем это вредно, сказано в самом `add_contact` дважды — про имя
+    // и про момент добавления: «потерять отметку значило бы отправить
+    // почтой сообщение тому, кто сидит за столом напротив». Ровно это
+    // и выходит.
+    //
+    // Чего проверка не стережёт: путей, где карточка знакомого
+    // не добавляется заново вовсе. Их большинство — и приём от третьего
+    // человека, и список участников группы, и рукопожатие — стерегут
+    // себя сами проверкой `contains_key`; здесь проверяется тот путь,
+    // где такой проверки нет и быть не должно: человек вставил
+    // карточку сам.
+    use ratatosk_proto::transport_policy::Reachability;
+    use ratatosk_proto::Transport;
+
+    let mut alice = node(1, "alice");
+    let peer = Identity::from_seed([9; 32]);
+    let card = ratatosk_codec::ContactCard {
+        ik: peer.public().ik,
+        sk: peer.public().sk,
+        onion: String::new(),
+        chatmail: String::new(),
+        display_name: "сосед".to_owned(),
+        version: 1,
+        ygg: Vec::new(),
+        nostr: Vec::new(),
+        nostr_relays: Vec::new(),
+    };
+    let card_bytes = card.encode().expect("карточка собирается");
+    let peer_ik = card.ik;
+    alice
+        .step(
+            0,
+            Input::Command(Command::AddContact {
+                card_bytes: card_bytes.clone(),
+                met_in_person: true,
+            }),
+        )
+        .expect("контакт добавлен");
+    let _ = air_only(&mut alice, peer_ik);
+    // **Обе половины, потому что обе в одной строке правки.** Имя теста
+    // обещает LAN и эфир; возврат поломки показал, что без этой половины
+    // снятие `seen_on_lan` не роняет ничего.
+    alice
+        .step(
+            0,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .expect("LAN включается");
+    alice.step(1_000, Input::SeenOnLan { peer_ik }).expect("маяк LAN услышан");
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "обстановка: собеседника услышали эфиром, иначе проверять нечего"
+    );
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_lan,
+        "обстановка: собеседника услышали и в сети"
+    );
+    assert!(
+        Reachability::of(alice.contacts()[&peer_ik].availability).rung(Transport::Bt).usable(),
+        "обстановка: ступень годна, иначе отказ ничего не докажет"
+    );
+
+    // Та же карточка приезжает заново — ровно так, как её вставляет
+    // человек, уже имеющий этот контакт.
+    alice
+        .step(2_000, Input::Command(Command::AddContact { card_bytes, met_in_person: false }))
+        .expect("карточка принята заново");
+
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_bt,
+        "повторная карточка не повод забыть, что собеседник слышен в эфире"
+    );
+    assert!(
+        alice.contacts()[&peer_ik].availability.seen_on_lan,
+        "и то же про локальную сеть: правило одно, и строка правки одна"
+    );
+    assert!(
+        Reachability::of(alice.contacts()[&peer_ik].availability).rung(Transport::Bt).usable(),
+        "иначе §5.4 отправит почтой тому, кто сидит за столом напротив"
+    );
+}
+
 /// Кадры, ушедшие эфиром, — в том порядке, в каком ядро их отдало.
 fn air_sends(effects: &[Effect]) -> Vec<Vec<u8>> {
     effects

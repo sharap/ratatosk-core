@@ -41,7 +41,7 @@ use super::{
     dial_attempt_limit, note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress,
     DialFuture,
 };
-use crate::link::spawn_read_loop;
+use crate::link::{spawn_read_loop, Broke};
 use crate::runner::{TransportError, TransportEvent};
 
 /// Через сколько пробовать сканирование заново, если оно кончилось.
@@ -538,7 +538,12 @@ async fn run(
     // Спрашиваем контроллер **до** того, как что-то пойдёт не так.
     tell_about_controller(&adapter).await;
 
-    let _accepting = Stopped(spawn_accept_loop(listener, events.clone(), setup.accepted.clone()));
+    let _accepting = Stopped(spawn_accept_loop(
+        listener,
+        events.clone(),
+        setup.accepted.clone(),
+        setup.closed.clone(),
+    ));
     let _scanning = Stopped(spawn_scan_loop(adapter.clone(), setup, airtime));
 
     advertise_loop(adapter, my_ik, psm, events).await
@@ -784,6 +789,7 @@ fn spawn_accept_loop(
     listener: StreamListener,
     events: mpsc::Sender<TransportEvent>,
     accepted: mpsc::Sender<(u64, Chunked<WriteHalf<Stream>>)>,
+    closed: mpsc::Sender<u64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Номера принятых каналов свои и растут подряд. Совпасть им
@@ -807,7 +813,16 @@ fn spawn_accept_loop(
                         // Раннера больше нет — читать некому и незачем.
                         return;
                     }
-                    spawn_read_loop(reader, Transport::Bt, Some(link), None, events.clone());
+                    // Конец чтения — это конец канала, и раннер узнаёт
+                    // о нём по номеру: имени у принятого канала нет,
+                    // его называет ядро. Разбор — у `AirSetup::closed`.
+                    spawn_read_loop(
+                        reader,
+                        Transport::Bt,
+                        Some(link),
+                        Broke::Link(closed.clone()),
+                        events.clone(),
+                    );
                 }
                 // Выйти из цикла значило бы замолчать навсегда.
                 Err(error) => {
@@ -1311,7 +1326,9 @@ async fn dial(
                 // Набранный канал знает собеседника: его и набирали.
                 // Поэтому обрыв, замеченный чтением, доедет до ядра
                 // отсюда — см. разбор у `spawn_read_loop`.
-                Some(events) => spawn_read_loop(reader, Transport::Bt, None, Some(peer_ik), events),
+                Some(events) => {
+                    spawn_read_loop(reader, Transport::Bt, None, Broke::Peer(peer_ik), events)
+                }
                 // **Канал без чтения — это звено в одну сторону, и молчать
                 // о нём нельзя.** Писать в него будут как в исправный:
                 // кадры уезжают, ответы собеседника уходят в брошенный

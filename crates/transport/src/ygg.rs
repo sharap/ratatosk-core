@@ -106,7 +106,7 @@ use ratatosk_proto::ygg::{address_of, YggSetup, KEY_LEN};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use crate::link::{spawn_read_loop, Link};
+use crate::link::{spawn_read_loop, Broke, Link};
 use crate::runner::{Runner, TransportCommand, TransportError, TransportEvent};
 
 /// Порт, на котором стороны ищут друг друга в меше.
@@ -1112,7 +1112,7 @@ fn spawn_accept_loop(
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
-                    spawn_read_loop(stream, Transport::Ygg, None, None, events.clone());
+                    spawn_read_loop(stream, Transport::Ygg, None, Broke::Nobody, events.clone());
                 }
                 // Исчерпание дескрипторов лечится ожиданием, а не выходом
                 // из цикла: выйдя, транспорт замолчал бы навсегда.
@@ -1282,7 +1282,7 @@ fn spawn_node_accept_loop(
                     // Раз на соединение, а не на кадр: соединений единицы,
                     // а повтор ядро отбрасывает молча.
                     let _ = events.send(TransportEvent::Ready { transport: Transport::Ygg }).await;
-                    spawn_read_loop(conn, Transport::Ygg, None, None, events.clone());
+                    spawn_read_loop(conn, Transport::Ygg, None, Broke::Nobody, events.clone());
                 }
                 Err(error) => {
                     tracing::debug!(?error, "меш: приём закрыт, узел остановлен");

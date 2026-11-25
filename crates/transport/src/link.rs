@@ -378,6 +378,27 @@ fn frame_kind(frame: &[u8]) -> String {
 /// любой ступени, у которой пакеты есть.
 const READ_CHUNK: usize = SizeClass::S.frame_len() + 1;
 
+/// Кому сказать, что чтение кончилось.
+///
+/// Обрыв знает читающая половина — она падает на нём сразу, — а сказать
+/// о нём некому до тех пор, пока не ясно **про кого** говорить. Вариантов
+/// ровно три, и они не сводятся друг к другу.
+#[derive(Debug, Clone)]
+pub(crate) enum Broke {
+    /// Собеседник известен: канал набирали к нему. Новость едет ядру
+    /// как обрыв связи.
+    Peer([u8; 32]),
+    /// Канал принят, и чей он — читающая половина не знает: имя называет
+    /// ядро рукопожатием (§8.2), а не адрес радио. Поэтому наружу едет
+    /// **номер канала**, а переводит его в собеседника раннер ступени —
+    /// у него и только у него есть список «номер → чей» (`bound`).
+    Link(mpsc::Sender<u64>),
+    /// Ступени, где обрыв замечает своя петля: LAN и меш гасят связи
+    /// при смене сети (`restart`), onion — в задаче набора. Второго пути
+    /// им не нужно, и молчание здесь не недосмотр.
+    Nobody,
+}
+
 /// Читающая задача: разбирает поток на кадры и отдаёт их ядру.
 ///
 /// `link` — номер принятой связи, если у ступени связи счётные и в них
@@ -386,10 +407,8 @@ const READ_CHUNK: usize = SizeClass::S.frame_len() + 1;
 /// двусторонний. У остальных ступеней `None` — см.
 /// [`TransportEvent::Received::link`].
 ///
-/// `peer_ik` — кому принадлежит этот канал, **если это известно отсюда**.
-/// Известно оно ровно у набранного эфирного канала: его набирали к
-/// определённому собеседнику. Нужно оно затем, чтобы об обрыве узнало
-/// ядро, — и вот разбор, из которого это выросло.
+/// `broke` — кому сказать, что чтение кончилось (см. [`Broke`]). Вот
+/// разбор, из которого этот параметр вырос.
 ///
 /// # Конец чтения — это обрыв, и раньше о нём не знал никто
 ///
@@ -405,15 +424,11 @@ const READ_CHUNK: usize = SizeClass::S.frame_len() + 1;
 ///
 /// Читающая половина знает об обрыве первой и бесплатно: чтение падает
 /// на нём сразу. Поэтому новость едет отсюда.
-///
-/// `None` у ступеней, где обрыв замечает своя петля: LAN и меш гасят
-/// связи при смене сети (`restart`), onion — в своей задаче набора.
-/// Их молчание здесь не недосмотр, а отсутствие второго пути.
 pub(crate) fn spawn_read_loop<R>(
     reader: R,
     via: Transport,
     link: Option<u64>,
-    peer_ik: Option<[u8; 32]>,
+    broke: Broke,
     events: mpsc::Sender<TransportEvent>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
@@ -536,11 +551,25 @@ pub(crate) fn spawn_read_loop<R>(
                 return;
             }
         }
-        // **Обрыв, замеченный чтением, едет ядру.** Отказ отправки здесь
-        // глотается сознательно: ядра может уже не быть, а закрывать
-        // нечего — канал и так кончился.
-        if let Some(peer_ik) = peer_ik {
-            let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
+        // **Обрыв, замеченный чтением, едет дальше.** Отказы отправки
+        // здесь глотаются сознательно: получателя может уже не быть,
+        // а закрывать нечего — канал и так кончился.
+        match broke {
+            Broke::Peer(peer_ik) => {
+                let _ = events.send(TransportEvent::Disconnected { peer_ik, via }).await;
+            }
+            // Номер есть у принятого канала всегда: он и приехал
+            // вместе с ним. `None` тут означало бы принятый канал
+            // без номера, то есть ошибку выше, и молчать о ней нельзя.
+            Broke::Link(closed) => match link {
+                Some(link) => {
+                    let _ = closed.send(link).await;
+                }
+                None => {
+                    tracing::error!(?via, "принятый канал без номера — об обрыве сказать нечем")
+                }
+            },
+            Broke::Nobody => {}
         }
     });
 }
@@ -771,7 +800,7 @@ mod tests {
         let reader = WholePacketsOnly { packets: std::collections::VecDeque::from([packet]) };
 
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        spawn_read_loop(reader, Transport::Bt, Some(5), None, events_tx);
+        spawn_read_loop(reader, Transport::Bt, Some(5), Broke::Nobody, events_tx);
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events_rx.recv())
             .await
@@ -799,7 +828,7 @@ mod tests {
         // это проверяется у эфира (`bluetooth::tests`).
         let (writer, reader) = tokio::io::duplex(64);
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        spawn_read_loop(reader, Transport::Bt, None, Some([9u8; 32]), events_tx);
+        spawn_read_loop(reader, Transport::Bt, None, Broke::Peer([9u8; 32]), events_tx);
         // Канал кончился, и больше ничего не произошло: ни кадра,
         // ни отправки. Именно в этом и состоит проверка.
         drop(writer);
@@ -825,7 +854,7 @@ mod tests {
         // и выдумывать имя здесь нельзя.
         let (writer, reader) = tokio::io::duplex(64);
         let (events_tx, mut events_rx) = mpsc::channel(4);
-        spawn_read_loop(reader, Transport::Bt, Some(3), None, events_tx);
+        spawn_read_loop(reader, Transport::Bt, Some(3), Broke::Nobody, events_tx);
         drop(writer);
 
         let event =
@@ -1104,7 +1133,7 @@ mod tests {
         // о себе ничего не сообщает.
         let (writer, reader) = tokio::io::duplex(SizeClass::S.frame_len() * 2);
         let (events_tx, mut events_rx) = mpsc::channel(8);
-        spawn_read_loop(reader, Transport::Onion, None, None, events_tx);
+        spawn_read_loop(reader, Transport::Onion, None, Broke::Nobody, events_tx);
 
         // Новости самой связи уезжают в отдельный канал: этот тест смотрит
         // на приём, а не на набор.

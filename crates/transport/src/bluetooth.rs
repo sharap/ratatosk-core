@@ -310,7 +310,8 @@ pub trait Air: Send + 'static {
     /// `peer_ik` радио не нужен для набора — набирают по адресу, — и
     /// нужен **читающей половине канала**: она первой узнаёт об обрыве
     /// и обязана сказать об этом ядру, а сказать можно только о ком-то
-    /// по имени. Разбор — у [`crate::link::spawn_read_loop`].
+    /// по имени. Разбор — у читающей задачи (`link::spawn_read_loop`,
+    /// внутренняя), в разделе «Конец чтения — это обрыв».
     fn dial(&self, target: BtAddress, peer_ik: [u8; 32]) -> DialFuture<Self::Stream>;
 }
 
@@ -355,6 +356,22 @@ pub struct AirSetup<S> {
     /// Иначе транспорт узнавал бы собеседника по адресу радио, чего §8.2
     /// не разрешает ни при каких удобствах.
     pub accepted: mpsc::Sender<(u64, S)>,
+    /// Куда сообщать, что **принятый канал кончился**.
+    ///
+    /// Едет сюда номер, а не собеседник, и по той же причине, по которой
+    /// номер едет в `accepted`: чей это канал, радио не знает — имя
+    /// называет ядро. Переводит номер в собеседника раннер, у которого
+    /// список «номер → чей» и есть.
+    ///
+    /// # Зачем это нужно сверх неудачной записи
+    ///
+    /// Смерть канала замечала только запись, а задаче записи умирать
+    /// не с чего, пока писать нечего. На стенде принятый канал умер
+    /// в 21:03:36 (чтение: `ConnectionReset`), а запись узнала об этом
+    /// в 21:04:51 — через семьдесят шесть секунд, и сообщение за это
+    /// время легло в ожидание. У набранного канала то же стоило пяти
+    /// часов (0.4.11).
+    pub closed: mpsc::Sender<u64>,
 }
 
 /// Сколько ждать одну попытку набора по **постоянному** адресу.
@@ -590,6 +607,30 @@ impl Accepted {
         }
     }
 
+    /// Выбрасывает канал с этим номером и, если нужно, повышает объёмный.
+    ///
+    /// Отличается от [`Accepted::tidy`] тем, **откуда берётся знание**:
+    /// `tidy` спрашивает у задачи записи, жива ли она, а здесь нам уже
+    /// сказали — чтение этого канала кончилось. Разница не косметическая:
+    /// задача записи переживает смерть канала, пока ей нечего писать,
+    /// и ровно на этом связь числилась живой пять часов (0.4.11).
+    ///
+    /// Возвращает, остался ли хоть один живой канал.
+    fn drop_link(&mut self, link: u64) -> bool {
+        if self.bulk.as_ref().is_some_and(|(known, _)| *known == link) {
+            self.bulk = None;
+        }
+        if self.urgent.0 == link {
+            match self.bulk.take() {
+                Some(promoted) => self.urgent = promoted,
+                None => return false,
+            }
+        }
+        // Заодно и обычная уборка: о смерти второго канала могли
+        // не сказать, а спросить задачу записи ничего не стоит.
+        self.tidy()
+    }
+
     /// Занят ли этот номер связи одним из двух каналов.
     fn holds(&self, link: u64) -> bool {
         self.urgent.0 == link || self.bulk.as_ref().is_some_and(|(known, _)| *known == link)
@@ -765,6 +806,9 @@ pub struct BtRunner<A: Air> {
     last_heard: std::collections::BTreeMap<[u8; 32], std::time::Instant>,
     accepted_rx: mpsc::Receiver<(u64, A::Stream)>,
     accepted_tx: mpsc::Sender<(u64, A::Stream)>,
+    /// Номера принятых каналов, у которых кончилось чтение.
+    closed_rx: mpsc::Receiver<u64>,
+    closed_tx: mpsc::Sender<u64>,
     /// Нужен объявлению: маяк выводится из него.
     my_ik: [u8; 32],
     enabled: bool,
@@ -786,6 +830,9 @@ impl<A: Air> BtRunner<A> {
     ) -> Result<BtRunner<A>, TransportError> {
         let (events_tx, events_rx) = mpsc::channel(64);
         let (accepted_tx, accepted_rx) = mpsc::channel(ACCEPTED_QUEUE);
+        // Та же ёмкость, что у очереди принятых каналов: больше номеров,
+        // чем каналов, прийти не может.
+        let (closed_tx, closed_rx) = mpsc::channel(ACCEPTED_QUEUE);
         let mut runner = BtRunner {
             air,
             events_tx,
@@ -799,6 +846,8 @@ impl<A: Air> BtRunner<A> {
             last_heard: std::collections::BTreeMap::new(),
             accepted_rx,
             accepted_tx,
+            closed_rx,
+            closed_tx,
             directory: Arc::new(Mutex::new(BTreeMap::new())),
             watched: Arc::new(Mutex::new(Vec::new())),
             heard: Arc::new(Mutex::new(Vec::new())),
@@ -872,6 +921,7 @@ impl<A: Air> BtRunner<A> {
                 directory: Arc::clone(&self.directory),
                 events: self.events_tx.clone(),
                 accepted: self.accepted_tx.clone(),
+                closed: self.closed_tx.clone(),
             });
         } else {
             // Уход из эфира обязан быть немедленным: человек выключил
@@ -1460,10 +1510,53 @@ impl<A: Air> Runner for BtRunner<A> {
     }
 
     async fn next_event(&mut self) -> Option<TransportEvent> {
-        let event = self.events_rx.recv().await?;
-        // Новости о наборе разбираются по дороге: раннер обязан знать,
-        // к кому дозвониться нельзя, — от этого зависит, чем везти
-        // объёмный кадр.
+        loop {
+            // Выбор, а не ожидание одной очереди: о конце принятого канала
+            // говорит не ядро, а его собственное чтение, и ждать этой
+            // новости наравне с остальными — единственный способ узнать
+            // о ней вовремя. Разбор — у `AirSetup::closed`.
+            //
+            // `biased` отдаёт первое слово концу канала: он редок, а всё,
+            // что приедет после него, может пойти в мёртвый канал.
+            //
+            // Будущие здесь созданы и брошены внутри макроса — наружу
+            // уезжает только значение. Иначе `&mut self` в разборе ниже
+            // спорил бы с ними за заём.
+            let news = tokio::select! {
+                biased;
+                link = self.closed_rx.recv() => Tidings::Closed(link),
+                event = self.events_rx.recv() => Tidings::Event(event),
+            };
+            match news {
+                // Ядра больше нет — и раннера тоже не нужно.
+                Tidings::Event(None) => return None,
+                Tidings::Event(Some(event)) => return Some(self.note_event(event).await),
+                // Эта половина не кончается никогда: отправитель лежит
+                // в самом раннере. Пришедшее `None` означало бы, что
+                // раннер уже разобран, и возвращать тогда нечего.
+                Tidings::Closed(None) => return None,
+                Tidings::Closed(Some(link)) => {
+                    if let Some(event) = self.channel_ended(link).await {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Что пришло раннеру эфира: новость ядру или конец принятого канала.
+enum Tidings {
+    Event(Option<TransportEvent>),
+    Closed(Option<u64>),
+}
+
+impl<A: Air> BtRunner<A> {
+    /// Разбирает новость по дороге к ядру.
+    ///
+    /// Раннер обязан знать, к кому дозвониться нельзя, — от этого зависит,
+    /// чем везти объёмный кадр.
+    async fn note_event(&mut self, event: TransportEvent) -> TransportEvent {
         match &event {
             TransportEvent::Connected { peer_ik, via: Transport::Bt } => {
                 // Только про **набранную** связь. Принятая тоже объявляется
@@ -1530,7 +1623,7 @@ impl<A: Air> Runner for BtRunner<A> {
                 // нечего. Ровно та же проверка, что у удавшейся связи
                 // рядом, и по той же причине.
                 if !self.dialed.remove(peer_ik) {
-                    return Some(event);
+                    return event;
                 }
                 let vain = self.undialable.entry(*peer_ik).or_default();
                 vain.fails = vain.fails.saturating_add(1);
@@ -1566,7 +1659,62 @@ impl<A: Air> Runner for BtRunner<A> {
             }
             _ => {}
         }
-        Some(event)
+        event
+    }
+
+    /// Принятый канал кончился: чтение его больше не идёт.
+    ///
+    /// Номер в собеседника переводится **здесь**, и только здесь это
+    /// возможно: список «номер → чей» ведёт раннер, потому что имя каналу
+    /// называет ядро (§8.2), а не адрес радио.
+    ///
+    /// Возвращает новость ядру, если отвечать этому собеседнику стало
+    /// нечем. Пока жив хоть один канал — набранный или второй принятый —
+    /// новости нет: «оборвалось» при живом канале хуже молчания, по нему
+    /// §5.4 шагнёт на следующую ступень, имея работающую эту.
+    async fn channel_ended(&mut self, link: u64) -> Option<TransportEvent> {
+        // Канал мог кончиться раньше, чем ядро успело его назвать.
+        // Не беда, и говорить об этом ядру нечего: собеседника у такого
+        // канала нет даже у нас.
+        if self.unbound.remove(&link).is_some() {
+            tracing::debug!(link, "эфир: принятый канал кончился, не дождавшись имени");
+            return None;
+        }
+        let Some(peer_ik) = self.bound.iter().find(|(_, held)| held.holds(link)).map(|(ik, _)| *ik)
+        else {
+            // Номер чужой или уже убранный: `tidy` мог снять этот канал
+            // раньше по неудачной записи. Это обычное дело, а не беда.
+            tracing::debug!(link, "эфир: кончился канал, которого за нами не числится");
+            return None;
+        };
+        let alive = self.bound.get_mut(&peer_ik).is_some_and(|held| held.drop_link(link));
+        if alive {
+            tracing::info!(
+                peer = %short(&peer_ik),
+                link,
+                "эфир: принятый канал кончился — отвечаем остальными"
+            );
+            return None;
+        }
+        self.bound.remove(&peer_ik);
+        // Набранный канал живёт своей жизнью, и его смерть приезжает
+        // своей новостью (`Broke::Peer`). Пока он жив, отвечать есть чем.
+        let dialed_alive = self.links.get(&peer_ik).is_some_and(|held| !held.is_closed())
+            || self.bulk.get(&peer_ik).is_some_and(|held| !held.is_closed());
+        if dialed_alive {
+            tracing::info!(
+                peer = %short(&peer_ik),
+                link,
+                "эфир: принятые каналы кончились — отвечаем набранным"
+            );
+            return None;
+        }
+        tracing::info!(
+            peer = %short(&peer_ik),
+            link,
+            "эфир: принятые каналы кончились — отвечать больше нечем"
+        );
+        Some(TransportEvent::Disconnected { peer_ik, via: Transport::Bt })
     }
 }
 
@@ -2346,6 +2494,114 @@ mod tests {
         assert!(
             radio.opened.lock().expect("замок").is_empty(),
             "набирать было незачем: канал уже открыт и назван"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_channel_that_closed_stops_being_the_answer() {
+        // **Вторая половина той же поломки (0.4.11), и снята она
+        // с устройства.** Принятый канал умер в 21:03:36 — чтение честно
+        // сообщило `ConnectionReset`, — а узнала об этом запись в 21:04:51,
+        // через семьдесят шесть секунд: задаче записи умирать не с чего,
+        // пока писать нечего. Сообщение за это время легло в ожидание.
+        //
+        // У набранного канала то же стоило пяти часов, и там имя у чтения
+        // есть. Здесь его нет — чей канал, решает ядро (§8.2), — поэтому
+        // наружу едет номер, а переводит его раннер.
+        //
+        // Чего проверка не стережёт: что номер и правда приедет с живого
+        // радио. Здесь он подаётся руками (`air.on_closed`).
+        let (mut bt, _radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [7u8; 32];
+        air.on_incoming(77);
+        bt.execute(TransportCommand::BindLink { peer_ik, via: Transport::Bt, link: 77 })
+            .await
+            .expect("ядро назвало канал");
+
+        // Канал умирает — и больше ничего не происходит. Ни одной
+        // отправки: именно в этом и состоит проверка.
+        air.on_closed(77);
+
+        let mut broken = false;
+        for _ in 0..200 {
+            match tokio::time::timeout(Duration::from_millis(20), bt.next_event()).await {
+                Ok(Some(TransportEvent::Disconnected { peer_ik: who, via: Transport::Bt }))
+                    if who == peer_ik =>
+                {
+                    broken = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(
+            broken,
+            "конец чтения принятого канала — обрыв, и ядро обязано узнать без отправки"
+        );
+        assert!(
+            !bt.bound.contains_key(&peer_ik),
+            "мёртвый принятый канал надо забыть, иначе ответ уедет в мертвеца"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_channel_that_closed_leaves_the_other_one_answering() {
+        // Пара к предыдущей, и она про границу правила. Каналов у одного
+        // собеседника бывает два — срочный и объёмный, — и смерть одного
+        // не повод объявлять обрыв: по такой новости §5.4 шагнул бы
+        // на следующую ступень, имея работающую эту.
+        let (mut bt, radio, air) = runner_with_radio().await;
+        bt.set_enabled(true);
+        air.on_ready(0x0080);
+
+        let peer_ik = [7u8; 32];
+        air.on_incoming(77);
+        bt.execute(TransportCommand::BindLink { peer_ik, via: Transport::Bt, link: 77 })
+            .await
+            .expect("ядро назвало срочный");
+        air.on_incoming(78);
+        bt.execute(TransportCommand::BindLink { peer_ik, via: Transport::Bt, link: 78 })
+            .await
+            .expect("ядро назвало объёмный");
+
+        // Умирает объёмный. Срочный жив, и разговор обязан продолжиться
+        // им — молча, без новости об обрыве.
+        air.on_closed(78);
+
+        // Новости тут ходят и другие (связь принятая объявляется
+        // установленной, объявления слышны); проверяется отсутствие
+        // **обрыва**, а не тишина.
+        for _ in 0..15 {
+            match tokio::time::timeout(Duration::from_millis(20), bt.next_event()).await {
+                Ok(Some(TransportEvent::Disconnected { peer_ik: who, via: Transport::Bt }))
+                    if who == peer_ik =>
+                {
+                    panic!("при живом втором канале обрыва нет — новости о нём быть не должно")
+                }
+                Ok(Some(_)) | Err(_) => continue,
+                Ok(None) => break,
+            }
+        }
+        bt.execute(TransportCommand::Send {
+            peer: peer(peer_ik),
+            via: Transport::Bt,
+            frame: vec![7u8; SizeClass::S.frame_len()],
+            handoff: None,
+        })
+        .await
+        .expect("кадр принят в очередь");
+        assert!(
+            wait_for(|| {
+                let written = radio.written.lock().expect("замок");
+                written.iter().any(|(channel, _)| *channel == 77)
+            })
+            .await,
+            "ответ обязан уйти живым каналом"
         );
     }
 

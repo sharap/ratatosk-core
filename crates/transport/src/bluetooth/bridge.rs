@@ -55,7 +55,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{note_advert, short, short_record, unix_seconds, Air, AirSetup, BtAddress, DialFuture};
-use crate::link::{fnv_update, spawn_read_loop, FNV_OFFSET};
+use crate::link::{fnv_update, spawn_read_loop, Broke, FNV_OFFSET};
 use crate::runner::{TransportError, TransportEvent};
 
 /// Сколько кусков, пришедших от платформы, ждут разбора.
@@ -534,11 +534,11 @@ impl Bridge {
     }
 
     fn on_incoming(self: &Arc<Self>, channel: u64) {
-        let events = match self.setup.lock() {
-            Ok(held) => held.as_ref().map(|setup| setup.events.clone()),
+        let ways = match self.setup.lock() {
+            Ok(held) => held.as_ref().map(|setup| (setup.events.clone(), setup.closed.clone())),
             Err(_) => None,
         };
-        let Some(events) = events else {
+        let Some((events, closed)) = ways else {
             // Ступень выключена, а канал пришёл: закрываем, не читая.
             if let Some(radio) = self.radio() {
                 radio.close(channel);
@@ -555,7 +555,15 @@ impl Bridge {
             // Кадры отсюда сразу едут сборщику, и вместе с ними — номер
             // канала: ответить в него можно, а набрать телефон в ответ
             // нельзя (см. `AirSetup::accepted`).
-            spawn_read_loop(Incoming::new(rx), Transport::Bt, Some(channel), None, events);
+            // Конец чтения — это конец канала, и раннер узнаёт о нём
+            // по номеру: имени у принятого канала нет, его называет ядро.
+            spawn_read_loop(
+                Incoming::new(rx),
+                Transport::Bt,
+                Some(channel),
+                Broke::Link(closed),
+                events,
+            );
         });
         if spawned.is_none() {
             // Ступень не поднята: читать этот канал некому и незачем.
@@ -754,7 +762,7 @@ impl Bridge {
             //
             // Заводить задачу здесь можно прямо: `dial` живёт внутри
             // задачи связи, а та — в рантайме ядра. Чужих потоков тут нет.
-            spawn_read_loop(Incoming::new(rx), Transport::Bt, None, Some(peer_ik), events);
+            spawn_read_loop(Incoming::new(rx), Transport::Bt, None, Broke::Peer(peer_ik), events);
         }
         Ok(Outgoing { bridge: self, channel, alive })
     }

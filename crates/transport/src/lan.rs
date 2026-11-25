@@ -39,7 +39,7 @@ use ratatosk_proto::transport_policy::{Transport, LAN_CONNECT_TIMEOUT_MS, PRESEN
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use crate::link::{spawn_read_loop, Link};
+use crate::link::{spawn_read_loop, Broke, Link};
 use crate::runner::{Runner, TransportCommand, TransportError, TransportEvent};
 
 /// Имя mDNS-сервиса (§5.1).
@@ -585,7 +585,7 @@ fn spawn_accept_loop(listener: TcpListener, events: mpsc::Sender<TransportEvent>
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
-                    spawn_read_loop(stream, Transport::Lan, None, None, events.clone());
+                    spawn_read_loop(stream, Transport::Lan, None, Broke::Nobody, events.clone());
                 }
                 // Исчерпание дескрипторов лечится ожиданием, а не выходом
                 // из цикла: выйдя, транспорт замолчал бы навсегда.

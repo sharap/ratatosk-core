@@ -74,7 +74,7 @@ use tor_hsservice::{handle_rend_requests, HsNickname, RunningOnionService};
 // СВЕРИТЬ: идентификатор хранилища ключей.
 use tor_keymgr::KeystoreId;
 
-use crate::link::{spawn_read_loop, Link};
+use crate::link::{spawn_read_loop, Broke, Link};
 use crate::onion::SERVICE_PORT;
 use crate::runner::{PeerAddress, Runner, TransportCommand, TransportError, TransportEvent};
 
@@ -671,7 +671,9 @@ where
             // СВЕРИТЬ: конструктор `Connected`.
             let connected = tor_cell::relaycell::msg::Connected::new_empty();
             match request.accept(connected).await {
-                Ok(stream) => spawn_read_loop(stream, Transport::Onion, None, None, events.clone()),
+                Ok(stream) => {
+                    spawn_read_loop(stream, Transport::Onion, None, Broke::Nobody, events.clone())
+                }
                 Err(error) => {
                     tracing::debug!(?error, "входящий поток не принят");
                 }

@@ -1162,6 +1162,68 @@ fn a_quiet_receiver_does_not_make_the_sender_dial_a_busy_channel() {
     );
 }
 
+#[test]
+fn a_quiet_receiver_is_still_watched_while_the_session_is_being_set_up() {
+    // **Поломка моей же правки, найденная на устройстве через час.**
+    //
+    // Срок тишины спрашивал дорогу коротко — «есть годная с живой
+    // сессией или нет», — и на `нет` возвращался молча и без нового
+    // срока. А `нет` приходит и тогда, когда сессия **заводится**:
+    // состояние заведомо временное. На стенде вышло так: pinephone
+    // спросил куски, канал оборвался, рукопожатие пошло заново — и
+    // цепочка сроков умерла навсегда, не сказав ни слова. То есть
+    // правка про «незаконченную отдачу» не срабатывала ровно в том
+    // случае, ради которого делалась.
+    //
+    // Проверяется здесь именно это: сессии нет, рукопожатие идёт —
+    // набора быть не должно, а срок обязан взвестись заново.
+    use ratatosk_proto::Transport;
+
+    let (mut alice, alice_blobs) = node_with_blobs(1, "alice");
+    let (mut bob, _bob_blobs) = node_with_blobs(2, "bob");
+    introduce(&mut alice, &mut bob);
+    for who in [&mut alice, &mut bob] {
+        who.step(900, Input::Command(Command::SetAutoAcceptBytes(Some(files::MAX_FILE_BYTES))))
+            .unwrap();
+    }
+    air_only(&mut bob, alice.own_card().ik);
+    let mut outgoing = air_only(&mut alice, bob.own_card().ik);
+    outgoing.extend(send_text(&mut alice, &bob, 1_000, "привет"));
+    pump(&mut alice, &mut bob, 1_000, outgoing);
+
+    let token = transfer_left_hanging(&mut alice, &mut bob, &alice_blobs, "/tmp/dolgiy.bin");
+
+    // **Дорога меняется на ту, где сессии нет.** Так выглядит и обрыв
+    // с перерукопожатием, и обычное дело: §5.4 выбирает локальную сеть
+    // раньше эфира, а сессия на ней своя и её ещё нет.
+    alice
+        .step(
+            400_000,
+            Input::Command(Command::SetTransportEnabled {
+                transport: Transport::Lan,
+                enabled: true,
+            }),
+        )
+        .expect("LAN включается");
+    alice.step(400_100, Input::TransportReady { transport: Transport::Lan }).expect("LAN поднялся");
+    alice.step(400_200, Input::SeenOnLan { peer_ik: bob.own_card().ik }).expect("маяк LAN услышан");
+    // И эфир перестаёт работать: иначе дорога по нему годна и с живой
+    // сессией, а проверяется именно случай «дорога есть, сессии нет».
+    alice
+        .step(400_300, Input::TransportLost { transport: Transport::Bt })
+        .expect("эфир перестал работать");
+
+    let effects = alice.step(500_000, Input::Timer { token }).expect("срок тишины");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Connect { .. })),
+        "поверх рукопожатия набирать незачем: {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SetTimer { .. })),
+        "но срок обязан взвестись заново — иначе цепочка умирает навсегда: {effects:?}"
+    );
+}
+
 /// Кадры, ушедшие эфиром, — в том порядке, в каком ядро их отдало.
 fn air_sends(effects: &[Effect]) -> Vec<Vec<u8>> {
     effects

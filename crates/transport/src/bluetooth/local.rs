@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bluer::adv::{Advertisement, Type as AdvType};
+use bluer::adv::{Advertisement, AdvertisementHandle, Type as AdvType};
 use bluer::l2cap::{Socket as L2capSocket, SocketAddr as L2capAddr, Stream, StreamListener};
 use bluer::{
     Adapter, AdapterEvent, AdapterProperty, Address, AddressType, DiscoveryFilter,
@@ -183,6 +183,51 @@ const ADVERT_INTERVAL: Duration = Duration::from_millis(250);
 /// собеседник примет (§5.1 проверяет −1, 0, +1), а вот запись
 /// из будущего при расхождении часов — не обязательно.
 const SLOT_MARGIN: Duration = Duration::from_secs(2);
+
+/// Сколько ждать между снятием прежнего объявления и новым.
+///
+/// # Снятие объявления асинхронно, и это не наша выдумка
+///
+/// `drop` у ручки объявления в `bluer` только роняет `oneshot::Sender`;
+/// само снятие делает **фоновая задача**, и `UnregisterAdvertisement`
+/// уезжает по D-Bus уже после того, как `drop` вернулся. Прочитано
+/// в `bluer-0.17.4`, `src/adv.rs`: в `Drop` там стоит пустое тело
+/// с пояснением «required for drop order».
+///
+/// Значит новая регистрация идёт **наперегонки** со снятием прежней.
+/// У контроллера с расширенным объявлением мест много, и гонка
+/// не видна. У контроллера без него место одно, и новая регистрация
+/// в этой гонке отказывает.
+///
+/// # Что это стоило на устройстве
+///
+/// PinePhone (RTL8723CS, BT 4.2): первая регистрация после запуска
+/// удавалась всегда, а **каждый** поворот слота — ни разу.
+///
+/// ```text
+/// 09:38:51  эфир: объявились slot=1995110 ключ=a672eede
+/// 09:45:02  эфир не поднялся error=объявление: Failed to register
+///             advertisement
+/// 09:45:02  ступень перестала работать — §5.4 её больше не выбирает
+/// ```
+///
+/// То есть эфир на этом устройстве жил ровно до первой границы слота —
+/// от шести минут до четверти часа, — и дальше лежал до перезапуска
+/// приложения. Вчера я списал это на сброс адаптера; сброса здесь
+/// не было никакого, только обычный поворот слота.
+///
+/// Полсекунды взяты с запасом к одному обмену по D-Bus. Цена — щель
+/// в объявлении раз в четверть часа; сверх паузы стоит повтор
+/// (см. `announce`), потому что срок снятия — чужой, а не наш.
+const ADVERT_SETTLE: Duration = Duration::from_millis(500);
+
+/// Сколько раз пробовать зарегистрировать объявление.
+///
+/// Пауза `ADVERT_SETTLE` убирает гонку в обычном случае, а повтор —
+/// в необычном: срок снятия принадлежит `bluetoothd`, и обещать за него
+/// мы не вправе. Два — потому что третий уже означал бы не гонку,
+/// а отказ по другой причине, и разбирать его надо не здесь.
+const ADVERT_TRIES: usize = 2;
 
 /// Перо, которое не пишет пакетов больше безопасного.
 ///
@@ -821,7 +866,7 @@ async fn advertise_loop(
         let payload =
             advert::payload(&record, psm).map_err(|e| refused("нагрузка объявления", e))?;
 
-        let handle = match adapter.advertise(announcement(&payload, interval_taken)).await {
+        let handle = match announce(&adapter, announcement(&payload, interval_taken)).await {
             Ok(handle) => handle,
             Err(error) if interval_taken => {
                 // Платформа сказала «умею», а не вышло. Отступаем — но
@@ -834,8 +879,7 @@ async fn advertise_loop(
                      объявляемся умолчанием, и набирать нас будут дольше (0.4.3)"
                 );
                 interval_taken = false;
-                adapter
-                    .advertise(announcement(&payload, false))
+                announce(&adapter, announcement(&payload, false))
                     .await
                     .map_err(|e| refused("объявление", e))?
             }
@@ -875,7 +919,49 @@ async fn advertise_loop(
         // одного устройства в эфире — это два разных маяка от одного
         // радио, то есть подсказка тому, кто их сличает.
         drop(handle);
+        // **И пауза, потому что снятие асинхронно.** Разбор —
+        // у `ADVERT_SETTLE`; коротко: `drop` возвращается раньше, чем
+        // `bluetoothd` снял объявление, и новая регистрация шла
+        // наперегонки со снятием прежней. На контроллере с одним местом
+        // под объявление эта гонка убивала ступень на каждом повороте
+        // слота.
+        tokio::time::sleep(ADVERT_SETTLE).await;
     }
+}
+
+/// Регистрирует объявление, пересиливая гонку со снятием прежнего.
+///
+/// Отдельной функцией ради одного: **повтор тут про гонку, а не про
+/// надежду**. Срок снятия принадлежит `bluetoothd` (разбор —
+/// у `ADVERT_SETTLE`), и обещать за него мы не вправе; пауза перед
+/// повтором — та же, что после снятия.
+async fn announce(
+    adapter: &Adapter,
+    advertisement: Advertisement,
+) -> bluer::Result<AdvertisementHandle> {
+    let mut last = None;
+    for attempt in 0..ADVERT_TRIES {
+        if attempt > 0 {
+            tokio::time::sleep(ADVERT_SETTLE).await;
+        }
+        match adapter.advertise(advertisement.clone()).await {
+            Ok(handle) => {
+                if attempt > 0 {
+                    // Вслух: по этой строке видно, что гонка настоящая
+                    // и что пауза перед ней оказалась короткой. Молчи
+                    // она — следующий разбор начался бы с догадки.
+                    tracing::info!(
+                        попытка = attempt + 1,
+                        "эфир: объявление зарегистрировалось не с первого раза"
+                    );
+                }
+                return Ok(handle);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    // Попыток хотя бы одна, так что отказ здесь есть всегда.
+    Err(last.expect("хотя бы одна попытка объявления"))
 }
 
 /// Собирает объявление: нагрузка, тип, интервал.

@@ -65,8 +65,9 @@ async fn ask(tor: &crate::onion::TorHandle) -> Result<Vec<u8>, MailServerListErr
     // но ещё не поднявшийся Tor дал бы отказ там, где прямой запрос
     // прошёл бы.
     let via_tor = tor.is_up();
-    let mut stream =
-        crate::tls::connect(mail::MAIL_SERVER_LIST_HOST, 443, via_tor, tor).await.map_err(|_| SILENT)?;
+    let mut stream = crate::tls::connect(mail::MAIL_SERVER_LIST_HOST, 443, via_tor, tor)
+        .await
+        .map_err(|_| SILENT)?;
     let request = http::get(mail::MAIL_SERVER_LIST_HOST, mail::MAIL_SERVER_LIST_PATH, None, ACCEPT);
     stream.write_all(request.as_bytes()).await.map_err(|_| SILENT)?;
     stream.flush().await.map_err(|_| SILENT)?;
@@ -102,7 +103,8 @@ mod tests {
 
     #[test]
     fn the_request_names_the_source_and_nothing_about_us() {
-        let request = http::get(mail::MAIL_SERVER_LIST_HOST, mail::MAIL_SERVER_LIST_PATH, None, ACCEPT);
+        let request =
+            http::get(mail::MAIL_SERVER_LIST_HOST, mail::MAIL_SERVER_LIST_PATH, None, ACCEPT);
         assert!(request.starts_with("GET /relays HTTP/1.1\r\n"), "{request}");
         assert!(request.contains("Host: chatmail.at\r\n"), "{request}");
         assert!(request.contains("Accept: text/html\r\n"), "{request}");

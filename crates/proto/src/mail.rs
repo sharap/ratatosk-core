@@ -622,7 +622,9 @@ pub fn server_host_ok(host: &str) -> bool {
         && !host.starts_with(['.', '-'])
         && !host.ends_with(['.', '-'])
         && !host.contains("..")
-        && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
 }
 
 /// Текст пункта без разметки: теги сняты, пробелы и переводы строк сведены
@@ -698,11 +700,18 @@ is hosted in Falkenstein, Germany and is geared towards German speaking users</p
         );
         // Два сервера одного пункта делят пояснение; сущность раскрыта.
         assert_eq!(servers[2].note, servers[3].note);
-        assert!(servers[2].note.ends_with("are hosted in Italy & run by one operator"), "{}", servers[2].note);
+        assert!(
+            servers[2].note.ends_with("are hosted in Italy & run by one operator"),
+            "{}",
+            servers[2].note
+        );
         assert_eq!(servers[0].account_url(), "https://nine.testrun.org/new");
         // `<link>` в шапке — не пункт списка: пояснение к первому серверу
         // начинается с него самого, а не с шапки страницы.
-        assert_eq!(servers[0].note, "nine.testrun.org is the default onboarding relay for many chatmail apps");
+        assert_eq!(
+            servers[0].note,
+            "nine.testrun.org is the default onboarding relay for many chatmail apps"
+        );
     }
 
     #[test]
@@ -718,7 +727,10 @@ is hosted in Falkenstein, Germany and is geared towards German speaking users</p
     fn a_page_without_servers_gives_nothing() {
         assert!(mail_servers_from_page("").is_empty());
         assert!(mail_servers_from_page("<html><body><p>503</p></body></html>").is_empty());
-        assert!(mail_servers_from_page("<li>без ссылки</li><li><a href=\"http://plain.example/\">x</a></li>").is_empty());
+        assert!(mail_servers_from_page(
+            "<li>без ссылки</li><li><a href=\"http://plain.example/\">x</a></li>"
+        )
+        .is_empty());
         // Оборванная страница не роняет разбор.
         assert_eq!(mail_servers_from_page("<li><a href=\"https://a.example/\">a").len(), 1);
         assert!(mail_servers_from_page("<li><a href=\"https://a.example").is_empty());
@@ -747,9 +759,11 @@ is hosted in Falkenstein, Germany and is geared towards German speaking users</p
         assert!(server_host_ok("chika.aangat.lahat.computer"));
         assert!(server_host_ok("e2ee.wang"));
         // И в разборе: негодное имя сервером не становится.
-        let page = "<li><a href=\"https://Evil.Example/\">x</a><a href=\"https://a.example:444/\">y</a>\
+        let page =
+            "<li><a href=\"https://Evil.Example/\">x</a><a href=\"https://a.example:444/\">y</a>\
                     <a href=\"https://good.example/\">z</a></li>";
-        let hosts: Vec<String> = mail_servers_from_page(page).into_iter().map(|server| server.host).collect();
+        let hosts: Vec<String> =
+            mail_servers_from_page(page).into_iter().map(|server| server.host).collect();
         assert_eq!(hosts, ["good.example"]);
     }
 
@@ -765,8 +779,9 @@ is hosted in Falkenstein, Germany and is geared towards German speaking users</p
 
     #[test]
     fn the_list_is_bounded() {
-        let page: String =
-            (0..MAX_LIST_SERVERS + 10).map(|n| format!("<li><a href=\"https://s{n}.example/\">s</a></li>")).collect();
+        let page: String = (0..MAX_LIST_SERVERS + 10)
+            .map(|n| format!("<li><a href=\"https://s{n}.example/\">s</a></li>"))
+            .collect();
         assert_eq!(mail_servers_from_page(&page).len(), MAX_LIST_SERVERS);
     }
 }

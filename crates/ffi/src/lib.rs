@@ -633,6 +633,13 @@ pub enum FfiFileWaitReason {
     /// не ускоряет. Показывать такой файл зависшим нельзя — он движется,
     /// просто не сейчас.
     Queued,
+    /// Эта передача замолчала и сама уступила ступень.
+    ///
+    /// Не то же, что [`FfiFileWaitReason::Queued`]: там ступень занял
+    /// кто-то другой, а здесь её занимал этот файл и отпустил, не дождав
+    /// кусков. Очередь при этом бывает пуста, и текст про «другие файлы»
+    /// был бы неправдой.
+    Stalled,
 }
 
 /// Переводит причину наружу.
@@ -646,6 +653,7 @@ const fn wait_reason_of(reason: ratatosk_proto::files::FileWait) -> FfiFileWaitR
         FileWait::MailboxFull => FfiFileWaitReason::MailboxFull,
         FileWait::Silent => FfiFileWaitReason::Silent,
         FileWait::Queued => FfiFileWaitReason::Queued,
+        FileWait::Stalled => FfiFileWaitReason::Stalled,
     }
 }
 
@@ -660,6 +668,7 @@ const fn wait_reason_back(reason: FfiFileWaitReason) -> ratatosk_proto::files::F
         FfiFileWaitReason::MailboxFull => FileWait::MailboxFull,
         FfiFileWaitReason::Silent => FileWait::Silent,
         FfiFileWaitReason::Queued => FileWait::Queued,
+        FfiFileWaitReason::Stalled => FileWait::Stalled,
     }
 }
 

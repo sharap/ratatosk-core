@@ -6426,6 +6426,64 @@ fn a_silent_sender_does_not_block_the_whole_receiving_side() {
 }
 
 #[test]
+fn a_transfer_that_yielded_the_rung_itself_is_not_called_a_queue() {
+    // **Что человеку сказали, а не только что сделал движок.** Саму
+    // уступку ступени стерегут две проверки ниже; здесь стережётся
+    // текст §14.
+    //
+    // Уступив ступень по `YIELD_AFTER_STALLS`, передача встаёт в очередь
+    // — и прежде ей выдавалась та же причина, что файлу, стоящему
+    // за **чужой** передачей: `Queued`, то есть «Сейчас передаются
+    // другие файлы». В этом стенде других файлов нет вовсе, и очередь,
+    // в которую она встала, пуста: ступень вернётся ей же. Человек
+    // по такому тексту ищет вторую передачу, которой не существует.
+    //
+    // Чего эта проверка **не** стережёт: что уступка случилась вовремя
+    // (это ниже), что текст читается хорошо, и что клиент его рисует.
+    // Только то, что причина названа своя.
+    let mut stand = Stand::without_mail(0x574e, 3);
+    stand.air_only();
+    stand.accept_everything(A);
+
+    let air = ratatosk_proto::files::chunk_bytes_for(Transport::Bt);
+    let big: Vec<u8> = (0..air * 40 + 5).map(|i| (i % 251) as u8).collect();
+
+    // Единственная передача в стенде — и она замолкает на полпути.
+    stand.send_file(C, stand.chat_with(A), "propal.bin", &big);
+    stand.run_for(1_500);
+    let source = stand.sim.node(C).home.source().join("propal.bin");
+    std::fs::remove_file(&source).expect("исходник убирается");
+
+    // **Ждём с запасом, а не по базовому сроку.** Считать уступку
+    // в `YIELD_AFTER_STALLS` базовых сроков можно только тогда, когда
+    // кто-то стоит в очереди: правило «пока ступени ждут, срок равен
+    // базовому» работает от очереди. Здесь очередь пуста нарочно —
+    // значит срок удваивается, и первая проверка этого теста считала
+    // неверно. Десять минут заведомо больше двух сроков с удвоением.
+    stand.run_for(10 * 60 * 1000);
+
+    let reasons: Vec<_> = stand
+        .sim
+        .node(A)
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::FileWaitsForChannel { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        reasons.contains(&ratatosk_proto::files::FileWait::Stalled),
+        "уступившая ступень передача обязана назвать свою причину, сказано: {reasons:?}"
+    );
+    assert!(
+        !reasons.contains(&ratatosk_proto::files::FileWait::Queued),
+        "других файлов в стенде нет — винить их нечем, сказано: {reasons:?}"
+    );
+}
+
+#[test]
 fn a_stalled_transfer_does_not_hold_the_rung_longer_and_longer() {
     // **Уступка сняла запирание, но не поделила ступень честно.**
     //

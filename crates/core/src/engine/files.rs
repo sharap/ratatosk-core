@@ -2514,9 +2514,14 @@ impl<S: Store> Engine<S> {
             };
             self.leave_lane(&file_id);
             self.enqueue_file(file_id, lane);
+            // **Причина своя, а не `Queued`.** Очередь, в которую файл
+            // сейчас встал, бывает пуста: тогда `wake_queued_files`
+            // вернёт ступень ему же. Сказать в этот миг «сейчас
+            // передаются другие файлы» — значит послать человека искать
+            // вторую передачу, которой нет.
             effects.push(Effect::Notify(Event::FileWaitsForChannel {
                 file_id,
-                reason: FileWait::Queued,
+                reason: FileWait::Stalled,
             }));
             return Ok(effects);
         }

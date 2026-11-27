@@ -42,11 +42,11 @@ use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
 use ratatosk_core::engine::SelfAddresses;
-use ratatosk_core::{Command, Effect, Engine, Event, Input, OsEntropy};
+use ratatosk_core::{Command, Effect, Engine, Event, Input, OsEntropy, OutgoingFile};
 use ratatosk_crypto::Identity;
 use ratatosk_proto::receipts::{advance, DeliveryStatus};
 use ratatosk_proto::Transport;
-use ratatosk_store::{FsBlobs, SqliteStore, Store};
+use ratatosk_store::{Blobs, FsBlobs, SqliteStore, Store};
 use zeroize::Zeroizing;
 
 type Node = Engine<SqliteStore>;
@@ -182,6 +182,20 @@ enum Act {
     MailUp,
     /// Первый пишет тому, к кому путь не откроется никогда.
     WriteNowhere,
+    /// Первый отправляет файл: без него уборке сирот нечего стеречь.
+    SendFile,
+    /// Первый удаляет у себя самое старое видимое сообщение — надгробие.
+    Delete,
+    /// Часы прыгают вперёд на столько часов (до сорока пяти суток).
+    ///
+    /// Без прыжка уборка не наступает вовсе: её расписание требует
+    /// шести часов между полными прогонами (`Schedule`), и свойство
+    /// без этого проверяло бы «уборка, которой не было, ничего
+    /// не испортила».
+    Skip(u32),
+    /// Уборка (§12) плюс выметание сирот — то, что в живом приложении
+    /// делает драйвер после каждого шага.
+    Tidy,
     /// Первый удаляет знакомого.
     ///
     /// К `Undeliverable` это **не** ведёт, и проверка алфавита это
@@ -208,6 +222,10 @@ fn acts() -> impl Strategy<Value = Vec<Act>> {
         2 => Just(Act::Plug),
         2 => Just(Act::MailDown),
         2 => Just(Act::MailUp),
+        3 => Just(Act::SendFile),
+        2 => Just(Act::Delete),
+        4 => (1u32..1_080).prop_map(Act::Skip),
+        5 => Just(Act::Tidy),
         1 => Just(Act::Forget),
     ];
     prop::collection::vec(act, 1..32)
@@ -309,11 +327,91 @@ struct Pair {
     announced: BTreeMap<[u8; 16], DeliveryStatus>,
     /// Всё, через что статусы прошли: по этому списку проверяется алфавит.
     ladder: BTreeSet<DeliveryStatus>,
+    /// Часы: двигаются и шагами, и прыжками `Skip`.
+    clock_ms: u64,
+    /// Каталог, из которого первый отправляет файлы.
+    source: PathBuf,
+    /// Второй взгляд на те же куски — тестовый, рядом с ядровым.
+    blobs_a: FsBlobs,
+    /// И у получателя: куски лежат именно у него.
+    blobs_b: FsBlobs,
+    /// Сколько строк убрала уборка за весь скрипт: ноль означает, что
+    /// свойство ничего не проверило.
+    tidied_rows: u64,
+    /// Сколько раз уборка шла при живом файле, на который ссылается
+    /// видимое сообщение.
+    tidied_with_files: usize,
+    /// И сколько раз — при живом надгробии.
+    tombstones: usize,
+}
+
+/// Снимок того, что человеку показывают — у одного узла.
+///
+/// Нарочно **не** вся база: уборка §12 и обязана выбрасывать служебное —
+/// пропущенные ключи, окно дедупликации, anti-replay, старые надгробия.
+/// Стережётся то, что видно на экране: сообщения чатов и куски файлов,
+/// на которые ссылается хоть одно такое сообщение.
+/// Что видно про одно сообщение: тело, ответ-на, статус.
+///
+/// Псевдонимом, а не прямо в поле: clippy зовёт разводить составные
+/// типы, и зовёт справедливо — тройку в углу `BTreeMap` не прочитать.
+type Shown = (Vec<u8>, Option<[u8; 16]>, Option<u8>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct Half {
+    /// Номер сообщения → то, что про него видно.
+    messages: BTreeMap<[u8; 16], Shown>,
+    /// Файл → его куски, как они лежат на диске.
+    files: BTreeMap<[u8; 16], Vec<(u64, u64)>>,
+}
+
+/// Снимок обеих сторон.
+///
+/// Обеих — потому что куски лежат у **получателя**. Отправитель читает
+/// исходник с диска и своих кусков не держит: у него в снимке файл есть,
+/// а список кусков пуст. Настоящий же страх, записанный в `files.rs`, —
+/// что уборка сирот сотрёт **полученное** вложение, то есть то, что
+/// человек уже скачал. Стереги только отправителя — эта половина
+/// осталась бы непроверенной.
+#[derive(Debug, PartialEq, Eq)]
+struct View {
+    alice: Half,
+    bob: Half,
+}
+
+/// Снимок одного узла по названным чатам.
+fn half_of(node: &Node, blobs: &FsBlobs, chats: &[[u8; 16]]) -> Half {
+    let mut messages = BTreeMap::new();
+    for chat in chats {
+        for message in node.store().messages(chat, 500, None).expect("чтение чата") {
+            messages.insert(message.msg_id, (message.body, message.reply_to, message.status));
+        }
+    }
+    // Файл показывается вместе с сообщением, и только с ним: кусок,
+    // на который не ссылается ни одно видимое сообщение, уборка вправе
+    // вымести — он и есть сирота.
+    let mut files = BTreeMap::new();
+    for file_id in node.store().all_file_ids().expect("список файлов") {
+        let mentioned = node
+            .store()
+            .messages_of_file(&file_id)
+            .expect("ссылки на файл")
+            .into_iter()
+            .any(|msg_id| messages.contains_key(&msg_id));
+        if mentioned {
+            files.insert(file_id, blobs.stored_chunks(&file_id).expect("куски"));
+        }
+    }
+    Half { messages, files }
 }
 
 impl Pair {
     fn new() -> Pair {
         let (home_a, home_b) = (fresh_home(1), fresh_home(2));
+        let source = home_a.join("source");
+        std::fs::create_dir_all(&source).expect("каталог исходников");
+        let blobs_dir = home_a.join("blobs");
+        let home_b_blobs = home_b.join("blobs");
         let mut alice = open(1, &home_a);
         let mut bob = open(2, &home_b);
         let alice_ik = alice.own_card().ik;
@@ -364,6 +462,22 @@ impl Pair {
             seen: BTreeMap::new(),
             announced: BTreeMap::new(),
             ladder: BTreeSet::new(),
+            clock_ms: 1_000,
+            source,
+            blobs_a: FsBlobs::new(blobs_dir),
+            blobs_b: FsBlobs::new(home_b_blobs),
+            tidied_rows: 0,
+            tidied_with_files: 0,
+            tombstones: 0,
+        }
+    }
+
+    /// Что человеку показывают — у обоих, из базы и с диска.
+    fn view(&self) -> View {
+        let chats = [self.chat, self.back, self.nowhere];
+        View {
+            alice: half_of(&self.alice, &self.blobs_a, &chats),
+            bob: half_of(&self.bob, &self.blobs_b, &chats),
         }
     }
 
@@ -372,7 +486,10 @@ impl Pair {
     /// Отказ шага — законный исход, а не падение: после `Forget` писать
     /// и правда некому, и лестница обязана держаться и в этом случае.
     fn play(&mut self, number: usize, act: Act) -> Result<(), String> {
-        let now_ms = 1_000 + number as u64 * 1_000;
+        // Часы живут у пары, а не считаются от номера шага: `Skip`
+        // двигает их прыжком, и уборка наступает только от этого.
+        self.clock_ms += 1_000;
+        let now_ms = self.clock_ms;
         // Статусы своих сообщений объявляет первый узел; что говорит
         // второй — про свои, и к этой лестнице не относится.
         let mut said: Vec<([u8; 16], DeliveryStatus)> = Vec::new();
@@ -505,6 +622,86 @@ impl Pair {
                 let ready = Input::TransportReady { transport: Transport::Mail };
                 if let Ok(effects) = self.alice.step(now_ms, ready) {
                     sort_out(effects, &mut self.a, &mut said);
+                }
+            }
+            Act::SendFile => {
+                // Файл кладётся на диск: ядро читает исходник сам.
+                let name = format!("gostinec-{number}.bin");
+                let path = self.source.join(&name);
+                let body: Vec<u8> = (0..4_096u32).map(|i| (i % 251) as u8).collect();
+                std::fs::write(&path, &body).expect("исходник файла");
+                let command = Command::SendFiles {
+                    chat: self.chat,
+                    files: vec![OutgoingFile { path, preview: None }],
+                    text: format!("файл {number}"),
+                };
+                if let Ok(effects) = self.alice.step(now_ms, Input::Command(command)) {
+                    sort_out(effects, &mut self.a, &mut said);
+                }
+            }
+            Act::Delete => {
+                // Окно читается целиком: запрос отдаёт **хвост** чата,
+                // и с `limit = 1` первым оказалось бы самое свежее.
+                let inbox = self.alice.store().messages(&self.chat, 500, None);
+                if let Ok(messages) = inbox {
+                    if let Some(oldest) = messages.first() {
+                        let command = Command::DeleteMessages {
+                            chat: self.chat,
+                            msg_ids: vec![oldest.msg_id],
+                        };
+                        if let Ok(effects) = self.alice.step(now_ms, Input::Command(command)) {
+                            sort_out(effects, &mut self.a, &mut said);
+                            self.tombstones += 1;
+                        }
+                    }
+                }
+            }
+            Act::Skip(hours) => {
+                self.clock_ms += u64::from(hours) * 60 * 60 * 1_000;
+            }
+            Act::Tidy => {
+                // **Снимок до и после, и сличение целиком.** Уборка §12
+                // вправе выбрасывать служебное, но не то, что видно
+                // на экране.
+                let before = self.view();
+                // Считается живой файл **с кусками**: пустой список
+                // у отправителя покрытием не считается.
+                let had_files = before
+                    .alice
+                    .files
+                    .values()
+                    .chain(before.bob.files.values())
+                    .any(|chunks| !chunks.is_empty());
+                // Прибираются **оба**: в живом приложении это делает
+                // драйвер на каждом устройстве, а куски лежат у получателя.
+                let rows = self.alice.compact_if_due(self.clock_ms).expect("уборка")
+                    + self.bob.compact_if_due(self.clock_ms).expect("уборка");
+                let swept = self.alice.sweep_orphan_files().expect("выметание сирот");
+                let swept_back = self.bob.sweep_orphan_files().expect("выметание сирот");
+                let after = self.view();
+                self.tidied_rows += rows;
+                if had_files {
+                    self.tidied_with_files += 1;
+                }
+                if before.alice.messages != after.alice.messages
+                    || before.bob.messages != after.bob.messages
+                {
+                    return Err(format!(
+                        "шаг {number}: уборка тронула показываемое. Было сообщений {}/{}, \
+                         стало {}/{}; убрано строк {rows}, файлов выметено {}",
+                        before.alice.messages.len(),
+                        before.bob.messages.len(),
+                        after.alice.messages.len(),
+                        after.bob.messages.len(),
+                        swept.files + swept_back.files
+                    ));
+                }
+                if before.alice.files != after.alice.files || before.bob.files != after.bob.files {
+                    return Err(format!(
+                        "шаг {number}: уборка вымела куски файла, на который ссылается \
+                         видимое сообщение. Было {:?} и {:?}, стало {:?} и {:?}",
+                        before.alice.files, before.bob.files, after.alice.files, after.bob.files
+                    ));
                 }
             }
             Act::Forget => {
@@ -700,6 +897,54 @@ fn a_read_receipt_overtaking_the_delivered_one_does_not_push_the_status_back() {
     pair.tidy();
 }
 
+/// Скрипт, который заведомо доводит уборку до работы.
+///
+/// Руками, как и лестница статусов: свойство ниже зелено ровно
+/// настолько, насколько его скрипты доводят уборку до чего-то, что
+/// она **может** выбросить. Уборка, которой не было, ничего не портит.
+fn whole_tidy() -> Vec<Act> {
+    let mut script = vec![Act::SendFile];
+    // Файл уезжает: куски запечатываются и ложатся на диск.
+    for _ in 0..12 {
+        script.push(Act::Deliver(0));
+    }
+    // Тридцать один день: истекают окно дедупликации и anti-replay (§9.2,
+    // §8.3) — тридцать суток у обоих. Без этого прыжка уборка идёт
+    // и не находит ничего.
+    script.push(Act::Skip(31 * 24));
+    script.push(Act::Tidy);
+    // Теперь надгробие: удаляем самое старое — то самое сообщение с файлом.
+    script.push(Act::Write);
+    script.push(Act::Delete);
+    script.push(Act::Skip(48));
+    script.push(Act::Tidy);
+    script
+}
+
+#[test]
+fn the_alphabet_makes_the_tidying_actually_tidy() {
+    // **Вторая проверка на проверку.** Та же цена, что у лестницы
+    // статусов: свойство «уборка не трогает показываемого» зелено
+    // на пустом месте, если уборка не наступила или ничего не нашла.
+    //
+    // Чего она не стережёт: что до этого доходят **случайные** скрипты.
+    // Стережётся проходимость алфавита.
+    let mut pair = Pair::new();
+    for (number, act) in whole_tidy().iter().enumerate() {
+        pair.play(number, *act).expect("уборка не трогает показываемого");
+    }
+    assert!(
+        pair.tidied_rows > 0,
+        "уборка не выбросила ни одной строки — свойство ничего не проверило"
+    );
+    assert!(
+        pair.tidied_with_files > 0,
+        "ни одной уборки при живом файле, на который ссылается видимое сообщение"
+    );
+    assert!(pair.tombstones > 0, "ни одного надгробия: уборке надгробий нечего схлопывать");
+    pair.tidy();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         // Случаев немного нарочно: каждый открывает две базы SQLite
@@ -742,6 +987,55 @@ proptest! {
         let mut pair = Pair::new();
         for (number, act) in script.iter().enumerate() {
             if let Err(trouble) = pair.play(number, *act) {
+                return Err(TestCaseError::fail(trouble));
+            }
+        }
+        pair.tidy();
+    }
+
+    /// Уборка (§12) не трогает того, что показывается.
+    ///
+    /// # Что именно стережётся
+    ///
+    /// Уборка обязана выбрасывать служебное — пропущенные ключи, окно
+    /// дедупликации, anti-replay, надгробия старше девяноста суток,
+    /// причинные ссылки за окном, — и обязана **не** выбрасывать то, что
+    /// видно на экране. Между этими двумя списками и живёт ошибка:
+    /// в `files.rs` прямо записан страх, что «уборка сирот однажды сотрёт
+    /// отправленный файл», и сирота от нужного файла отличается
+    /// единственной ссылкой из сообщения.
+    ///
+    /// Снимок берётся до и после **каждой** уборки и сличается целиком:
+    /// сообщения трёх чатов (номер, тело, ответ-на, статус) и куски
+    /// файлов, на которые ссылается хоть одно видимое сообщение.
+    ///
+    /// # Чего не стережёт
+    ///
+    /// *Что уборка убирает.* Свойство запрещает лишнее и не требует
+    /// нужного: уборка, не делающая ничего, его проходит. Что она
+    /// доходит до работы, держит `the_alphabet_makes_the_tidying_actually_tidy`.
+    ///
+    /// *Надгробий.* Удалённое сообщение из `messages()` не возвращается
+    /// (`tombstone_ms IS NULL` в запросе), в снимок не попадает,
+    /// и свёртка надгробий через девяносто суток свойству невидима.
+    /// Поэтому прыжки часов здесь любого размера.
+    ///
+    /// *Чужой половины.* Смотрится база первого узла.
+    #[test]
+    fn a_tidying_never_touches_what_is_shown(script in acts()) {
+        let mut pair = Pair::new();
+        for (number, act) in script.iter().enumerate() {
+            if let Err(trouble) = pair.play(number, *act) {
+                return Err(TestCaseError::fail(trouble));
+            }
+        }
+        // **Уборка в конце — обязательна.** Случайный скрипт может
+        // не позвать её ни разу, и тогда случай проверил бы только
+        // лестницу статусов. Тридцать один день — чтобы уборке было
+        // что найти.
+        let last = script.len();
+        for (number, act) in [Act::Skip(31 * 24), Act::Tidy].iter().enumerate() {
+            if let Err(trouble) = pair.play(last + number, *act) {
                 return Err(TestCaseError::fail(trouble));
             }
         }

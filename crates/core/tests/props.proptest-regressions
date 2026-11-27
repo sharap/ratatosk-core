@@ -4,4 +4,17 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+#
+# Эти сиды найдены на **нарочных** поломках — так в этом дереве
+# проверяется каждая проверка (`CLAUDE.md`): лестница §9.4 обойдена
+# в `note_status`, уборка надгробий сносит живые строки, сиротой
+# считается любой файл. Настоящих ошибок такого рода в дереве
+# не было; строки оставлены потому, что это кратчайшие скрипты,
+# проходящие по опасным местам — переставленные квитанции, уборка
+# при живом файле, прыжок часов, — и прогонять их первыми дешевле
+# всего. Выбросить их можно без потери: свойство найдёт эти пути
+# заново, только не сразу.
 cc da54ae890f47ef7504e3bec69c5a3665792445ed0381d0524b9ba0be02e9cbf0 # shrinks to script = [Write, Deliver(0), Deliver(0), Deliver(0), Read, Deliver(5), Deliver(0)]
+cc dfe21bc54df80b366a7527dfe1093cc1357bff284bb4fd0811d631ae77ed3e24 # shrinks to script = [Write, Skip(853), Skip(563)]
+cc 77110a3091a5930a6fdfd1365b69c1e4c286e379a493b0abf34340428d4c9911 # shrinks to script = [SendFile, Tidy]
+cc 6304cddd7792e6f2a6a7a26fec780277ed839200ed901b5fc0db6987f4e6e789 # shrinks to script = [SendFile, Skip(1)]

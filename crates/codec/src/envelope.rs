@@ -12,6 +12,10 @@
 //!   8: ? {1: bytes, 2: uint, 3: uint},  ; фрагмент
 //! }
 //! ```
+//!
+//! Байты каждого случая зафиксированы векторами —
+//! `crates/codec/tests/vectors/envelope.txt`, посчитанными независимой
+//! реализацией CBOR (§6, §16).
 
 use ciborium::value::Value;
 use ratatosk_crdt::{Hlc, MsgId};
